@@ -1,0 +1,10 @@
+openai>=1.0.0
+pytest
+numpy
+pandas
+tqdm
+rank-bm25
+networkx
+transformers
+sentencepiece
+llmlingua
