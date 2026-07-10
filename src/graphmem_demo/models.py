@@ -33,6 +33,8 @@ class LeafNode:
     user_text: str
     message_count: int
     retrieval_text: str = ""
+    compact_facts: list[str] = field(default_factory=list)
+    anchor_terms: dict[str, list[str]] = field(default_factory=dict)
     embedding: list[float] | None = None
 
 
@@ -102,6 +104,9 @@ class DeepSeekCallRecord:
         "build_summary_raw_group",
         "build_summary_session_direct",
         "build_summary_session_merge",
+        "build_root_edge_anchor",
+        "build_leaf_edge_anchor",
+        "answer_note_extraction",
         "answer_qa",
     ]
     call_id: str

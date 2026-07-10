@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import graphmem_demo.clients as clients_module
 from graphmem_demo.clients import (
     DeepSeekClient,
@@ -24,8 +26,11 @@ from graphmem_demo.data import (
     load_longmemeval_cases,
     speaker_retrieval_text_from_raw,
 )
+from graphmem_demo.fusion_retrieval import FusionRetrievalConfig, rank_leaves_fusion
 from graphmem_demo.models import DeepSeekCallRecord, GraphEdge, LeafNode, QuestionCase, SummaryNode
 from graphmem_demo.pipeline import (
+    _answer_note_messages,
+    _answer_context_from_notes,
     DemoConfig,
     _answer_messages,
     _build_root_graph,
@@ -38,13 +43,26 @@ from graphmem_demo.pipeline import (
     _expand_root_ids,
     _expand_selected_session_context,
     _fit_context_budget,
+    _iterative_kick_and_backfill_leaves,
     _leaf_embedding_attr,
+    _apply_leaf_enrichment_from_parsed,
+    _apply_leaf_enrichment_to_node,
+    _context_text,
+    _latest_reference_date,
+    _normalize_temporal_compact_facts,
+    _leaf_enrichment_enabled,
+    _leaf_retrieval_text,
+    _lossless_root_summary_text,
     _parse_summary,
+    _parse_answer_notes,
+    _render_root_summary_body,
     _render_summary,
     _retrieve_hybrid,
+    _should_compress_summary_input,
     _summary_anchor_terms,
     _summary_retrieval_text,
     _summary_messages,
+    _summary_max_tokens,
     _variant_spec,
     run_demo,
     run_case,
@@ -53,6 +71,7 @@ from graphmem_demo.stats import aggregate_variant_stats, build_question_stats
 
 
 GRAPHMEM_ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = GRAPHMEM_ROOT / "test" / "fixtures"
 
 
 def _load_generic_ops_module():
@@ -67,7 +86,7 @@ def _load_generic_ops_module():
 
 def test_loader_selects_multi_session_cases() -> None:
     cases = load_longmemeval_cases(
-        GRAPHMEM_ROOT / "data" / "longmemeval_s_subset_10_per_type.json",
+        FIXTURES / "longmemeval_s_subset_10_per_type.json",
         question_type="multi-session",
     )
     assert len(cases) == 10
@@ -81,7 +100,7 @@ def test_loader_selects_multi_session_cases() -> None:
 
 def test_loader_can_select_all_question_types() -> None:
     cases = load_longmemeval_cases(
-        GRAPHMEM_ROOT / "data" / "longmemeval_s_subset_10_per_type.json",
+        FIXTURES / "longmemeval_s_subset_10_per_type.json",
         question_type="all",
     )
     assert len(cases) == 60
@@ -206,7 +225,7 @@ def test_explicit_speaker_cases_use_raw_leaf_text_in_auto_mode() -> None:
 def test_explicit_speaker_cases_get_wider_retrieval_caps() -> None:
     case = QuestionCase(
         question_id="q1",
-        question_type="category_1",
+        question_type="multi-session",
         question="What did Melanie do?",
         answer="answer",
         question_date=None,
@@ -305,6 +324,7 @@ def test_stats_keep_build_and_answer_tokens_separate() -> None:
     records = [
         _record("build_summary_leaf", 10, 2),
         _record("build_summary_internal", 4, 1),
+        _record("answer_note_extraction", 5, 2),
         _record("answer_qa", 9, 3, reasoning_tokens=7),
     ]
     question_stats = build_question_stats(
@@ -323,9 +343,9 @@ def test_stats_keep_build_and_answer_tokens_separate() -> None:
     aggregate = aggregate_variant_stats([question_stats], "token_efficient_graphmem")
     assert question_stats.build_prompt_tokens == 14
     assert question_stats.build_completion_tokens == 3
-    assert question_stats.answer_prompt_tokens == 9
-    assert question_stats.answer_completion_tokens == 3
-    assert aggregate.total_deepseek_tokens == 29
+    assert question_stats.answer_prompt_tokens == 14
+    assert question_stats.answer_completion_tokens == 5
+    assert aggregate.total_deepseek_tokens == 36
     assert aggregate.retrieval_answer_session_hit_rate == 1.0
 
 
@@ -730,10 +750,10 @@ def test_bad_structured_summary_keeps_raw_text_and_parse_error(tmp_path: Path) -
         llm=llm,
     )
     assert run.summaries[0].raw_summary_text == "not json"
-    assert run.summaries[0].summary == "not json"
-    assert run.summaries[0].parse_error
+    assert "User: On day 0 I visited place 0." in run.summaries[0].summary
+    assert run.summaries[0].parse_error is None
     assert run.summaries[0].truncated is True
-    assert run.stats.summary_parse_error_count == 1
+    assert run.stats.summary_parse_error_count == 0
     assert run.stats.summary_truncation_count == 1
 
 
@@ -772,6 +792,7 @@ def test_compact_v2_schema_and_compression_chunks(tmp_path: Path) -> None:
             data_path=tmp_path / "unused.json",
             output_dir=tmp_path / "run",
             variants=("direct_session_k16_compact_graphmem",),
+            build_leaf_text="user_only",
             compressor_chunk_rough_tokens=4,
             mock_services=True,
         ),
@@ -782,7 +803,8 @@ def test_compact_v2_schema_and_compression_chunks(tmp_path: Path) -> None:
         compressor,
     )
     assert set(run.summaries[0].parsed_summary or {}) == {"m", "k"}
-    assert run.summaries[0].summary.startswith("Memory:")
+    assert "User:" in run.summaries[0].summary
+    assert "Memory:" not in run.summaries[0].summary
     assert max(record.chunk_count for record in compressor.records) > 1
     assert all("Remember visit" not in record.compressor for record in compressor.records)
 
@@ -802,7 +824,7 @@ def test_hybrid_global_leaf_fallback_adds_non_root_leaf(tmp_path: Path) -> None:
         _root("distractor-root", "distractor", [1.0, 0.0], [distractor.node_id]),
         _root("answer-root", "answer", [0.0, 1.0], [answer.node_id]),
     ]
-    summaries, leaves, edges = _retrieve_hybrid(
+    summaries, leaves, edges, _ = _retrieve_hybrid(
         config,
         "Which answer is current?",
         [distractor, answer],
@@ -833,7 +855,7 @@ def test_hybrid_root_seed_preserves_root_session_leaf(tmp_path: Path) -> None:
         _root("root-summary", "root-session", [1.0, 0.0], [root_leaf.node_id]),
         _root("global-summary", "global-session", [0.0, 1.0], [global_leaf.node_id]),
     ]
-    _, leaves, _ = _retrieve_hybrid(
+    _, leaves, _, _ = _retrieve_hybrid(
         config,
         "Which root session?",
         [root_leaf, global_leaf],
@@ -844,6 +866,499 @@ def test_hybrid_root_seed_preserves_root_session_leaf(tmp_path: Path) -> None:
         False,
     )
     assert leaves == [root_leaf]
+
+
+def test_graph_search_prefers_seed_sessions_over_alphabetical(tmp_path: Path) -> None:
+    config = DemoConfig(
+        data_path=tmp_path / "unused.json",
+        output_dir=tmp_path / "run",
+        leaf_top_k=6,
+        qa_summary_top_k=2,
+        global_leaf_top_k=0,
+        root_candidate_k=1,
+        enable_graph_search=True,
+        graph_search_seed_leaves=1,
+        graph_search_max_sessions=3,
+        graph_search_session_min_leaves=2,
+        mock_services=True,
+    )
+    hot_leaf = _leaf("hot-leaf", "zzz_hot_session", [1.0, 0.0])
+    hot_neighbor = _leaf("hot-neighbor", "zzz_hot_session", [0.8, 0.0])
+    cold_leaves = [
+        _leaf(f"cold-{index}", f"aaa_cold_{index}", [0.0, 0.1])
+        for index in range(3)
+    ]
+    for index, leaf in enumerate(cold_leaves):
+        leaf.turn_index = index
+    roots = [
+        _root("hot-root", "zzz_hot_session", [1.0, 0.0], [hot_leaf.node_id, hot_neighbor.node_id]),
+        _root("cold-root", "aaa_cold_0", [0.0, 1.0], [cold_leaves[0].node_id]),
+    ]
+    _, leaves, _, _ = _retrieve_hybrid(
+        config,
+        "hot topic",
+        [hot_leaf, hot_neighbor, *cold_leaves],
+        roots,
+        [],
+        [1.0, 0.0],
+        True,
+        False,
+    )
+    assert hot_leaf in leaves
+    assert sum(1 for leaf in leaves if leaf.session_id == "zzz_hot_session") >= 2
+
+
+def test_graph_search_propagates_along_leaf_edges(tmp_path: Path) -> None:
+    config = DemoConfig(
+        data_path=tmp_path / "unused.json",
+        output_dir=tmp_path / "run",
+        leaf_top_k=3,
+        qa_summary_top_k=1,
+        global_leaf_top_k=0,
+        root_candidate_k=1,
+        enable_graph_search=True,
+        graph_search_seed_leaves=1,
+        graph_search_session_min_leaves=2,
+        mock_services=True,
+    )
+    seed_leaf = _leaf("seed-leaf", "session-a", [1.0, 0.0])
+    neighbor_leaf = _leaf("neighbor-leaf", "session-a", [0.1, 0.0])
+    distractor = _leaf("distractor-leaf", "session-b", [0.9, 0.1])
+    roots = [
+        _root("root-a", "session-a", [1.0, 0.0], [seed_leaf.node_id, neighbor_leaf.node_id]),
+        _root("root-b", "session-b", [0.9, 0.1], [distractor.node_id]),
+    ]
+    edges = [
+        GraphEdge(
+            src=seed_leaf.node_id,
+            dst=neighbor_leaf.node_id,
+            relation="temporal_neighbor",
+            score=0.9,
+        )
+    ]
+    _, leaves, used_edges, protected = _retrieve_hybrid(
+        config,
+        "seed topic",
+        [seed_leaf, neighbor_leaf, distractor],
+        roots,
+        edges,
+        [1.0, 0.0],
+        True,
+        False,
+    )
+    leaf_ids = {leaf.node_id for leaf in leaves}
+    assert seed_leaf.node_id in leaf_ids
+    assert neighbor_leaf.node_id in leaf_ids
+    assert used_edges
+
+
+def test_graph_search_session_coverage_keeps_secondary_sessions(tmp_path: Path) -> None:
+    """Coverage floor must keep a second graph-ranked session, not only the hottest one."""
+    hot_a = _leaf("hot-a", "sess-a", [1.0, 0.0])
+    hot_a2 = _leaf("hot-a2", "sess-a", [0.95, 0.0])
+    hot_a3 = _leaf("hot-a3", "sess-a", [0.9, 0.0])
+    hot_a4 = _leaf("hot-a4", "sess-a", [0.85, 0.0])
+    secondary = _leaf("secondary", "sess-b", [0.55, 0.0])
+    roots = [
+        _root("root-a", "sess-a", [1.0, 0.0], [hot_a.node_id, hot_a2.node_id, hot_a3.node_id, hot_a4.node_id]),
+        _root("root-b", "sess-b", [0.55, 0.0], [secondary.node_id]),
+    ]
+    edges = [
+        GraphEdge(src="root-a", dst="root-b", relation="semantic_neighbor", score=0.9),
+    ]
+    config = DemoConfig(
+        data_path=tmp_path / "unused.json",
+        output_dir=tmp_path / "run_cov",
+        leaf_top_k=4,
+        qa_summary_top_k=2,
+        enable_graph_search=True,
+        graph_search_seed_only=True,
+        graph_search_seed_roots=2,
+        graph_search_seed_leaves=1,
+        graph_search_session_coverage=2,
+        graph_search_per_session_leaf_cap=4,
+        graph_search_embedding_blend=0.0,
+        graph_search_structural_root_leaf_weight=0.1,
+        mock_services=True,
+    )
+    _, leaves, _, _ = _retrieve_hybrid(
+        config,
+        "hot topic",
+        [hot_a, hot_a2, hot_a3, hot_a4, secondary],
+        roots,
+        edges,
+        [1.0, 0.0],
+        True,
+        False,
+    )
+    sessions = {leaf.session_id for leaf in leaves}
+    assert "sess-a" in sessions
+    assert "sess-b" in sessions
+
+
+def test_graph_search_free_select_prefers_ppr_over_diversify_fill(tmp_path: Path) -> None:
+    """Free select must not spend the budget as 2-leaves-per-session diversify."""
+    seed = _leaf("seed", "sess-a", [1.0, 0.0])
+    # Strong graph neighbor in same session, weak embedding.
+    graph_hit = _leaf("graph-hit", "sess-a", [0.05, 0.0])
+    # High embedding distractors in other sessions (would fill Phase-1 diversify).
+    distractors = [
+        _leaf(f"dist-{i}", f"sess-{i}", [0.9 - 0.01 * i, 0.1])
+        for i in range(8)
+    ]
+    roots = [
+        _root("root-a", "sess-a", [1.0, 0.0], [seed.node_id, graph_hit.node_id]),
+        *[_root(f"root-{i}", f"sess-{i}", [0.9 - 0.01 * i, 0.1], [distractors[i].node_id]) for i in range(8)],
+    ]
+    edges = [
+        GraphEdge(src=seed.node_id, dst=graph_hit.node_id, relation="entity_neighbor", score=0.99)
+    ]
+    config = DemoConfig(
+        data_path=tmp_path / "unused.json",
+        output_dir=tmp_path / "run",
+        leaf_top_k=6,
+        qa_summary_top_k=2,
+        enable_graph_search=True,
+        graph_search_seed_only=True,
+        graph_search_seed_leaves=1,
+        graph_search_session_coverage=2,
+        graph_search_embedding_blend=0.0,
+        graph_search_structural_root_leaf_weight=0.1,
+        graph_search_per_session_leaf_cap=4,
+        mock_services=True,
+    )
+    _, leaves, _, _ = _retrieve_hybrid(
+        config,
+        "seed topic",
+        [seed, graph_hit, *distractors],
+        roots,
+        edges,
+        [1.0, 0.0],
+        True,
+        False,
+    )
+    leaf_ids = {leaf.node_id for leaf in leaves}
+    assert seed.node_id in leaf_ids
+    assert graph_hit.node_id in leaf_ids
+    # Must be allowed to take >1 leaf from the hot session (old Phase-1 lock forbade this pattern).
+    assert sum(1 for leaf in leaves if leaf.session_id == "sess-a") >= 2
+
+
+def test_graph_search_seed_only_reaches_off_pool_neighbors(tmp_path: Path) -> None:
+    seed_leaf = _leaf("seed-leaf", "session-a", [1.0, 0.0])
+    hidden_neighbor = _leaf("hidden-neighbor", "session-a", [0.05, 0.0])
+    distractor = _leaf("distractor-leaf", "session-b", [0.99, 0.01])
+    roots = [
+        _root("root-a", "session-a", [0.1, 0.99], [seed_leaf.node_id, hidden_neighbor.node_id]),
+        _root("root-b", "session-b", [0.99, 0.01], [distractor.node_id]),
+    ]
+    edges = [
+        GraphEdge(
+            src=seed_leaf.node_id,
+            dst=hidden_neighbor.node_id,
+            relation="temporal_neighbor",
+            score=0.95,
+        )
+    ]
+    query = [1.0, 0.0]
+
+    pool_config = DemoConfig(
+        data_path=tmp_path / "unused.json",
+        output_dir=tmp_path / "run_pool",
+        leaf_top_k=3,
+        qa_summary_top_k=1,
+        global_leaf_top_k=0,
+        root_candidate_k=1,
+        enable_graph_search=True,
+        graph_search_seed_only=False,
+        graph_search_seed_leaves=1,
+        graph_search_embedding_blend=0.0,
+        graph_search_session_min_leaves=2,
+        mock_services=True,
+    )
+    _, pool_leaves, _, _ = _retrieve_hybrid(
+        pool_config,
+        "seed topic",
+        [seed_leaf, hidden_neighbor, distractor],
+        roots,
+        edges,
+        query,
+        True,
+        False,
+    )
+    assert hidden_neighbor.node_id not in {leaf.node_id for leaf in pool_leaves}
+
+    seed_only_config = DemoConfig(
+        data_path=tmp_path / "unused.json",
+        output_dir=tmp_path / "run_seed_only",
+        leaf_top_k=3,
+        qa_summary_top_k=1,
+        global_leaf_top_k=0,
+        root_candidate_k=1,
+        enable_graph_search=True,
+        graph_search_seed_only=True,
+        graph_search_seed_leaves=1,
+        graph_search_embedding_blend=0.0,
+        graph_search_session_min_leaves=2,
+        mock_services=True,
+    )
+    _, seed_only_leaves, _, _ = _retrieve_hybrid(
+        seed_only_config,
+        "seed topic",
+        [seed_leaf, hidden_neighbor, distractor],
+        roots,
+        edges,
+        query,
+        True,
+        False,
+    )
+    leaf_ids = {leaf.node_id for leaf in seed_only_leaves}
+    assert seed_leaf.node_id in leaf_ids
+    assert hidden_neighbor.node_id in leaf_ids
+
+
+def test_graph_first_retrieval_reaches_hidden_neighbor(tmp_path: Path) -> None:
+    seed_leaf = _leaf("seed-leaf", "session-a", [1.0, 0.0])
+    hidden_neighbor = _leaf("hidden-neighbor", "session-a", [0.05, 0.0])
+    distractor = _leaf("distractor-leaf", "session-b", [0.99, 0.01])
+    roots = [
+        _root("root-a", "session-a", [0.1, 0.99], [seed_leaf.node_id, hidden_neighbor.node_id]),
+        _root("root-b", "session-b", [0.99, 0.01], [distractor.node_id]),
+    ]
+    edges = [
+        GraphEdge(
+            src=seed_leaf.node_id,
+            dst=hidden_neighbor.node_id,
+            relation="temporal_neighbor",
+            score=0.95,
+        ),
+        GraphEdge(
+            src="root-a",
+            dst="root-b",
+            relation="semantic_neighbor",
+            score=0.8,
+        ),
+    ]
+    config = DemoConfig(
+        data_path=tmp_path / "unused.json",
+        output_dir=tmp_path / "run_graph_first",
+        leaf_top_k=4,
+        qa_summary_top_k=2,
+        global_leaf_top_k=2,
+        per_session_leaf_k=2,
+        enable_graph_first_retrieval=True,
+        graph_first_session_coverage=2,
+        graph_search_seed_leaves=1,
+        graph_first_embedding_blend=0.0,
+        mock_services=True,
+    )
+    _, leaves, _, _ = _retrieve_hybrid(
+        config,
+        "seed topic",
+        [seed_leaf, hidden_neighbor, distractor],
+        roots,
+        edges,
+        [1.0, 0.0],
+        True,
+        False,
+    )
+    leaf_ids = {leaf.node_id for leaf in leaves}
+    assert seed_leaf.node_id in leaf_ids
+    assert hidden_neighbor.node_id in leaf_ids
+    assert distractor.node_id in leaf_ids
+    assert {leaf.session_id for leaf in leaves} == {"session-a", "session-b"}
+
+
+def test_fusion_retrieval_promotes_entity_keyword_hit() -> None:
+    distractor = LeafNode(
+        node_id="distractor",
+        question_id="q",
+        session_id="session-b",
+        session_date=None,
+        turn_index=0,
+        raw_text="User: I enjoy reading historical fiction in general.",
+        user_text="User: I enjoy reading historical fiction in general.",
+        message_count=1,
+        retrieval_text="User: I enjoy reading historical fiction in general.",
+        embedding=[0.99, 0.01],
+    )
+    target = LeafNode(
+        node_id="target",
+        question_id="q",
+        session_id="session-a",
+        session_date=None,
+        turn_index=0,
+        raw_text=(
+            'User: I am currently on page 250 of "The Nightingale" by Kristin Hannah. '
+            "Assistant: Great choice — the book has 440 pages."
+        ),
+        user_text='User: I am currently on page 250 of "The Nightingale" by Kristin Hannah.',
+        message_count=2,
+        retrieval_text=(
+            'User: I am currently on page 250 of "The Nightingale" by Kristin Hannah. '
+            "Assistant: Great choice — the book has 440 pages."
+        ),
+        embedding=[0.05, 0.0],
+    )
+    ranked = rank_leaves_fusion(
+        [distractor, target],
+        [1.0, 0.0],
+        'How many pages do I have left to read in "The Nightingale"?',
+        config=FusionRetrievalConfig(
+            weight_semantic=0.5,
+            weight_keyword=1.5,
+            weight_entity=2.0,
+            query_adaptive_weights=False,
+        ),
+    )
+    assert [leaf.node_id for leaf in ranked] == ["target", "distractor"]
+
+
+def test_fusion_retrieval_config_validation(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="fusion_method"):
+        DemoConfig(
+            data_path=tmp_path / "unused.json",
+            output_dir=tmp_path / "run",
+            fusion_method="invalid",
+            mock_services=True,
+        )
+
+
+def test_graph_first_with_fusion_uses_better_seeds(tmp_path: Path) -> None:
+    seed_leaf = LeafNode(
+        node_id="seed-leaf",
+        question_id="q",
+        session_id="session-a",
+        session_date=None,
+        turn_index=0,
+        raw_text='User: I finished "The Nightingale" last week.',
+        user_text='User: I finished "The Nightingale" last week.',
+        message_count=1,
+        retrieval_text='User: I finished "The Nightingale" last week.',
+        embedding=[0.2, 0.98],
+    )
+    hidden_neighbor = LeafNode(
+        node_id="hidden-neighbor",
+        question_id="q",
+        session_id="session-a",
+        session_date=None,
+        turn_index=1,
+        raw_text="User: The hardcover edition has 440 pages total.",
+        user_text="User: The hardcover edition has 440 pages total.",
+        message_count=1,
+        retrieval_text="User: The hardcover edition has 440 pages total.",
+        embedding=[0.05, 0.0],
+    )
+    distractor = LeafNode(
+        node_id="distractor-leaf",
+        question_id="q",
+        session_id="session-b",
+        session_date=None,
+        turn_index=0,
+        raw_text="User: I like novels in general.",
+        user_text="User: I like novels in general.",
+        message_count=1,
+        retrieval_text="User: I like novels in general.",
+        embedding=[0.99, 0.01],
+    )
+    roots = [
+        _root("root-a", "session-a", [0.1, 0.99], [seed_leaf.node_id, hidden_neighbor.node_id]),
+        _root("root-b", "session-b", [0.99, 0.01], [distractor.node_id]),
+    ]
+    edges = [
+        GraphEdge(
+            src=seed_leaf.node_id,
+            dst=hidden_neighbor.node_id,
+            relation="temporal_neighbor",
+            score=0.95,
+        ),
+        GraphEdge(
+            src="root-a",
+            dst="root-b",
+            relation="semantic_neighbor",
+            score=0.8,
+        ),
+    ]
+    config = DemoConfig(
+        data_path=tmp_path / "unused.json",
+        output_dir=tmp_path / "run_graph_first_fusion",
+        leaf_top_k=4,
+        qa_summary_top_k=2,
+        global_leaf_top_k=2,
+        per_session_leaf_k=2,
+        enable_graph_first_retrieval=True,
+        enable_fusion_retrieval=True,
+        fusion_query_adaptive_weights=False,
+        graph_first_session_coverage=2,
+        graph_search_seed_leaves=1,
+        graph_first_embedding_blend=0.0,
+        mock_services=True,
+    )
+    _, leaves, _, _ = _retrieve_hybrid(
+        config,
+        'How many pages are in "The Nightingale"?',
+        [seed_leaf, hidden_neighbor, distractor],
+        roots,
+        edges,
+        [1.0, 0.0],
+        True,
+        False,
+    )
+    leaf_ids = {leaf.node_id for leaf in leaves}
+    assert seed_leaf.node_id in leaf_ids
+    assert hidden_neighbor.node_id in leaf_ids
+
+
+def test_raw_build_skips_summary_compression(tmp_path: Path) -> None:
+    compressor = MockCompressor(0.5)
+    config = DemoConfig(
+        data_path=tmp_path / "unused.json",
+        output_dir=tmp_path / "run",
+        variants=("direct_session_k16_compact_graphmem",),
+        mock_services=True,
+    )
+    spec = _variant_spec(config, "direct_session_k16_compact_graphmem")
+    case = _synthetic_case("What did we discuss?")
+    assert _effective_leaf_text_mode("auto", spec, case, "build") == "raw"
+    assert not _should_compress_summary_input(config, spec, case)
+    run_case(
+        config,
+        case,
+        "direct_session_k16_compact_graphmem",
+        MockDeepSeekClient(),
+        MockEmbeddingClient(),
+        compressor,
+    )
+    assert compressor.records == []
+
+
+def test_user_only_build_still_compresses_summary_input(tmp_path: Path) -> None:
+    config = DemoConfig(
+        data_path=tmp_path / "unused.json",
+        output_dir=tmp_path / "run",
+        variants=("direct_session_k16_compact_graphmem",),
+        build_leaf_text="user_only",
+        mock_services=True,
+    )
+    spec = _variant_spec(config, "direct_session_k16_compact_graphmem")
+    case = _synthetic_case("What did we discuss?")
+    assert _should_compress_summary_input(config, spec, case)
+
+
+def test_compact_graphmem_variant_uses_raw_leaf_text(tmp_path: Path) -> None:
+    config = DemoConfig(
+        data_path=tmp_path / "unused.json",
+        output_dir=tmp_path / "run",
+        variants=("direct_session_k16_compact_graphmem",),
+        mock_services=True,
+    )
+    spec = _variant_spec(config, "direct_session_k16_compact_graphmem")
+    assert spec.build_leaf_text == "raw"
+    assert spec.retrieval_leaf_text == "raw"
+    case = _synthetic_case("What did we discuss?")
+    assert _effective_leaf_text_mode("auto", spec, case, "build") == "raw"
+    assert _effective_leaf_text_mode("auto", spec, case, "retrieval") == "raw"
+    assert _summary_max_tokens(config, spec) == 2048
 
 
 def test_multilingual_schema_parse_and_render() -> None:
@@ -887,6 +1402,183 @@ def test_summary_retrieval_text_adds_search_cues_without_raw_copy() -> None:
     assert "[Child 1]" not in retrieval_text
 
 
+def test_parse_compact_summary_with_leaf_entries() -> None:
+    payload = json.dumps(
+        {
+            "m": ["User likes oat milk."],
+            "k": ["coffee"],
+            "leaves": [
+                {"i": 1, "f": ["User prefers oat milk."], "k": ["oat milk"]},
+                {"i": 2, "f": ["Assistant recommended Blue Bottle."], "k": ["Blue Bottle"]},
+            ],
+        }
+    )
+    parsed, error = _parse_summary(payload, "compact_memory_v2")
+    assert error is None
+    assert parsed is not None
+    assert parsed["m"] == ["User likes oat milk."]
+    assert parsed["leaves"][0]["f"] == ["User prefers oat milk."]
+    assert parsed["leaves"][1]["k"] == ["Blue Bottle"]
+
+
+def test_leaf_enrichment_updates_retrieval_text() -> None:
+    leaf = LeafNode(
+        node_id="q1:s1:leaf:0",
+        question_id="q1",
+        session_id="s1",
+        session_date="2023/05/12",
+        turn_index=0,
+        raw_text="User: I prefer oat milk.\nAssistant: Try Blue Bottle.",
+        user_text="User: I prefer oat milk.",
+        message_count=2,
+    )
+    _apply_leaf_enrichment_to_node(
+        leaf,
+        ["User prefers oat milk.", "Assistant recommended Blue Bottle."],
+        ["oat milk", "Blue Bottle"],
+    )
+    assert leaf.compact_facts
+    assert "oat milk" in leaf.anchor_terms.get("keywords", [])
+    assert "Facts:" in leaf.retrieval_text
+    assert "Anchor terms:" in leaf.retrieval_text
+    assert leaf.raw_text in leaf.retrieval_text
+
+
+def test_apply_leaf_enrichment_from_parsed_maps_child_index() -> None:
+    leaf = LeafNode(
+        node_id="q1:s1:leaf:0",
+        question_id="q1",
+        session_id="s1",
+        session_date="2023/05/12",
+        turn_index=0,
+        raw_text="User: I prefer oat milk.",
+        user_text="User: I prefer oat milk.",
+        message_count=1,
+    )
+    parsed = {
+        "m": ["session fact"],
+        "k": ["coffee"],
+        "leaves": [{"i": 1, "f": ["User prefers oat milk."], "k": ["oat milk"]}],
+    }
+    _apply_leaf_enrichment_from_parsed([leaf], parsed, {leaf.node_id: leaf})
+    assert leaf.compact_facts == ["User prefers oat milk."]
+    assert "oat milk" in leaf.anchor_terms.get("keywords", [])
+
+
+def test_summary_messages_include_leaf_schema_when_requested() -> None:
+    messages = _summary_messages(
+        "session-1",
+        "2023/05/12",
+        "build_summary_session_direct",
+        "[Child 1]\nUser: hello",
+        "compact_memory_v2",
+        include_leaf_enrichment=True,
+    )
+    assert '"leaves"' in messages[0]["content"]
+    assert "matching i=N" in messages[0]["content"]
+
+
+def test_leaf_enrichment_enabled_only_for_compact_schema() -> None:
+    config = DemoConfig(
+        data_path="data.json",
+        output_dir=Path("runs/test"),
+        enable_leaf_enrichment=True,
+        summary_schema="compact_memory_v2",
+    )
+    spec = _variant_spec(config, "direct_session_k16_compact_graphmem")
+    assert _leaf_enrichment_enabled(config, spec) is True
+    config.summary_schema = "minimal_memory_v1"
+    assert _leaf_enrichment_enabled(config, spec) is False
+
+
+def test_lossless_root_summary_keeps_full_child_dialogue() -> None:
+    leaf = LeafNode(
+        node_id="q1:s1:leaf:0",
+        question_id="q1",
+        session_id="s1",
+        session_date="2023/05/12",
+        turn_index=0,
+        raw_text="User: I prefer oat milk.\nAssistant: Try Blue Bottle.",
+        user_text="User: I prefer oat milk.",
+        message_count=2,
+    )
+    text = _lossless_root_summary_text([leaf], "raw", "2023/05/12")
+    assert "Session date: 2023/05/12" in text
+    assert "User: I prefer oat milk." in text
+    assert "Assistant: Try Blue Bottle." in text
+    assert "Memory:" not in text
+
+
+def test_render_root_summary_body_prefers_lossless_storage() -> None:
+    leaf = LeafNode(
+        node_id="q1:s1:leaf:0",
+        question_id="q1",
+        session_id="s1",
+        session_date="2023/05/12",
+        turn_index=0,
+        raw_text="User: I bought Architectural Digest.",
+        user_text="User: I bought Architectural Digest.",
+        message_count=1,
+    )
+    config = DemoConfig(
+        data_path="data.json",
+        output_dir=Path("runs/test"),
+        enable_lossless_root_summary=True,
+        summary_schema="compact_memory_v2",
+    )
+    spec = _variant_spec(config, "direct_session_k16_compact_graphmem")
+    case = QuestionCase(
+        question_id="q1",
+        question_type="multi-session",
+        question="What did I buy?",
+        answer="Architectural Digest",
+        question_date=None,
+        haystack_sessions=[[{"role": "user", "content": "I bought Architectural Digest."}]],
+        haystack_session_ids=["s1"],
+        haystack_dates=["2023/05/12"],
+        answer_session_ids=["s1"],
+    )
+    job = SimpleNamespace(
+        children=[leaf],
+        session_date="2023/05/12",
+    )
+    parsed = {"m": ["User subscribed."], "k": ["subscription"]}
+    body, parse_error = _render_root_summary_body(
+        config,
+        spec,
+        case,
+        job,
+        parsed=parsed,
+        summary_text=json.dumps(parsed),
+        schema="compact_memory_v2",
+        parse_error="invalid_json: boom",
+    )
+    assert parse_error is None
+    assert "Architectural Digest" in body
+    assert "Memory:" not in body
+
+
+def test_should_compress_summary_input_disabled_for_raw_build() -> None:
+    config = DemoConfig(
+        data_path="data.json",
+        output_dir=Path("runs/test"),
+        build_leaf_text="raw",
+    )
+    spec = _variant_spec(config, "direct_session_k16_compact_graphmem")
+    case = QuestionCase(
+        question_id="q1",
+        question_type="multi-session",
+        question="?",
+        answer="a",
+        question_date=None,
+        haystack_sessions=[[{"role": "user", "content": "hi"}]],
+        haystack_session_ids=["s1"],
+        haystack_dates=[None],
+        answer_session_ids=["s1"],
+    )
+    assert _should_compress_summary_input(config, spec, case) is False
+
+
 def test_root_graph_adds_keyword_neighbor_edges() -> None:
     first = _root("root-a", "a", [1.0, 0.0], ["leaf-a"])
     second = _root("root-b", "b", [0.0, 1.0], ["leaf-b"])
@@ -906,7 +1598,7 @@ def test_root_graph_adds_keyword_neighbor_edges() -> None:
 
 def test_root_graph_adds_typed_anchor_edges_and_expands_them() -> None:
     first = _root("root-a", "a", [1.0, 0.0], ["leaf-a"])
-    second = _root("root-b", "b", [0.0, 1.0], ["leaf-b"])
+    second = _root("root-b", "b", [0.95, 0.05], ["leaf-b"])
     third = _root("root-c", "c", [0.0, -1.0], ["leaf-c"])
     first.anchor_terms = {"entities": ["Architectural Digest"], "actions": ["subscribed"]}
     second.anchor_terms = {"entities": ["Architectural Digest"], "actions": ["cancelled"]}
@@ -958,7 +1650,7 @@ def test_summary_anchor_terms_extracts_speaker_action_attribute_phrases() -> Non
 
 def test_root_graph_adds_state_phrase_edges() -> None:
     first = _root("root-a", "a", [1.0, 0.0], ["leaf-a"])
-    second = _root("root-b", "b", [0.0, 1.0], ["leaf-b"])
+    second = _root("root-b", "b", [0.95, 0.05], ["leaf-b"])
     third = _root("root-c", "c", [0.0, -1.0], ["leaf-c"])
     first.anchor_terms = {"state_phrases": ["currently reading seven husbands"]}
     second.anchor_terms = {"state_phrases": ["currently reading seven husbands"]}
@@ -1020,7 +1712,7 @@ def test_single_llm_variant_preserves_raw_assistant_evidence_and_larger_summary_
     assert spec.build_leaf_text == "user_only"
     assert spec.retrieval_leaf_text == "user_only"
     assert spec.raw_question_types == ("single-session-assistant", "single-session-preference")
-    assert spec.summary_max_tokens == 512
+    assert spec.summary_max_tokens == 2048
     assistant_case = _synthetic_case("What did you recommend?")
     assistant_case.question_type = "single-session-assistant"
     update_case = _synthetic_case("How many Instagram followers do I currently have?")
@@ -1039,7 +1731,7 @@ def test_single_llm_variant_preserves_raw_assistant_evidence_and_larger_summary_
     )
     summary_calls = [record for record in run.llm_records if record.stage.startswith("build_summary")]
     assert summary_calls
-    assert all(record.max_tokens == 512 for record in summary_calls)
+    assert all(record.max_tokens == 2048 for record in summary_calls)
 
 
 def test_compact_summary_prompt_keeps_assistant_previous_conversation_answers() -> None:
@@ -1054,6 +1746,124 @@ def test_compact_summary_prompt_keeps_assistant_previous_conversation_answers() 
     assert "assistant-provided" in system
     assert "tables" in system
     assert "previous conversation" in system
+
+
+def test_summary_prompt_requests_fuzzy_time_normalization_with_session_date() -> None:
+    messages = _summary_messages(
+        "s1",
+        "2026/05/22",
+        "build_summary_session_direct",
+        "User: I went there last week.",
+        "compact_memory_v2",
+    )
+    system = messages[0]["content"]
+    assert "Normalize fuzzy time mentions" in system
+    assert "YYYY-MM-DD" in system
+    assert "append the resolved date in parentheses" in system
+
+
+def test_leaf_enrichment_prompt_requires_absolute_dates_in_facts() -> None:
+    messages = _summary_messages(
+        "s1",
+        "2023/07/15",
+        "build_summary_session_direct",
+        "[Child 1]\nUser: I attended the workshop yesterday.",
+        "compact_memory_v2",
+        include_leaf_enrichment=True,
+    )
+    system = messages[0]["content"]
+    assert "Write facts with explicit YYYY-MM-DD date(s)" in system
+    assert "Do not leave relative-only time words in facts" in system
+
+
+def test_normalize_temporal_compact_facts_resolves_yesterday() -> None:
+    facts = _normalize_temporal_compact_facts(
+        ["Attended workshop yesterday."],
+        "2023/07/15",
+    )
+    assert facts == ["Attended workshop yesterday (2023-07-14)."]
+
+
+def test_normalize_temporal_compact_facts_promotes_parenthetical_dates() -> None:
+    facts = _normalize_temporal_compact_facts(
+        ["Finished book last week (2023-05-01 to 2023-05-07)."],
+        "2023/05/12",
+    )
+    assert "2023-05-01 to 2023-05-07" in facts[0]
+    assert "last week" in facts[0]
+
+
+def test_context_text_orders_evidence_oldest_to_newest() -> None:
+    older = LeafNode(
+        node_id="q1:s1:leaf:0",
+        question_id="q1",
+        session_id="s1",
+        session_date="2023/05/01",
+        turn_index=0,
+        raw_text="User: first event.",
+        user_text="User: first event.",
+        message_count=1,
+    )
+    newer = LeafNode(
+        node_id="q1:s2:leaf:0",
+        question_id="q1",
+        session_id="s2",
+        session_date="2023/06/01",
+        turn_index=0,
+        raw_text="User: second event.",
+        user_text="User: second event.",
+        message_count=1,
+    )
+    context = _context_text([], [newer, older])
+    assert context.index("first event") < context.index("second event")
+
+
+def test_latest_reference_date_uses_latest_retrieved_session_date() -> None:
+    case = QuestionCase(
+        question_id="q1",
+        question_type="temporal-reasoning",
+        question="When did it happen?",
+        answer="2023-06-01",
+        answer_session_ids=["s2"],
+        question_date="2023/07/01",
+        haystack_session_ids=["s1", "s2"],
+        haystack_dates=["2023/05/01", "2023/06/01"],
+        haystack_sessions=[],
+    )
+    leaves = [
+        LeafNode(
+            node_id="q1:s1:leaf:0",
+            question_id="q1",
+            session_id="s1",
+            session_date="2023/05/01",
+            turn_index=0,
+            raw_text="User: first.",
+            user_text="User: first.",
+            message_count=1,
+        ),
+        LeafNode(
+            node_id="q1:s2:leaf:0",
+            question_id="q1",
+            session_id="s2",
+            session_date="2023/06/01",
+            turn_index=0,
+            raw_text="User: second.",
+            user_text="User: second.",
+            message_count=1,
+        ),
+    ]
+    assert _latest_reference_date(case, [], leaves) == "2023-06-01"
+
+
+def test_answer_prompt_includes_reference_date_anchor() -> None:
+    case = _synthetic_case("When did I attend the workshop?")
+    prompt = _answer_messages(
+        case,
+        "Session date: 2023/07/15\nUser: I attended the workshop yesterday.",
+        reference_date="2023-07-15",
+    )
+    user = prompt[1]["content"]
+    assert "These conversations took place around 2023-07-15." in user
 
 
 def test_enhanced_hybrid_retrieval_seeds_each_candidate_root_session(tmp_path: Path) -> None:
@@ -1078,7 +1888,7 @@ def test_enhanced_hybrid_retrieval_seeds_each_candidate_root_session(tmp_path: P
         _root("architectural-root", "architectural", [0.9, 0.1], [leaves[1].node_id]),
         _root("forbes-root", "forbes", [0.8, 0.2], [leaves[2].node_id]),
     ]
-    _, selected, _ = _retrieve_hybrid(
+    _, selected, _, _ = _retrieve_hybrid(
         config,
         "How many magazine subscriptions do I currently have?",
         leaves,
@@ -1089,6 +1899,32 @@ def test_enhanced_hybrid_retrieval_seeds_each_candidate_root_session(tmp_path: P
         True,
     )
     assert {leaf.session_id for leaf in selected} >= {"new-yorker", "architectural", "forbes"}
+
+
+def test_iterative_kick_and_backfill_kicks_low_relevance_and_refills() -> None:
+    pool = [
+        _leaf("a", "s1", [1.0, 0.0]),
+        _leaf("b", "s2", [0.9, 0.1]),
+        _leaf("c", "s3", [0.8, 0.2]),
+        _leaf("d", "s4", [0.7, 0.3]),
+    ]
+    selected = [pool[0], pool[3]]
+    scores = {"a": 1.0, "b": 0.85, "c": 0.6, "d": 0.1}
+
+    refined = _iterative_kick_and_backfill_leaves(
+        selected,
+        pool,
+        scores,
+        max_rounds=2,
+        max_kick_per_round=5,
+        min_relevance_ratio=0.5,
+        protect_top_k=1,
+    )
+
+    ids = [leaf.node_id for leaf in refined]
+    assert "a" in ids
+    assert "d" not in ids
+    assert len(refined) == len(selected)
 
 
 def test_multilevel_summary_candidates_can_narrow_leaf_candidates(tmp_path: Path) -> None:
@@ -1119,7 +1955,7 @@ def test_multilevel_summary_candidates_can_narrow_leaf_candidates(tmp_path: Path
         [distractor_leaf.node_id],
     )
 
-    _, root_only_leaves, _ = _retrieve_hybrid(
+    _, root_only_leaves, _, _ = _retrieve_hybrid(
         config,
         "Where do I currently keep my old sneakers?",
         [target_leaf, distractor_leaf],
@@ -1129,7 +1965,7 @@ def test_multilevel_summary_candidates_can_narrow_leaf_candidates(tmp_path: Path
         False,
         False,
     )
-    _, multilevel_leaves, _ = _retrieve_hybrid(
+    _, multilevel_leaves, _, _ = _retrieve_hybrid(
         config,
         "Where do I currently keep my old sneakers?",
         [target_leaf, distractor_leaf],
@@ -1216,6 +2052,80 @@ def test_enhanced_answer_prompt_demands_evidence_and_time_math() -> None:
     assert "Do not count recommendations" in system
     assert "currently-own or currently-use" in system
     assert "attended/visited/completed" in system
+    assert "Final answer line must contain only" in system
+
+
+def test_default_answer_prompt_requires_single_final_value_line() -> None:
+    case = _synthetic_case("When did I attend the workshop?")
+    prompt = _answer_messages(case, "Session date: 2023/07/15\nUser: I attended the workshop yesterday.")
+    system = prompt[0]["content"]
+    assert "Output format must be exactly two sections" in system
+    assert "Final answer: <value>" in system
+
+
+def test_answer_note_prompt_requests_structured_json_notes() -> None:
+    case = _synthetic_case("How much did I spend on gifts for my sister?")
+    prompt = _answer_note_messages(case, "Evidence block")
+    assert '"notes" as a list' in prompt[0]["content"]
+    assert "session_id" in prompt[0]["content"]
+    assert "Question: How much did I spend on gifts for my sister?" in prompt[1]["content"]
+
+
+def test_parse_answer_notes_accepts_json_object() -> None:
+    text = json.dumps(
+        {
+            "notes": [
+                {
+                    "session_id": "s1",
+                    "date": "2023/05/30",
+                    "fact": "Bought a necklace for my sister.",
+                    "value": "$200",
+                    "entities": ["sister", "Tiffany"],
+                    "evidence_quote": "I just got a silver necklace for $200.",
+                }
+            ]
+        }
+    )
+    notes, error = _parse_answer_notes(text)
+    assert error is None
+    assert len(notes) == 1
+    assert notes[0]["session_id"] == "s1"
+    assert notes[0]["value"] == "$200"
+    assert "Tiffany" in notes[0]["entities"]
+
+
+def test_answer_context_from_notes_uses_structured_block() -> None:
+    case = _synthetic_case("How much did I spend on gifts for my sister?")
+    context = _answer_context_from_notes(
+        case,
+        [
+            {
+                "session_id": "s1",
+                "date": "2023/05/30",
+                "fact": "Bought necklace.",
+                "value": "$200",
+                "entities": "sister, Tiffany",
+                "evidence_quote": "silver necklace for $200",
+            }
+        ],
+        raw_context="Raw evidence block",
+        include_raw_context=False,
+    )
+    assert "Structured evidence notes" in context
+    assert '"session_id": "s1"' in context
+    assert "Raw evidence block" not in context
+
+
+def test_answer_context_from_notes_can_append_raw_fallback() -> None:
+    case = _synthetic_case("How much did I spend on gifts for my sister?")
+    context = _answer_context_from_notes(
+        case,
+        [{"session_id": "s1", "date": "", "fact": "Bought necklace.", "value": "", "entities": "", "evidence_quote": ""}],
+        raw_context="Raw evidence block",
+        include_raw_context=True,
+    )
+    assert "Raw evidence (fallback only when notes are insufficient)" in context
+    assert "Raw evidence block" in context
 
 
 def _record(stage: str, prompt: int, completion: int, reasoning_tokens: int = 0) -> DeepSeekCallRecord:

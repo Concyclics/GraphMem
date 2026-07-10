@@ -47,6 +47,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--global-leaf-top-k", type=int, default=40)
     parser.add_argument("--qa-summary-top-k", type=int, default=4)
     parser.add_argument("--per-session-leaf-k", type=int, default=4)
+    parser.add_argument("--enable-coverage-rerank", action="store_true")
+    parser.add_argument("--coverage-rerank-lambda", type=float, default=0.75)
+    parser.add_argument("--coverage-rerank-pool-k", type=int, default=80)
     parser.add_argument("--graph-neighbor-k", type=int, default=2)
     parser.add_argument("--qa-context-token-budget", type=int, default=10000)
     parser.add_argument(
@@ -63,6 +66,36 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "raw", "user_only"],
         default="auto",
     )
+    parser.add_argument("--enable-graph-search", action="store_true")
+    parser.add_argument("--graph-search-seed-roots", type=int, default=6)
+    parser.add_argument("--graph-search-seed-leaves", type=int, default=10)
+    parser.add_argument("--graph-search-ppr-damping", type=float, default=0.85)
+    parser.add_argument("--graph-search-ppr-iterations", type=int, default=25)
+    parser.add_argument("--graph-search-embedding-blend", type=float, default=0.1)
+    parser.add_argument(
+        "--graph-search-seed-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Embedding only picks PPR seeds; PPR runs on the full graph and leaves are "
+            "selected by global graph score (default: on)."
+        ),
+    )
+    parser.add_argument(
+        "--graph-search-structural-root-leaf-weight",
+        type=float,
+        default=0.1,
+        help="Root↔leaf structural weight (default: 0.1; avoid high values).",
+    )
+    parser.add_argument(
+        "--graph-search-session-coverage",
+        type=int,
+        default=0,
+        help="Free-select: guarantee ≥1 leaf from each of the top-N sessions (0=off, default).",
+    )
+    parser.add_argument("--graph-search-session-min-leaves", type=int, default=3)
+    parser.add_argument("--graph-search-max-sessions", type=int, default=8)
+    parser.add_argument("--graph-search-per-session-leaf-cap", type=int, default=4)
     return parser.parse_args()
 
 
@@ -150,6 +183,9 @@ def main() -> None:
         global_leaf_top_k=args.global_leaf_top_k,
         qa_summary_top_k=args.qa_summary_top_k,
         per_session_leaf_k=args.per_session_leaf_k,
+        enable_coverage_rerank=args.enable_coverage_rerank,
+        coverage_rerank_lambda=args.coverage_rerank_lambda,
+        coverage_rerank_pool_k=args.coverage_rerank_pool_k,
         graph_neighbor_k=args.graph_neighbor_k,
         qa_context_token_budget=args.qa_context_token_budget,
         retrieval_leaf_text=args.retrieval_leaf_text,
@@ -157,6 +193,18 @@ def main() -> None:
         enable_speaker_retrieval_text=args.enable_speaker_retrieval_text,
         enable_typed_root_edges=args.enable_typed_root_edges,
         enable_multilevel_summary_retrieval=args.enable_multilevel_summary_retrieval,
+        enable_graph_search=args.enable_graph_search,
+        graph_search_seed_roots=args.graph_search_seed_roots,
+        graph_search_seed_leaves=args.graph_search_seed_leaves,
+        graph_search_ppr_damping=args.graph_search_ppr_damping,
+        graph_search_ppr_iterations=args.graph_search_ppr_iterations,
+        graph_search_embedding_blend=args.graph_search_embedding_blend,
+        graph_search_seed_only=args.graph_search_seed_only,
+        graph_search_structural_root_leaf_weight=args.graph_search_structural_root_leaf_weight,
+        graph_search_session_coverage=args.graph_search_session_coverage,
+        graph_search_session_min_leaves=args.graph_search_session_min_leaves,
+        graph_search_max_sessions=args.graph_search_max_sessions,
+        graph_search_per_session_leaf_cap=args.graph_search_per_session_leaf_cap,
     )
     spec = _variant_spec(config, args.variant)
     cases = load_longmemeval_cases(args.data, args.question_type, args.max_questions)

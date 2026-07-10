@@ -38,7 +38,7 @@ def build_question_stats(
     peak_inflight_deepseek: int = 0,
 ) -> QuestionStats:
     build_records = [record for record in records if record.stage in BUILD_STAGES]
-    answer_records = [record for record in records if record.stage == "answer_qa"]
+    answer_records = [record for record in records if record.stage.startswith("answer_")]
     return QuestionStats(
         question_id=question_id,
         variant=variant,

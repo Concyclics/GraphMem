@@ -16,7 +16,13 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from graphmem_demo.clients import DeepSeekClient  # noqa: E402
 from graphmem_demo.data import load_longmemeval_cases  # noqa: E402
-from graphmem_demo.pipeline import _answer_messages  # noqa: E402
+from graphmem_demo.pipeline import (  # noqa: E402
+    _answer_messages,
+    _compute_plan_messages,
+    _execute_compute_plan,
+    _extract_json_object,
+    _is_arithmetic_question,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,13 +33,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrieval-results", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--variant", default="reanswer_from_retrieval")
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B-Instruct-2507")
     parser.add_argument("--base-url")
     parser.add_argument("--question-type", default="all")
-    parser.add_argument("--max-questions", type=int, default=60)
+    parser.add_argument("--max-questions", type=int, default=70)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--enhanced-qa", action="store_true")
+    parser.add_argument("--enable-compute-plan", action="store_true")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -63,12 +70,27 @@ def answer_one(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     llm = DeepSeekClient(model=args.model, base_url=args.base_url)
     started = time.perf_counter()
+    answer_context = retrieval["context_text"]
+    computed_block = ""
+    if args.enable_compute_plan and _is_arithmetic_question(case):
+        plan_result = llm.chat(
+            question_id=case.question_id,
+            variant=args.variant,
+            stage="answer_qa",
+            thinking_mode="none",
+            messages=_compute_plan_messages(case, retrieval["context_text"]),
+            max_tokens=args.max_tokens,
+            json_mode=True,
+        )
+        computed_block = _execute_compute_plan(_extract_json_object(plan_result.text or ""))
+        if computed_block:
+            answer_context = f"{retrieval['context_text']}\n\n{computed_block}"
     result = llm.chat(
         question_id=case.question_id,
         variant=args.variant,
         stage="answer_qa",
         thinking_mode="none",
-        messages=_answer_messages(case, retrieval["context_text"], enhanced=args.enhanced_qa),
+        messages=_answer_messages(case, answer_context, enhanced=args.enhanced_qa),
         max_tokens=args.max_tokens,
     )
     answer_row = {
@@ -83,6 +105,7 @@ def answer_one(
         "retrieved_answer_session_all_hit": retrieval.get("answer_session_all_hit", False),
         "retrieved_answer_session_recall": retrieval.get("answer_session_recall", 0.0),
         "source_retrieval_variant": retrieval.get("variant"),
+        "compute_plan_block": computed_block,
         "answer_latency_sec": time.perf_counter() - started,
     }
     return answer_row, asdict(result.record)
