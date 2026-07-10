@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -26,6 +27,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--deepseek-model")
+    parser.add_argument(
+        "--deepseek-base-url",
+        default=None,
+        help="OpenAI-compatible LLM base URL (local vLLM: http://127.0.0.1:8001/v1).",
+    )
+    parser.add_argument(
+        "--llm-local",
+        action="store_true",
+        help="Use local vLLM for build/answer (port 8001, dummy API key).",
+    )
+    parser.add_argument("--llm-local-port", type=int, default=8001)
     parser.add_argument("--embedding-base-url", default="http://127.0.0.1:8002/v1")
     parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
     parser.add_argument("--tree-mode", choices=["legacy_kway", "direct_session"])
@@ -37,6 +49,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--global-leaf-top-k", type=int, default=24)
     parser.add_argument("--qa-summary-top-k", type=int, default=4)
     parser.add_argument("--per-session-leaf-k", type=int, default=2)
+    parser.add_argument("--enable-coverage-rerank", action="store_true")
+    parser.add_argument("--coverage-rerank-lambda", type=float, default=0.75)
+    parser.add_argument("--coverage-rerank-pool-k", type=int, default=80)
     parser.add_argument("--graph-neighbor-k", type=int, default=2)
     parser.add_argument("--qa-context-token-budget", type=int, default=10000)
     parser.add_argument("--qa-max-tokens", type=int, default=1024)
@@ -56,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--summarizer-base-url", default="http://127.0.0.1:8003/v1")
     parser.add_argument("--summarizer-model")
-    parser.add_argument("--summary-token-budget", type=int, default=320)
+    parser.add_argument("--summary-token-budget", type=int, default=1280)
     parser.add_argument("--build-leaf-text", choices=["auto", "raw", "user_only"], default="auto")
     parser.add_argument(
         "--retrieval-leaf-text",
@@ -64,17 +79,296 @@ def parse_args() -> argparse.Namespace:
         default="auto",
     )
     parser.add_argument("--compressor-chunk-rough-tokens", type=int, default=384)
-    parser.add_argument("--raw-group-summary-max-tokens", type=int, default=256)
-    parser.add_argument("--session-summary-max-tokens", type=int, default=320)
-    parser.add_argument("--legacy-internal-summary-max-tokens", type=int, default=224)
+    parser.add_argument("--raw-group-summary-max-tokens", type=int, default=1024)
+    parser.add_argument("--session-summary-max-tokens", type=int, default=2048)
+    parser.add_argument("--legacy-internal-summary-max-tokens", type=int, default=896)
     parser.add_argument("--llmlingua-model")
     parser.add_argument("--llmlingua-device-map")
     parser.add_argument("--use-llmlingua2", action="store_true")
     parser.add_argument("--enable-speaker-profiles", action="store_true")
     parser.add_argument("--enable-speaker-neighbor-window", action="store_true")
     parser.add_argument("--enable-speaker-retrieval-text", action="store_true")
+    parser.add_argument(
+        "--disable-explicit-speaker-retrieval-boost",
+        action="store_true",
+        help="Do not auto-inflate leaf/global/per-session retrieval k for speaker-labeled data.",
+    )
+    parser.add_argument(
+        "--disable-leaf-enrichment",
+        action="store_true",
+        help="Skip per-leaf facts/keywords emitted during compact_memory_v2 session summary.",
+    )
+    parser.add_argument(
+        "--disable-lossless-root-summary",
+        action="store_true",
+        help="Store LLM-rendered compact summary on roots instead of full child dialogue.",
+    )
     parser.add_argument("--enable-typed-root-edges", action="store_true")
     parser.add_argument("--enable-multilevel-summary-retrieval", action="store_true")
+    parser.add_argument("--enable-llm-root-edges", action="store_true")
+    parser.add_argument("--enable-llm-leaf-edges", action="store_true")
+    parser.add_argument("--enable-leaf-graph-expansion", action="store_true")
+    parser.add_argument(
+        "--enable-compute-plan",
+        action="store_true",
+        help="Level-2 program-aided arithmetic: LLM emits a JSON compute plan, code executes it.",
+    )
+    parser.add_argument(
+        "--force-enhanced-retrieval",
+        action="store_true",
+        help="Force enhanced retrieval logic regardless of variant defaults.",
+    )
+    parser.add_argument(
+        "--force-enhanced-qa",
+        action="store_true",
+        help="Force enhanced QA prompt regardless of variant defaults.",
+    )
+    parser.add_argument(
+        "--enable-answer-note-extraction",
+        action="store_true",
+        help="Run stage-A note extraction before final QA.",
+    )
+    parser.add_argument(
+        "--answer-note-max-tokens",
+        type=int,
+        default=1024,
+        help="Max tokens for note extraction stage (default: 1024).",
+    )
+    parser.add_argument(
+        "--disable-answer-use-notes-for-qa",
+        action="store_true",
+        help="Extract notes but keep final QA on raw context.",
+    )
+    parser.add_argument(
+        "--answer-include-raw-context-with-notes",
+        action="store_true",
+        help="When QA uses notes, append raw evidence as fallback context.",
+    )
+    parser.add_argument("--llm-root-edge-max-tokens", type=int, default=256)
+    parser.add_argument("--llm-root-edge-neighbors-per-relation", type=int, default=2)
+    parser.add_argument("--llm-root-edge-min-shared", type=int, default=1)
+    parser.add_argument("--llm-root-edge-anchor-limit", type=int, default=8)
+    parser.add_argument("--llm-leaf-edge-max-tokens", type=int, default=1024)
+    parser.add_argument("--llm-leaf-edge-max-snippet-chars", type=int, default=1024)
+    parser.add_argument(
+        "--llm-leaf-edge-min-confidence",
+        type=float,
+        default=0.8,
+        help="Drop LLM leaf edges below this confidence (default: 0.8).",
+    )
+    parser.add_argument(
+        "--llm-leaf-edge-max-edges-per-leaf",
+        type=int,
+        default=3,
+        help="Cap non-temporal LLM edges per leaf; keep highest confidence (default: 3).",
+    )
+    parser.add_argument(
+        "--llm-leaf-edge-max-edges-per-session",
+        type=int,
+        default=16,
+        help="Cap LLM leaf edges per session after confidence filter (default: 16).",
+    )
+    parser.add_argument("--llm-leaf-edge-max-leaves-per-session", type=int, default=48)
+    parser.add_argument("--leaf-graph-neighbor-k", type=int, default=2)
+    parser.add_argument("--leaf-graph-expansion-budget", type=int, default=4)
+    parser.add_argument(
+        "--enable-graph-search",
+        action="store_true",
+        help="HippoRAG-style retrieval: embedding seeds + PPR over root/leaf edges.",
+    )
+    parser.add_argument("--graph-search-seed-roots", type=int, default=6)
+    parser.add_argument("--graph-search-seed-leaves", type=int, default=10)
+    parser.add_argument("--graph-search-ppr-damping", type=float, default=0.85)
+    parser.add_argument("--graph-search-ppr-iterations", type=int, default=25)
+    parser.add_argument("--graph-search-embedding-blend", type=float, default=0.1)
+    parser.add_argument(
+        "--graph-search-seed-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Embedding only picks PPR seeds; PPR runs on the full graph and leaves are "
+            "selected by global graph score (default: on)."
+        ),
+    )
+    parser.add_argument(
+        "--graph-search-structural-root-leaf-weight",
+        type=float,
+        default=0.1,
+        help="Root↔leaf structural weight (default: 0.1; avoid high values).",
+    )
+    parser.add_argument(
+        "--graph-search-session-coverage",
+        type=int,
+        default=0,
+        help="Free-select: guarantee ≥1 leaf from each of the top-N sessions (0=off, default).",
+    )
+    parser.add_argument("--graph-search-session-min-leaves", type=int, default=3)
+    parser.add_argument("--graph-search-max-sessions", type=int, default=8)
+    parser.add_argument("--graph-search-per-session-leaf-cap", type=int, default=4)
+    parser.add_argument("--no-graph-search-protect-leaves", action="store_true")
+    parser.add_argument(
+        "--enable-graph-first-retrieval",
+        action="store_true",
+        help=(
+            "Graph-primary retrieval: PPR/graph scores drive leaf selection with a "
+            "global embedding safety pool (recommended over --enable-graph-search)."
+        ),
+    )
+    parser.add_argument(
+        "--graph-first-embedding-blend",
+        type=float,
+        default=0.25,
+        help="Final leaf score weight on embedding rank (default: 0.25; graph dominates).",
+    )
+    parser.add_argument(
+        "--graph-first-session-coverage",
+        type=int,
+        default=2,
+        help="Guarantee at least one leaf from each of the top-N graph-ranked sessions.",
+    )
+    parser.add_argument(
+        "--graph-first-candidate-pool-k",
+        type=int,
+        default=80,
+        help="Max graph-expanded leaves in the candidate pool before final selection.",
+    )
+    parser.add_argument(
+        "--enable-fusion-retrieval",
+        action="store_true",
+        help=(
+            "Triple-pass leaf ranking: semantic embedding + BM25 keyword + entity overlap, "
+            "fused with RRF (composable with graph-first)."
+        ),
+    )
+    parser.add_argument(
+        "--fusion-method",
+        choices=["rrf", "weighted"],
+        default="rrf",
+        help="How to combine semantic/keyword/entity ranks (default: rrf).",
+    )
+    parser.add_argument("--fusion-rrf-k", type=int, default=60)
+    parser.add_argument("--fusion-weight-semantic", type=float, default=1.0)
+    parser.add_argument("--fusion-weight-keyword", type=float, default=1.0)
+    parser.add_argument("--fusion-weight-entity", type=float, default=1.0)
+    parser.add_argument(
+        "--no-fusion-query-adaptive-weights",
+        action="store_true",
+        help="Disable query-type weight boosts for keyword/entity passes.",
+    )
+    parser.add_argument(
+        "--disable-typed-retrieval",
+        action="store_true",
+        help="Disable query-time typed anchor matching for root ranking and PPR seeds.",
+    )
+    parser.add_argument(
+        "--typed-retrieval-embedding-blend",
+        type=float,
+        default=0.55,
+        help="Blend between embedding (1.0) and typed anchor overlap (0.0) for roots/seeds.",
+    )
+    parser.add_argument(
+        "--disable-protected-fusion",
+        action="store_true",
+        help="Allow fusion to fully rerank leaves instead of protecting semantic top-K.",
+    )
+    parser.add_argument(
+        "--fusion-semantic-protect-k",
+        type=int,
+        default=10,
+        help="When protected fusion is on, keep this many semantic-top leaves at the front.",
+    )
+    parser.add_argument(
+        "--disable-query-type-retrieval-boost",
+        action="store_true",
+        help="Disable question-type-aware retrieval budget boost (list/date questions).",
+    )
+    parser.add_argument(
+        "--list-question-extra-leaf-budget",
+        type=int,
+        default=6,
+        help="Extra leaf budget for list/set-style questions.",
+    )
+    parser.add_argument(
+        "--temporal-question-extra-leaf-budget",
+        type=int,
+        default=4,
+        help="Extra leaf budget for temporal/date questions.",
+    )
+    parser.add_argument(
+        "--disable-dual-channel-candidate-merge",
+        action="store_true",
+        help="Disable semantic+structured dual-channel candidate merge.",
+    )
+    parser.add_argument(
+        "--dual-channel-structured-pool-k",
+        type=int,
+        default=24,
+        help="Structured channel top-k merged into semantic ranking.",
+    )
+    parser.add_argument(
+        "--enable-iterative-leaf-denoise",
+        action="store_true",
+        help="Iteratively kick low-relevance selected leaves and backfill from ranked tail.",
+    )
+    parser.add_argument(
+        "--iterative-leaf-denoise-max-rounds",
+        type=int,
+        default=3,
+        help="Maximum denoise rounds (default: 3).",
+    )
+    parser.add_argument(
+        "--iterative-leaf-denoise-max-kick-per-round",
+        type=int,
+        default=5,
+        help="Maximum leaves kicked each round (default: 5).",
+    )
+    parser.add_argument(
+        "--iterative-leaf-denoise-min-relevance-ratio",
+        type=float,
+        default=0.35,
+        help="Kick leaves below max_relevance * ratio (default: 0.35).",
+    )
+    parser.add_argument(
+        "--iterative-leaf-denoise-protect-top-k",
+        type=int,
+        default=3,
+        help="Protect this many top-ranked pool leaves from kicking (default: 3).",
+    )
+    parser.add_argument(
+        "--iterative-leaf-denoise-keep-structured-top-k",
+        type=int,
+        default=2,
+        help="Always protect this many structured-signal leaves during LLM denoise.",
+    )
+    parser.add_argument(
+        "--typed-root-neighbors-per-relation",
+        type=int,
+        default=1,
+        help="Max typed root edges kept per relation type (entity/update/time/...).",
+    )
+    parser.add_argument(
+        "--typed-root-max-edges-per-root",
+        type=int,
+        default=6,
+        help="Cap non-semantic/non-keyword typed edges per root node.",
+    )
+    parser.add_argument(
+        "--typed-root-min-edge-score",
+        type=float,
+        default=0.76,
+        help="Drop typed root edges below this score before PPR.",
+    )
+    parser.add_argument(
+        "--typed-root-semantic-support-min-cosine",
+        type=float,
+        default=0.25,
+        help="Require at least this embedding cosine for typed root bridges.",
+    )
+    parser.add_argument(
+        "--disable-typed-root-semantic-support",
+        action="store_true",
+        help="Allow typed root edges even when session embeddings are dissimilar.",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--mock-services",
@@ -88,14 +382,26 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+DEFAULT_LOCAL_LLM_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+
 def main() -> None:
     args = parse_args()
+    deepseek_base_url = args.deepseek_base_url
+    deepseek_model = args.deepseek_model
+    if args.llm_local:
+        deepseek_base_url = deepseek_base_url or f"http://127.0.0.1:{args.llm_local_port}/v1"
+        deepseek_model = deepseek_model or os.environ.get("DEEPSEEK_MODEL", DEFAULT_LOCAL_LLM_MODEL)
+        os.environ.setdefault("DEEPSEEK_API_KEY", "local-llm")
+        os.environ.setdefault("DEEPSEEK_BASE_URL", deepseek_base_url)
+        os.environ.setdefault("DEEPSEEK_MODEL", deepseek_model)
     config = DemoConfig(
         data_path=args.data,
         output_dir=args.output_dir,
         question_type=args.question_type,
         variants=tuple(args.variants),
-        deepseek_model=args.deepseek_model,
+        deepseek_model=deepseek_model,
+        deepseek_base_url=deepseek_base_url,
         embedding_base_url=args.embedding_base_url,
         embedding_model=args.embedding_model,
         tree_mode=args.tree_mode,
@@ -107,6 +413,9 @@ def main() -> None:
         global_leaf_top_k=args.global_leaf_top_k,
         qa_summary_top_k=args.qa_summary_top_k,
         per_session_leaf_k=args.per_session_leaf_k,
+        enable_coverage_rerank=args.enable_coverage_rerank,
+        coverage_rerank_lambda=args.coverage_rerank_lambda,
+        coverage_rerank_pool_k=args.coverage_rerank_pool_k,
         graph_neighbor_k=args.graph_neighbor_k,
         qa_context_token_budget=args.qa_context_token_budget,
         qa_max_tokens=args.qa_max_tokens,
@@ -138,8 +447,77 @@ def main() -> None:
         enable_speaker_profiles=args.enable_speaker_profiles,
         enable_speaker_neighbor_window=args.enable_speaker_neighbor_window,
         enable_speaker_retrieval_text=args.enable_speaker_retrieval_text,
+        enable_explicit_speaker_retrieval_boost=not args.disable_explicit_speaker_retrieval_boost,
+        enable_leaf_enrichment=not args.disable_leaf_enrichment,
+        enable_lossless_root_summary=not args.disable_lossless_root_summary,
         enable_typed_root_edges=args.enable_typed_root_edges,
         enable_multilevel_summary_retrieval=args.enable_multilevel_summary_retrieval,
+        enable_llm_root_edges=args.enable_llm_root_edges,
+        llm_root_edge_max_tokens=args.llm_root_edge_max_tokens,
+        llm_root_edge_neighbors_per_relation=args.llm_root_edge_neighbors_per_relation,
+        llm_root_edge_min_shared=args.llm_root_edge_min_shared,
+        llm_root_edge_anchor_limit=args.llm_root_edge_anchor_limit,
+        enable_llm_leaf_edges=args.enable_llm_leaf_edges,
+        enable_leaf_graph_expansion=args.enable_leaf_graph_expansion,
+        llm_leaf_edge_max_tokens=args.llm_leaf_edge_max_tokens,
+        llm_leaf_edge_max_snippet_chars=args.llm_leaf_edge_max_snippet_chars,
+        llm_leaf_edge_min_confidence=args.llm_leaf_edge_min_confidence,
+        llm_leaf_edge_max_edges_per_leaf=args.llm_leaf_edge_max_edges_per_leaf,
+        llm_leaf_edge_max_edges_per_session=args.llm_leaf_edge_max_edges_per_session,
+        llm_leaf_edge_max_leaves_per_session=args.llm_leaf_edge_max_leaves_per_session,
+        leaf_graph_neighbor_k=args.leaf_graph_neighbor_k,
+        leaf_graph_expansion_budget=args.leaf_graph_expansion_budget,
+        enable_graph_search=args.enable_graph_search,
+        graph_search_seed_roots=args.graph_search_seed_roots,
+        graph_search_seed_leaves=args.graph_search_seed_leaves,
+        graph_search_ppr_damping=args.graph_search_ppr_damping,
+        graph_search_ppr_iterations=args.graph_search_ppr_iterations,
+        graph_search_embedding_blend=args.graph_search_embedding_blend,
+        graph_search_seed_only=args.graph_search_seed_only,
+        graph_search_structural_root_leaf_weight=args.graph_search_structural_root_leaf_weight,
+        graph_search_session_coverage=args.graph_search_session_coverage,
+        graph_search_session_min_leaves=args.graph_search_session_min_leaves,
+        graph_search_max_sessions=args.graph_search_max_sessions,
+        graph_search_per_session_leaf_cap=args.graph_search_per_session_leaf_cap,
+        graph_search_protect_leaves=not args.no_graph_search_protect_leaves,
+        enable_graph_first_retrieval=args.enable_graph_first_retrieval,
+        graph_first_embedding_blend=args.graph_first_embedding_blend,
+        graph_first_session_coverage=args.graph_first_session_coverage,
+        graph_first_candidate_pool_k=args.graph_first_candidate_pool_k,
+        enable_fusion_retrieval=args.enable_fusion_retrieval,
+        fusion_method=args.fusion_method,
+        fusion_rrf_k=args.fusion_rrf_k,
+        fusion_weight_semantic=args.fusion_weight_semantic,
+        fusion_weight_keyword=args.fusion_weight_keyword,
+        fusion_weight_entity=args.fusion_weight_entity,
+        fusion_query_adaptive_weights=not args.no_fusion_query_adaptive_weights,
+        enable_typed_retrieval=not args.disable_typed_retrieval,
+        typed_retrieval_embedding_blend=args.typed_retrieval_embedding_blend,
+        enable_protected_fusion=not args.disable_protected_fusion,
+        fusion_semantic_protect_k=args.fusion_semantic_protect_k,
+        enable_query_type_retrieval_boost=not args.disable_query_type_retrieval_boost,
+        list_question_extra_leaf_budget=args.list_question_extra_leaf_budget,
+        temporal_question_extra_leaf_budget=args.temporal_question_extra_leaf_budget,
+        enable_dual_channel_candidate_merge=not args.disable_dual_channel_candidate_merge,
+        dual_channel_structured_pool_k=args.dual_channel_structured_pool_k,
+        enable_iterative_leaf_denoise=args.enable_iterative_leaf_denoise,
+        iterative_leaf_denoise_max_rounds=args.iterative_leaf_denoise_max_rounds,
+        iterative_leaf_denoise_max_kick_per_round=args.iterative_leaf_denoise_max_kick_per_round,
+        iterative_leaf_denoise_min_relevance_ratio=args.iterative_leaf_denoise_min_relevance_ratio,
+        iterative_leaf_denoise_protect_top_k=args.iterative_leaf_denoise_protect_top_k,
+        iterative_leaf_denoise_keep_structured_top_k=args.iterative_leaf_denoise_keep_structured_top_k,
+        typed_root_neighbors_per_relation=args.typed_root_neighbors_per_relation,
+        typed_root_max_edges_per_root=args.typed_root_max_edges_per_root,
+        typed_root_min_edge_score=args.typed_root_min_edge_score,
+        typed_root_semantic_support_min_cosine=args.typed_root_semantic_support_min_cosine,
+        typed_root_require_semantic_support=not args.disable_typed_root_semantic_support,
+        enable_compute_plan=args.enable_compute_plan,
+        enable_answer_note_extraction=args.enable_answer_note_extraction,
+        answer_note_max_tokens=args.answer_note_max_tokens,
+        answer_use_notes_for_qa=not args.disable_answer_use_notes_for_qa,
+        answer_include_raw_context_with_notes=args.answer_include_raw_context_with_notes,
+        force_enhanced_retrieval=args.force_enhanced_retrieval,
+        force_enhanced_qa=args.force_enhanced_qa,
     )
     aggregates = run_demo(config)
     for aggregate in aggregates:

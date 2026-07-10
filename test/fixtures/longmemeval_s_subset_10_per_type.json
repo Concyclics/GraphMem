@@ -1,0 +1,1682 @@
+[
+  {
+    "question_id": "multi-session-0",
+    "question_type": "multi-session",
+    "question": "Sample multi-session question 0?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "mul-s0"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "mul-s0"
+    ]
+  },
+  {
+    "question_id": "multi-session-1",
+    "question_type": "multi-session",
+    "question": "Sample multi-session question 1?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "mul-s1"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "mul-s1"
+    ]
+  },
+  {
+    "question_id": "multi-session-2",
+    "question_type": "multi-session",
+    "question": "Sample multi-session question 2?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "mul-s2"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "mul-s2"
+    ]
+  },
+  {
+    "question_id": "multi-session-3",
+    "question_type": "multi-session",
+    "question": "Sample multi-session question 3?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "mul-s3"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "mul-s3"
+    ]
+  },
+  {
+    "question_id": "multi-session-4",
+    "question_type": "multi-session",
+    "question": "Sample multi-session question 4?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "mul-s4"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "mul-s4"
+    ]
+  },
+  {
+    "question_id": "multi-session-5",
+    "question_type": "multi-session",
+    "question": "Sample multi-session question 5?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "mul-s5"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "mul-s5"
+    ]
+  },
+  {
+    "question_id": "multi-session-6",
+    "question_type": "multi-session",
+    "question": "Sample multi-session question 6?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "mul-s6"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "mul-s6"
+    ]
+  },
+  {
+    "question_id": "multi-session-7",
+    "question_type": "multi-session",
+    "question": "Sample multi-session question 7?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "mul-s7"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "mul-s7"
+    ]
+  },
+  {
+    "question_id": "multi-session-8",
+    "question_type": "multi-session",
+    "question": "Sample multi-session question 8?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "mul-s8"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "mul-s8"
+    ]
+  },
+  {
+    "question_id": "multi-session-9",
+    "question_type": "multi-session",
+    "question": "Sample multi-session question 9?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "mul-s9"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "mul-s9"
+    ]
+  },
+  {
+    "question_id": "temporal-reasoning-0",
+    "question_type": "temporal-reasoning",
+    "question": "Sample temporal-reasoning question 0?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "tem-s0"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "tem-s0"
+    ]
+  },
+  {
+    "question_id": "temporal-reasoning-1",
+    "question_type": "temporal-reasoning",
+    "question": "Sample temporal-reasoning question 1?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "tem-s1"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "tem-s1"
+    ]
+  },
+  {
+    "question_id": "temporal-reasoning-2",
+    "question_type": "temporal-reasoning",
+    "question": "Sample temporal-reasoning question 2?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "tem-s2"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "tem-s2"
+    ]
+  },
+  {
+    "question_id": "temporal-reasoning-3",
+    "question_type": "temporal-reasoning",
+    "question": "Sample temporal-reasoning question 3?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "tem-s3"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "tem-s3"
+    ]
+  },
+  {
+    "question_id": "temporal-reasoning-4",
+    "question_type": "temporal-reasoning",
+    "question": "Sample temporal-reasoning question 4?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "tem-s4"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "tem-s4"
+    ]
+  },
+  {
+    "question_id": "temporal-reasoning-5",
+    "question_type": "temporal-reasoning",
+    "question": "Sample temporal-reasoning question 5?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "tem-s5"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "tem-s5"
+    ]
+  },
+  {
+    "question_id": "temporal-reasoning-6",
+    "question_type": "temporal-reasoning",
+    "question": "Sample temporal-reasoning question 6?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "tem-s6"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "tem-s6"
+    ]
+  },
+  {
+    "question_id": "temporal-reasoning-7",
+    "question_type": "temporal-reasoning",
+    "question": "Sample temporal-reasoning question 7?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "tem-s7"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "tem-s7"
+    ]
+  },
+  {
+    "question_id": "temporal-reasoning-8",
+    "question_type": "temporal-reasoning",
+    "question": "Sample temporal-reasoning question 8?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "tem-s8"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "tem-s8"
+    ]
+  },
+  {
+    "question_id": "temporal-reasoning-9",
+    "question_type": "temporal-reasoning",
+    "question": "Sample temporal-reasoning question 9?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "tem-s9"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "tem-s9"
+    ]
+  },
+  {
+    "question_id": "knowledge-update-0",
+    "question_type": "knowledge-update",
+    "question": "Sample knowledge-update question 0?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "kno-s0"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "kno-s0"
+    ]
+  },
+  {
+    "question_id": "knowledge-update-1",
+    "question_type": "knowledge-update",
+    "question": "Sample knowledge-update question 1?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "kno-s1"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "kno-s1"
+    ]
+  },
+  {
+    "question_id": "knowledge-update-2",
+    "question_type": "knowledge-update",
+    "question": "Sample knowledge-update question 2?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "kno-s2"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "kno-s2"
+    ]
+  },
+  {
+    "question_id": "knowledge-update-3",
+    "question_type": "knowledge-update",
+    "question": "Sample knowledge-update question 3?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "kno-s3"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "kno-s3"
+    ]
+  },
+  {
+    "question_id": "knowledge-update-4",
+    "question_type": "knowledge-update",
+    "question": "Sample knowledge-update question 4?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "kno-s4"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "kno-s4"
+    ]
+  },
+  {
+    "question_id": "knowledge-update-5",
+    "question_type": "knowledge-update",
+    "question": "Sample knowledge-update question 5?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "kno-s5"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "kno-s5"
+    ]
+  },
+  {
+    "question_id": "knowledge-update-6",
+    "question_type": "knowledge-update",
+    "question": "Sample knowledge-update question 6?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "kno-s6"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "kno-s6"
+    ]
+  },
+  {
+    "question_id": "knowledge-update-7",
+    "question_type": "knowledge-update",
+    "question": "Sample knowledge-update question 7?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "kno-s7"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "kno-s7"
+    ]
+  },
+  {
+    "question_id": "knowledge-update-8",
+    "question_type": "knowledge-update",
+    "question": "Sample knowledge-update question 8?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "kno-s8"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "kno-s8"
+    ]
+  },
+  {
+    "question_id": "knowledge-update-9",
+    "question_type": "knowledge-update",
+    "question": "Sample knowledge-update question 9?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "kno-s9"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "kno-s9"
+    ]
+  },
+  {
+    "question_id": "single-session-user-0",
+    "question_type": "single-session-user",
+    "question": "Sample single-session-user question 0?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s0"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s0"
+    ]
+  },
+  {
+    "question_id": "single-session-user-1",
+    "question_type": "single-session-user",
+    "question": "Sample single-session-user question 1?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s1"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s1"
+    ]
+  },
+  {
+    "question_id": "single-session-user-2",
+    "question_type": "single-session-user",
+    "question": "Sample single-session-user question 2?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s2"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s2"
+    ]
+  },
+  {
+    "question_id": "single-session-user-3",
+    "question_type": "single-session-user",
+    "question": "Sample single-session-user question 3?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s3"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s3"
+    ]
+  },
+  {
+    "question_id": "single-session-user-4",
+    "question_type": "single-session-user",
+    "question": "Sample single-session-user question 4?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s4"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s4"
+    ]
+  },
+  {
+    "question_id": "single-session-user-5",
+    "question_type": "single-session-user",
+    "question": "Sample single-session-user question 5?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s5"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s5"
+    ]
+  },
+  {
+    "question_id": "single-session-user-6",
+    "question_type": "single-session-user",
+    "question": "Sample single-session-user question 6?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s6"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s6"
+    ]
+  },
+  {
+    "question_id": "single-session-user-7",
+    "question_type": "single-session-user",
+    "question": "Sample single-session-user question 7?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s7"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s7"
+    ]
+  },
+  {
+    "question_id": "single-session-user-8",
+    "question_type": "single-session-user",
+    "question": "Sample single-session-user question 8?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s8"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s8"
+    ]
+  },
+  {
+    "question_id": "single-session-user-9",
+    "question_type": "single-session-user",
+    "question": "Sample single-session-user question 9?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s9"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s9"
+    ]
+  },
+  {
+    "question_id": "single-session-assistant-0",
+    "question_type": "single-session-assistant",
+    "question": "Sample single-session-assistant question 0?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s0"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s0"
+    ]
+  },
+  {
+    "question_id": "single-session-assistant-1",
+    "question_type": "single-session-assistant",
+    "question": "Sample single-session-assistant question 1?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s1"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s1"
+    ]
+  },
+  {
+    "question_id": "single-session-assistant-2",
+    "question_type": "single-session-assistant",
+    "question": "Sample single-session-assistant question 2?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s2"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s2"
+    ]
+  },
+  {
+    "question_id": "single-session-assistant-3",
+    "question_type": "single-session-assistant",
+    "question": "Sample single-session-assistant question 3?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s3"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s3"
+    ]
+  },
+  {
+    "question_id": "single-session-assistant-4",
+    "question_type": "single-session-assistant",
+    "question": "Sample single-session-assistant question 4?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s4"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s4"
+    ]
+  },
+  {
+    "question_id": "single-session-assistant-5",
+    "question_type": "single-session-assistant",
+    "question": "Sample single-session-assistant question 5?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s5"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s5"
+    ]
+  },
+  {
+    "question_id": "single-session-assistant-6",
+    "question_type": "single-session-assistant",
+    "question": "Sample single-session-assistant question 6?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s6"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s6"
+    ]
+  },
+  {
+    "question_id": "single-session-assistant-7",
+    "question_type": "single-session-assistant",
+    "question": "Sample single-session-assistant question 7?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s7"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s7"
+    ]
+  },
+  {
+    "question_id": "single-session-assistant-8",
+    "question_type": "single-session-assistant",
+    "question": "Sample single-session-assistant question 8?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s8"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s8"
+    ]
+  },
+  {
+    "question_id": "single-session-assistant-9",
+    "question_type": "single-session-assistant",
+    "question": "Sample single-session-assistant question 9?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s9"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s9"
+    ]
+  },
+  {
+    "question_id": "single-session-preference-0",
+    "question_type": "single-session-preference",
+    "question": "Sample single-session-preference question 0?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s0"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s0"
+    ]
+  },
+  {
+    "question_id": "single-session-preference-1",
+    "question_type": "single-session-preference",
+    "question": "Sample single-session-preference question 1?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s1"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s1"
+    ]
+  },
+  {
+    "question_id": "single-session-preference-2",
+    "question_type": "single-session-preference",
+    "question": "Sample single-session-preference question 2?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s2"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s2"
+    ]
+  },
+  {
+    "question_id": "single-session-preference-3",
+    "question_type": "single-session-preference",
+    "question": "Sample single-session-preference question 3?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s3"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s3"
+    ]
+  },
+  {
+    "question_id": "single-session-preference-4",
+    "question_type": "single-session-preference",
+    "question": "Sample single-session-preference question 4?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s4"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s4"
+    ]
+  },
+  {
+    "question_id": "single-session-preference-5",
+    "question_type": "single-session-preference",
+    "question": "Sample single-session-preference question 5?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s5"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s5"
+    ]
+  },
+  {
+    "question_id": "single-session-preference-6",
+    "question_type": "single-session-preference",
+    "question": "Sample single-session-preference question 6?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s6"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s6"
+    ]
+  },
+  {
+    "question_id": "single-session-preference-7",
+    "question_type": "single-session-preference",
+    "question": "Sample single-session-preference question 7?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s7"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s7"
+    ]
+  },
+  {
+    "question_id": "single-session-preference-8",
+    "question_type": "single-session-preference",
+    "question": "Sample single-session-preference question 8?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s8"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s8"
+    ]
+  },
+  {
+    "question_id": "single-session-preference-9",
+    "question_type": "single-session-preference",
+    "question": "Sample single-session-preference question 9?",
+    "answer": "sample answer",
+    "question_date": "2026/05/22",
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi"
+        }
+      ]
+    ],
+    "haystack_session_ids": [
+      "sin-s9"
+    ],
+    "haystack_dates": [
+      "2026/05/22"
+    ],
+    "answer_session_ids": [
+      "sin-s9"
+    ]
+  }
+]

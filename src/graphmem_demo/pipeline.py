@@ -8,7 +8,8 @@ import threading
 import time
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,25 @@ from .clients import (
     rough_token_count,
 )
 from .data import build_leaf_nodes, group_by_session, load_longmemeval_cases
+from .llm_root_edges import (
+    build_llm_anchor_edges,
+    llm_root_anchor_messages,
+    parse_llm_root_anchors,
+)
+from .llm_leaf_edges import (
+    build_session_leaf_edges,
+    llm_session_leaf_edge_messages,
+    parse_llm_leaf_edges,
+)
+from .fusion_retrieval import FusionRetrievalConfig, compute_fusion_scores
+from .graph_retrieval import (
+    GraphFirstConfig,
+    GraphSearchConfig,
+    graph_first_retrieve,
+    graph_search_retrieve,
+)
+from .root_graph_edges import RootGraphEdgePolicy, build_root_graph
+from .typed_retrieval import rank_roots_hybrid
 from .models import (
     DeepSeekCallRecord,
     GraphEdge,
@@ -36,6 +56,7 @@ from .models import (
     SummaryNode,
     VariantStats,
 )
+from .retrieval_cues import proper_name_cues
 from .stats import (
     aggregate_variant_stats,
     build_question_stats,
@@ -74,8 +95,8 @@ VARIANT_SPECS = {
         False,
         fanout_k=16,
         summary_schema="compact_memory_v2",
-        build_leaf_text="user_only",
-        retrieval_leaf_text="user_only",
+        build_leaf_text="raw",
+        retrieval_leaf_text="raw",
         hybrid_retrieval=True,
     ),
     "direct_session_k16_compact_graphmem": VariantSpec(
@@ -84,8 +105,8 @@ VARIANT_SPECS = {
         True,
         fanout_k=16,
         summary_schema="compact_memory_v2",
-        build_leaf_text="user_only",
-        retrieval_leaf_text="user_only",
+        build_leaf_text="raw",
+        retrieval_leaf_text="raw",
         hybrid_retrieval=True,
     ),
     "qwen35_2b_summary_graphmem": VariantSpec(
@@ -149,7 +170,7 @@ VARIANT_SPECS = {
         False,
         True,
         fanout_k=16,
-        summary_max_tokens=512,
+        summary_max_tokens=2048,
         summary_schema="compact_memory_v2",
         build_leaf_text="user_only",
         retrieval_leaf_text="user_only",
@@ -176,6 +197,7 @@ class DemoConfig:
         "direct_session_k16_compact_graphmem",
     )
     deepseek_model: str | None = None
+    deepseek_base_url: str | None = None
     embedding_base_url: str = "http://127.0.0.1:8002/v1"
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     tree_mode: str | None = None
@@ -187,9 +209,12 @@ class DemoConfig:
     global_leaf_top_k: int = 24
     qa_summary_top_k: int = 4
     per_session_leaf_k: int = 2
+    enable_coverage_rerank: bool = False
+    coverage_rerank_lambda: float = 0.75
+    coverage_rerank_pool_k: int = 80
     graph_neighbor_k: int = 2
-    qa_context_token_budget: int = 10000
-    qa_max_tokens: int = 1024
+    qa_context_token_budget: int = 18000
+    qa_max_tokens: int = 4096
     compression_ratio: float = 0.5
     max_questions: int = 10
     question_workers: int = 2
@@ -199,13 +224,14 @@ class DemoConfig:
     summarizer_kind: str = "auto"
     summarizer_base_url: str = "http://127.0.0.1:8003/v1"
     summarizer_model: str | None = None
+    # Deprecated: summary jobs now use per-stage max token caps (raw_group/session/legacy).
     summary_token_budget: int = 320
     build_leaf_text: str = "auto"
     retrieval_leaf_text: str = "auto"
     compressor_chunk_rough_tokens: int = 384
-    raw_group_summary_max_tokens: int = 256
-    session_summary_max_tokens: int = 320
-    legacy_internal_summary_max_tokens: int = 224
+    raw_group_summary_max_tokens: int = 2048
+    session_summary_max_tokens: int = 2048
+    legacy_internal_summary_max_tokens: int = 2048
     resume: bool = False
     mock_services: bool = False
     mock_llm: bool = False
@@ -218,8 +244,111 @@ class DemoConfig:
     enable_speaker_profiles: bool = False
     enable_speaker_neighbor_window: bool = False
     enable_speaker_retrieval_text: bool = False
+    # Compatibility toggle: when enabled, datasets with explicit speaker labels
+    # get larger retrieval budgets (leaf/global/per-session caps).
+    enable_explicit_speaker_retrieval_boost: bool = True
+    # When True with compact_memory_v2, session summary also emits per-leaf facts/keywords.
+    enable_leaf_enrichment: bool = True
+    # When True, SummaryNode.summary stores full child dialogue (lossless); LLM JSON is
+    # metadata only (anchors / leaf enrichment), never the canonical summary body.
+    enable_lossless_root_summary: bool = True
     enable_typed_root_edges: bool = False
     enable_multilevel_summary_retrieval: bool = False
+    enable_llm_root_edges: bool = False
+    llm_root_edge_max_tokens: int = 2048
+    llm_root_edge_neighbors_per_relation: int = 2
+    llm_root_edge_min_shared: int = 1
+    llm_root_edge_anchor_limit: int = 8
+    # Within-session leaf graph: deterministic turn neighbors + optional LLM semantic links.
+    enable_llm_leaf_edges: bool = False
+    enable_leaf_graph_expansion: bool = False
+    llm_leaf_edge_max_tokens: int = 1024
+    llm_leaf_edge_max_snippet_chars: int = 1024
+    llm_leaf_edge_min_confidence: float = 0.8
+    llm_leaf_edge_max_edges_per_leaf: int = 3
+    llm_leaf_edge_max_edges_per_session: int = 16
+    llm_leaf_edge_max_leaves_per_session: int = 48
+    leaf_graph_neighbor_k: int = 2
+    leaf_graph_expansion_budget: int = 4
+    # HippoRAG-style graph search: embedding picks seeds, PPR walks edges (root/leaf).
+    enable_graph_search: bool = False
+    graph_search_seed_roots: int = 6
+    graph_search_seed_leaves: int = 10
+    graph_search_ppr_damping: float = 0.85
+    graph_search_ppr_iterations: int = 25
+    graph_search_embedding_blend: float = 0.1
+    # When True, embedding only picks PPR seeds; PPR runs on the full leaf/root graph,
+    # and leaves are selected by global PPR/blend score (no Phase-1 diversify budget lock).
+    graph_search_seed_only: bool = True
+    # Weak root↔leaf links. High values (e.g. 0.9) equalize PPR inside a session.
+    graph_search_structural_root_leaf_weight: float = 0.1
+    # Free-select: guarantee ≥1 leaf from each of the top-N graph-ranked sessions (0 = off).
+    graph_search_session_coverage: int = 0
+    graph_search_session_min_leaves: int = 3
+    graph_search_max_sessions: int = 8
+    graph_search_per_session_leaf_cap: int = 4
+    graph_search_protect_leaves: bool = True
+    # Graph-primary retrieval: PPR/graph drives selection; global embedding pool is backup.
+    enable_graph_first_retrieval: bool = False
+    graph_first_embedding_blend: float = 0.25
+    graph_first_session_coverage: int = 2
+    graph_first_candidate_pool_k: int = 80
+    # Triple-pass retrieval fusion: semantic + BM25 keyword + entity overlap (RRF by default).
+    enable_fusion_retrieval: bool = False
+    fusion_method: str = "rrf"
+    fusion_rrf_k: int = 60
+    fusion_weight_semantic: float = 1.0
+    fusion_weight_keyword: float = 1.0
+    fusion_weight_entity: float = 1.0
+    fusion_query_adaptive_weights: bool = True
+    enable_typed_retrieval: bool = True
+    typed_retrieval_embedding_blend: float = 0.55
+    enable_protected_fusion: bool = True
+    fusion_semantic_protect_k: int = 10
+    # Query-shape-aware retrieval budget and dual-channel candidate merge.
+    enable_query_type_retrieval_boost: bool = True
+    list_question_extra_leaf_budget: int = 6
+    temporal_question_extra_leaf_budget: int = 4
+    enable_dual_channel_candidate_merge: bool = True
+    dual_channel_structured_pool_k: int = 24
+    # Iterative post-retrieval denoise: kick low-relevance leaves and backfill from tail.
+    enable_iterative_leaf_denoise: bool = False
+    iterative_leaf_denoise_max_rounds: int = 3
+    iterative_leaf_denoise_max_kick_per_round: int = 5
+    iterative_leaf_denoise_min_relevance_ratio: float = 0.35
+    iterative_leaf_denoise_protect_top_k: int = 3
+    iterative_leaf_denoise_keep_structured_top_k: int = 2
+    # Typed root graph edges: additive high-confidence bridges, pruned for cross-topic noise.
+    typed_root_neighbors_per_relation: int = 1
+    typed_root_max_edges_per_root: int = 6
+    typed_root_min_edge_score: float = 0.76
+    typed_root_entity_min_shared_specific: int = 1
+    typed_root_entity_min_shared_generic: int = 2
+    typed_root_time_min_shared: int = 1
+    typed_root_state_min_shared: int = 1
+    typed_root_event_min_shared: int = 2
+    typed_root_keyword_min_shared: int = 2
+    typed_root_update_min_actions: int = 2
+    typed_root_update_min_entities: int = 1
+    typed_root_corpus_keyword_min_shared: int = 2
+    typed_root_require_semantic_support: bool = True
+    typed_root_semantic_support_min_cosine: float = 0.25
+    typed_root_filter_generic_entities: bool = True
+    # Stage-A reader: extract structured notes from retrieved evidence before QA.
+    enable_answer_note_extraction: bool = False
+    answer_note_max_tokens: int = 1024
+    # Stage-B reader: when notes are available, answer from notes first.
+    answer_use_notes_for_qa: bool = True
+    answer_include_raw_context_with_notes: bool = False
+    # Program-aided arithmetic (Level 2): on arithmetic-looking questions, ask the LLM for a
+    # JSON "compute plan" (operation + operands it read from the evidence), execute it
+    # deterministically in code, and feed the computed results back into the answer. This
+    # keeps the LLM responsible for *what* to compute while code does the actual math.
+    # Adds one extra LLM call per gated question. Opt-in (A/B with --enable-compute-plan).
+    enable_compute_plan: bool = False
+    # Force stricter reasoning/answer prompts regardless of variant defaults.
+    force_enhanced_retrieval: bool = False
+    force_enhanced_qa: bool = False
 
     def __post_init__(self) -> None:
         unknown = set(self.variants) - VARIANTS
@@ -250,8 +379,111 @@ class DemoConfig:
             raise ValueError("qa_context_token_budget must be at least 1000")
         if self.qa_max_tokens < 128:
             raise ValueError("qa_max_tokens must be at least 128")
-        if self.summary_token_budget < 32:
-            raise ValueError("summary_token_budget must be at least 32")
+        if self.llm_root_edge_max_tokens < 64:
+            raise ValueError("llm_root_edge_max_tokens must be at least 64")
+        if self.llm_root_edge_neighbors_per_relation < 1:
+            raise ValueError("llm_root_edge_neighbors_per_relation must be at least 1")
+        if self.llm_root_edge_min_shared < 1:
+            raise ValueError("llm_root_edge_min_shared must be at least 1")
+        if self.llm_root_edge_anchor_limit < 1:
+            raise ValueError("llm_root_edge_anchor_limit must be at least 1")
+        if self.llm_leaf_edge_max_tokens < 64:
+            raise ValueError("llm_leaf_edge_max_tokens must be at least 64")
+        if self.llm_leaf_edge_max_snippet_chars < 64:
+            raise ValueError("llm_leaf_edge_max_snippet_chars must be at least 64")
+        if not 0.0 <= self.llm_leaf_edge_min_confidence <= 1.0:
+            raise ValueError("llm_leaf_edge_min_confidence must be in [0, 1]")
+        if self.llm_leaf_edge_max_edges_per_leaf < 1:
+            raise ValueError("llm_leaf_edge_max_edges_per_leaf must be at least 1")
+        if self.llm_leaf_edge_max_edges_per_session < 1:
+            raise ValueError("llm_leaf_edge_max_edges_per_session must be at least 1")
+        if self.llm_leaf_edge_max_leaves_per_session < 2:
+            raise ValueError("llm_leaf_edge_max_leaves_per_session must be at least 2")
+        if self.leaf_graph_neighbor_k < 1:
+            raise ValueError("leaf_graph_neighbor_k must be at least 1")
+        if self.leaf_graph_expansion_budget < 0:
+            raise ValueError("leaf_graph_expansion_budget cannot be negative")
+        if self.graph_search_seed_roots < 1 or self.graph_search_seed_leaves < 1:
+            raise ValueError("graph_search_seed_roots and graph_search_seed_leaves must be at least 1")
+        if not 0.0 < self.graph_search_ppr_damping < 1.0:
+            raise ValueError("graph_search_ppr_damping must be in (0, 1)")
+        if self.graph_search_ppr_iterations < 1:
+            raise ValueError("graph_search_ppr_iterations must be at least 1")
+        if not 0.0 <= self.graph_search_embedding_blend <= 1.0:
+            raise ValueError("graph_search_embedding_blend must be in [0, 1]")
+        if self.graph_search_session_min_leaves < 1:
+            raise ValueError("graph_search_session_min_leaves must be at least 1")
+        if self.graph_search_max_sessions < 1:
+            raise ValueError("graph_search_max_sessions must be at least 1")
+        if self.graph_search_per_session_leaf_cap < 1:
+            raise ValueError("graph_search_per_session_leaf_cap must be at least 1")
+        if self.graph_search_structural_root_leaf_weight < 0.0:
+            raise ValueError("graph_search_structural_root_leaf_weight cannot be negative")
+        if self.graph_search_session_coverage < 0:
+            raise ValueError("graph_search_session_coverage cannot be negative")
+        if not 0.0 <= self.graph_first_embedding_blend <= 1.0:
+            raise ValueError("graph_first_embedding_blend must be in [0, 1]")
+        if self.graph_first_session_coverage < 0:
+            raise ValueError("graph_first_session_coverage cannot be negative")
+        if self.graph_first_candidate_pool_k < 1:
+            raise ValueError("graph_first_candidate_pool_k must be at least 1")
+        if not 0.0 <= self.typed_retrieval_embedding_blend <= 1.0:
+            raise ValueError("typed_retrieval_embedding_blend must be in [0, 1]")
+        if self.fusion_semantic_protect_k < 0:
+            raise ValueError("fusion_semantic_protect_k cannot be negative")
+        if self.list_question_extra_leaf_budget < 0:
+            raise ValueError("list_question_extra_leaf_budget cannot be negative")
+        if self.temporal_question_extra_leaf_budget < 0:
+            raise ValueError("temporal_question_extra_leaf_budget cannot be negative")
+        if self.dual_channel_structured_pool_k < 1:
+            raise ValueError("dual_channel_structured_pool_k must be at least 1")
+        if self.iterative_leaf_denoise_max_rounds < 1:
+            raise ValueError("iterative_leaf_denoise_max_rounds must be at least 1")
+        if self.iterative_leaf_denoise_max_kick_per_round < 1:
+            raise ValueError("iterative_leaf_denoise_max_kick_per_round must be at least 1")
+        if not 0.0 <= self.iterative_leaf_denoise_min_relevance_ratio <= 1.0:
+            raise ValueError("iterative_leaf_denoise_min_relevance_ratio must be in [0, 1]")
+        if self.iterative_leaf_denoise_protect_top_k < 0:
+            raise ValueError("iterative_leaf_denoise_protect_top_k cannot be negative")
+        if self.iterative_leaf_denoise_keep_structured_top_k < 0:
+            raise ValueError("iterative_leaf_denoise_keep_structured_top_k cannot be negative")
+        if self.answer_note_max_tokens < 128:
+            raise ValueError("answer_note_max_tokens must be at least 128")
+        if self.typed_root_neighbors_per_relation < 1:
+            raise ValueError("typed_root_neighbors_per_relation must be at least 1")
+        if self.typed_root_max_edges_per_root < 1:
+            raise ValueError("typed_root_max_edges_per_root must be at least 1")
+        if not 0.0 <= self.typed_root_min_edge_score <= 1.0:
+            raise ValueError("typed_root_min_edge_score must be in [0, 1]")
+        if not 0.0 <= self.typed_root_semantic_support_min_cosine <= 1.0:
+            raise ValueError("typed_root_semantic_support_min_cosine must be in [0, 1]")
+        if self.fusion_method not in {"rrf", "weighted"}:
+            raise ValueError("fusion_method must be rrf or weighted")
+        if self.fusion_rrf_k < 1:
+            raise ValueError("fusion_rrf_k must be at least 1")
+        for weight_name in (
+            "fusion_weight_semantic",
+            "fusion_weight_keyword",
+            "fusion_weight_entity",
+        ):
+            if getattr(self, weight_name) < 0.0:
+                raise ValueError(f"{weight_name} cannot be negative")
+        for field_name in ("build_leaf_text", "retrieval_leaf_text"):
+            if getattr(self, field_name) not in {"auto", "raw", "user_only"}:
+                raise ValueError(f"{field_name} must be auto, raw, or user_only")
+        if min(
+            self.root_candidate_k,
+            self.qa_summary_top_k,
+            self.per_session_leaf_k,
+        ) < 1:
+            raise ValueError("V2 retrieval k values must be at least 1")
+        # global_leaf_top_k == 0 is a valid "disable the global leaf candidate pool" setting.
+        if self.global_leaf_top_k < 0:
+            raise ValueError("global_leaf_top_k cannot be negative")
+        if not 0.0 <= self.coverage_rerank_lambda <= 1.0:
+            raise ValueError("coverage_rerank_lambda must be in [0, 1]")
+        if self.coverage_rerank_pool_k < 2:
+            raise ValueError("coverage_rerank_pool_k must be at least 2")
 
     def use_mock_llm(self) -> bool:
         return self.mock_services or self.mock_llm
@@ -264,16 +496,6 @@ class DemoConfig:
 
     def use_mock_summarizer(self) -> bool:
         return self.mock_services or self.mock_summarizer
-        for field_name in ("build_leaf_text", "retrieval_leaf_text"):
-            if getattr(self, field_name) not in {"auto", "raw", "user_only"}:
-                raise ValueError(f"{field_name} must be auto, raw, or user_only")
-        if min(
-            self.root_candidate_k,
-            self.global_leaf_top_k,
-            self.qa_summary_top_k,
-            self.per_session_leaf_k,
-        ) < 1:
-            raise ValueError("V2 retrieval k values must be at least 1")
 
 
 @dataclass
@@ -285,6 +507,9 @@ class CaseRun:
     answer: str
     llm_records: list[DeepSeekCallRecord]
     stats: QuestionStats
+    answer_notes: list[dict[str, str]] = field(default_factory=list)
+    answer_note_parse_error: str | None = None
+    answer_used_notes: bool = False
 
 
 @dataclass
@@ -505,7 +730,10 @@ def _complete_services(
     summarizer_model = config.summarizer_model or spec.default_summarizer_model or "Qwen/Qwen3.5-2B"
     return (
         llm
-        or (MockDeepSeekClient() if config.use_mock_llm() else DeepSeekClient(model=config.deepseek_model)),
+        or (MockDeepSeekClient() if config.use_mock_llm() else DeepSeekClient(
+            model=config.deepseek_model,
+            base_url=config.deepseek_base_url,
+        )),
         embedder
         or (
             MockEmbeddingClient()
@@ -592,7 +820,6 @@ def _memory_cache_fingerprint(config: DemoConfig, case: QuestionCase, variant: s
         "fanout_k": spec.fanout_k or config.fanout_k,
         "summary_schema": _summary_schema(config, spec),
         "summary_max_tokens": _summary_max_tokens(config, spec),
-        "summary_token_budget": config.summary_token_budget,
         "summarizer_kind": config.summarizer_kind,
         "summarizer_model": config.summarizer_model or spec.default_summarizer_model,
         "uses_local_summary": _uses_local_summary(config, spec),
@@ -601,6 +828,7 @@ def _memory_cache_fingerprint(config: DemoConfig, case: QuestionCase, variant: s
         "build_leaf_text": _effective_leaf_text_mode(
             config.build_leaf_text, spec, case, phase="build"
         ),
+        "skip_compression_for_raw_build": True,
         "retrieval_leaf_text": _effective_leaf_text_mode(
             config.retrieval_leaf_text, spec, case, phase="retrieval"
         ),
@@ -616,11 +844,42 @@ def _memory_cache_fingerprint(config: DemoConfig, case: QuestionCase, variant: s
         "enable_speaker_retrieval_text": config.enable_speaker_retrieval_text,
         "enable_typed_root_edges": config.enable_typed_root_edges,
         "enable_multilevel_summary_retrieval": config.enable_multilevel_summary_retrieval,
+        "enable_llm_root_edges": config.enable_llm_root_edges,
+        "llm_root_edge_max_tokens": config.llm_root_edge_max_tokens,
+        "llm_root_edge_neighbors_per_relation": config.llm_root_edge_neighbors_per_relation,
+        "llm_root_edge_min_shared": config.llm_root_edge_min_shared,
+        "llm_root_edge_anchor_limit": config.llm_root_edge_anchor_limit,
+        "enable_llm_leaf_edges": config.enable_llm_leaf_edges,
+        "enable_leaf_graph_expansion": config.enable_leaf_graph_expansion,
+        "llm_leaf_edge_max_snippet_chars": config.llm_leaf_edge_max_snippet_chars,
+        "llm_leaf_edge_min_confidence": config.llm_leaf_edge_min_confidence,
+        "llm_leaf_edge_max_edges_per_leaf": config.llm_leaf_edge_max_edges_per_leaf,
+        "llm_leaf_edge_max_edges_per_session": config.llm_leaf_edge_max_edges_per_session,
+        "leaf_graph_neighbor_k": config.leaf_graph_neighbor_k,
+        "leaf_graph_expansion_budget": config.leaf_graph_expansion_budget,
+        "enable_graph_search": config.enable_graph_search,
+        "enable_graph_first_retrieval": config.enable_graph_first_retrieval,
+        "enable_fusion_retrieval": config.enable_fusion_retrieval,
+        "enable_typed_retrieval": config.enable_typed_retrieval,
+        "enable_answer_note_extraction": config.enable_answer_note_extraction,
+        "answer_note_max_tokens": config.answer_note_max_tokens,
+        "answer_use_notes_for_qa": config.answer_use_notes_for_qa,
+        "answer_include_raw_context_with_notes": config.answer_include_raw_context_with_notes,
+        "typed_retrieval_embedding_blend": config.typed_retrieval_embedding_blend,
+        "enable_protected_fusion": config.enable_protected_fusion,
+        "fusion_semantic_protect_k": config.fusion_semantic_protect_k,
+        "fusion_method": config.fusion_method,
+        "graph_search_session_min_leaves": config.graph_search_session_min_leaves,
+        "graph_search_max_sessions": config.graph_search_max_sessions,
         "graph_neighbor_k": config.graph_neighbor_k,
-        "leaf_retrieval_text_version": 1,
-        "summary_retrieval_text_version": 3,
+        "leaf_retrieval_text_version": 3,
+        "temporal_normalization_version": 1,
+        "enable_leaf_enrichment": config.enable_leaf_enrichment,
+        "enable_lossless_root_summary": config.enable_lossless_root_summary,
+        "summary_retrieval_text_version": 5,
         "summary_anchor_terms_version": 4,
-        "keyword_edge_version": 3,
+        "keyword_edge_version": 4,
+        "root_graph_edge_policy_version": 1,
         "data_hash": data_hash,
     }
     return hashlib.sha256(
@@ -929,6 +1188,9 @@ def _write_case_outputs(
                 "question": case.question,
                 "gold_answer": case.answer,
                 "prediction": run.answer,
+                "answer_notes": run.answer_notes,
+                "answer_note_parse_error": run.answer_note_parse_error,
+                "answer_used_notes": run.answer_used_notes,
                 "answer_session_ids": case.answer_session_ids,
                 "retrieved_answer_session_hit": run.retrieval.answer_session_hit,
                 "retrieved_answer_session_any_hit": run.retrieval.answer_session_hit,
@@ -1000,13 +1262,15 @@ def build_memory(
     retrieval_leaf_mode = _effective_leaf_text_mode(
         config.retrieval_leaf_text, spec, case, phase="retrieval"
     )
-    _embed_nodes(
-        leaves,
-        embedder,
-        case.question_id,
-        variant,
-        attr=_leaf_embedding_attr(config, case, retrieval_leaf_mode),
-    )
+    leaf_enrichment = _leaf_enrichment_enabled(config, spec)
+    if spec.tree_mode == "raw_rag" or not leaf_enrichment:
+        _embed_nodes(
+            leaves,
+            embedder,
+            case.question_id,
+            variant,
+            attr=_leaf_embedding_attr(config, case, retrieval_leaf_mode),
+        )
     summaries: list[SummaryNode] = []
     roots: list[SummaryNode] = []
     edges: list[GraphEdge] = []
@@ -1039,14 +1303,49 @@ def build_memory(
             )
             summaries.extend(speaker_profiles)
             roots.extend(speaker_profiles)
+        if leaf_enrichment:
+            _embed_nodes(
+                leaves,
+                embedder,
+                case.question_id,
+                variant,
+                attr=_leaf_embedding_attr(config, case, retrieval_leaf_mode),
+            )
         _embed_nodes(summaries, embedder, case.question_id, variant, attr="retrieval_text")
         if spec.graph:
             graph_roots = summaries if config.enable_multilevel_summary_retrieval else roots
             edges = _build_root_graph(
                 graph_roots,
                 config.graph_neighbor_k,
-                enable_typed_edges=config.enable_typed_root_edges,
+                edge_policy=_root_graph_edge_policy(
+                    config,
+                    enable_typed_edges=_effective_typed_root_edges(config),
+                ),
             )
+            if config.enable_llm_root_edges:
+                llm_edges = _build_llm_root_edges(
+                    config,
+                    case,
+                    variant,
+                    graph_roots,
+                    llm,
+                    llm_records,
+                    metrics,
+                    limiter,
+                )
+                edges = _merge_graph_edges(edges, llm_edges)
+            if config.enable_llm_leaf_edges or config.enable_leaf_graph_expansion:
+                leaf_edges = _build_session_leaf_graph_edges(
+                    config,
+                    case,
+                    variant,
+                    leaves,
+                    llm,
+                    llm_records,
+                    metrics,
+                    limiter,
+                )
+                edges = _merge_graph_edges(edges, leaf_edges)
     build_latency = time.perf_counter() - build_started
     return MemoryBuild(
         leaves=leaves,
@@ -1090,7 +1389,116 @@ def run_case_with_memory(
         enhanced_retrieval=spec.enhanced_retrieval,
         enhanced_qa=spec.enhanced_qa,
     )
+    if config.enable_iterative_leaf_denoise and retrieval.leaf_node_ids:
+        denoise_started = time.perf_counter()
+        query_vector = embedder.embed([case.question], question_id=case.question_id, variant=variant)[0]
+        ranked_pool_leaves = _rank_leaves_for_config(
+            config,
+            leaves,
+            query_vector,
+            case.question,
+            enhanced=spec.enhanced_retrieval,
+        )
+        leaf_by_id = {leaf.node_id: leaf for leaf in leaves}
+        selected_leaves = [
+            leaf_by_id[node_id]
+            for node_id in retrieval.leaf_node_ids
+            if node_id in leaf_by_id
+        ]
+        selected_roots = [
+            root
+            for root in retrieval_roots
+            if root.node_id in set(retrieval.summary_node_ids)
+        ]
+        if selected_leaves:
+            selected_leaves = _iterative_kick_and_backfill_leaves_with_llm(
+                config=config,
+                case=case,
+                variant=variant,
+                llm=llm,
+                limiter=limiter,
+                metrics=answer_metrics,
+                llm_records=llm_records,
+                selected_leaves=selected_leaves,
+                ranked_pool_leaves=ranked_pool_leaves,
+            )
+            selected_roots, selected_leaves = _fit_context_budget(
+                selected_roots,
+                selected_leaves,
+                _evidence_context_budget(config, case, spec.enhanced_qa),
+            )
+            retrieved_sessions = sorted({leaf.session_id for leaf in selected_leaves})
+            answer_sessions = set(case.answer_session_ids)
+            answer_session_count = len(set(retrieved_sessions) & answer_sessions)
+            gold_answer_session_count = len(answer_sessions)
+            retrieval.summary_node_ids = [root.node_id for root in selected_roots]
+            retrieval.leaf_node_ids = [leaf.node_id for leaf in selected_leaves]
+            retrieval.retrieved_session_ids = retrieved_sessions
+            retrieval.answer_session_hit = bool(answer_session_count)
+            retrieval.answer_session_all_hit = (
+                gold_answer_session_count > 0 and answer_session_count == gold_answer_session_count
+            )
+            retrieval.answer_session_recall = (
+                answer_session_count / gold_answer_session_count if gold_answer_session_count else 0.0
+            )
+            retrieval.retrieved_answer_session_count = answer_session_count
+            retrieval.gold_answer_session_count = gold_answer_session_count
+            retrieval.context_text = _context_text(selected_roots, selected_leaves)
+            retrieval.latency_sec += time.perf_counter() - denoise_started
     answer_started = time.perf_counter()
+    answer_context = retrieval.context_text
+    raw_answer_context = answer_context
+    answer_notes: list[dict[str, str]] = []
+    answer_note_parse_error: str | None = None
+    answer_used_notes = False
+    if config.enable_compute_plan and _is_arithmetic_question(case):
+        plan_result = _tracked_chat(
+            llm,
+            limiter,
+            answer_metrics,
+            question_id=case.question_id,
+            variant=variant,
+            stage="answer_qa",
+            thinking_mode="none",
+            messages=_compute_plan_messages(case, retrieval.context_text),
+            max_tokens=config.qa_max_tokens,
+            json_mode=True,
+        )
+        llm_records.append(plan_result.record)
+        computed_block = _execute_compute_plan(_extract_json_object(plan_result.text or ""))
+        if computed_block:
+            answer_context = f"{retrieval.context_text}\n\n{computed_block}"
+            raw_answer_context = answer_context
+    if config.enable_answer_note_extraction:
+        note_result = _tracked_chat(
+            llm,
+            limiter,
+            answer_metrics,
+            question_id=case.question_id,
+            variant=variant,
+            stage="answer_note_extraction",
+            thinking_mode="none",
+            messages=_answer_note_messages(case, answer_context),
+            max_tokens=min(config.qa_max_tokens, config.answer_note_max_tokens),
+            json_mode=True,
+        )
+        llm_records.append(note_result.record)
+        answer_notes, answer_note_parse_error = _parse_answer_notes(note_result.text)
+        if config.answer_use_notes_for_qa and answer_notes:
+            answer_context = _answer_context_from_notes(
+                case,
+                answer_notes,
+                raw_context=raw_answer_context,
+                include_raw_context=config.answer_include_raw_context_with_notes,
+            )
+            answer_used_notes = True
+    reference_date = _reference_date_from_retrieval(
+        case,
+        leaves,
+        retrieval_roots,
+        retrieval.leaf_node_ids,
+        retrieval.summary_node_ids,
+    )
     answer_result = _tracked_chat(
         llm,
         limiter,
@@ -1099,7 +1507,12 @@ def run_case_with_memory(
         variant=variant,
         stage="answer_qa",
         thinking_mode="none",
-        messages=_answer_messages(case, retrieval.context_text, enhanced=spec.enhanced_qa),
+        messages=_answer_messages(
+            case,
+            answer_context,
+            enhanced=spec.enhanced_qa,
+            reference_date=reference_date,
+        ),
         max_tokens=config.qa_max_tokens,
     )
     llm_records.append(answer_result.record)
@@ -1138,6 +1551,9 @@ def run_case_with_memory(
         answer=answer_result.text,
         llm_records=llm_records,
         stats=stats,
+        answer_notes=answer_notes,
+        answer_note_parse_error=answer_note_parse_error,
+        answer_used_notes=answer_used_notes,
     )
 
 
@@ -1167,6 +1583,8 @@ def _clone_memory_for_case(
             user_text=leaf.user_text,
             message_count=leaf.message_count,
             retrieval_text=leaf.retrieval_text or leaf.raw_text,
+            compact_facts=list(leaf.compact_facts),
+            anchor_terms=dict(leaf.anchor_terms),
             embedding=list(leaf.embedding) if leaf.embedding is not None else None,
         )
         for leaf in memory.leaves
@@ -1215,24 +1633,30 @@ def _clone_memory_for_case(
 
 def _variant_spec(config: DemoConfig, variant: str) -> VariantSpec:
     spec = VARIANT_SPECS[variant]
-    if config.tree_mode is None or spec.tree_mode == "raw_rag":
-        return spec
-    return VariantSpec(
-        tree_mode=config.tree_mode,
-        compression=spec.compression,
-        graph=spec.graph,
-        fanout_k=None,
-        summary_max_tokens=spec.summary_max_tokens,
-        summary_schema=spec.summary_schema,
-        build_leaf_text=spec.build_leaf_text,
-        retrieval_leaf_text=spec.retrieval_leaf_text,
-        raw_question_types=spec.raw_question_types,
-        hybrid_retrieval=spec.hybrid_retrieval,
-        local_summary=spec.local_summary,
-        default_summarizer_model=spec.default_summarizer_model,
-        enhanced_retrieval=spec.enhanced_retrieval,
-        enhanced_qa=spec.enhanced_qa,
-    )
+    if config.tree_mode is not None and spec.tree_mode != "raw_rag":
+        spec = VariantSpec(
+            tree_mode=config.tree_mode,
+            compression=spec.compression,
+            graph=spec.graph,
+            fanout_k=None,
+            summary_max_tokens=spec.summary_max_tokens,
+            summary_schema=spec.summary_schema,
+            build_leaf_text=spec.build_leaf_text,
+            retrieval_leaf_text=spec.retrieval_leaf_text,
+            raw_question_types=spec.raw_question_types,
+            hybrid_retrieval=spec.hybrid_retrieval,
+            local_summary=spec.local_summary,
+            default_summarizer_model=spec.default_summarizer_model,
+            enhanced_retrieval=spec.enhanced_retrieval,
+            enhanced_qa=spec.enhanced_qa,
+        )
+    if config.force_enhanced_retrieval or config.force_enhanced_qa:
+        spec = replace(
+            spec,
+            enhanced_retrieval=spec.enhanced_retrieval or config.force_enhanced_retrieval,
+            enhanced_qa=spec.enhanced_qa or config.force_enhanced_qa,
+        )
+    return spec
 
 
 def _summary_schema(config: DemoConfig, spec: VariantSpec) -> str:
@@ -1271,6 +1695,25 @@ def _has_explicit_speakers(case: QuestionCase) -> bool:
         for session in case.haystack_sessions
         for message in session
     )
+
+
+def _should_compress_summary_input(
+    config: DemoConfig,
+    spec: VariantSpec,
+    case: QuestionCase,
+) -> bool:
+    """Skip LLMLingua before summarization when build uses raw leaf text.
+
+    Raw dialogue is already the fidelity target; compressing it before the
+    summary LLM was the main source of truncation/parse regressions (subset50:
+    27 truncations with raw+compress vs 9 on the older shorter-input baseline).
+    """
+    if not spec.compression:
+        return False
+    if config.summarizer_kind == "none" or _uses_local_summary(config, spec):
+        return False
+    build_mode = _effective_leaf_text_mode(config.build_leaf_text, spec, case, phase="build")
+    return build_mode != "raw"
 
 
 def _leaf_text_attr(mode: str) -> str:
@@ -1510,6 +1953,7 @@ def _build_legacy_kway_roots(
             metrics,
             limiter,
             summarizer,
+            leaves_by_id={leaf.node_id: leaf for leaf in leaves},
         )
         grouped = _group_summaries_by_session(next_nodes)
         current = {}
@@ -1584,6 +2028,7 @@ def _build_direct_session_roots(
         metrics,
         limiter,
         summarizer,
+        leaves_by_id={leaf.node_id: leaf for leaf in leaves},
     )
     all_summaries.extend(first_nodes)
     for session_id, session_nodes in _group_summaries_by_session(first_nodes).items():
@@ -1621,6 +2066,7 @@ def _build_direct_session_roots(
             metrics,
             limiter,
             summarizer,
+            leaves_by_id={leaf.node_id: leaf for leaf in leaves},
         )
         all_summaries.extend(merge_nodes)
         pending_merge = {}
@@ -1645,6 +2091,8 @@ def _run_summary_jobs(
     metrics: BuildMetrics,
     limiter: InflightLimiter,
     summarizer: Any | None,
+    *,
+    leaves_by_id: dict[str, LeafNode] | None = None,
 ) -> list[SummaryNode]:
     if not jobs:
         return []
@@ -1662,7 +2110,17 @@ def _run_summary_jobs(
     if worker_count == 1:
         results = [
             _summarize_job(
-                config, case, variant, spec, job, llm, compressor, metrics, limiter, summarizer
+                config,
+                case,
+                variant,
+                spec,
+                job,
+                llm,
+                compressor,
+                metrics,
+                limiter,
+                summarizer,
+                leaves_by_id=leaves_by_id,
             )
             for job in jobs
         ]
@@ -1681,6 +2139,7 @@ def _run_summary_jobs(
                         metrics,
                         limiter,
                         summarizer,
+                        leaves_by_id=leaves_by_id,
                     ),
                     jobs,
                 )
@@ -1693,7 +2152,129 @@ def _run_summary_jobs(
     return [node for node, _ in results]
 
 
-def _summarize_job(
+def _summary_needs_recovery(node: SummaryNode) -> bool:
+    return node.truncated or node.parse_error is not None
+
+
+def _job_children_are_splittable_leaves(job: SummaryJob) -> bool:
+    return len(job.children) > 1 and all(isinstance(child, LeafNode) for child in job.children)
+
+
+def _merge_compact_parsed_summaries(
+    left: dict[str, Any] | None,
+    right: dict[str, Any] | None,
+) -> dict[str, Any]:
+    merged: dict[str, list[str]] = {"m": [], "k": []}
+    seen: dict[str, set[str]] = {"m": set(), "k": set()}
+    for parsed in (left, right):
+        if not parsed:
+            continue
+        for key in ("m", "k"):
+            for item in _summary_string_list(parsed.get(key)):
+                if item in seen[key]:
+                    continue
+                seen[key].add(item)
+                merged[key].append(item)
+    return merged
+
+
+def _merge_split_summary_nodes(
+    left: SummaryNode,
+    right: SummaryNode,
+    job: SummaryJob,
+    schema: str,
+    child_text: str,
+    *,
+    config: DemoConfig,
+    spec: VariantSpec,
+    case: QuestionCase,
+) -> SummaryNode:
+    parsed = (
+        _merge_compact_parsed_summaries(left.parsed_summary, right.parsed_summary)
+        if schema == "compact_memory_v2"
+        else left.parsed_summary or right.parsed_summary
+    )
+    summary_text = "\n\n".join(
+        block
+        for block in (left.raw_summary_text or "", right.raw_summary_text or "")
+        if block.strip()
+    )
+    rendered_summary, summary_parse_error = _render_root_summary_body(
+        config,
+        spec,
+        case,
+        job,
+        parsed=parsed,
+        summary_text=summary_text,
+        schema=schema,
+    )
+    merged_has_content = bool(rendered_summary.strip())
+    return SummaryNode(
+        node_id=(
+            f"{left.question_id}:{job.session_id}:summary:"
+            f"{job.stage}:l{job.level}:g{job.group_number}"
+        ),
+        question_id=left.question_id,
+        session_id=job.session_id,
+        session_date=job.session_date,
+        level=job.level,
+        child_ids=[*left.child_ids, *right.child_ids],
+        leaf_ids=sorted(set(left.leaf_ids) | set(right.leaf_ids)),
+        summary=rendered_summary,
+        retrieval_text=_summary_retrieval_text(
+            rendered_summary,
+            parsed,
+            child_text,
+            job.session_date,
+        ),
+        anchor_terms=_summary_anchor_terms(parsed, child_text, job.session_date),
+        summary_mode=job.summary_mode,
+        summary_schema_version=schema,
+        parsed_summary=parsed,
+        raw_summary_text=summary_text,
+        truncated=left.truncated or right.truncated,
+        parse_error=summary_parse_error if not merged_has_content else None,
+        source_level=job.level,
+    )
+
+
+def _lossless_root_summary_text(
+    children: list[LeafNode | SummaryNode],
+    leaf_text_mode: str,
+    session_date: str | None,
+) -> str:
+    blocks: list[str] = []
+    if session_date:
+        blocks.append(f"Session date: {session_date}")
+    for index, child in enumerate(children, start=1):
+        if isinstance(child, LeafNode):
+            blocks.append(f"[Child {index}]\n{_leaf_text(child, leaf_text_mode)}")
+        elif child.summary.strip():
+            blocks.append(child.summary.strip())
+    return "\n\n".join(blocks)
+
+
+def _render_root_summary_body(
+    config: DemoConfig,
+    spec: VariantSpec,
+    case: QuestionCase,
+    job: SummaryJob,
+    *,
+    parsed: dict[str, Any] | None,
+    summary_text: str,
+    schema: str,
+    parse_error: str | None = None,
+) -> tuple[str, str | None]:
+    leaf_mode = _leaf_text_mode(config.build_leaf_text, spec.build_leaf_text)
+    if config.enable_lossless_root_summary:
+        body = _lossless_root_summary_text(job.children, leaf_mode, job.session_date)
+        if body.strip():
+            return body, None
+        return _render_summary(parsed, summary_text, schema), parse_error
+    return _render_summary(parsed, summary_text, schema), parse_error
+
+
+def _summarize_job_once(
     config: DemoConfig,
     case: QuestionCase,
     variant: str,
@@ -1704,13 +2285,17 @@ def _summarize_job(
     metrics: BuildMetrics,
     limiter: InflightLimiter,
     summarizer: Any | None,
+    *,
+    max_tokens: int,
+    leaves_by_id: dict[str, LeafNode] | None = None,
 ) -> tuple[SummaryNode, DeepSeekCallRecord | None]:
     schema = _summary_schema(config, spec)
+    include_leaf_enrichment = _job_supports_leaf_enrichment(config, spec, job)
     child_text = _child_text(
         job.children,
         _leaf_text_mode(config.build_leaf_text, spec.build_leaf_text),
     )
-    if spec.compression and config.summarizer_kind != "none" and not _uses_local_summary(config, spec):
+    if _should_compress_summary_input(config, spec, case):
         child_text = compressor.compress(
             child_text,
             question_id=case.question_id,
@@ -1718,7 +2303,14 @@ def _summarize_job(
             stage=job.stage,
             chunk_rough_tokens=config.compressor_chunk_rough_tokens,
         )
-    messages = _summary_messages(job.session_id, job.session_date, job.stage, child_text, schema)
+    messages = _summary_messages(
+        job.session_id,
+        job.session_date,
+        job.stage,
+        child_text,
+        schema,
+        include_leaf_enrichment=include_leaf_enrichment,
+    )
     if _uses_local_summary(config, spec):
         if summarizer is None:
             raise RuntimeError("qwen_local summarizer is required for this variant")
@@ -1727,7 +2319,7 @@ def _summarize_job(
             variant=variant,
             stage=job.stage,
             messages=messages,
-            max_tokens=config.summary_token_budget,
+            max_tokens=max_tokens,
             json_mode=True,
         )
         summary_text = summary_result.text
@@ -1743,14 +2335,28 @@ def _summarize_job(
             stage=job.stage,
             thinking_mode="none",
             messages=messages,
-            max_tokens=job.max_tokens,
+            max_tokens=max_tokens,
             json_mode=True,
         )
         summary_text = result.text
         record = result.record
         finish_reason = result.record.finish_reason
     parsed, parse_error = _parse_summary(summary_text, schema)
-    rendered_summary = _render_summary(parsed, summary_text, schema)
+    rendered_summary, summary_parse_error = _render_root_summary_body(
+        config,
+        spec,
+        case,
+        job,
+        parsed=parsed,
+        summary_text=summary_text,
+        schema=schema,
+        parse_error=parse_error,
+    )
+    if include_leaf_enrichment and leaves_by_id is not None:
+        _apply_leaf_enrichment_from_parsed(job.children, parsed, leaves_by_id)
+    effective_parse_error = summary_parse_error if summary_parse_error is not None else parse_error
+    if config.enable_lossless_root_summary and rendered_summary.strip():
+        effective_parse_error = None
     node = SummaryNode(
         node_id=(
             f"{case.question_id}:{job.session_id}:summary:"
@@ -1775,9 +2381,116 @@ def _summarize_job(
         parsed_summary=parsed,
         raw_summary_text=summary_text,
         truncated=finish_reason == "length",
-        parse_error=parse_error,
+        parse_error=effective_parse_error,
         source_level=job.level,
     )
+    return node, record
+
+
+def _summarize_job(
+    config: DemoConfig,
+    case: QuestionCase,
+    variant: str,
+    spec: VariantSpec,
+    job: SummaryJob,
+    llm: Any,
+    compressor: Any,
+    metrics: BuildMetrics,
+    limiter: InflightLimiter,
+    summarizer: Any | None,
+    *,
+    leaves_by_id: dict[str, LeafNode] | None = None,
+) -> tuple[SummaryNode, DeepSeekCallRecord | None]:
+    schema = _summary_schema(config, spec)
+    child_text = _child_text(
+        job.children,
+        _leaf_text_mode(config.build_leaf_text, spec.build_leaf_text),
+    )
+    retry_cap = _summary_max_tokens(config, spec)
+    node, record = _summarize_job_once(
+        config,
+        case,
+        variant,
+        spec,
+        job,
+        llm,
+        compressor,
+        metrics,
+        limiter,
+        summarizer,
+        max_tokens=job.max_tokens,
+        leaves_by_id=leaves_by_id,
+    )
+    if _summary_needs_recovery(node) and job.max_tokens < retry_cap:
+        boosted_tokens = min(max(job.max_tokens * 2, retry_cap), retry_cap)
+        if boosted_tokens > job.max_tokens:
+            retry_node, retry_record = _summarize_job_once(
+                config,
+                case,
+                variant,
+                spec,
+                job,
+                llm,
+                compressor,
+                metrics,
+                limiter,
+                summarizer,
+                max_tokens=boosted_tokens,
+                leaves_by_id=leaves_by_id,
+            )
+            previous = (0 if _summary_needs_recovery(node) else 1, len(node.summary or ""))
+            candidate = (0 if _summary_needs_recovery(retry_node) else 1, len(retry_node.summary or ""))
+            if candidate >= previous:
+                node, record = retry_node, retry_record or record
+    if _summary_needs_recovery(node) and _job_children_are_splittable_leaves(job):
+        midpoint = len(job.children) // 2
+        left_job = replace(
+            job,
+            children=job.children[:midpoint],
+            max_tokens=min(job.max_tokens, retry_cap),
+        )
+        right_job = replace(
+            job,
+            children=job.children[midpoint:],
+            max_tokens=min(job.max_tokens, retry_cap),
+        )
+        left_node, left_record = _summarize_job(
+            config,
+            case,
+            variant,
+            spec,
+            left_job,
+            llm,
+            compressor,
+            metrics,
+            limiter,
+            summarizer,
+            leaves_by_id=leaves_by_id,
+        )
+        right_node, right_record = _summarize_job(
+            config,
+            case,
+            variant,
+            spec,
+            right_job,
+            llm,
+            compressor,
+            metrics,
+            limiter,
+            summarizer,
+            leaves_by_id=leaves_by_id,
+        )
+        node = _merge_split_summary_nodes(
+            left_node,
+            right_node,
+            job,
+            schema,
+            child_text,
+            config=config,
+            spec=spec,
+            case=case,
+        )
+        record = right_record or left_record or record
     return node, record
 
 
@@ -1802,9 +2515,10 @@ def _retrieve(
     selected_roots: list[SummaryNode] = []
     selected_leaves: list[LeafNode]
     retrieval_edges: list[GraphEdge] = []
+    protected_leaf_ids: set[str] = set()
 
     if hybrid_retrieval:
-        selected_roots, selected_leaves, retrieval_edges = _retrieve_hybrid(
+        selected_roots, selected_leaves, retrieval_edges, protected_leaf_ids = _retrieve_hybrid(
             config,
             case,
             leaves,
@@ -1815,27 +2529,85 @@ def _retrieve(
             enhanced_retrieval,
         )
     elif roots:
-        ranked_roots = _rank_nodes(roots, query_vector)
+        ranked_roots = _rank_roots_for_config(config, roots, query_vector, case.question)
         root_ids = [root.node_id for root in ranked_roots[: config.root_top_k]]
         if graph_enabled:
             root_ids, retrieval_edges = _expand_root_ids(root_ids, edges, config.graph_neighbor_k)
         selected_roots = [root_by_id[node_id] for node_id in root_ids if node_id in root_by_id]
         candidate_leaf_ids = {leaf_id for root in selected_roots for leaf_id in root.leaf_ids}
         candidate_leaves = [leaf_by_id[node_id] for node_id in candidate_leaf_ids if node_id in leaf_by_id]
-        selected_leaves = _rank_leaves(
+        ranked_leaves = _rank_leaves_for_config(
+            config,
             candidate_leaves or leaves,
             query_vector,
             case.question,
             enhanced=enhanced_retrieval,
-        )[: _effective_leaf_top_k(config, case)]
+        )
+        if config.enable_coverage_rerank:
+            ranked_leaves = _coverage_rerank_leaves(
+                ranked_leaves,
+                query_vector,
+                case.question,
+                enhanced=enhanced_retrieval,
+                lambda_weight=config.coverage_rerank_lambda,
+                pool_k=config.coverage_rerank_pool_k,
+            )
+        ranked_leaves = _apply_dual_channel_merge_for_config(
+            config,
+            ranked_leaves,
+            candidate_leaves or leaves,
+            case.question,
+            case.question_type,
+        )
+        selected_leaves = ranked_leaves[: _effective_leaf_top_k(config, case)]
+        if config.enable_leaf_graph_expansion and graph_enabled:
+            selected_leaves, leaf_graph_edges = _apply_leaf_graph_expansion(
+                config,
+                case,
+                selected_leaves,
+                edges,
+                leaf_by_id,
+            )
+            retrieval_edges.extend(leaf_graph_edges)
     else:
-        selected_leaves = _rank_leaves(
-            leaves, query_vector, case.question, enhanced=enhanced_retrieval
-        )[: _effective_leaf_top_k(config, case)]
+        ranked_leaves = _rank_leaves_for_config(
+            config,
+            leaves,
+            query_vector,
+            case.question,
+            enhanced=enhanced_retrieval,
+        )
+        if config.enable_coverage_rerank:
+            ranked_leaves = _coverage_rerank_leaves(
+                ranked_leaves,
+                query_vector,
+                case.question,
+                enhanced=enhanced_retrieval,
+                lambda_weight=config.coverage_rerank_lambda,
+                pool_k=config.coverage_rerank_pool_k,
+            )
+        ranked_leaves = _apply_dual_channel_merge_for_config(
+            config,
+            ranked_leaves,
+            leaves,
+            case.question,
+            case.question_type,
+        )
+        selected_leaves = ranked_leaves[: _effective_leaf_top_k(config, case)]
+        if config.enable_leaf_graph_expansion and graph_enabled:
+            selected_leaves, leaf_graph_edges = _apply_leaf_graph_expansion(
+                config,
+                case,
+                selected_leaves,
+                edges,
+                leaf_by_id,
+            )
+            retrieval_edges.extend(leaf_graph_edges)
     selected_roots, selected_leaves = _fit_context_budget(
         selected_roots,
         selected_leaves,
         _evidence_context_budget(config, case, enhanced_qa),
+        protected_leaf_ids=protected_leaf_ids if config.graph_search_protect_leaves else None,
     )
     retrieved_sessions = sorted({leaf.session_id for leaf in selected_leaves})
     answer_sessions = set(case.answer_session_ids)
@@ -1873,13 +2645,89 @@ def _retrieve_hybrid(
     query_vector: list[float],
     graph_enabled: bool,
     enhanced: bool,
-) -> tuple[list[SummaryNode], list[LeafNode], list[GraphEdge]]:
+) -> tuple[list[SummaryNode], list[LeafNode], list[GraphEdge], set[str]]:
     question = case.question if isinstance(case, QuestionCase) else case
     question_type = case.question_type if isinstance(case, QuestionCase) else ""
     leaf_by_id = {leaf.node_id: leaf for leaf in leaves}
     root_by_id = {root.node_id: root for root in roots}
     roots_by_session = {root.session_id: root for root in roots}
-    ranked_roots = _rank_nodes(roots, query_vector)
+    ranked_roots = _rank_roots_for_config(config, roots, query_vector, question)
+    rank_leaves_fn = lambda leaves, query_vector, question, enhanced=enhanced: _rank_leaves_for_config(
+        config,
+        leaves,
+        query_vector,
+        question,
+        enhanced=enhanced,
+    )
+
+    if config.enable_graph_first_retrieval and graph_enabled:
+        graph_result = graph_first_retrieve(
+            leaves=leaves,
+            roots=roots,
+            edges=edges,
+            query_vector=query_vector,
+            question=question,
+            search_config=_graph_first_config(config, case),
+            rank_leaves_fn=rank_leaves_fn,
+            enhanced=enhanced,
+        )
+        return _graph_retrieval_return(
+            config,
+            case,
+            graph_result,
+            leaves,
+            question,
+            question_type,
+            enhanced=enhanced,
+        )
+
+    if config.enable_graph_search and graph_enabled:
+        retrieval_edges: list[GraphEdge] = []
+        if config.graph_search_seed_only:
+            graph_leaves = leaves
+        else:
+            root_ids = [root.node_id for root in ranked_roots[: config.root_candidate_k]]
+            root_ids, retrieval_edges = _expand_root_ids(root_ids, edges, config.graph_neighbor_k)
+            candidate_leaf_ids: set[str] = set()
+            for root_id in root_ids:
+                root = root_by_id.get(root_id)
+                if root is not None:
+                    candidate_leaf_ids.update(root.leaf_ids)
+            global_leaf_ids = _global_leaf_ids_for_hybrid(
+                config,
+                case,
+                leaves,
+                query_vector,
+                question,
+                enhanced=enhanced,
+                rank_leaves_fn=rank_leaves_fn,
+            )
+            graph_leaves = [
+                leaf_by_id[leaf_id]
+                for leaf_id in candidate_leaf_ids | global_leaf_ids
+                if leaf_id in leaf_by_id
+            ] or leaves
+        graph_result = graph_search_retrieve(
+            leaves=graph_leaves,
+            roots=roots,
+            edges=edges,
+            query_vector=query_vector,
+            question=question,
+            search_config=_graph_search_config(config, case),
+            rank_leaves_fn=rank_leaves_fn,
+            enhanced=enhanced,
+        )
+        return _graph_retrieval_return(
+            config,
+            case,
+            graph_result,
+            leaves,
+            question,
+            question_type,
+            enhanced=enhanced,
+            retrieval_edges=retrieval_edges,
+        )
+
     root_ids = [root.node_id for root in ranked_roots[: config.root_candidate_k]]
     retrieval_edges: list[GraphEdge] = []
     if graph_enabled:
@@ -1889,18 +2737,34 @@ def _retrieve_hybrid(
         root = root_by_id.get(root_id)
         if root is not None:
             candidate_leaf_ids.update(root.leaf_ids)
-    global_leaf_ids = {
-        leaf.node_id
-        for leaf in _rank_leaves(leaves, query_vector, question, enhanced=enhanced)[
-            : _effective_global_leaf_top_k(config, case)
-        ]
-    }
+    global_leaf_ids = _global_leaf_ids_for_hybrid(
+        config,
+        case,
+        leaves,
+        query_vector,
+        question,
+        enhanced=enhanced,
+        rank_leaves_fn=rank_leaves_fn,
+    )
     candidate_leaves = [
         leaf_by_id[leaf_id]
         for leaf_id in candidate_leaf_ids | global_leaf_ids
         if leaf_id in leaf_by_id
     ]
-    ranked_leaves = _rank_leaves(candidate_leaves or leaves, query_vector, question, enhanced=enhanced)
+    ranked_leaves = _coverage_rerank_for_config(
+        config,
+        rank_leaves_fn(candidate_leaves or leaves, query_vector, question, enhanced=enhanced),
+        query_vector,
+        question,
+        enhanced=enhanced,
+    )
+    ranked_leaves = _apply_dual_channel_merge_for_config(
+        config,
+        ranked_leaves,
+        candidate_leaves or leaves,
+        question,
+        question_type,
+    )
     seed_roots = (
         [root_by_id[root_id] for root_id in root_ids if root_id in root_by_id]
         if enhanced
@@ -1920,16 +2784,14 @@ def _retrieve_hybrid(
         seed_leaves=root_seed_leaves,
     )
     if enhanced:
-        selected_leaves = _expand_selected_session_context(
+        selected_leaves = _expand_leaves_if_enhanced(
+            config,
+            case,
             selected_leaves,
             leaves,
             question,
             question_type,
-            _effective_leaf_top_k(config, case),
-            explicit_speaker=(
-                isinstance(case, QuestionCase) and _has_explicit_speakers(case)
-                and config.enable_speaker_neighbor_window
-            ),
+            enhanced=enhanced,
         )
     context_sessions = {leaf.session_id for leaf in selected_leaves}
     summary_rank = {root.node_id: index for index, root in enumerate(ranked_roots)}
@@ -1947,23 +2809,50 @@ def _retrieve_hybrid(
             if len(selected_roots) >= config.qa_summary_top_k:
                 break
     selected_roots = selected_roots[: config.qa_summary_top_k]
-    return selected_roots, selected_leaves, retrieval_edges
+    if config.enable_leaf_graph_expansion and graph_enabled:
+        selected_leaves, leaf_graph_edges = _apply_leaf_graph_expansion(
+            config,
+            case,
+            selected_leaves,
+            edges,
+            leaf_by_id,
+        )
+        retrieval_edges.extend(leaf_graph_edges)
+    return selected_roots, selected_leaves, retrieval_edges, set()
 
 
 def _effective_leaf_top_k(config: DemoConfig, case: QuestionCase | str) -> int:
-    if isinstance(case, QuestionCase) and _has_explicit_speakers(case):
-        return max(config.leaf_top_k, 24)
-    return config.leaf_top_k
+    effective = config.leaf_top_k
+    if (
+        config.enable_explicit_speaker_retrieval_boost
+        and isinstance(case, QuestionCase)
+        and _has_explicit_speakers(case)
+    ):
+        effective = max(effective, 24)
+    if config.enable_query_type_retrieval_boost and isinstance(case, QuestionCase):
+        if _is_list_or_set_question(case.question, case.question_type):
+            effective += config.list_question_extra_leaf_budget
+        elif _is_temporal_question(case.question, case.question_type):
+            effective += config.temporal_question_extra_leaf_budget
+    return effective
 
 
 def _effective_global_leaf_top_k(config: DemoConfig, case: QuestionCase | str) -> int:
-    if isinstance(case, QuestionCase) and _has_explicit_speakers(case):
+    if (
+        config.enable_explicit_speaker_retrieval_boost
+        and isinstance(case, QuestionCase)
+        and _has_explicit_speakers(case)
+    ):
         return max(config.global_leaf_top_k, 48)
     return config.global_leaf_top_k
 
 
 def _effective_per_session_leaf_k(config: DemoConfig, case: QuestionCase | str) -> int:
-    if isinstance(case, QuestionCase) and _has_explicit_speakers(case):
+    if (
+        config.enable_explicit_speaker_retrieval_boost
+        and isinstance(case, QuestionCase)
+        and _has_explicit_speakers(case)
+    ):
         return max(config.per_session_leaf_k, 3)
     return config.per_session_leaf_k
 
@@ -2096,144 +2985,237 @@ def _root_seed_leaves(
     return seed_leaves
 
 
+def _root_graph_edge_policy(
+    config: DemoConfig,
+    *,
+    enable_typed_edges: bool,
+) -> RootGraphEdgePolicy:
+    return RootGraphEdgePolicy(
+        graph_neighbor_k=config.graph_neighbor_k,
+        enable_typed_edges=enable_typed_edges,
+        typed_neighbors_per_relation=config.typed_root_neighbors_per_relation,
+        keyword_neighbors_per_root=config.graph_neighbor_k,
+        semantic_neighbors_per_root=config.graph_neighbor_k,
+        typed_min_score=config.typed_root_min_edge_score,
+        typed_max_per_root=config.typed_root_max_edges_per_root,
+        entity_min_shared_specific=config.typed_root_entity_min_shared_specific,
+        entity_min_shared_generic=config.typed_root_entity_min_shared_generic,
+        time_min_shared=config.typed_root_time_min_shared,
+        state_min_shared=config.typed_root_state_min_shared,
+        event_min_shared=config.typed_root_event_min_shared,
+        typed_keyword_min_shared=config.typed_root_keyword_min_shared,
+        update_min_actions=config.typed_root_update_min_actions,
+        update_min_entities=config.typed_root_update_min_entities,
+        corpus_keyword_min_shared=config.typed_root_corpus_keyword_min_shared,
+        require_semantic_support=config.typed_root_require_semantic_support,
+        semantic_support_min_cosine=config.typed_root_semantic_support_min_cosine,
+        filter_generic_entities=config.typed_root_filter_generic_entities,
+    )
+
+
 def _build_root_graph(
     roots: list[SummaryNode],
     graph_neighbor_k: int,
     *,
     enable_typed_edges: bool = False,
+    prefer_typed_edges: bool = False,
+    edge_policy: RootGraphEdgePolicy | None = None,
 ) -> list[GraphEdge]:
-    edges: list[GraphEdge] = []
-    seen: set[tuple[str, str, str]] = set()
-    temporal_roots = sorted(roots, key=lambda root: (root.session_date or "", root.session_id))
-    for left, right in zip(temporal_roots, temporal_roots[1:]):
-        _add_edge(edges, seen, left.node_id, right.node_id, 1.0, "temporal_neighbor")
-    root_terms = {root.node_id: _summary_term_set(root.retrieval_text or root.summary) for root in roots}
-    keyword_neighbors: dict[str, list[tuple[float, SummaryNode]]] = {root.node_id: [] for root in roots}
-    typed_neighbors: dict[str, list[tuple[float, SummaryNode, str]]] = {
-        root.node_id: [] for root in roots
-    }
-    root_anchors = (
-        {root.node_id: _typed_anchor_sets(root) for root in roots}
-        if enable_typed_edges
-        else {}
-    )
-    for index, root in enumerate(roots):
-        terms = root_terms[root.node_id]
-        anchors = root_anchors.get(root.node_id, {})
-        for candidate in roots[index + 1 :]:
-            if enable_typed_edges:
-                candidate_anchors = root_anchors.get(candidate.node_id, {})
-                for relation, score in _typed_anchor_edge_scores(anchors, candidate_anchors):
-                    typed_neighbors[root.node_id].append((score, candidate, relation))
-                    typed_neighbors[candidate.node_id].append((score, root, relation))
-            if not terms:
-                continue
-            candidate_terms = root_terms[candidate.node_id]
-            if not candidate_terms:
-                continue
-            shared = terms & candidate_terms
-            if len(shared) < 2:
-                continue
-            score = min(0.99, 0.45 + len(shared) / max(len(terms | candidate_terms), 1))
-            keyword_neighbors[root.node_id].append((score, candidate))
-            keyword_neighbors[candidate.node_id].append((score, root))
-    for root in roots:
-        per_relation: dict[str, int] = {}
-        for score, candidate, relation in sorted(
-            typed_neighbors[root.node_id],
-            key=lambda item: (item[0], item[2], item[1].node_id),
-            reverse=True,
-        ):
-            if per_relation.get(relation, 0) >= graph_neighbor_k:
-                continue
-            _add_edge(edges, seen, root.node_id, candidate.node_id, score, relation)
-            per_relation[relation] = per_relation.get(relation, 0) + 1
-    for root in roots:
-        for score, candidate in sorted(
-            keyword_neighbors[root.node_id],
-            key=lambda item: (item[0], item[1].node_id),
-            reverse=True,
-        )[:graph_neighbor_k]:
-            _add_edge(edges, seen, root.node_id, candidate.node_id, score, "keyword_neighbor")
-    for root in roots:
-        neighbors = sorted(
-            (
-                (cosine_similarity(root.embedding, candidate.embedding), candidate)
-                for candidate in roots
-                if candidate.node_id != root.node_id
-            ),
-            key=lambda item: item[0],
-            reverse=True,
+    del prefer_typed_edges  # deprecated: typed edges are always additive now
+    if edge_policy is None:
+        edge_policy = RootGraphEdgePolicy(
+            graph_neighbor_k=graph_neighbor_k,
+            enable_typed_edges=enable_typed_edges,
+            keyword_neighbors_per_root=graph_neighbor_k,
+            semantic_neighbors_per_root=graph_neighbor_k,
         )
-        for score, candidate in neighbors[:graph_neighbor_k]:
-            _add_edge(edges, seen, root.node_id, candidate.node_id, score, "semantic_neighbor")
-    return edges
+    return build_root_graph(roots, edge_policy)
 
 
-def _typed_anchor_sets(root: SummaryNode) -> dict[str, set[str]]:
-    anchors = root.anchor_terms or _summary_anchor_terms(
-        root.parsed_summary,
-        root.raw_summary_text or root.retrieval_text or root.summary,
-        root.session_date,
+def _build_llm_root_edges(
+    config: DemoConfig,
+    case: QuestionCase,
+    variant: str,
+    roots: list[SummaryNode],
+    llm: Any,
+    llm_records: list[DeepSeekCallRecord],
+    metrics: BuildMetrics,
+    limiter: InflightLimiter,
+) -> list[GraphEdge]:
+    llm_anchors: dict[str, dict[str, list[str]]] = {}
+    for root in roots:
+        result = _tracked_chat(
+            llm,
+            limiter,
+            metrics,
+            question_id=case.question_id,
+            variant=variant,
+            stage="build_root_edge_anchor",
+            thinking_mode="none",
+            messages=llm_root_anchor_messages(root),
+            max_tokens=config.llm_root_edge_max_tokens,
+            json_mode=True,
+        )
+        llm_records.append(result.record)
+        parsed = parse_llm_root_anchors(
+            result.text,
+            max_items_per_key=config.llm_root_edge_anchor_limit,
+        )
+        if parsed:
+            llm_anchors[root.node_id] = parsed
+    return build_llm_anchor_edges(
+        roots,
+        llm_anchors,
+        neighbors_per_relation=config.llm_root_edge_neighbors_per_relation,
+        min_shared=config.llm_root_edge_min_shared,
     )
-    typed: dict[str, set[str]] = {}
-    for key, values in anchors.items():
-        cleaned = {
-            _normalize_anchor(value)
-            for value in values
-            if _normalize_anchor(value)
-        }
-        if cleaned:
-            typed[key] = cleaned
-    return typed
 
 
-def _normalize_anchor(value: str) -> str:
-    text = re.sub(r"\s+", " ", str(value).strip(" \t\r\n.,;:")).casefold()
-    if len(text) < 2 or text in _SUMMARY_CUE_STOPWORDS:
-        return ""
-    return text
-
-
-def _typed_anchor_edge_scores(
-    left: dict[str, set[str]],
-    right: dict[str, set[str]],
-) -> list[tuple[str, float]]:
-    scores: list[tuple[str, float]] = []
-    relation_specs = (
-        ("entities", "entity_neighbor", 0.86, 0.04, 1),
-        ("times", "time_neighbor", 0.76, 0.04, 1),
-        ("actions", "event_neighbor", 0.68, 0.04, 2),
-        ("state_phrases", "state_neighbor", 0.74, 0.03, 1),
-        ("keywords", "keyword_neighbor", 0.58, 0.03, 2),
+def _build_session_leaf_graph_edges(
+    config: DemoConfig,
+    case: QuestionCase,
+    variant: str,
+    leaves: list[LeafNode],
+    llm: Any,
+    llm_records: list[DeepSeekCallRecord],
+    metrics: BuildMetrics,
+    limiter: InflightLimiter,
+) -> list[GraphEdge]:
+    leaves_by_session = group_by_session(leaves)
+    llm_edges_by_session: dict[str, list[GraphEdge]] = {}
+    if config.enable_llm_leaf_edges:
+        for session_id, session_leaves in leaves_by_session.items():
+            if len(session_leaves) < 2:
+                continue
+            capped = sorted(session_leaves, key=lambda item: item.turn_index)[
+                : config.llm_leaf_edge_max_leaves_per_session
+            ]
+            result = _tracked_chat(
+                llm,
+                limiter,
+                metrics,
+                question_id=case.question_id,
+                variant=variant,
+                stage="build_leaf_edge_anchor",
+                thinking_mode="none",
+                messages=llm_session_leaf_edge_messages(
+                    session_id,
+                    capped,
+                    max_snippet_chars=config.llm_leaf_edge_max_snippet_chars,
+                ),
+                max_tokens=config.llm_leaf_edge_max_tokens,
+                json_mode=True,
+            )
+            llm_records.append(result.record)
+            valid_ids = {leaf.node_id for leaf in capped}
+            parsed = parse_llm_leaf_edges(
+                result.text,
+                valid_leaf_ids=valid_ids,
+                min_confidence=config.llm_leaf_edge_min_confidence,
+                max_edges_per_leaf=config.llm_leaf_edge_max_edges_per_leaf,
+                max_edges_per_session=config.llm_leaf_edge_max_edges_per_session,
+            )
+            if parsed:
+                llm_edges_by_session[session_id] = parsed
+    return build_session_leaf_edges(
+        leaves_by_session,
+        enable_deterministic=True,
+        llm_edges_by_session=llm_edges_by_session,
     )
-    for key, relation, base, step, threshold in relation_specs:
-        shared = left.get(key, set()) & right.get(key, set())
-        if len(shared) < threshold:
-            continue
-        scores.append((relation, min(0.97, base + len(shared) * step)))
-    if (left.get("actions", set()) & right.get("actions", set())) and (
-        left.get("entities", set()) & right.get("entities", set())
-        or left.get("keywords", set()) & right.get("keywords", set())
-    ):
-        scores.append(("update_neighbor", 0.82))
-    return scores
 
 
-def _add_edge(
+def _leaf_only_edges(edges: list[GraphEdge], leaf_by_id: dict[str, LeafNode]) -> list[GraphEdge]:
+    return [
+        edge
+        for edge in edges
+        if edge.src in leaf_by_id and edge.dst in leaf_by_id
+    ]
+
+
+def _expand_leaf_ids(
+    seed_leaf_ids: list[str],
     edges: list[GraphEdge],
-    seen: set[tuple[str, str, str]],
-    src: str,
-    dst: str,
-    score: float,
-    relation: str,
-) -> None:
-    pair = tuple(sorted((src, dst)))
-    key = (pair[0], pair[1], relation)
-    if key in seen:
-        return
-    edges.append(GraphEdge(src=pair[0], dst=pair[1], score=score, relation=relation))  # type: ignore[arg-type]
-    seen.add(key)
+    leaf_by_id: dict[str, LeafNode],
+    neighbor_k: int,
+) -> tuple[list[str], list[GraphEdge]]:
+    if not seed_leaf_ids or not edges:
+        return list(seed_leaf_ids), []
+    expanded = list(seed_leaf_ids)
+    seen = set(seed_leaf_ids)
+    used_edges: list[GraphEdge] = []
+    neighbor_counts = {leaf_id: 0 for leaf_id in seed_leaf_ids}
+    for edge in sorted(edges, key=_edge_expansion_sort_key, reverse=True):
+        for source, destination in ((edge.src, edge.dst), (edge.dst, edge.src)):
+            if source not in neighbor_counts:
+                continue
+            if destination in seen:
+                continue
+            source_leaf = leaf_by_id.get(source)
+            destination_leaf = leaf_by_id.get(destination)
+            if source_leaf is None or destination_leaf is None:
+                continue
+            if source_leaf.session_id != destination_leaf.session_id:
+                continue
+            if neighbor_counts[source] >= neighbor_k:
+                continue
+            expanded.append(destination)
+            seen.add(destination)
+            used_edges.append(edge)
+            neighbor_counts[source] += 1
+            neighbor_counts.setdefault(destination, 0)
+    return expanded, used_edges
+
+
+def _apply_leaf_graph_expansion(
+    config: DemoConfig,
+    case: QuestionCase,
+    selected_leaves: list[LeafNode],
+    edges: list[GraphEdge],
+    leaf_by_id: dict[str, LeafNode],
+) -> tuple[list[LeafNode], list[GraphEdge]]:
+    if not config.enable_leaf_graph_expansion or config.leaf_graph_expansion_budget <= 0:
+        return selected_leaves, []
+    leaf_edges = _leaf_only_edges(edges, leaf_by_id)
+    if not leaf_edges:
+        return selected_leaves, []
+    seed_ids = [leaf.node_id for leaf in selected_leaves]
+    expanded_ids, used_edges = _expand_leaf_ids(
+        seed_ids,
+        leaf_edges,
+        leaf_by_id,
+        config.leaf_graph_neighbor_k,
+    )
+    selected_ids = {leaf.node_id for leaf in selected_leaves}
+    base_limit = _effective_leaf_top_k(config, case)
+    max_total = base_limit + config.leaf_graph_expansion_budget
+    result = list(selected_leaves)
+    added = 0
+    for leaf_id in expanded_ids:
+        if leaf_id in selected_ids:
+            continue
+        if len(result) >= max_total or added >= config.leaf_graph_expansion_budget:
+            break
+        leaf = leaf_by_id.get(leaf_id)
+        if leaf is None:
+            continue
+        result.append(leaf)
+        selected_ids.add(leaf_id)
+        added += 1
+    return result, used_edges
+
+
+def _merge_graph_edges(base_edges: list[GraphEdge], extra_edges: list[GraphEdge]) -> list[GraphEdge]:
+    merged = list(base_edges)
+    seen: set[tuple[str, str, str]] = {
+        (edge.src, edge.dst, edge.relation) for edge in merged
+    }
+    for edge in extra_edges:
+        key = (edge.src, edge.dst, edge.relation)
+        if key in seen:
+            continue
+        merged.append(edge)
+        seen.add(key)
+    return merged
 
 
 def _expand_root_ids(
@@ -2258,14 +3240,14 @@ def _expand_root_ids(
 
 
 _EDGE_RELATION_EXPANSION_BONUS = {
-    "update_neighbor": 0.08,
-    "entity_neighbor": 0.06,
-    "state_neighbor": 0.06,
-    "event_neighbor": 0.04,
-    "time_neighbor": 0.03,
-    "keyword_neighbor": 0.01,
-    "temporal_neighbor": 0.0,
-    "semantic_neighbor": 0.0,
+    "keyword_neighbor": 0.06,
+    "semantic_neighbor": 0.03,
+    "temporal_neighbor": 0.01,
+    "time_neighbor": 0.04,
+    "state_neighbor": 0.05,
+    "entity_neighbor": 0.04,
+    "event_neighbor": 0.03,
+    "update_neighbor": 0.02,
 }
 
 
@@ -2289,12 +3271,535 @@ def _embed_nodes(nodes: list[Any], embedder: Any, question_id: str, variant: str
         node.embedding = vector
 
 
+def _effective_typed_root_edges(config: DemoConfig) -> bool:
+    if config.enable_typed_root_edges:
+        return True
+    if not config.enable_typed_retrieval:
+        return False
+    return config.enable_graph_first_retrieval or config.enable_graph_search
+
+
+def _rank_roots_for_config(
+    config: DemoConfig,
+    roots: list[SummaryNode],
+    query_vector: list[float],
+    question: str,
+) -> list[SummaryNode]:
+    if config.enable_typed_retrieval and question.strip():
+        return rank_roots_hybrid(
+            roots,
+            query_vector,
+            question,
+            embedding_blend=config.typed_retrieval_embedding_blend,
+        )
+    return _rank_nodes(roots, query_vector)
+
+
 def _rank_nodes(nodes: list[Any], query_vector: list[float]) -> list[Any]:
     return sorted(
         nodes,
         key=lambda node: (cosine_similarity(node.embedding, query_vector), node.node_id),
         reverse=True,
     )
+
+
+def _fusion_retrieval_config(config: DemoConfig) -> FusionRetrievalConfig:
+    method = config.fusion_method if config.fusion_method in {"rrf", "weighted"} else "rrf"
+    protect_k = (
+        config.fusion_semantic_protect_k
+        if config.enable_protected_fusion and config.enable_fusion_retrieval
+        else 0
+    )
+    return FusionRetrievalConfig(
+        method=method,
+        rrf_k=config.fusion_rrf_k,
+        weight_semantic=config.fusion_weight_semantic,
+        weight_keyword=config.fusion_weight_keyword,
+        weight_entity=config.fusion_weight_entity,
+        query_adaptive_weights=config.fusion_query_adaptive_weights,
+        protect_semantic_top_k=protect_k,
+    )
+
+
+def _leaf_scores_for_config(
+    config: DemoConfig,
+    leaves: list[LeafNode],
+    query_vector: list[float],
+    question: str,
+    *,
+    enhanced: bool,
+) -> dict[str, float]:
+    if config.enable_fusion_retrieval:
+        return compute_fusion_scores(
+            leaves,
+            query_vector,
+            question,
+            config=_fusion_retrieval_config(config),
+        )
+    query_terms = _important_query_terms(question)
+    update_query = _is_update_sensitive_question(question)
+    return {
+        leaf.node_id: _leaf_rank_score(
+            leaf,
+            query_vector,
+            query_terms=query_terms,
+            update_query=update_query,
+            enhanced=enhanced,
+        )
+        for leaf in leaves
+    }
+
+
+def _rank_leaves_for_config(
+    config: DemoConfig,
+    leaves: list[LeafNode],
+    query_vector: list[float],
+    question: str,
+    *,
+    enhanced: bool,
+) -> list[LeafNode]:
+    if not config.enable_fusion_retrieval and not enhanced:
+        return _rank_nodes(leaves, query_vector)
+    scores = _leaf_scores_for_config(
+        config, leaves, query_vector, question, enhanced=enhanced
+    )
+    return sorted(
+        leaves,
+        key=lambda leaf: (scores.get(leaf.node_id, 0.0), leaf.node_id),
+        reverse=True,
+    )
+
+
+def _explicit_speaker_enhanced(config: DemoConfig, case: QuestionCase | str) -> bool:
+    return (
+        isinstance(case, QuestionCase)
+        and _has_explicit_speakers(case)
+        and config.enable_speaker_neighbor_window
+    )
+
+
+def _expand_leaves_if_enhanced(
+    config: DemoConfig,
+    case: QuestionCase | str,
+    selected_leaves: list[LeafNode],
+    leaves: list[LeafNode],
+    question: str,
+    question_type: str,
+    *,
+    enhanced: bool,
+) -> list[LeafNode]:
+    if not enhanced:
+        return selected_leaves
+    return _expand_selected_session_context(
+        selected_leaves,
+        leaves,
+        question,
+        question_type,
+        _effective_leaf_top_k(config, case),
+        explicit_speaker=_explicit_speaker_enhanced(config, case),
+    )
+
+
+def _graph_first_config(config: DemoConfig, case: QuestionCase | str) -> GraphFirstConfig:
+    return GraphFirstConfig(
+        seed_roots=config.graph_search_seed_roots,
+        seed_leaves=config.graph_search_seed_leaves,
+        ppr_damping=config.graph_search_ppr_damping,
+        ppr_iterations=config.graph_search_ppr_iterations,
+        embedding_blend=config.graph_first_embedding_blend,
+        structural_root_leaf_weight=config.graph_search_structural_root_leaf_weight,
+        leaf_limit=_effective_leaf_top_k(config, case),
+        root_limit=config.qa_summary_top_k,
+        global_leaf_top_k=_effective_global_leaf_top_k(config, case),
+        per_session_leaf_k=_effective_per_session_leaf_k(config, case),
+        session_coverage=config.graph_first_session_coverage,
+        per_session_leaf_cap=config.graph_search_per_session_leaf_cap,
+        max_activated_sessions=config.graph_search_max_sessions,
+        candidate_pool_k=config.graph_first_candidate_pool_k,
+        use_typed_retrieval=config.enable_typed_retrieval,
+        typed_embedding_blend=config.typed_retrieval_embedding_blend,
+    )
+
+
+def _graph_search_config(config: DemoConfig, case: QuestionCase | str) -> GraphSearchConfig:
+    return GraphSearchConfig(
+        seed_roots=config.graph_search_seed_roots,
+        seed_leaves=config.graph_search_seed_leaves,
+        ppr_damping=config.graph_search_ppr_damping,
+        ppr_iterations=config.graph_search_ppr_iterations,
+        embedding_blend=config.graph_search_embedding_blend,
+        session_min_leaves=config.graph_search_session_min_leaves,
+        max_activated_sessions=config.graph_search_max_sessions,
+        per_session_leaf_cap=config.graph_search_per_session_leaf_cap,
+        leaf_limit=_effective_leaf_top_k(config, case),
+        root_limit=config.qa_summary_top_k,
+        structural_root_leaf_weight=config.graph_search_structural_root_leaf_weight,
+        seed_only=config.graph_search_seed_only,
+        free_leaf_select=config.graph_search_seed_only,
+        session_coverage=config.graph_search_session_coverage,
+        use_typed_retrieval=config.enable_typed_retrieval,
+        typed_embedding_blend=config.typed_retrieval_embedding_blend,
+    )
+
+
+def _coverage_rerank_for_config(
+    config: DemoConfig,
+    leaves: list[LeafNode],
+    query_vector: list[float],
+    question: str,
+    *,
+    enhanced: bool,
+) -> list[LeafNode]:
+    if not config.enable_coverage_rerank:
+        return leaves
+    relevance = (
+        _leaf_scores_for_config(
+            config,
+            leaves[: config.coverage_rerank_pool_k],
+            query_vector,
+            question,
+            enhanced=enhanced,
+        )
+        if config.enable_fusion_retrieval
+        else None
+    )
+    return _coverage_rerank_leaves(
+        leaves,
+        query_vector,
+        question,
+        enhanced=enhanced,
+        lambda_weight=config.coverage_rerank_lambda,
+        pool_k=config.coverage_rerank_pool_k,
+        relevance_scores=relevance,
+    )
+
+
+def _iterative_kick_and_backfill_leaves(
+    selected_leaves: list[LeafNode],
+    ranked_pool_leaves: list[LeafNode],
+    relevance_scores: dict[str, float],
+    *,
+    max_rounds: int,
+    max_kick_per_round: int,
+    min_relevance_ratio: float,
+    protect_top_k: int,
+    protected_leaf_ids: set[str] | None = None,
+) -> list[LeafNode]:
+    if not selected_leaves:
+        return selected_leaves
+    if not ranked_pool_leaves:
+        return selected_leaves
+
+    target_k = len(selected_leaves)
+    selected_ids = {leaf.node_id for leaf in selected_leaves}
+    pool_by_id = {leaf.node_id: leaf for leaf in ranked_pool_leaves}
+    protected_ids = set(protected_leaf_ids or set())
+    for leaf in ranked_pool_leaves[:protect_top_k]:
+        if leaf.node_id in selected_ids:
+            protected_ids.add(leaf.node_id)
+
+    max_score = max((relevance_scores.get(leaf.node_id, 0.0) for leaf in ranked_pool_leaves), default=0.0)
+    threshold = max_score * min_relevance_ratio
+    if threshold <= 0:
+        return selected_leaves
+
+    selected = list(selected_leaves)
+    for _ in range(max_rounds):
+        kick_candidates = [
+            leaf
+            for leaf in selected
+            if leaf.node_id not in protected_ids
+            and relevance_scores.get(leaf.node_id, 0.0) < threshold
+        ]
+        kick_candidates.sort(key=lambda leaf: relevance_scores.get(leaf.node_id, 0.0))
+        kick = kick_candidates[:max_kick_per_round]
+        if not kick:
+            break
+        kick_ids = {leaf.node_id for leaf in kick}
+
+        selected = [leaf for leaf in selected if leaf.node_id not in kick_ids]
+        selected_ids -= kick_ids
+
+        refill: list[LeafNode] = []
+        for leaf in ranked_pool_leaves:
+            if len(refill) >= len(kick):
+                break
+            if leaf.node_id in selected_ids:
+                continue
+            refill.append(pool_by_id[leaf.node_id])
+            selected_ids.add(leaf.node_id)
+
+        if not refill:
+            break
+        selected.extend(refill)
+
+        selected.sort(
+            key=lambda leaf: (relevance_scores.get(leaf.node_id, 0.0), -leaf.turn_index, leaf.node_id),
+            reverse=True,
+        )
+        selected = selected[:target_k]
+        selected_ids = {leaf.node_id for leaf in selected}
+
+    return selected
+
+
+def _iterative_kick_and_backfill_leaves_with_llm(
+    *,
+    config: DemoConfig,
+    case: QuestionCase,
+    variant: str,
+    llm: Any,
+    limiter: InflightLimiter,
+    metrics: BuildMetrics,
+    llm_records: list[DeepSeekCallRecord],
+    selected_leaves: list[LeafNode],
+    ranked_pool_leaves: list[LeafNode],
+) -> list[LeafNode]:
+    if not selected_leaves or not ranked_pool_leaves:
+        return selected_leaves
+
+    target_k = len(selected_leaves)
+    pool_rank = {leaf.node_id: index for index, leaf in enumerate(ranked_pool_leaves)}
+    selected: list[LeafNode] = sorted(
+        selected_leaves,
+        key=lambda leaf: (pool_rank.get(leaf.node_id, 10**9), leaf.node_id),
+    )
+    selected_ids = {leaf.node_id for leaf in selected}
+    protected_ids = {
+        leaf.node_id
+        for leaf in ranked_pool_leaves[: config.iterative_leaf_denoise_protect_top_k]
+        if leaf.node_id in selected_ids
+    }
+    structured_selected = _rank_structured_leaf_channel(
+        config,
+        selected,
+        case.question,
+        case.question_type,
+    )
+    for leaf in structured_selected[: config.iterative_leaf_denoise_keep_structured_top_k]:
+        protected_ids.add(leaf.node_id)
+
+    for _ in range(config.iterative_leaf_denoise_max_rounds):
+        payload = _llm_pick_kick_leaf_indices(
+            case=case,
+            variant=variant,
+            llm=llm,
+            limiter=limiter,
+            metrics=metrics,
+            llm_records=llm_records,
+            selected_leaves=selected,
+            max_kick_per_round=config.iterative_leaf_denoise_max_kick_per_round,
+            protected_leaf_ids=protected_ids,
+        )
+        kick_indices = payload.get("kick_indices") or []
+        kick_set = {
+            int(index)
+            for index in kick_indices
+            if isinstance(index, int) and 0 <= index < len(selected)
+        }
+        if not kick_set:
+            break
+        kick_ids = {selected[index].node_id for index in sorted(kick_set)}
+        kick_ids -= protected_ids
+        if not kick_ids:
+            break
+
+        selected = [leaf for leaf in selected if leaf.node_id not in kick_ids]
+        selected_ids = {leaf.node_id for leaf in selected}
+
+        refill: list[LeafNode] = []
+        for leaf in ranked_pool_leaves:
+            if len(selected) + len(refill) >= target_k:
+                break
+            if leaf.node_id in selected_ids:
+                continue
+            refill.append(leaf)
+            selected_ids.add(leaf.node_id)
+        selected.extend(refill)
+        selected = sorted(
+            selected,
+            key=lambda leaf: (pool_rank.get(leaf.node_id, 10**9), leaf.node_id),
+        )[:target_k]
+        selected_ids = {leaf.node_id for leaf in selected}
+
+    return selected
+
+
+def _llm_pick_kick_leaf_indices(
+    *,
+    case: QuestionCase,
+    variant: str,
+    llm: Any,
+    limiter: InflightLimiter,
+    metrics: BuildMetrics,
+    llm_records: list[DeepSeekCallRecord],
+    selected_leaves: list[LeafNode],
+    max_kick_per_round: int,
+    protected_leaf_ids: set[str],
+) -> dict[str, Any]:
+    result = _tracked_chat(
+        llm,
+        limiter,
+        metrics,
+        question_id=case.question_id,
+        variant=variant,
+        stage="answer_retrieval_denoise",
+        thinking_mode="none",
+        messages=_retrieval_denoise_messages(
+            case,
+            selected_leaves,
+            max_kick_per_round=max_kick_per_round,
+            protected_leaf_ids=protected_leaf_ids,
+        ),
+        max_tokens=2048,
+        json_mode=True,
+    )
+    llm_records.append(result.record)
+    payload = _extract_json_object(result.text or "")
+    if not isinstance(payload, dict):
+        return {"kick_indices": []}
+    if "kick_indices" not in payload:
+        return {"kick_indices": []}
+    raw_indices = payload.get("kick_indices")
+    if not isinstance(raw_indices, list):
+        return {"kick_indices": []}
+    indices: list[int] = []
+    for value in raw_indices:
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            continue
+        if index < 0 or index >= len(selected_leaves):
+            continue
+        indices.append(index)
+    if len(indices) > max_kick_per_round:
+        indices = indices[:max_kick_per_round]
+    return {"kick_indices": sorted(set(indices))}
+
+
+def _retrieval_denoise_messages(
+    case: QuestionCase,
+    selected_leaves: list[LeafNode],
+    *,
+    max_kick_per_round: int,
+    protected_leaf_ids: set[str],
+) -> list[dict[str, str]]:
+    temporal_question = _is_temporal_question(case.question, case.question_type)
+    list_question = _is_list_or_set_question(case.question, case.question_type)
+    system_content = (
+        "You are filtering noisy retrieval evidence for QA. "
+        "Given the question and current selected leaves, identify leaves that are clearly irrelevant "
+        "to answering the question. Kick at most the allowed number, and it is valid to kick none. "
+        "Never kick protected leaves. "
+        "Preserve evidence diversity: for temporal questions keep enough time-anchored leaves, and for "
+        "list/set questions keep leaves covering different concrete items. "
+        "Return strict JSON only with keys: kick_indices (array[int]) and rationale (string)."
+    )
+    rows = []
+    for index, leaf in enumerate(selected_leaves):
+        protected = "yes" if leaf.node_id in protected_leaf_ids else "no"
+        structured_score = _structured_signal_score(leaf, case.question, case.question_type)
+        tags: list[str] = []
+        if structured_score > 0:
+            tags.append("structured_match")
+        text = (leaf.retrieval_text or leaf.raw_text or "").lower()
+        if re.search(r"yesterday|today|last|week|month|year|before|after|ago|\\d{4}[-/]\\d{1,2}[-/]\\d{1,2}", text):
+            tags.append("time_anchor")
+        if re.search(r",| and | or |including|plus|以及|还有|包括|、", text):
+            tags.append("list_like")
+        rows.append(
+            {
+                "index": index,
+                "node_id": leaf.node_id,
+                "protected": protected,
+                "tags": tags,
+                "session_id": leaf.session_id,
+                "session_date": leaf.session_date or "",
+                "text": _shorten_text_for_denoise(leaf.retrieval_text or leaf.raw_text, 420),
+            }
+        )
+    user_content = json.dumps(
+        {
+            "question_id": case.question_id,
+            "question_type": case.question_type,
+            "question_date": case.question_date or "",
+            "question": case.question,
+            "question_mode": {
+                "temporal_question": temporal_question,
+                "list_or_set_question": list_question,
+            },
+            "max_kick_per_round": max_kick_per_round,
+            "selected_leaves": rows,
+            "rules": [
+                "Kick only clearly irrelevant leaves.",
+                "If uncertain, keep the leaf.",
+                "Do not kick protected=yes leaves.",
+                "kick_indices length must be <= max_kick_per_round.",
+                "For temporal questions keep at least one time_anchor leaf if available.",
+                "For list/set questions keep multiple list_like/structured_match leaves if available.",
+            ],
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _shorten_text_for_denoise(text: str, max_chars: int) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 3] + "..."
+
+
+def _global_leaf_ids_for_hybrid(
+    config: DemoConfig,
+    case: QuestionCase | str,
+    leaves: list[LeafNode],
+    query_vector: list[float],
+    question: str,
+    *,
+    enhanced: bool,
+    rank_leaves_fn: Any,
+) -> set[str]:
+    global_ranked = _coverage_rerank_for_config(
+        config,
+        rank_leaves_fn(leaves, query_vector, question, enhanced=enhanced),
+        query_vector,
+        question,
+        enhanced=enhanced,
+    )
+    return {
+        leaf.node_id
+        for leaf in global_ranked[: _effective_global_leaf_top_k(config, case)]
+    }
+
+
+def _graph_retrieval_return(
+    config: DemoConfig,
+    case: QuestionCase | str,
+    graph_result: Any,
+    leaves: list[LeafNode],
+    question: str,
+    question_type: str,
+    *,
+    enhanced: bool,
+    retrieval_edges: list[GraphEdge] | None = None,
+) -> tuple[list[SummaryNode], list[LeafNode], list[GraphEdge], set[str]]:
+    selected_leaves = _expand_leaves_if_enhanced(
+        config,
+        case,
+        graph_result.selected_leaves,
+        leaves,
+        question,
+        question_type,
+        enhanced=enhanced,
+    )
+    edges = list(retrieval_edges or []) + list(graph_result.used_edges)
+    return graph_result.selected_roots, selected_leaves, edges, set(graph_result.graph_leaf_ids)
 
 
 def _rank_leaves(
@@ -2311,13 +3816,214 @@ def _rank_leaves(
     return sorted(
         leaves,
         key=lambda leaf: (
-            cosine_similarity(leaf.embedding, query_vector)
-            + _lexical_overlap_score(leaf.raw_text, query_terms)
-            + _update_signal_score(leaf.raw_text if update_query else ""),
+            _leaf_rank_score(
+                leaf,
+                query_vector,
+                query_terms=query_terms,
+                update_query=update_query,
+                enhanced=enhanced,
+            ),
             leaf.node_id,
         ),
         reverse=True,
     )
+
+
+def _leaf_rank_score(
+    leaf: LeafNode,
+    query_vector: list[float],
+    *,
+    query_terms: set[str],
+    update_query: bool,
+    enhanced: bool,
+) -> float:
+    base = cosine_similarity(leaf.embedding, query_vector)
+    if not enhanced:
+        return base
+    return (
+        base
+        + _lexical_overlap_score(leaf.raw_text, query_terms)
+        + _update_signal_score(leaf.raw_text if update_query else "")
+    )
+
+
+def _coverage_rerank_leaves(
+    leaves: list[LeafNode],
+    query_vector: list[float],
+    question: str,
+    *,
+    enhanced: bool,
+    lambda_weight: float,
+    pool_k: int,
+    relevance_scores: dict[str, float] | None = None,
+) -> list[LeafNode]:
+    if len(leaves) < 2:
+        return leaves
+    if pool_k < len(leaves):
+        rerank_pool = leaves[:pool_k]
+        remainder = leaves[pool_k:]
+    else:
+        rerank_pool = leaves
+        remainder = []
+    query_terms = _important_query_terms(question)
+    update_query = _is_update_sensitive_question(question)
+    if relevance_scores is None:
+        relevance = {
+            leaf.node_id: _leaf_rank_score(
+                leaf,
+                query_vector,
+                query_terms=query_terms,
+                update_query=update_query,
+                enhanced=enhanced,
+            )
+            for leaf in rerank_pool
+        }
+    else:
+        relevance = {leaf.node_id: relevance_scores.get(leaf.node_id, 0.0) for leaf in rerank_pool}
+    by_id = {leaf.node_id: leaf for leaf in rerank_pool}
+    ordered_pool = sorted(
+        rerank_pool, key=lambda leaf: (relevance[leaf.node_id], leaf.node_id), reverse=True
+    )
+    selected: list[LeafNode] = []
+    selected_ids: set[str] = set()
+    while len(selected) < len(ordered_pool):
+        best_leaf: LeafNode | None = None
+        best_score = float("-inf")
+        for leaf in ordered_pool:
+            if leaf.node_id in selected_ids:
+                continue
+            if not selected:
+                redundancy = 0.0
+            else:
+                redundancy = max(
+                    cosine_similarity(leaf.embedding, chosen.embedding) for chosen in selected
+                )
+            mmr_score = lambda_weight * relevance[leaf.node_id] - (1.0 - lambda_weight) * redundancy
+            if (
+                mmr_score > best_score
+                or (
+                    mmr_score == best_score
+                    and best_leaf is not None
+                    and leaf.node_id > best_leaf.node_id
+                )
+            ):
+                best_score = mmr_score
+                best_leaf = leaf
+        if best_leaf is None:
+            break
+        selected.append(by_id[best_leaf.node_id])
+        selected_ids.add(best_leaf.node_id)
+    if len(selected) == len(rerank_pool):
+        return selected + remainder
+    residual_pool = [leaf for leaf in rerank_pool if leaf.node_id not in selected_ids]
+    return selected + residual_pool + remainder
+
+
+def _is_temporal_question(question: str, question_type: str = "") -> bool:
+    if question_type == "category_2":
+        return True
+    return bool(
+        re.search(
+            r"\bwhen\b|what time|date|yesterday|today|last week|last month|last friday|before|after|ago|weekend|month|year|哪天|什么时候|日期|上周|上个月|昨天|前",
+            question,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _is_list_or_set_question(question: str, question_type: str = "") -> bool:
+    if question_type == "category_1":
+        return True
+    return bool(
+        re.search(
+            r"what (activities|events|books|types|ways)|where has|in what ways|who supports|what does|which|list|哪些|什么活动|哪些活动|哪些事件|哪些书|哪些类型",
+            question,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _structured_signal_score(leaf: LeafNode, question: str, question_type: str = "") -> float:
+    text = (leaf.retrieval_text or leaf.raw_text or "").lower()
+    score = 0.0
+    terms = _important_query_terms(question)
+    if terms:
+        score += min(0.6, 0.08 * sum(term in text for term in terms))
+    if _is_temporal_question(question, question_type):
+        if re.search(
+            r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b|\b\d{1,2}:\d{2}\b|yesterday|today|last|week|month|year|before|after|ago|昨天|上周|上个月|之前|之后",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            score += 0.35
+    if _is_list_or_set_question(question, question_type):
+        if re.search(
+            r",| and | or |also|including|plus|with|以及|还有|包括|和|、",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            score += 0.2
+    return score
+
+
+def _rank_structured_leaf_channel(
+    config: DemoConfig,
+    candidate_leaves: list[LeafNode],
+    question: str,
+    question_type: str = "",
+) -> list[LeafNode]:
+    scored = [
+        (leaf, _structured_signal_score(leaf, question, question_type))
+        for leaf in candidate_leaves
+    ]
+    scored = [item for item in scored if item[1] > 0.0]
+    scored.sort(key=lambda item: (item[1], item[0].node_id), reverse=True)
+    return [leaf for leaf, _ in scored[: config.dual_channel_structured_pool_k]]
+
+
+def _merge_ranked_leaf_channels(
+    primary_ranked: list[LeafNode],
+    structured_ranked: list[LeafNode],
+) -> list[LeafNode]:
+    if not structured_ranked:
+        return primary_ranked
+    primary_copy = list(primary_ranked)
+    structured_copy = list(structured_ranked)
+    merged: list[LeafNode] = []
+    seen: set[str] = set()
+    while primary_copy or structured_copy:
+        for _ in range(2):
+            if not primary_copy:
+                break
+            leaf = primary_copy.pop(0)
+            if leaf.node_id in seen:
+                continue
+            merged.append(leaf)
+            seen.add(leaf.node_id)
+        if structured_copy:
+            leaf = structured_copy.pop(0)
+            if leaf.node_id not in seen:
+                merged.append(leaf)
+                seen.add(leaf.node_id)
+    return merged
+
+
+def _apply_dual_channel_merge_for_config(
+    config: DemoConfig,
+    ranked_leaves: list[LeafNode],
+    candidate_leaves: list[LeafNode],
+    question: str,
+    question_type: str = "",
+) -> list[LeafNode]:
+    if not config.enable_dual_channel_candidate_merge:
+        return ranked_leaves
+    structured_ranked = _rank_structured_leaf_channel(
+        config,
+        candidate_leaves,
+        question,
+        question_type,
+    )
+    return _merge_ranked_leaf_channels(ranked_leaves, structured_ranked)
 
 
 def _important_query_terms(question: str) -> set[str]:
@@ -2443,6 +4149,14 @@ _SUMMARY_ACTION_CUES = (
 )
 
 
+def _body_keyword_cues(text: str, *, limit: int = 16) -> list[str]:
+    terms = sorted(
+        _summary_term_set(text),
+        key=lambda item: (-len(item), item),
+    )
+    return terms[:limit]
+
+
 def _summary_retrieval_text(
     rendered_summary: str,
     parsed: dict[str, Any] | None,
@@ -2479,6 +4193,11 @@ def _summary_anchor_terms(
         for key in ("keywords", "k"):
             keyword_candidates.extend(_summary_string_list(parsed.get(key)))
     anchors["keywords"] = _dedupe_cues(keyword_candidates, limit_per_type)
+    if len(anchors["keywords"]) < 4:
+        anchors["keywords"] = _dedupe_cues(
+            [*anchors["keywords"], *_body_keyword_cues(source_text)],
+            limit_per_type,
+        )
     anchors["entities"] = _dedupe_cues(_proper_name_cues(source_text), limit_per_type)
     time_candidates = _numeric_time_cues(source_text)
     if session_date:
@@ -2543,25 +4262,7 @@ def _summary_search_cues(
 
 
 def _proper_name_cues(text: str) -> list[str]:
-    cues: list[str] = []
-    for match in re.finditer(r'"([^"\n]{3,80})"', text):
-        cue = match.group(1).strip()
-        if cue and cue.lower() not in _SUMMARY_CUE_STOPWORDS:
-            cues.append(cue)
-    for match in re.finditer(r"(?<![A-Za-z])'([^'\n]{3,80})'(?![A-Za-z])", text):
-        cue = match.group(1).strip()
-        if cue and cue.lower() not in _SUMMARY_CUE_STOPWORDS:
-            cues.append(cue)
-    for match in re.finditer(
-        r"\b[A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,4}\b",
-        text,
-    ):
-        cue = match.group(0).strip(" .,:;")
-        normalized = cue.lower()
-        if len(cue) < 3 or normalized in _SUMMARY_CUE_STOPWORDS:
-            continue
-        cues.append(cue)
-    return cues
+    return proper_name_cues(text, stopwords=_SUMMARY_CUE_STOPWORDS)
 
 
 def _state_phrase_cues(text: str) -> list[str]:
@@ -2696,13 +4397,48 @@ def _summary_term_set(text: str) -> set[str]:
     return terms
 
 
+def _time_normalization_rule(
+    session_date: str | None,
+    *,
+    for_leaf_facts: bool = False,
+) -> str:
+    if session_date and for_leaf_facts:
+        return (
+            "Resolve every fuzzy or relative time mention in leaf facts using the provided session "
+            "date. Write facts with explicit YYYY-MM-DD date(s) as the primary time reference. "
+            "Examples: 'Attended workshop on 2023-07-14' instead of 'Attended workshop yesterday'; "
+            "'Trip during 2023-05-01 to 2023-05-07' for last week; 'Moved in 2022' for last year "
+            "when the session date implies that calendar year. For ranges like last week or "
+            "two weekends ago, write the resolved start/end dates. Do not leave relative-only "
+            "time words in facts when session date is known."
+        )
+    if session_date:
+        return (
+            "Normalize fuzzy time mentions (e.g., today, yesterday, last week, this Friday, "
+            "two weekends ago) using the provided session date. Keep the original fuzzy phrase "
+            "and append the resolved date in parentheses when possible, for example "
+            "'last week (2023-05-01 to 2023-05-07)' or 'yesterday (2023-05-11)'. Prefer "
+            "explicit YYYY-MM-DD formatting for resolved dates."
+        )
+    return (
+        "Preserve explicit time/date phrases; if session date is unknown, do not invent "
+        "absolute dates from fuzzy time mentions."
+    )
+
+
 def _summary_messages(
     session_id: str,
     session_date: str | None,
     stage: str,
     child_text: str,
     schema: str,
+    *,
+    include_leaf_enrichment: bool = False,
 ) -> list[dict[str, str]]:
+    time_normalization_rule = _time_normalization_rule(
+        session_date,
+        for_leaf_facts=include_leaf_enrichment and schema == "compact_memory_v2",
+    )
     if schema == "multilingual_memory_v1":
         system_prompt = (
             "Extract multilingual user memory as JSON only with exactly these keys: "
@@ -2710,17 +4446,37 @@ def _summary_messages(
             "Use short atomic strings in the original language when possible. Preserve numbers, "
             "dates, times, costs, negations, cancellations, purchases, subscriptions, arrivals, "
             "departures, current state, and updates. Ignore assistant filler and generic advice. "
-            "Use at most 8 facts/events total, 6 counts/dates/updates total, and 10 keywords."
+            "Use at most 8 facts/events total, 6 counts/dates/updates total, and 10 keywords. "
+            + time_normalization_rule
         )
     elif schema == "compact_memory_v2":
-        system_prompt = (
-            'Extract memory as JSON only: {"m":["short memory fact or update"],'
-            '"k":["keyword"]}. Keep user facts, preferences, plans, purchases, visits, '
-            "events, counts, costs, dates, negations, and updates. Also keep assistant-provided "
-            "answers, recommendations, named entities, methods, options, tables, numbers, and "
-            "rubrics that could answer a later 'previous conversation' question. Use at most 8 "
-            "short atomic m strings and 8 keywords. Drop only unrelated filler and repeated wording."
-        )
+        if include_leaf_enrichment:
+            system_prompt = (
+                'Extract memory as JSON only: {"m":["session-level memory fact"],'
+                '"k":["session keyword"],'
+                '"leaves":[{"i":1,"f":["short fact for child 1"],'
+                '"k":["keyword"]}]}. '
+                "For each [Child N] block, add one leaves entry with matching i=N. "
+                "Each leaf f must capture user AND assistant facts from that child only. "
+                "Session m/k are global highlights across all children. Keep user facts, "
+                "preferences, plans, purchases, visits, events, counts, costs, dates, "
+                "negations, and updates. Also keep assistant-provided answers, "
+                "recommendations, named entities, methods, options, tables, numbers, and "
+                "rubrics that could answer a later 'previous conversation' question. "
+                "Use at most 16 m strings, 16 session k strings, 4 f and 6 k per leaf. "
+                "Drop only unrelated filler and repeated wording. "
+                + time_normalization_rule
+            )
+        else:
+            system_prompt = (
+                'Extract memory as JSON only: {"m":["short memory fact or update"],'
+                '"k":["keyword"]}. Keep user facts, preferences, plans, purchases, visits, '
+                "events, counts, costs, dates, negations, and updates. Also keep assistant-provided "
+                "answers, recommendations, named entities, methods, options, tables, numbers, and "
+                "rubrics that could answer a later 'previous conversation' question. Use at most 16 "
+                "short atomic m strings and 16 keywords. Drop only unrelated filler and repeated wording. "
+                + time_normalization_rule
+            )
     else:
         system_prompt = (
             "Extract compact memory as a JSON object only. Use this schema exactly: "
@@ -2728,7 +4484,8 @@ def _summary_messages(
             '"updates":["short update or contradiction"],"time_anchors":["short temporal anchor"],'
             '"keywords":["keyword"]}. Use short strings. Keep user facts, preferences, plans, '
             "purchases, visits, events, updates, negations, and temporal anchors. Drop assistant "
-            "filler and repeated wording. Return empty arrays when a list has no content."
+            "filler and repeated wording. Return empty arrays when a list has no content. "
+            + time_normalization_rule
         )
     return [
         {
@@ -2745,7 +4502,407 @@ def _summary_messages(
     ]
 
 
-def _answer_messages(case: QuestionCase, context: str, *, enhanced: bool = False) -> list[dict[str, str]]:
+_ARITHMETIC_QUESTION_TYPES = {"temporal-reasoning"}
+
+_ARITHMETIC_KEYWORDS = (
+    "how many",
+    "how much",
+    "how long",
+    "how old",
+    "how often",
+    "total",
+    "sum",
+    "average",
+    "combined",
+    "altogether",
+    "in total",
+    "number of",
+    "count",
+    "times",
+    "days ago",
+    "weeks ago",
+    "months ago",
+    "years ago",
+    "how many days",
+    "how many weeks",
+    "how many months",
+    "how many years",
+    "since",
+    "elapsed",
+    "difference",
+    "older",
+    "younger",
+    "longer",
+    "shorter",
+    "more than",
+    "less than",
+    "duration",
+    "cost",
+    "spend",
+    "spent",
+    "price",
+    "percent",
+)
+
+# Supported deterministic operations for the Level-2 compute plan. Operands are supplied
+# by the LLM (the values it read from the evidence); code only performs the math.
+_COMPUTE_PLAN_OPS = (
+    "diff_days",
+    "elapsed_weeks",
+    "elapsed_months",
+    "add",
+    "subtract",
+    "multiply",
+    "divide",
+    "count",
+    "min",
+    "max",
+)
+
+
+def _is_arithmetic_question(case: QuestionCase) -> bool:
+    if case.question_type in _ARITHMETIC_QUESTION_TYPES:
+        return True
+    text = (case.question or "").lower()
+    return any(keyword in text for keyword in _ARITHMETIC_KEYWORDS)
+
+
+def _compute_plan_messages(case: QuestionCase, context: str) -> list[dict[str, str]]:
+    ops = ", ".join(_COMPUTE_PLAN_OPS)
+    system_content = (
+        "You convert a memory QA question into a deterministic compute plan. Read the "
+        "question and evidence, then decide whether answering requires arithmetic "
+        "(elapsed time between dates, sums, totals, counts, comparisons, differences). "
+        "CODE will perform the math, so you must NOT compute results yourself \u2014 your only "
+        "job is to pick the CORRECT operands from the evidence. Wrong operands are worse "
+        "than no plan, so be careful.\n"
+        "Return STRICT JSON only with this shape:\n"
+        '{"steps": [{"op": "<op>", "label": "<short name>", "unit": "<unit>", '
+        '"round": "<rounding>", "args": {...}}]}\n'
+        f"Allowed op values: {ops}.\n"
+        "EVERY operand must be an object that cites its evidence, NOT a bare value:\n"
+        '  {"value": <date-or-number>, "source": "<verbatim quote or \'question date\'>"}\n'
+        "The source must be a verbatim snippet copied from the evidence line you read the "
+        "value from, and it MUST contain the EVENT/SUBJECT WORDS \u2014 not just a date or "
+        "timestamp. A bare date like '2022/03/21 (Mon) 15:54' is NOT acceptable; quote the "
+        "clause that names what happened, e.g. \"attended a baking class on 2022/03/21\". "
+        "This is how the answer step verifies you picked the right event. If you cannot "
+        'quote an explicit value tied to the question\'s subject, do NOT invent one \u2014 '
+        'return {"steps": []}.\n'
+        "Argument conventions:\n"
+        '- diff_days/elapsed_weeks/elapsed_months: args {"a": <operand>, "b": <operand>}; '
+        "dates as YYYY-MM-DD or exactly as shown. Result is |a-b|.\n"
+        '- add/subtract/multiply/divide: args {"a": <operand>, "b": <operand>}; '
+        'add also accepts {"values": [<operand>, ...]}.\n'
+        '- count: args {"items": [<operand>, ...]} returns the list length.\n'
+        '- min/max: args {"values": [<operand>, ...]}.\n'
+        "Two extra rules that prevent the most common mistakes:\n"
+        "1. ANCHOR: for any 'X ago', 'since', 'how long ago/until', or relative-time "
+        "question, one operand MUST be the question date (use source \"question date\"); "
+        "never use a session timestamp as the anchor. The other operand is the dated event "
+        "that matches the question's subject \u2014 if several events have dates, do NOT just "
+        "take the first or most recent; pick the one whose text actually matches the "
+        "subject, and quote that subject text in source so the choice is auditable.\n"
+        "2. UNIT/ROUND: set \"unit\" to the unit the question asks for (days, weeks, "
+        "months, or years) and \"round\" to how the answer should be reported: use "
+        "\"nearest\" for natural phrasing like 'how many weeks ago' (so 20 days -> 3 "
+        "weeks), \"exact\" when a precise count is wanted, \"floor\" only if the question "
+        "says 'full/complete'. Defaults: weeks/months -> nearest, days -> exact.\n"
+        'If NO arithmetic is needed, return {"steps": []}. Return JSON only, no prose.'
+    )
+    user_content = (
+        f"Question date: {case.question_date or 'unknown'}\n"
+        f"Question: {case.question}\n\nRetrieved memory evidence:\n{context}"
+    )
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _operand_value(value: Any) -> Any:
+    """Operands may be a bare scalar or an object {"value": ..., "source": ...}."""
+    if isinstance(value, dict):
+        return value.get("value")
+    return value
+
+
+def _operand_source(value: Any) -> str | None:
+    if isinstance(value, dict):
+        src = value.get("source")
+        return str(src).strip() if src not in (None, "") else None
+    return None
+
+
+def _coerce_number(value: Any) -> float | None:
+    value = _operand_value(value)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        match = re.search(r"-?\d[\d,]*\.?\d*", value.replace(",", ""))
+        if match:
+            try:
+                return float(match.group(0))
+            except ValueError:
+                return None
+    return None
+
+
+def _coerce_date(value: Any) -> date | None:
+    value = _operand_value(value)
+    if isinstance(value, str):
+        return _parse_plan_date(value)
+    return None
+
+
+def _parse_plan_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    match = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", value)
+    if not match:
+        return None
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+
+
+def _format_number(value: float) -> str:
+    if value == int(value):
+        return str(int(value))
+    return f"{value:.2f}"
+
+
+_UNIT_DAYS = {"days": 1.0, "weeks": 7.0, "months": 30.44, "years": 365.25}
+
+# Map the legacy op name to the unit it implies, so callers can keep using the old ops.
+_OP_DEFAULT_UNIT = {"diff_days": "days", "elapsed_weeks": "weeks", "elapsed_months": "months"}
+
+
+def _render_elapsed(days: int, unit: str, rounding: str) -> str:
+    """Render an elapsed-time result, leading with the requested unit/rounding and
+    always keeping the exact day count so the answer model can sanity-check."""
+    unit = unit if unit in _UNIT_DAYS else "days"
+    raw = days / _UNIT_DAYS[unit]
+    if unit == "days":
+        return f"{days} days"
+    if rounding == "exact":
+        primary = f"{raw:.2f} {unit}"
+    elif rounding == "floor":
+        primary = f"{int(raw)} {unit} (rounded down)"
+    else:  # nearest (default for weeks/months/years)
+        primary = f"~{round(raw)} {unit}"
+    return f"{primary} (= {days} days exact; {raw:.2f} {unit})"
+
+
+def _execute_compute_step(
+    op: str, args: dict[str, Any], *, unit: str | None, rounding: str | None
+) -> str | None:
+    """Execute a single deterministic compute step. Returns a human-readable result
+    string, or None if the operands are insufficient/invalid."""
+    if op in {"diff_days", "elapsed_weeks", "elapsed_months"}:
+        date_a = _coerce_date(args.get("a"))
+        date_b = _coerce_date(args.get("b"))
+        if date_a is None or date_b is None:
+            return None
+        days = abs((date_a - date_b).days)
+        chosen_unit = unit or _OP_DEFAULT_UNIT.get(op, "days")
+        chosen_round = rounding or ("exact" if chosen_unit == "days" else "nearest")
+        return _render_elapsed(days, chosen_unit, chosen_round)
+    if op in {"add", "min", "max"}:
+        values = args.get("values")
+        if values is None and op == "add":
+            a = _coerce_number(args.get("a"))
+            b = _coerce_number(args.get("b"))
+            values = [v for v in (a, b) if v is not None]
+        numbers = [n for n in (_coerce_number(v) for v in (values or [])) if n is not None]
+        if not numbers:
+            return None
+        result = {"add": sum(numbers), "min": min(numbers), "max": max(numbers)}[op]
+        return _format_number(result)
+    if op in {"subtract", "multiply", "divide"}:
+        a = _coerce_number(args.get("a"))
+        b = _coerce_number(args.get("b"))
+        if a is None or b is None:
+            return None
+        if op == "subtract":
+            return _format_number(a - b)
+        if op == "multiply":
+            return _format_number(a * b)
+        if b == 0:
+            return None
+        return _format_number(a / b)
+    if op == "count":
+        items = args.get("items")
+        if not isinstance(items, list):
+            return None
+        return str(len(items))
+    return None
+
+
+def _operand_trace(args: dict[str, Any]) -> str:
+    """Echo the operands (with their cited sources) so the answer model can verify them."""
+    parts: list[str] = []
+    for key in ("a", "b"):
+        if key in args:
+            raw = _operand_value(args[key])
+            src = _operand_source(args[key])
+            parts.append(f"{key}={raw}" + (f" [{src}]" if src else ""))
+    for key in ("values", "items"):
+        seq = args.get(key)
+        if isinstance(seq, list):
+            rendered = ", ".join(
+                f"{_operand_value(v)}" + (f" [{_operand_source(v)}]" if _operand_source(v) else "")
+                for v in seq
+            )
+            parts.append(f"{key}=[{rendered}]")
+    return "; ".join(parts)
+
+
+def _execute_compute_plan(plan: dict[str, Any] | None) -> str:
+    """Render a deterministic results block from a parsed compute plan, or '' if empty."""
+    if not isinstance(plan, dict):
+        return ""
+    steps = plan.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return ""
+    lines: list[str] = []
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        op = str(step.get("op") or "").strip()
+        if op not in _COMPUTE_PLAN_OPS:
+            continue
+        args = step.get("args") if isinstance(step.get("args"), dict) else {}
+        unit = str(step.get("unit") or "").strip().lower() or None
+        rounding = str(step.get("round") or "").strip().lower() or None
+        result = _execute_compute_step(op, args, unit=unit, rounding=rounding)
+        if result is None:
+            continue
+        label = str(step.get("label") or f"{op}_{index}").strip()
+        trace = _operand_trace(args)
+        line = f"- {label}: {result}"
+        if trace:
+            line += f"\n    operands: {trace}"
+        lines.append(line)
+    if not lines:
+        return ""
+    header = (
+        "Precomputed results: CODE did the math exactly from the operands you supplied. "
+        "Trust the arithmetic, but first VERIFY each operand below against the evidence "
+        "(check the cited source matches the question's subject); if an operand is wrong, "
+        "ignore that line and reason from the evidence instead."
+    )
+    return header + "\n" + "\n".join(lines)
+
+
+def _answer_note_messages(case: QuestionCase, context: str) -> list[dict[str, str]]:
+    system_content = (
+        "Extract concise evidence notes for downstream answering. Return JSON object only with key "
+        '"notes" as a list. Each note object must contain: '
+        "session_id (string), date (string), fact (string), value (string), "
+        "entities (array of strings), evidence_quote (string). "
+        "Use empty strings or empty arrays if unknown. Keep only details relevant to the question. "
+        "Do not infer unseen facts."
+    )
+    return [
+        {"role": "system", "content": system_content},
+        {
+            "role": "user",
+            "content": (
+                f"Question date: {case.question_date or 'unknown'}\n"
+                f"Question: {case.question}\n\nRetrieved memory evidence:\n{context}"
+            ),
+        },
+    ]
+
+
+def _parse_answer_notes(text: str, *, max_notes: int = 24) -> tuple[list[dict[str, str]], str | None]:
+    if not text.strip():
+        return [], "empty_note_response"
+    try:
+        payload = json.loads(text)
+    except (TypeError, json.JSONDecodeError) as error:
+        payload = _extract_json_object(text)
+        if payload is None:
+            return [], f"invalid_json: {error}"
+    if not isinstance(payload, dict):
+        return [], "note_json_must_be_object"
+    raw_notes = payload.get("notes")
+    if not isinstance(raw_notes, list):
+        return [], "missing_notes_list"
+    parsed: list[dict[str, str]] = []
+    for entry in raw_notes:
+        if not isinstance(entry, dict):
+            continue
+        fact = _summary_string(entry.get("fact"))
+        if not fact:
+            continue
+        entities = _summary_string_list(entry.get("entities"))
+        parsed.append(
+            {
+                "session_id": _summary_string(entry.get("session_id")),
+                "date": _summary_string(entry.get("date")),
+                "fact": fact,
+                "value": _summary_string(entry.get("value")),
+                "entities": ", ".join(entities[:6]),
+                "evidence_quote": _summary_string(entry.get("evidence_quote")),
+            }
+        )
+        if len(parsed) >= max_notes:
+            break
+    if not parsed:
+        return [], "no_valid_notes"
+    return parsed, None
+
+
+def _answer_context_from_notes(
+    case: QuestionCase,
+    notes: list[dict[str, str]],
+    *,
+    raw_context: str,
+    include_raw_context: bool,
+) -> str:
+    compact_notes = []
+    for index, note in enumerate(notes, start=1):
+        compact_notes.append(
+            {
+                "id": f"n{index}",
+                "session_id": note.get("session_id", ""),
+                "date": note.get("date", ""),
+                "fact": note.get("fact", ""),
+                "value": note.get("value", ""),
+                "entities": note.get("entities", ""),
+                "evidence_quote": note.get("evidence_quote", ""),
+            }
+        )
+    note_block = json.dumps({"question": case.question, "notes": compact_notes}, ensure_ascii=False, indent=2)
+    if include_raw_context:
+        return (
+            "Structured evidence notes (primary source for reasoning):\n"
+            f"{note_block}\n\n"
+            "Raw evidence (fallback only when notes are insufficient):\n"
+            f"{raw_context}"
+        )
+    return "Structured evidence notes:\n" + note_block
+
+
+def _answer_messages(
+    case: QuestionCase,
+    context: str,
+    *,
+    enhanced: bool = False,
+    reference_date: str | None = None,
+) -> list[dict[str, str]]:
+    final_value_rule = (
+        "Output format must be exactly two sections: (1) 'Evidence facts:' with brief supporting "
+        "facts, then (2) one line 'Final answer: <value>'. The Final answer line must contain only "
+        "the requested final value (or list/count/date span) with no extra explanation. For relative "
+        "time/date answers, keep the original phrase and append resolved date(s) in parentheses, e.g. "
+        "'the Friday before 15 July 2023 (2023-07-14)'."
+    )
     if enhanced:
         system_content = (
             "Answer the user memory question from the supplied evidence only. First write a short "
@@ -2763,6 +4920,8 @@ def _answer_messages(case: QuestionCase, context: str, *, enhanced: bool = False
             "For questions asking how many times an event happened, if the event is not mentioned, "
             "answer that the information is insufficient or not mentioned; do not convert absence of "
             "evidence into a numeric zero. "
+            "If the evidence is in structured notes JSON, reason from those notes first and use "
+            "evidence_quote/session_id fields for traceability. "
             "For preference or advice questions, use the evidence as user-specific constraints and "
             "give a useful personalized answer; do not require that the exact recommendation already "
             "appears in memory. Preserve negative preferences and avoidances, such as avoiding phone "
@@ -2794,15 +4953,21 @@ def _answer_messages(case: QuestionCase, context: str, *, enhanced: bool = False
             "states separate entities, including twins or multiple named items in the same turn. "
             "For holiday/date questions, if a session date is the "
             "holiday and the user describes a flight or event as today/recent in that session, use "
-            "that dated evidence unless another retrieved fact directly contradicts it."
+            "that dated evidence unless another retrieved fact directly contradicts it. "
+            + final_value_rule
         )
     else:
         system_content = (
             "Answer the user memory question from the supplied evidence. If evidence is "
             "insufficient, say so. Compute direct counts, totals, elapsed times, and clock "
             "times when the evidence gives the needed values or time anchors. Keep the answer "
-            "concise and state the evidence-based calculation when one is needed."
+            "concise and state the evidence-based calculation when one is needed. If structured "
+            "notes are provided, use them as the primary evidence source. "
+            + final_value_rule
         )
+    reference_line = ""
+    if reference_date:
+        reference_line = f"These conversations took place around {reference_date}.\n"
     return [
         {
             "role": "system",
@@ -2812,6 +4977,7 @@ def _answer_messages(case: QuestionCase, context: str, *, enhanced: bool = False
             "role": "user",
             "content": (
                 f"Question date: {case.question_date or 'unknown'}\n"
+                f"{reference_line}"
                 f"Question: {case.question}\n\nRetrieved memory evidence:\n{context}"
             ),
         },
@@ -2826,6 +4992,272 @@ def _evidence_context_budget(config: DemoConfig, case: QuestionCase, enhanced_qa
     # budget uses a rough local counter, while provider accounting is model-side.
     answer_margin = max(2400, config.qa_max_tokens + 1400)
     return max(1000, config.qa_context_token_budget - overhead - answer_margin)
+
+
+def _leaf_enrichment_enabled(config: DemoConfig, spec: VariantSpec) -> bool:
+    return config.enable_leaf_enrichment and _summary_schema(config, spec) == "compact_memory_v2"
+
+
+def _job_supports_leaf_enrichment(
+    config: DemoConfig,
+    spec: VariantSpec,
+    job: SummaryJob,
+) -> bool:
+    return _leaf_enrichment_enabled(config, spec) and all(
+        isinstance(child, LeafNode) for child in job.children
+    )
+
+
+def _merge_string_lists(*lists: list[str], limit: int = 16) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for values in lists:
+        for value in values:
+            key = value.casefold()
+            if not value or key in seen:
+                continue
+            seen.add(key)
+            merged.append(value)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+def _parse_leaf_enrichment_entries(
+    parsed: dict[str, Any] | None,
+) -> dict[int, tuple[list[str], list[str]]]:
+    if not parsed:
+        return {}
+    entries = parsed.get("leaves")
+    if not isinstance(entries, list):
+        return {}
+    result: dict[int, tuple[list[str], list[str]]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        index_value = entry.get("i")
+        if index_value is None:
+            index_value = entry.get("index")
+        if index_value is None:
+            index_value = entry.get("child")
+        try:
+            child_index = int(index_value)
+        except (TypeError, ValueError):
+            continue
+        facts = _summary_string_list(entry.get("f") or entry.get("facts"))
+        keywords = _summary_string_list(entry.get("k") or entry.get("keywords"))
+        if not facts and not keywords:
+            continue
+        previous = result.get(child_index, ([], []))
+        result[child_index] = (
+            _merge_string_lists(previous[0], facts),
+            _merge_string_lists(previous[1], keywords),
+        )
+    return result
+
+
+def _leaf_retrieval_text(
+    raw_text: str,
+    compact_facts: list[str],
+    anchor_terms: dict[str, list[str]],
+    session_date: str | None,
+) -> str:
+    blocks: list[str] = []
+    if session_date:
+        blocks.append(f"Session date: {session_date}")
+    if compact_facts:
+        blocks.append("Facts: " + "; ".join(compact_facts))
+    anchor_text = _summary_anchor_text(anchor_terms)
+    if anchor_text:
+        blocks.append("Anchor terms:\n" + anchor_text)
+    if raw_text.strip():
+        blocks.append(raw_text.strip())
+    return "\n".join(blocks)
+
+
+_PARENTHESES_DATE_PATTERN = re.compile(
+    r"\((\d{4}-\d{2}-\d{2}(?: to \d{4}-\d{2}-\d{2})?)\)"
+)
+_RELATIVE_TIME_FACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\byesterday\b", re.IGNORECASE), "yesterday"),
+    (re.compile(r"\btoday\b", re.IGNORECASE), "today"),
+    (re.compile(r"\blast week\b", re.IGNORECASE), "last week"),
+    (re.compile(r"\blast month\b", re.IGNORECASE), "last month"),
+    (re.compile(r"\blast year\b", re.IGNORECASE), "last year"),
+)
+
+
+def _format_iso_date(value: date) -> str:
+    return value.isoformat()
+
+
+def _resolve_relative_time_phrase(phrase: str, anchor: date) -> str | None:
+    normalized = phrase.casefold()
+    if normalized == "today":
+        return _format_iso_date(anchor)
+    if normalized == "yesterday":
+        return _format_iso_date(anchor - timedelta(days=1))
+    if normalized == "last week":
+        end = anchor - timedelta(days=1)
+        start = end - timedelta(days=6)
+        return f"{_format_iso_date(start)} to {_format_iso_date(end)}"
+    if normalized == "last month":
+        first_of_month = anchor.replace(day=1)
+        end = first_of_month - timedelta(days=1)
+        start = end.replace(day=1)
+        return f"{_format_iso_date(start)} to {_format_iso_date(end)}"
+    if normalized == "last year":
+        return str(anchor.year - 1)
+    return None
+
+
+def _promote_parenthetical_dates_in_fact(fact: str) -> str:
+    match = _PARENTHESES_DATE_PATTERN.search(fact)
+    if not match:
+        return fact
+    resolved = match.group(1)
+    without_parens = (fact[: match.start()] + fact[match.end() :]).strip()
+    without_parens = re.sub(r"\s{2,}", " ", without_parens).strip(" ,;")
+    if not without_parens:
+        return resolved
+    if resolved in without_parens:
+        return without_parens
+    return f"{without_parens} ({resolved})"
+
+
+def _normalize_temporal_compact_facts(
+    facts: list[str],
+    session_date: str | None,
+) -> list[str]:
+    anchor = _parse_plan_date(session_date)
+    normalized: list[str] = []
+    for fact in facts:
+        updated = _promote_parenthetical_dates_in_fact(fact)
+        if anchor is not None:
+            for pattern, label in _RELATIVE_TIME_FACT_PATTERNS:
+                if not pattern.search(updated):
+                    continue
+                resolved = _resolve_relative_time_phrase(label, anchor)
+                if not resolved:
+                    continue
+                if resolved in updated:
+                    updated = pattern.sub(resolved, updated)
+                else:
+                    updated = pattern.sub(f"{label} ({resolved})", updated)
+        normalized.append(updated.strip())
+    return normalized
+
+
+def _chronological_date_key(value: str | None) -> tuple[int, str]:
+    parsed = _parse_plan_date(value)
+    if parsed is None:
+        return (1, value or "")
+    return (0, parsed.isoformat())
+
+
+def _sort_summaries_chronologically(summaries: list[SummaryNode]) -> list[SummaryNode]:
+    return sorted(
+        summaries,
+        key=lambda summary: (
+            _chronological_date_key(summary.session_date),
+            summary.session_id,
+        ),
+    )
+
+
+def _sort_leaves_chronologically(leaves: list[LeafNode]) -> list[LeafNode]:
+    return sorted(
+        leaves,
+        key=lambda leaf: (
+            _chronological_date_key(leaf.session_date),
+            leaf.turn_index,
+            leaf.session_id,
+        ),
+    )
+
+
+def _latest_reference_date(
+    case: QuestionCase,
+    summaries: list[SummaryNode] | None = None,
+    leaves: list[LeafNode] | None = None,
+) -> str | None:
+    candidates: list[date] = []
+    for summary in summaries or []:
+        parsed = _parse_plan_date(summary.session_date)
+        if parsed is not None:
+            candidates.append(parsed)
+    for leaf in leaves or []:
+        parsed = _parse_plan_date(leaf.session_date)
+        if parsed is not None:
+            candidates.append(parsed)
+    if candidates:
+        return _format_iso_date(max(candidates))
+    return case.question_date or None
+
+
+def _reference_date_from_retrieval(
+    case: QuestionCase,
+    leaves: list[LeafNode],
+    summaries: list[SummaryNode],
+    leaf_node_ids: list[str],
+    summary_node_ids: list[str],
+) -> str | None:
+    leaf_by_id = {leaf.node_id: leaf for leaf in leaves}
+    summary_by_id = {summary.node_id: summary for summary in summaries}
+    selected_leaves = [leaf_by_id[node_id] for node_id in leaf_node_ids if node_id in leaf_by_id]
+    selected_summaries = [
+        summary_by_id[node_id] for node_id in summary_node_ids if node_id in summary_by_id
+    ]
+    return _latest_reference_date(case, selected_summaries, selected_leaves)
+
+
+def _apply_leaf_enrichment_to_node(
+    leaf: LeafNode,
+    facts: list[str],
+    keywords: list[str],
+) -> None:
+    facts = _normalize_temporal_compact_facts(facts, leaf.session_date)
+    leaf.compact_facts = _merge_string_lists(leaf.compact_facts, facts, limit=8)
+    rule_anchors = _summary_anchor_terms(None, leaf.raw_text, leaf.session_date)
+    if keywords:
+        rule_anchors["keywords"] = _merge_string_lists(
+            rule_anchors.get("keywords", []),
+            keywords,
+            limit=12,
+        )
+    merged_anchors: dict[str, list[str]] = dict(leaf.anchor_terms)
+    for key, values in rule_anchors.items():
+        merged_anchors[key] = _merge_string_lists(
+            merged_anchors.get(key, []),
+            values,
+            limit=16,
+        )
+    leaf.anchor_terms = {key: value for key, value in merged_anchors.items() if value}
+    leaf.retrieval_text = _leaf_retrieval_text(
+        leaf.raw_text,
+        leaf.compact_facts,
+        leaf.anchor_terms,
+        leaf.session_date,
+    )
+
+
+def _apply_leaf_enrichment_from_parsed(
+    children: list[LeafNode | SummaryNode],
+    parsed: dict[str, Any] | None,
+    leaves_by_id: dict[str, LeafNode],
+) -> None:
+    enrichment_by_index = _parse_leaf_enrichment_entries(parsed)
+    if not enrichment_by_index:
+        return
+    for index, child in enumerate(children, start=1):
+        if not isinstance(child, LeafNode):
+            continue
+        payload = enrichment_by_index.get(index)
+        if payload is None:
+            continue
+        facts, keywords = payload
+        leaf = leaves_by_id.get(child.node_id, child)
+        _apply_leaf_enrichment_to_node(leaf, facts, keywords)
 
 
 def _child_text(children: list[LeafNode | SummaryNode], leaf_text_mode: str) -> str:
@@ -2906,6 +5338,28 @@ def _parse_summary(text: str, schema: str) -> tuple[dict[str, Any] | None, str |
             "m": _summary_string_list(payload.get("m")),
             "k": _summary_string_list(payload.get("k")),
         }
+        leaf_entries = payload.get("leaves")
+        if isinstance(leaf_entries, list):
+            normalized_leaves: list[dict[str, Any]] = []
+            for entry in leaf_entries:
+                if not isinstance(entry, dict):
+                    continue
+                index_value = entry.get("i")
+                if index_value is None:
+                    index_value = entry.get("index")
+                if index_value is None:
+                    index_value = entry.get("child")
+                try:
+                    child_index = int(index_value)
+                except (TypeError, ValueError):
+                    continue
+                facts = _summary_string_list(entry.get("f") or entry.get("facts"))
+                keywords = _summary_string_list(entry.get("k") or entry.get("keywords"))
+                if not facts and not keywords:
+                    continue
+                normalized_leaves.append({"i": child_index, "f": facts, "k": keywords})
+            if normalized_leaves:
+                parsed["leaves"] = normalized_leaves
     else:
         parsed = {
             "compact_summary": _summary_string(payload.get("compact_summary")),
@@ -2982,17 +5436,19 @@ def _render_summary(parsed: dict[str, Any] | None, raw_text: str, schema: str) -
 
 
 def _context_text(summaries: list[SummaryNode], leaves: list[LeafNode]) -> str:
+    ordered_summaries = _sort_summaries_chronologically(summaries)
+    ordered_leaves = _sort_leaves_chronologically(leaves)
     blocks = []
-    if summaries:
+    if ordered_summaries:
         blocks.append("Relevant session summaries:")
         blocks.extend(
             f"- Session {summary.session_id} ({summary.session_date or 'unknown'}): {summary.summary}"
-            for summary in summaries
+            for summary in ordered_summaries
         )
     blocks.append("Raw evidence:")
     blocks.extend(
         f"[Session {leaf.session_id} | {leaf.session_date or 'unknown'} | turn {leaf.turn_index}]\n{leaf.raw_text}"
-        for leaf in leaves
+        for leaf in ordered_leaves
     )
     return "\n\n".join(blocks)
 
@@ -3001,13 +5457,34 @@ def _fit_context_budget(
     summaries: list[SummaryNode],
     leaves: list[LeafNode],
     token_budget: int,
+    *,
+    protected_leaf_ids: set[str] | None = None,
 ) -> tuple[list[SummaryNode], list[LeafNode]]:
+    protected_leaf_ids = protected_leaf_ids or set()
     kept_summaries = list(summaries)
     kept_leaves = list(leaves)
-    while kept_summaries and rough_token_count(_context_text(kept_summaries, kept_leaves)) > token_budget:
+
+    def over_budget() -> bool:
+        return rough_token_count(_context_text(kept_summaries, kept_leaves)) > token_budget
+
+    while len(kept_leaves) > 1 and over_budget():
+        removed = False
+        for index in range(len(kept_leaves) - 1, -1, -1):
+            if kept_leaves[index].node_id in protected_leaf_ids:
+                continue
+            kept_leaves.pop(index)
+            removed = True
+            break
+        if not removed:
+            break
+
+    while kept_summaries and over_budget():
         kept_summaries.pop()
-    while len(kept_leaves) > 1 and rough_token_count(_context_text(kept_summaries, kept_leaves)) > token_budget:
+
+    while len(kept_leaves) > 1 and over_budget():
         kept_leaves.pop()
+    while kept_summaries and over_budget():
+        kept_summaries.pop()
     return kept_summaries, kept_leaves
 
 

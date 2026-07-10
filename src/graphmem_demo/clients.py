@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -14,6 +16,26 @@ from .models import CompressionRecord, DeepSeekCallRecord, EmbeddingCallRecord
 
 
 _COMPRESSOR_LOAD_LOCK = threading.Lock()
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 def rough_token_count(text: str) -> int:
@@ -70,12 +92,23 @@ def _openai_client_class() -> Any:
     return OpenAI
 
 
+def _is_rate_limit_error(error: Exception) -> bool:
+    text = str(error).casefold()
+    return "429" in text or "rate_limit" in text or "too many pending requests" in text
+
+
+def _retry_sleep_sec(retry_count: int, error: Exception) -> float:
+    if _is_rate_limit_error(error):
+        return min(60.0, 5.0 * (2**retry_count))
+    return min(2**retry_count, 4.0)
+
+
 class DeepSeekClient:
     def __init__(
         self,
         model: str | None = None,
         base_url: str | None = None,
-        max_retries: int = 2,
+        max_retries: int = 6,
         timeout_sec: float = 180.0,
     ) -> None:
         api_key = os.environ.get("DEEPSEEK_API_KEY")
@@ -100,6 +133,8 @@ class DeepSeekClient:
         thinking_mode: str,
         max_tokens: int | None = None,
         json_mode: bool = False,
+        temperature: float | None = 0.0,
+        seed: int | None = 0,
     ) -> LLMResult:
         start = time.perf_counter()
         last_error: Exception | None = None
@@ -110,6 +145,10 @@ class DeepSeekClient:
                     "messages": messages,
                     "stream": False,
                 }
+                if temperature is not None:
+                    request["temperature"] = temperature
+                if seed is not None:
+                    request["seed"] = seed
                 if thinking_mode == "enabled":
                     request["extra_body"] = {"thinking": {"type": "enabled"}}
                     request["reasoning_effort"] = "high"
@@ -142,7 +181,7 @@ class DeepSeekClient:
             except Exception as error:  # pragma: no cover - depends on remote API behavior
                 last_error = error
                 if retry_count < self.max_retries:
-                    time.sleep(min(2**retry_count, 4))
+                    time.sleep(_retry_sleep_sec(retry_count, error))
         raise RuntimeError(f"DeepSeek {stage} call failed: {last_error}") from last_error
 
 
@@ -159,6 +198,8 @@ class MockDeepSeekClient:
         thinking_mode: str,
         max_tokens: int | None = None,
         json_mode: bool = False,
+        temperature: float | None = 0.0,
+        seed: int | None = 0,
     ) -> LLMResult:
         prompt = "\n".join(message["content"] for message in messages)
         if stage.startswith("build_summary"):
@@ -179,6 +220,33 @@ class MockDeepSeekClient:
                     )
             else:
                 text = "Summary: " + compact
+        elif stage == "build_root_edge_anchor":
+            text = json.dumps(
+                {
+                    "entities": ["mock user", "mock project"],
+                    "events": ["mock event"],
+                    "times": ["mock time"],
+                    "state_phrases": ["mock state"],
+                    "keywords": ["mock"],
+                }
+            )
+        elif stage == "build_leaf_edge_anchor":
+            text = json.dumps({"edges": []})
+        elif stage == "answer_note_extraction":
+            text = json.dumps(
+                {
+                    "notes": [
+                        {
+                            "session_id": "mock-session",
+                            "date": "unknown",
+                            "fact": "mock extracted fact",
+                            "value": "",
+                            "entities": ["mock"],
+                            "evidence_quote": "mock quote",
+                        }
+                    ]
+                }
+            )
         else:
             text = "Mock answer based on retrieved evidence."
         prompt_tokens = rough_token_count(prompt)
@@ -212,10 +280,24 @@ class EmbeddingClient:
         batch_size: int = 64,
     ) -> None:
         OpenAI = _openai_client_class()
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        # embed 与 llm 共用 GPU 时吞吐很低，单个大批请求可能要很久；调大超时并多重试，
+        # 否则偶发的慢请求会以 ReadTimeout 把整轮 benchmark 拖崩。
+        timeout = _env_float("EMBEDDING_TIMEOUT", 1800.0)
+        max_retries = _env_int("EMBEDDING_MAX_RETRIES", 4)
+        self.base_url = base_url
+        self.api_key = api_key
+        self.client = OpenAI(
+            api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries
+        )
         self.model = model
-        self.batch_size = batch_size
+        # 减小批大小，让每个 embedding 请求更轻、更快返回，降低超时概率。
+        self.batch_size = _env_int("EMBEDDING_BATCH_SIZE", batch_size)
         self.records: list[EmbeddingCallRecord] = []
+        # 让 vLLM 对超过上下文上限的输入自动截断，而不是直接返回 400。
+        # 取值应 <= embedding 服务的 max-model-len；用环境变量 EMBEDDING_TRUNCATE_TOKENS 配置。
+        self.truncate_prompt_tokens = _env_int("EMBEDDING_TRUNCATE_TOKENS", 0) or None
+        # 连接类异常时，按 batch 拆分重试，减少“一个慢请求拖死整轮”。
+        self.max_split_retries = _env_int("EMBEDDING_SPLIT_RETRIES", 2)
 
     def embed(
         self,
@@ -225,10 +307,14 @@ class EmbeddingClient:
         variant: str,
     ) -> list[list[float]]:
         vectors: list[list[float]] = []
-        for batch in _batches(texts, self.batch_size):
+        pending: deque[tuple[list[str], int]] = deque(
+            (batch, self.max_split_retries) for batch in _batches(texts, self.batch_size)
+        )
+        while pending:
+            batch, split_budget = pending.popleft()
             start = time.perf_counter()
             try:
-                response = self.client.embeddings.create(model=self.model, input=batch)
+                response = self._embed_batch(batch)
                 ordered = sorted(response.data, key=lambda item: item.index)
                 vectors.extend([list(item.embedding) for item in ordered])
                 usage = parse_usage(response.usage)
@@ -244,6 +330,29 @@ class EmbeddingClient:
                     )
                 )
             except Exception as error:
+                if _is_transient_embedding_error(error):
+                    split_batches = _split_batch(batch, split_budget)
+                    if split_batches is not None:
+                        # 将细粒度子批次插回队列头部，优先消化当前卡住批次。
+                        for child in reversed(split_batches):
+                            pending.appendleft((child, split_budget - 1))
+                        self.records.append(
+                            EmbeddingCallRecord(
+                                question_id=question_id,
+                                variant=variant,
+                                item_count=len(batch),
+                                prompt_tokens=0,
+                                total_tokens=0,
+                                latency_sec=time.perf_counter() - start,
+                                model=self.model,
+                                error_status=(
+                                    f"transient_embed_error_split_retry: {error}"
+                                ),
+                            )
+                        )
+                        # 重建客户端连接池，规避“坏连接一直卡住”。
+                        self._recreate_client()
+                        continue
                 self.records.append(
                     EmbeddingCallRecord(
                         question_id=question_id,
@@ -258,6 +367,25 @@ class EmbeddingClient:
                 )
                 raise
         return vectors
+
+    def _embed_batch(self, batch: list[str]) -> Any:
+        create_kwargs: dict[str, Any] = {"model": self.model, "input": batch}
+        if self.truncate_prompt_tokens:
+            create_kwargs["extra_body"] = {
+                "truncate_prompt_tokens": self.truncate_prompt_tokens
+            }
+        return self.client.embeddings.create(**create_kwargs)
+
+    def _recreate_client(self) -> None:
+        OpenAI = _openai_client_class()
+        timeout = _env_float("EMBEDDING_TIMEOUT", 1800.0)
+        max_retries = _env_int("EMBEDDING_MAX_RETRIES", 4)
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
 
 
 class MockEmbeddingClient:
@@ -304,7 +432,9 @@ class LLMLinguaCompressor:
             else "NousResearch/Llama-2-7b-hf"
         )
         self.model_name = model_name or os.environ.get("LLMLINGUA_MODEL_NAME", default_model)
-        self.device_map = device_map or os.environ.get("LLMLINGUA_DEVICE_MAP", "cuda")
+        # 默认放到 CPU 跑，避免和 vLLM 抢占本就紧张的 GPU 显存；
+        # 需要时可通过 --llmlingua-device-map cuda 或 LLMLINGUA_DEVICE_MAP=cuda 覆盖。
+        self.device_map = device_map or os.environ.get("LLMLINGUA_DEVICE_MAP", "cpu")
         self.use_llmlingua2 = use_llmlingua2
         self._compressor: Any = None
         self.records: list[CompressionRecord] = []
@@ -318,33 +448,63 @@ class LLMLinguaCompressor:
         stage: str,
         chunk_rough_tokens: int = 0,
     ) -> str:
+        compressor_name = f"{'llmlingua2' if self.use_llmlingua2 else 'llmlingua'}:{self.model_name}"
         if self._compressor is None:
-            with _COMPRESSOR_LOAD_LOCK:
-                if self._compressor is None:
-                    from llmlingua import PromptCompressor
+            try:
+                with _COMPRESSOR_LOAD_LOCK:
+                    if self._compressor is None:
+                        from llmlingua import PromptCompressor
 
-                    self._compressor = PromptCompressor(
-                        model_name=self.model_name,
-                        device_map=self.device_map,
-                        use_llmlingua2=self.use_llmlingua2,
+                        self._compressor = PromptCompressor(
+                            model_name=self.model_name,
+                            device_map=self.device_map,
+                            use_llmlingua2=self.use_llmlingua2,
+                        )
+            except Exception as error:
+                # Fail-open: preserve progress for long benchmark runs.
+                self.records.append(
+                    CompressionRecord(
+                        question_id=question_id,
+                        variant=variant,
+                        stage=stage,
+                        origin_tokens=rough_token_count(text),
+                        compressed_tokens=rough_token_count(text),
+                        latency_sec=0.0,
+                        compressor=compressor_name,
+                        chunk_count=1,
+                        error_status=f"compressor_init_failed: {error}",
                     )
+                )
+                return text
         chunks = _rough_text_chunks(text, chunk_rough_tokens)
         start = time.perf_counter()
         compressed_chunks: list[str] = []
         origin_tokens = 0
         compressed_tokens = 0
-        try:
-            for chunk in chunks:
+        chunk_errors: list[str] = []
+        for chunk in chunks:
+            chunk_token_est = rough_token_count(chunk)
+            origin_tokens += chunk_token_est
+            try:
                 result = self._compressor.compress_prompt([chunk], rate=self.ratio)
                 compressed_chunk = str(result["compressed_prompt"])
+                if not compressed_chunk.strip():
+                    compressed_chunk = chunk
+                    chunk_errors.append("empty_compressed_chunk")
                 compressed_chunks.append(compressed_chunk)
-                origin_tokens += _int_value(result.get("origin_tokens")) or rough_token_count(chunk)
                 compressed_tokens += _int_value(
                     result.get("compressed_tokens")
                 ) or rough_token_count(compressed_chunk)
-        except Exception as error:
-            raise RuntimeError(f"LLMLingua compression failed during {stage}: {error}") from error
-        compressed = "\n\n".join(compressed_chunks)
+            except Exception as error:
+                compressed_chunks.append(chunk)
+                compressed_tokens += chunk_token_est
+                chunk_errors.append(str(error))
+        compressed = "\n\n".join(compressed_chunks) if compressed_chunks else text
+        error_status = None
+        if chunk_errors:
+            preview = " | ".join(chunk_errors[:3])
+            suffix = f" (+{len(chunk_errors)-3} more)" if len(chunk_errors) > 3 else ""
+            error_status = f"chunk_compress_failed: {preview}{suffix}"
         self.records.append(
             CompressionRecord(
                 question_id=question_id,
@@ -353,8 +513,9 @@ class LLMLinguaCompressor:
                 origin_tokens=origin_tokens,
                 compressed_tokens=compressed_tokens,
                 latency_sec=time.perf_counter() - start,
-                compressor=f"{'llmlingua2' if self.use_llmlingua2 else 'llmlingua'}:{self.model_name}",
+                compressor=compressor_name,
                 chunk_count=len(chunks),
+                error_status=error_status,
             )
         )
         return compressed
@@ -543,6 +704,34 @@ def _int_value(value: Any) -> int:
 def _batches(values: list[str], size: int) -> Iterable[list[str]]:
     for start in range(0, len(values), size):
         yield values[start : start + size]
+
+
+def _is_transient_embedding_error(error: Exception) -> bool:
+    text = str(error).lower()
+    name = type(error).__name__.lower()
+    return (
+        "timeout" in text
+        or "timed out" in text
+        or "connection" in text
+        or "readerror" in text
+        or "connecterror" in text
+        or "apitimeouterror" in name
+        or "apiconnectionerror" in name
+    )
+
+
+def _split_batch(batch: list[str], max_split_retries: int) -> list[list[str]] | None:
+    if len(batch) <= 1:
+        return None
+    # 限制拆分层数，避免在异常状态下无限切分导致抖动。
+    if max_split_retries <= 0:
+        return None
+    mid = len(batch) // 2
+    left = batch[:mid]
+    right = batch[mid:]
+    if not left or not right:
+        return None
+    return [left, right]
 
 
 def _rough_text_chunks(text: str, max_rough_tokens: int) -> list[str]:
