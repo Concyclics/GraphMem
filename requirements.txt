@@ -8,3 +8,5 @@ networkx
 transformers
 sentencepiece
 llmlingua
+
+python-dotenv>=1.0.1

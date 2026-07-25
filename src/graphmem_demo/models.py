@@ -4,6 +4,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 
+GRAPHMEM_V2_SCHEMA = "graphmem_v2"
+
+
 def to_dict(value: Any) -> dict[str, Any]:
     return asdict(value)
 
@@ -36,6 +39,85 @@ class LeafNode:
     compact_facts: list[str] = field(default_factory=list)
     anchor_terms: dict[str, list[str]] = field(default_factory=dict)
     embedding: list[float] | None = None
+    schema_version: str = "graphmem_v1"
+
+
+@dataclass
+class AtomicFactNode:
+    node_id: str
+    question_id: str
+    session_id: str
+    subject: str
+    subject_key: str
+    predicate: str
+    predicate_key: str
+    object: str
+    object_key: str
+    kind: Literal["state", "event", "preference", "quantity", "assistant_fact"]
+    polarity: Literal["positive", "negative", "unknown"] = "positive"
+    modality: Literal["asserted", "planned", "possible", "conditional", "unknown"] = "asserted"
+    state_op: Literal["set", "add", "remove", "cancel", "complete", "none"] = "none"
+    context_key: str = ""
+    item_key: str = ""
+    event_time: str | None = None
+    observed_at: str | None = None
+    valid_from: str | None = None
+    valid_to: str | None = None
+    source_leaf_ids: list[str] = field(default_factory=list)
+    speaker: str = ""
+    role: str = "user"
+    confidence: float = 1.0
+    retrieval_text: str = ""
+    embedding: list[float] | None = None
+    observation_order: int = -1
+    measure_key: str = ""
+    collection_key: str = ""
+    quantity_role: Literal[
+        "total",
+        "count",
+        "baseline",
+        "current",
+        "delta",
+        "frequency",
+        "inventory",
+        "duration",
+        "date",
+        "unknown",
+    ] = "unknown"
+    schema_version: str = GRAPHMEM_V2_SCHEMA
+
+
+@dataclass
+class RoutingCardNode:
+    node_id: str
+    question_id: str
+    session_id: str
+    session_date: str | None
+    topics: list[str]
+    canonical_entities: list[str]
+    key_events: list[str]
+    current_states: list[str]
+    time_range: str
+    fact_ids: list[str]
+    leaf_ids: list[str]
+    retrieval_text: str
+    embedding: list[float] | None = None
+    schema_version: str = GRAPHMEM_V2_SCHEMA
+
+
+@dataclass
+class StateChain:
+    chain_id: str
+    question_id: str
+    subject_key: str
+    predicate_key: str
+    context_key: str
+    current_fact_ids: list[str]
+    history_fact_ids: list[str]
+    valid_from: str | None = None
+    valid_to: str | None = None
+    update_order: list[str] = field(default_factory=list)
+    schema_version: str = GRAPHMEM_V2_SCHEMA
 
 
 @dataclass
@@ -74,7 +156,25 @@ class GraphEdge:
         "time_neighbor",
         "event_neighbor",
         "update_neighbor",
+        "contains",
+        "source",
+        "next_turn",
+        "same_entity",
+        "same_predicate",
+        "same_measure",
+        "same_collection",
+        "operand_of",
+        "participates_in",
+        "supports",
+        "supersedes",
+        "contradicts",
+        "before",
+        "after",
     ]
+    directed: bool = False
+    confidence: float = 1.0
+    provenance: dict[str, Any] = field(default_factory=dict)
+    schema_version: str = "graphmem_v1"
 
 
 @dataclass
@@ -92,23 +192,21 @@ class RetrievedContext:
     answer_session_recall: float = 0.0
     retrieved_answer_session_count: int = 0
     gold_answer_session_count: int = 0
+    routing_card_ids: list[str] = field(default_factory=list)
+    fact_node_ids: list[str] = field(default_factory=list)
+    evidence_leaf_ids: list[str] = field(default_factory=list)
+    evidence_ledger: list[dict[str, Any]] = field(default_factory=list)
+    query_kind: str = "fact"
+    packed_rough_tokens: int = 0
+    schema_version: str = "graphmem_v1"
+    retrieval_trace: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class DeepSeekCallRecord:
     question_id: str
     variant: str
-    stage: Literal[
-        "build_summary_leaf",
-        "build_summary_internal",
-        "build_summary_raw_group",
-        "build_summary_session_direct",
-        "build_summary_session_merge",
-        "build_root_edge_anchor",
-        "build_leaf_edge_anchor",
-        "answer_note_extraction",
-        "answer_qa",
-    ]
+    stage: str
     call_id: str
     model: str
     thinking_mode: Literal["enabled", "disabled", "none"]
@@ -124,6 +222,8 @@ class DeepSeekCallRecord:
     finish_reason: str | None = None
     max_tokens: int | None = None
     response_format: str | None = None
+    breakdown_inferred: bool = False
+    excluded_from_budget: bool = False
 
 
 @dataclass
@@ -180,6 +280,17 @@ class QuestionStats:
     build_calls_per_session: float = 0.0
     ready_job_counts: list[dict[str, Any]] = field(default_factory=list)
     peak_inflight_deepseek: int = 0
+    build_cache_miss_input_tokens: int = 0
+    build_cache_hit_input_tokens: int = 0
+    build_output_tokens: int = 0
+    build_total_tokens: int = 0
+    answer_cache_miss_input_tokens: int = 0
+    answer_cache_hit_input_tokens: int = 0
+    answer_output_tokens: int = 0
+    answer_total_tokens: int = 0
+    build_budget_pass: bool = True
+    answer_budget_pass: bool = True
+    token_accounting_valid: bool = True
 
 
 @dataclass
@@ -212,3 +323,17 @@ class VariantStats:
     build_calls_per_session: float = 0.0
     peak_inflight_deepseek: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
+    build_cache_miss_input_tokens: int = 0
+    build_cache_hit_input_tokens: int = 0
+    build_output_tokens: int = 0
+    build_total_tokens: int = 0
+    answer_cache_miss_input_tokens: int = 0
+    answer_cache_hit_input_tokens: int = 0
+    answer_output_tokens: int = 0
+    answer_total_tokens: int = 0
+    build_budget_pass_count: int = 0
+    answer_budget_pass_count: int = 0
+    build_budget_max_tokens: int = 0
+    answer_budget_max_tokens: int = 0
+    over_build_budget_question_ids: list[str] = field(default_factory=list)
+    over_answer_budget_question_ids: list[str] = field(default_factory=list)

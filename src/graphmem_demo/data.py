@@ -39,7 +39,7 @@ def load_longmemeval_cases(
                 memory_cache_key=(
                     f"locomo:{row['locomo_sample_id']}"
                     if row.get("locomo_sample_id") is not None
-                    else None
+                    else f"longmemeval:{row['question_id']}"
                 ),
             )
         )
