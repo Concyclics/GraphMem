@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import queue
 import re
 import threading
 import time
@@ -47,16 +48,37 @@ from .graph_retrieval import (
 from .root_graph_edges import RootGraphEdgePolicy, build_root_graph
 from .typed_retrieval import rank_roots_hybrid
 from .models import (
+    GRAPHMEM_V2_SCHEMA,
+    AtomicFactNode,
     DeepSeekCallRecord,
     GraphEdge,
     LeafNode,
     QuestionCase,
     QuestionStats,
     RetrievedContext,
+    RoutingCardNode,
+    StateChain,
     SummaryNode,
     VariantStats,
 )
 from .retrieval_cues import proper_name_cues
+from .hierarchical_v2 import (
+    CONSOLIDATION_VERSION as V2_CONSOLIDATION_VERSION,
+    PROMPT_VERSION as V2_PROMPT_VERSION,
+    answer_messages as v2_answer_messages,
+    apply_answer_constraint as apply_v2_answer_constraint,
+    apply_consolidation as apply_v2_consolidation,
+    build_graph_edges as build_v2_graph_edges,
+    build_state_chains as build_v2_state_chains,
+    consolidation_messages as v2_consolidation_messages,
+    parse_session_extraction,
+    prompt_hash as v2_prompt_hash,
+    provider_token_estimate,
+    expand_query as expand_v2_query,
+    retrieve as retrieve_v2,
+    session_extraction_messages as v2_session_extraction_messages,
+    validate_provenance as validate_v2_provenance,
+)
 from .stats import (
     aggregate_variant_stats,
     build_question_stats,
@@ -84,6 +106,11 @@ class VariantSpec:
 
 
 VARIANT_SPECS = {
+    "hierarchical_state_graph_v2": VariantSpec(
+        "hierarchical_state_graph_v2", False, True,
+        summary_schema="graphmem_v2", hybrid_retrieval=True,
+        enhanced_retrieval=True, enhanced_qa=True,
+    ),
     "raw_rag": VariantSpec("raw_rag", False, False),
     "summary_tree_k4_no_compress": VariantSpec("legacy_kway", False, False, fanout_k=4),
     "summary_tree_k4_graphmem": VariantSpec("legacy_kway", True, True, fanout_k=4),
@@ -191,6 +218,7 @@ VARIANTS = set(VARIANT_SPECS)
 class DemoConfig:
     data_path: Path
     output_dir: Path
+    memory_cache_dir: Path | None = None
     question_type: str = "multi-session"
     variants: tuple[str, ...] = (
         "direct_session_k16_compact_no_compress",
@@ -218,8 +246,8 @@ class DemoConfig:
     compression_ratio: float = 0.5
     max_questions: int = 10
     question_workers: int = 2
-    summary_workers: int = 0
-    max_inflight_deepseek: int = 0
+    summary_workers: int = 32
+    max_inflight_deepseek: int = 32
     summary_schema: str | None = None
     summarizer_kind: str = "auto"
     summarizer_base_url: str = "http://127.0.0.1:8003/v1"
@@ -349,6 +377,17 @@ class DemoConfig:
     # Force stricter reasoning/answer prompts regardless of variant defaults.
     force_enhanced_retrieval: bool = False
     force_enhanced_qa: bool = False
+    reasoning_effort: str = "none"
+    build_budget_tokens: int = 300_000
+    answer_budget_tokens: int = 10_000
+    v2_fact_extraction_max_tokens: int = 3072
+    v2_consolidation_max_tokens: int = 3072
+    v2_card_k: int = 6
+    v2_fact_k: int = 14
+    v2_leaf_k: int = 14
+    v2_context_token_budget: int = 7600
+    v2_semantic_k: int = 3
+    v2_semantic_floor: float = 0.55
 
     def __post_init__(self) -> None:
         unknown = set(self.variants) - VARIANTS
@@ -362,13 +401,14 @@ class DemoConfig:
             raise ValueError("question_workers must be at least 1")
         if self.summary_workers < 0 or self.max_inflight_deepseek < 0:
             raise ValueError("summary_workers and max_inflight_deepseek cannot be negative")
-        if self.tree_mode is not None and self.tree_mode not in {"legacy_kway", "direct_session"}:
-            raise ValueError("tree_mode must be legacy_kway or direct_session")
+        if self.tree_mode is not None and self.tree_mode not in {"legacy_kway", "direct_session", "hierarchical_state_graph_v2"}:
+            raise ValueError("tree_mode must be legacy_kway, direct_session, or hierarchical_state_graph_v2")
         if self.summary_schema not in {
             None,
             "minimal_memory_v1",
             "compact_memory_v2",
             "multilingual_memory_v1",
+            "graphmem_v2",
         }:
             raise ValueError(
                 "summary_schema must be minimal_memory_v1, compact_memory_v2, or multilingual_memory_v1"
@@ -485,6 +525,17 @@ class DemoConfig:
         if self.coverage_rerank_pool_k < 2:
             raise ValueError("coverage_rerank_pool_k must be at least 2")
 
+        if self.reasoning_effort != "none":
+            raise ValueError("reasoning_effort must be none; it maps to thinking.type=disabled and is omitted from the API request")
+        if self.build_budget_tokens < 1 or self.answer_budget_tokens < 1:
+            raise ValueError("token budgets must be positive")
+        if not 0.0 <= self.v2_semantic_floor <= 1.0 or self.v2_semantic_k < 1:
+            raise ValueError("invalid V2 semantic graph settings")
+        if min(self.v2_card_k, self.v2_fact_k, self.v2_leaf_k) < 1:
+            raise ValueError("V2 retrieval limits must be positive")
+        if self.v2_context_token_budget < 1000:
+            raise ValueError("v2_context_token_budget must be at least 1000")
+
     def use_mock_llm(self) -> bool:
         return self.mock_services or self.mock_llm
 
@@ -510,6 +561,10 @@ class CaseRun:
     answer_notes: list[dict[str, str]] = field(default_factory=list)
     answer_note_parse_error: str | None = None
     answer_used_notes: bool = False
+    facts: list[AtomicFactNode] = field(default_factory=list)
+    routing_cards: list[RoutingCardNode] = field(default_factory=list)
+    state_chains: list[StateChain] = field(default_factory=list)
+    index_diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -521,6 +576,9 @@ class MemoryBuild:
     llm_records: list[DeepSeekCallRecord]
     metrics: "BuildMetrics"
     build_latency_sec: float
+    facts: list[AtomicFactNode] = field(default_factory=list)
+    routing_cards: list[RoutingCardNode] = field(default_factory=list)
+    state_chains: list[StateChain] = field(default_factory=list)
 
 
 @dataclass
@@ -529,6 +587,7 @@ class BuildMetrics:
     summary_parse_error_count: int = 0
     summary_truncation_count: int = 0
     peak_inflight_deepseek: int = 0
+    index_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     _active_deepseek: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -793,6 +852,8 @@ def _memory_cache_path(
         raise ValueError("memory_cache_key is required for memory cache path")
     key = _safe_cache_part(case.memory_cache_key)
     fingerprint = _memory_cache_fingerprint(config, case, variant)
+    if config.memory_cache_dir is not None:
+        return config.memory_cache_dir / variant / f"{key}-{fingerprint[:16]}.json"
     return variant_dir / "memory_cache" / f"{key}-{fingerprint[:16]}.json"
 
 
@@ -811,6 +872,19 @@ def _memory_cache_fingerprint(config: DemoConfig, case: QuestionCase, variant: s
     data_hash = hashlib.sha256(
         json.dumps(data_payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
     ).hexdigest()
+    if variant == "hierarchical_state_graph_v2":
+        payload = {
+            "version": 3, "variant": variant, "schema_version": GRAPHMEM_V2_SCHEMA,
+            "v2_prompt_hash": v2_prompt_hash(), "v2_prompt_version": V2_PROMPT_VERSION,
+            "v2_consolidation_version": V2_CONSOLIDATION_VERSION,
+            "v2_fact_extraction_max_tokens": config.v2_fact_extraction_max_tokens,
+            "v2_consolidation_max_tokens": config.v2_consolidation_max_tokens,
+            "v2_semantic_k": config.v2_semantic_k, "v2_semantic_floor": config.v2_semantic_floor,
+            "deepseek_model": config.deepseek_model, "embedding_model": config.embedding_model,
+            "data_hash": data_hash,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+
     payload = {
         "version": 1,
         "variant": variant,
@@ -882,6 +956,18 @@ def _memory_cache_fingerprint(config: DemoConfig, case: QuestionCase, variant: s
         "root_graph_edge_policy_version": 1,
         "data_hash": data_hash,
     }
+    if variant == "hierarchical_state_graph_v2":
+        payload.update({
+            "version": 2,
+            "schema_version": GRAPHMEM_V2_SCHEMA,
+            "v2_prompt_hash": v2_prompt_hash(),
+            "v2_prompt_version": V2_PROMPT_VERSION,
+            "v2_consolidation_version": V2_CONSOLIDATION_VERSION,
+            "v2_fact_extraction_max_tokens": config.v2_fact_extraction_max_tokens,
+            "v2_consolidation_max_tokens": config.v2_consolidation_max_tokens,
+            "v2_semantic_k": config.v2_semantic_k,
+            "v2_semantic_floor": config.v2_semantic_floor,
+        })
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
     ).hexdigest()
@@ -896,12 +982,16 @@ def _write_memory_cache(
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": 1,
+        "version": 2 if variant == "hierarchical_state_graph_v2" else 1,
+        "schema_version": GRAPHMEM_V2_SCHEMA if variant == "hierarchical_state_graph_v2" else "graphmem_v1",
         "memory_cache_key": case.memory_cache_key,
         "fingerprint": _memory_cache_fingerprint(config, case, variant),
         "source_question_id": case.question_id,
         "leaves": [asdict(leaf) for leaf in memory.leaves],
         "summaries": [asdict(summary) for summary in memory.summaries],
+        "facts": [asdict(fact) for fact in memory.facts],
+        "routing_cards": [asdict(card) for card in memory.routing_cards],
+        "state_chains": [asdict(chain) for chain in memory.state_chains],
         "root_ids": [root.node_id for root in memory.roots],
         "edges": [asdict(edge) for edge in memory.edges],
         "llm_records": [asdict(record) for record in memory.llm_records],
@@ -910,6 +1000,7 @@ def _write_memory_cache(
             "summary_parse_error_count": memory.metrics.summary_parse_error_count,
             "summary_truncation_count": memory.metrics.summary_truncation_count,
             "peak_inflight_deepseek": memory.metrics.peak_inflight_deepseek,
+            "index_diagnostics": memory.metrics.index_diagnostics,
         },
         "build_latency_sec": memory.build_latency_sec,
     }
@@ -921,10 +1012,13 @@ def _write_memory_cache(
 def _load_memory_cache(path: Path) -> MemoryBuild | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("version") != 1:
+        if payload.get("version") not in {1, 2}:
             return None
         leaves = [LeafNode(**row) for row in payload.get("leaves", [])]
         summaries = [SummaryNode(**row) for row in payload.get("summaries", [])]
+        facts = [AtomicFactNode(**row) for row in payload.get("facts", [])]
+        routing_cards = [RoutingCardNode(**row) for row in payload.get("routing_cards", [])]
+        state_chains = [StateChain(**row) for row in payload.get("state_chains", [])]
         summary_by_id = {summary.node_id: summary for summary in summaries}
         roots = [
             summary_by_id[root_id]
@@ -932,6 +1026,9 @@ def _load_memory_cache(path: Path) -> MemoryBuild | None:
             if root_id in summary_by_id
         ]
         edges = [GraphEdge(**row) for row in payload.get("edges", [])]
+        if facts and routing_cards:
+            deterministic_edges = build_v2_graph_edges(leaves, routing_cards, facts, state_chains)
+            edges = _merge_graph_edges(edges, deterministic_edges)
         llm_records = [
             DeepSeekCallRecord(**row) for row in payload.get("llm_records", [])
         ]
@@ -945,6 +1042,7 @@ def _load_memory_cache(path: Path) -> MemoryBuild | None:
                 metrics_payload.get("summary_truncation_count") or 0
             ),
             peak_inflight_deepseek=int(metrics_payload.get("peak_inflight_deepseek") or 0),
+            index_diagnostics=list(metrics_payload.get("index_diagnostics") or []),
         )
         return MemoryBuild(
             leaves=leaves,
@@ -954,6 +1052,9 @@ def _load_memory_cache(path: Path) -> MemoryBuild | None:
             llm_records=llm_records,
             metrics=metrics,
             build_latency_sec=float(payload.get("build_latency_sec") or 0.0),
+            facts=facts,
+            routing_cards=routing_cards,
+            state_chains=state_chains,
         )
     except Exception:
         return None
@@ -1020,6 +1121,59 @@ def _run_cases_with_memory_cache(
         key = case.memory_cache_key or f"question:{case.question_id}"
         grouped.setdefault(key, []).append(case)
 
+    # Cache-aware execution used to serialize this outer loop.  LongMemEval
+    # assigns every question its own cache key, so --question-workers only
+    # parallelized questions that happened to share one key and had no effect
+    # on the benchmark build.  Run independent cache groups concurrently; the
+    # recursive call receives exactly one group and therefore executes the
+    # existing single-build/share-within-group path below.
+    if (
+        config.question_workers > 1
+        and not has_injected_services
+        and len(grouped) > 1
+    ):
+        worker_count=min(config.question_workers,len(grouped))
+        group_config = replace(
+            config,
+            question_workers=max(1, config.question_workers // worker_count),
+        )
+
+        output_queue: queue.Queue[tuple[str, Any]] = queue.Queue(
+            maxsize=max(64, worker_count * 4)
+        )
+
+        def run_group(group_cases: list[QuestionCase]) -> None:
+            try:
+                for item in _run_cases_with_memory_cache(
+                    group_config,group_cases,variant,variant_dir,limiter,
+                    allow_memory_cache_read=allow_memory_cache_read,
+                    llm=llm,embedder=embedder,compressor=compressor,
+                    summarizer=summarizer,
+                ):
+                    output_queue.put(("item", item))
+            except BaseException as error:
+                output_queue.put(("error", error))
+            finally:
+                output_queue.put(("done", None))
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures={
+                executor.submit(run_group,group_cases):group_cases[0].question_id
+                for group_cases in grouped.values()
+            }
+            remaining = len(futures)
+            while remaining:
+                kind, payload = output_queue.get()
+                if kind == "item":
+                    yield payload
+                elif kind == "error":
+                    raise payload
+                else:
+                    remaining -= 1
+            for future in futures:
+                future.result()
+        return
+
     for group_cases in grouped.values():
         build_case = group_cases[0]
         memory_cache_key = build_case.memory_cache_key
@@ -1071,7 +1225,26 @@ def _run_cases_with_memory_cache(
                 *_records_since(build_summarizer, build_summarizer_start),
             ]
             _write_memory_cache(memory_cache_path, memory, build_case, variant, config)
-        build_record_question_id = build_case.question_id
+        build_record_question_id: str | None = build_case.question_id
+        if loaded_from_cache and variant == "hierarchical_state_graph_v2":
+            # A partial resume in the same output directory may already contain
+            # the original build owner. Do not attach saved build records to the
+            # first pending question a second time.
+            existing_build_owners = {
+                item.question_id
+                for item in _read_question_stats(variant_dir / "question_stats.jsonl")
+                if item.build_total_tokens > 0
+            }
+            cached_build_owner = next(
+                (
+                    record.question_id
+                    for record in memory.llm_records
+                    if record.stage.startswith("build_")
+                ),
+                None,
+            )
+            if cached_build_owner in existing_build_owners:
+                build_record_question_id = None
 
         worker_count = min(config.question_workers, len(group_cases))
         if has_injected_services:
@@ -1079,7 +1252,8 @@ def _run_cases_with_memory_cache(
         if worker_count <= 1:
             for case in group_cases:
                 include_build_records = (
-                    not loaded_from_cache and case.question_id == build_record_question_id
+                    case.question_id == build_record_question_id
+                    and (not loaded_from_cache or variant == "hierarchical_state_graph_v2")
                 )
                 run, embedding_records, compression_records = _run_case_with_cached_memory(
                     config,
@@ -1107,10 +1281,10 @@ def _run_cases_with_memory_cache(
                     variant,
                     limiter,
                     memory,
-                    (not loaded_from_cache and case.question_id == build_record_question_id),
+                    (case.question_id == build_record_question_id and (not loaded_from_cache or variant == "hierarchical_state_graph_v2")),
                     (
                         group_build_started
-                        if not loaded_from_cache and case.question_id == build_record_question_id
+                        if case.question_id == build_record_question_id
                         else None
                     ),
                     llm=llm,
@@ -1172,11 +1346,20 @@ def _write_case_outputs(
         variant_dir / "compression_stats.jsonl",
         [asdict(item) for item in compression_records],
     )
-    _append_jsonl(
-        variant_dir / "nodes.jsonl",
-        [_node_row(item) for item in [*run.leaves, *run.summaries]],
-    )
-    _append_jsonl(variant_dir / "edges.jsonl", [asdict(item) for item in run.edges])
+    # A LoCoMo conversation has many questions sharing one immutable memory.
+    # Persist that index only with its build-owner question; query-only cases
+    # still write retrieval, answer, and token records below.
+    persist_shared_index = not case.memory_cache_key or run.stats.build_total_tokens > 0
+    if persist_shared_index:
+        _append_jsonl(
+            variant_dir / "nodes.jsonl",
+            [_node_row(item) for item in [*run.leaves, *run.summaries, *run.routing_cards, *run.facts]],
+        )
+        _append_jsonl(
+            variant_dir / "state_chains.jsonl", [asdict(item) for item in run.state_chains]
+        )
+        _append_jsonl(variant_dir / "index_diagnostics.jsonl", run.index_diagnostics)
+        _append_jsonl(variant_dir / "edges.jsonl", [asdict(item) for item in run.edges])
     _append_jsonl(variant_dir / "question_stats.jsonl", [asdict(run.stats)])
     _append_jsonl(variant_dir / "retrieval_results.jsonl", [asdict(run.retrieval)])
     _append_jsonl(
@@ -1186,6 +1369,8 @@ def _write_case_outputs(
                 "question_id": case.question_id,
                 "variant": run.stats.variant,
                 "question": case.question,
+                "question_type": case.question_type,
+                "question_date": case.question_date,
                 "gold_answer": case.answer,
                 "prediction": run.answer,
                 "answer_notes": run.answer_notes,
@@ -1244,6 +1429,118 @@ def run_case(
     )
 
 
+def _build_v2_memory(
+    config: DemoConfig,
+    case: QuestionCase,
+    variant: str,
+    leaves: list[LeafNode],
+    llm: Any,
+    embedder: Any,
+    limiter: InflightLimiter,
+    metrics: BuildMetrics,
+    build_started: float,
+) -> MemoryBuild:
+    llm_records: list[DeepSeekCallRecord] = []
+    for leaf in leaves:
+        leaf.schema_version = GRAPHMEM_V2_SCHEMA
+    grouped = group_by_session(leaves)
+    session_dates = dict(zip(case.haystack_session_ids, case.haystack_dates))
+
+    def extract(session_id: str, session_leaves: list[LeafNode]) -> tuple[RoutingCardNode, list[AtomicFactNode], str | None, DeepSeekCallRecord]:
+        result = _tracked_chat(
+            llm, limiter, metrics, question_id=case.question_id, variant=variant,
+            stage="build_fact_extraction", thinking_mode="none",
+            messages=v2_session_extraction_messages(session_id, session_dates.get(session_id), session_leaves),
+            max_tokens=config.v2_fact_extraction_max_tokens, json_mode=True,
+        )
+        card, facts, error = parse_session_extraction(
+            result.text, question_id=case.question_id, session_id=session_id,
+            session_date=session_dates.get(session_id), leaves=session_leaves,
+        )
+        return card, facts, error, result.record
+
+    extracted: list[tuple[str, RoutingCardNode, list[AtomicFactNode], str | None, DeepSeekCallRecord]] = []
+    workers = min(32, config.summary_workers or 32, max(1, len(grouped)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(extract, session_id, values): session_id for session_id, values in grouped.items()}
+        for future in as_completed(futures):
+            session_id = futures[future]
+            card, facts, error, record = future.result()
+            extracted.append((session_id, card, facts, error, record))
+    extracted.sort(key=lambda row: case.haystack_session_ids.index(row[0]))
+    cards = [row[1] for row in extracted]
+    facts = [fact for row in extracted for fact in row[2]]
+    for observation_order, fact in enumerate(facts):
+        fact.observation_order = observation_order
+    llm_records.extend(row[4] for row in extracted)
+    metrics.summary_parse_error_count += sum(row[3] is not None for row in extracted)
+    for session_id, _card, session_facts, error, record in extracted:
+        metrics.index_diagnostics.append({
+            "question_id":case.question_id,"variant":variant,"stage":"session_extraction",
+            "session_id":session_id,"leaf_count":len(grouped[session_id]),"fact_count":len(session_facts),
+            "fallback_fact_count":sum(fact.confidence<=0.45 for fact in session_facts),
+            "parse_error":error,"finish_reason":record.finish_reason,
+            "prompt_tokens":record.prompt_tokens,"completion_tokens":record.completion_tokens,
+            "total_tokens":record.total_tokens,
+        })
+
+    extraction_total = sum(record.total_tokens for record in llm_records)
+    proposed_edges: list[GraphEdge] = []
+    consolidation_messages = v2_consolidation_messages(facts) if facts else []
+    consolidation_estimate = (
+        provider_token_estimate("\n".join(message["content"] for message in consolidation_messages))
+        + config.v2_consolidation_max_tokens
+    )
+    consolidation_allowed = bool(facts) and (
+        extraction_total + consolidation_estimate <= config.build_budget_tokens - 2_000
+    )
+    if consolidation_allowed:
+        consolidation = _tracked_chat(
+            llm, limiter, metrics, question_id=case.question_id, variant=variant,
+            stage="build_fact_consolidation", thinking_mode="none",
+            messages=consolidation_messages,
+            max_tokens=config.v2_consolidation_max_tokens, json_mode=True,
+        )
+        llm_records.append(consolidation.record)
+        proposed_edges, _aliases, error = apply_v2_consolidation(consolidation.text, facts)
+        if error:
+            metrics.summary_parse_error_count += 1
+        metrics.index_diagnostics.append({
+            "question_id":case.question_id,"variant":variant,"stage":"question_consolidation",
+            "fact_count":len(facts),"allowed":True,"estimated_tokens":consolidation_estimate,
+            "parse_error":error,"finish_reason":consolidation.record.finish_reason,
+            "prompt_tokens":consolidation.record.prompt_tokens,"completion_tokens":consolidation.record.completion_tokens,
+            "total_tokens":consolidation.record.total_tokens,"accepted_edge_count":len(proposed_edges),
+        })
+    else:
+        metrics.index_diagnostics.append({
+            "question_id":case.question_id,"variant":variant,"stage":"question_consolidation",
+            "fact_count":len(facts),"allowed":False,"estimated_tokens":consolidation_estimate,
+            "reason":"soft_budget_guard","extraction_total_tokens":extraction_total,
+        })
+
+    _embed_nodes(leaves, embedder, case.question_id, variant, attr="retrieval_text")
+    _embed_nodes(cards, embedder, case.question_id, variant, attr="retrieval_text")
+    _embed_nodes(facts, embedder, case.question_id, variant, attr="retrieval_text")
+    chains, state_edges = build_v2_state_chains(facts)
+    edges = build_v2_graph_edges(
+        leaves, cards, facts, chains,
+        semantic_k=config.v2_semantic_k, semantic_floor=config.v2_semantic_floor,
+    )
+    edges = _merge_graph_edges([*edges, *state_edges], proposed_edges)
+    provenance_errors = validate_v2_provenance(facts, leaves, edges)
+    if provenance_errors:
+        raise ValueError(f"V2 provenance validation failed: {provenance_errors[:8]}")
+    build_total = sum(record.total_tokens for record in llm_records if not record.excluded_from_budget)
+    if build_total > config.build_budget_tokens:
+        raise RuntimeError(f"build token budget exceeded for {case.question_id}: {build_total}>{config.build_budget_tokens}")
+    return MemoryBuild(
+        leaves=leaves, summaries=[], roots=[], edges=edges, llm_records=llm_records,
+        metrics=metrics, build_latency_sec=time.perf_counter()-build_started,
+        facts=facts, routing_cards=cards, state_chains=chains,
+    )
+
+
 def build_memory(
     config: DemoConfig,
     case: QuestionCase,
@@ -1259,6 +1556,10 @@ def build_memory(
     llm_records: list[DeepSeekCallRecord] = []
     build_started = time.perf_counter()
     leaves = build_leaf_nodes(case)
+    if variant == "hierarchical_state_graph_v2":
+        return _build_v2_memory(
+            config, case, variant, leaves, llm, embedder, limiter, metrics, build_started
+        )
     retrieval_leaf_mode = _effective_leaf_text_mode(
         config.retrieval_leaf_text, spec, case, phase="retrieval"
     )
@@ -1358,6 +1659,94 @@ def build_memory(
     )
 
 
+def _clone_v2_nodes(memory: MemoryBuild, question_id: str):
+    id_map: dict[str, str] = {}
+    def remap(node_id: str) -> str:
+        if node_id not in id_map:
+            suffix = node_id.split(":", 1)[1] if ":" in node_id else node_id
+            id_map[node_id] = f"{question_id}:{suffix}"
+        return id_map[node_id]
+    leaves = [replace(leaf, node_id=remap(leaf.node_id), question_id=question_id,
+                      compact_facts=list(leaf.compact_facts), anchor_terms=dict(leaf.anchor_terms),
+                      embedding=leaf.embedding) for leaf in memory.leaves]
+    facts = [replace(fact, node_id=remap(fact.node_id), question_id=question_id,
+                     source_leaf_ids=[remap(value) for value in fact.source_leaf_ids],
+                     observation_order=(fact.observation_order if fact.observation_order >= 0 else index),
+                     embedding=fact.embedding)
+             for index, fact in enumerate(memory.facts)]
+    cards = [replace(card, node_id=remap(card.node_id), question_id=question_id,
+                     fact_ids=[remap(value) for value in card.fact_ids], leaf_ids=[remap(value) for value in card.leaf_ids],
+                     embedding=card.embedding) for card in memory.routing_cards]
+    chains = [replace(chain, chain_id=remap(chain.chain_id), question_id=question_id,
+                      current_fact_ids=[remap(value) for value in chain.current_fact_ids],
+                      history_fact_ids=[remap(value) for value in chain.history_fact_ids],
+                      update_order=[remap(value) for value in chain.update_order]) for chain in memory.state_chains]
+    edges = [replace(edge, src=remap(edge.src), dst=remap(edge.dst), provenance=dict(edge.provenance)) for edge in memory.edges]
+    return leaves, cards, facts, chains, edges
+
+
+def _run_v2_case_with_memory(
+    config: DemoConfig, case: QuestionCase, variant: str, memory: MemoryBuild,
+    llm: Any, embedder: Any, limiter: InflightLimiter, *, include_build_records: bool,
+    case_started: float,
+) -> CaseRun:
+    answer_metrics = BuildMetrics()
+    llm_records = list(memory.llm_records) if include_build_records else []
+    leaves, cards, facts, chains, edges = _clone_v2_nodes(memory, case.question_id)
+    query_vector = embedder.embed([expand_v2_query(case.question)], question_id=case.question_id, variant=variant)[0]
+    retrieval = retrieve_v2(
+        case=case, variant=variant, leaves=leaves, cards=cards, facts=facts, chains=chains,
+        edges=edges, query_vector=query_vector, card_k=config.v2_card_k, fact_k=config.v2_fact_k,
+        leaf_k=config.v2_leaf_k, token_budget=config.v2_context_token_budget,
+    )
+    answer_started = time.perf_counter()
+    result = _tracked_chat(
+        llm, limiter, answer_metrics, question_id=case.question_id, variant=variant,
+        stage="answer_qa", thinking_mode="none", messages=v2_answer_messages(case, retrieval),
+        max_tokens=min(512, config.qa_max_tokens),
+    )
+    llm_records.append(result.record)
+    answer_text, answer_guard = apply_v2_answer_constraint(
+        case.question, retrieval, result.text
+    )
+    retrieval.retrieval_trace["answer_guard"] = answer_guard
+    answer_latency = time.perf_counter() - answer_started
+    # Gold support-session IDs are used only now, after the answer has been produced,
+    # for offline recall reporting. They never influence planning, retrieval, packing, or QA.
+    gold = set(case.answer_session_ids)
+    hit_count = len(set(retrieval.retrieved_session_ids) & gold)
+    retrieval.answer_session_hit = bool(hit_count)
+    retrieval.answer_session_all_hit = bool(gold) and hit_count == len(gold)
+    retrieval.answer_session_recall = hit_count / len(gold) if gold else 0.0
+    retrieval.retrieved_answer_session_count = hit_count
+    retrieval.gold_answer_session_count = len(gold)
+    build_metrics = memory.metrics if include_build_records else BuildMetrics()
+    stats = build_question_stats(
+        question_id=case.question_id, variant=variant, session_count=len(case.haystack_session_ids),
+        leaf_count=len(leaves), summary_count=len(cards)+len(facts), edge_count=len(edges), records=llm_records,
+        build_latency_sec=memory.build_latency_sec if include_build_records else 0.0,
+        retrieval_latency_sec=retrieval.latency_sec, answer_latency_sec=answer_latency,
+        answer_session_hit=retrieval.answer_session_hit, answer_session_all_hit=retrieval.answer_session_all_hit,
+        answer_session_recall=retrieval.answer_session_recall,
+        retrieved_answer_session_count=hit_count, gold_answer_session_count=len(gold),
+        wall_time_sec=time.perf_counter()-case_started,
+        summary_parse_error_count=build_metrics.summary_parse_error_count,
+        summary_truncation_count=build_metrics.summary_truncation_count,
+        ready_job_counts=build_metrics.ready_job_counts,
+        peak_inflight_deepseek=max(build_metrics.peak_inflight_deepseek, answer_metrics.peak_inflight_deepseek),
+        build_budget_tokens=config.build_budget_tokens, answer_budget_tokens=config.answer_budget_tokens,
+    )
+    if not stats.answer_budget_pass:
+        raise RuntimeError(f"answer token budget exceeded for {case.question_id}: {stats.answer_total_tokens}>{config.answer_budget_tokens}")
+    if not stats.token_accounting_valid:
+        raise RuntimeError(f"invalid DeepSeek token accounting for {case.question_id}")
+    return CaseRun(
+        leaves=leaves, summaries=[], edges=edges, retrieval=retrieval, answer=answer_text,
+        llm_records=llm_records, stats=stats, facts=facts, routing_cards=cards, state_chains=chains,
+        index_diagnostics=list(memory.metrics.index_diagnostics),
+    )
+
+
 def run_case_with_memory(
     config: DemoConfig,
     case: QuestionCase,
@@ -1373,6 +1762,11 @@ def run_case_with_memory(
     case_started = case_started if case_started is not None else time.perf_counter()
     spec = _variant_spec(config, variant)
     answer_metrics = BuildMetrics()
+    if variant == "hierarchical_state_graph_v2":
+        return _run_v2_case_with_memory(
+            config, case, variant, memory, llm, embedder, limiter,
+            include_build_records=include_build_records, case_started=case_started,
+        )
     llm_records: list[DeepSeekCallRecord] = list(memory.llm_records) if include_build_records else []
     leaves, summaries, roots, edges = _clone_memory_for_case(memory, case.question_id)
     retrieval_roots = summaries if config.enable_multilevel_summary_retrieval else roots
@@ -1621,10 +2015,9 @@ def _clone_memory_for_case(
     roots = [summary_by_id[node_id] for node_id in root_ids if node_id in summary_by_id]
     edges = [
         GraphEdge(
-            src=remap(edge.src),
-            dst=remap(edge.dst),
-            score=edge.score,
-            relation=edge.relation,
+            src=remap(edge.src), dst=remap(edge.dst), score=edge.score,
+            relation=edge.relation, directed=edge.directed, confidence=edge.confidence,
+            provenance=dict(edge.provenance), schema_version=edge.schema_version,
         )
         for edge in memory.edges
     ]
@@ -5492,9 +5885,16 @@ def _chunks(values: list[Any], size: int) -> list[list[Any]]:
     return [values[start : start + size] for start in range(0, len(values), size)]
 
 
-def _node_row(node: LeafNode | SummaryNode) -> dict[str, Any]:
+def _node_row(node: LeafNode | SummaryNode | RoutingCardNode | AtomicFactNode) -> dict[str, Any]:
     row = asdict(node)
-    row["node_type"] = "leaf" if isinstance(node, LeafNode) else "summary"
+    if isinstance(node, LeafNode):
+        row["node_type"] = "leaf"
+    elif isinstance(node, RoutingCardNode):
+        row["node_type"] = "routing_card"
+    elif isinstance(node, AtomicFactNode):
+        row["node_type"] = "atomic_fact"
+    else:
+        row["node_type"] = "summary"
     row.pop("embedding", None)
     return row
 
@@ -5505,6 +5905,8 @@ def _reset_jsonl_outputs(directory: Path) -> None:
         "embedding_calls.jsonl",
         "compression_stats.jsonl",
         "nodes.jsonl",
+        "state_chains.jsonl",
+        "index_diagnostics.jsonl",
         "edges.jsonl",
         "question_stats.jsonl",
         "retrieval_results.jsonl",
@@ -5602,15 +6004,25 @@ def _write_summary(output_dir: Path, aggregates: list[VariantStats]) -> None:
     columns = [
         "variant",
         "question_count",
-        "build_prompt_tokens",
-        "build_completion_tokens",
-        "answer_prompt_tokens",
-        "answer_completion_tokens",
+        "build_cache_miss_input_tokens",
+        "build_cache_hit_input_tokens",
+        "build_output_tokens",
+        "build_total_tokens",
+        "build_budget_max_tokens",
+        "build_budget_pass_count",
+        "answer_cache_miss_input_tokens",
+        "answer_cache_hit_input_tokens",
+        "answer_output_tokens",
+        "answer_total_tokens",
+        "answer_budget_max_tokens",
+        "answer_budget_pass_count",
         "reasoning_tokens",
         "total_deepseek_tokens",
         "deepseek_call_count",
         "avg_tokens_per_question",
         "token_budget_avg_under_300k",
+        "over_build_budget_question_ids",
+        "over_answer_budget_question_ids",
         "retrieval_answer_session_hit_rate",
         "retrieval_answer_session_all_hit_rate",
         "avg_retrieved_answer_session_recall",

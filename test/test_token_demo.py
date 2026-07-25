@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 import graphmem_demo.clients as clients_module
+import graphmem_demo.pipeline as pipeline_module
 from graphmem_demo.clients import (
     DeepSeekClient,
     LLMResult,
@@ -462,6 +463,44 @@ def test_locomo_memory_cache_builds_each_sample_once(tmp_path: Path) -> None:
     assert stage_counts["build_summary_session_direct"] == 2
     assert stage_counts["answer_qa"] == 2
     assert len([row for row in llm_rows if row["stage"].startswith("build_summary")]) == 2
+
+
+def test_distinct_memory_cache_groups_honor_question_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows=[]
+    for index in range(3):
+        row=_synthetic_row()
+        row["question_id"]=f"longmem-{index}"
+        row["question"]=f"What did I do after work, case {index}?"
+        rows.append(row)
+    data_path=tmp_path / "longmem.json"
+    data_path.write_text(json.dumps(rows),encoding="utf-8")
+
+    class SlowMockDeepSeekClient(MockDeepSeekClient):
+        lock=threading.Lock()
+        active=0
+        max_active=0
+
+        def chat(self, *args, **kwargs):
+            with self.lock:
+                type(self).active += 1
+                type(self).max_active=max(type(self).max_active,type(self).active)
+            try:
+                time.sleep(0.03)
+                return super().chat(*args,**kwargs)
+            finally:
+                with self.lock:
+                    type(self).active -= 1
+
+    monkeypatch.setattr(pipeline_module,"MockDeepSeekClient",SlowMockDeepSeekClient)
+    run_demo(DemoConfig(
+        data_path=data_path,question_type="all",output_dir=tmp_path / "run",
+        max_questions=3,variants=("single_llm_summary_graphmem",),
+        question_workers=3,summary_workers=1,max_inflight_deepseek=3,
+        mock_services=True,
+    ))
+    assert SlowMockDeepSeekClient.max_active >= 2
 
 
 def test_locomo_memory_cache_applies_with_injected_services(tmp_path: Path) -> None:

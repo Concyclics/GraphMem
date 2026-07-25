@@ -80,3 +80,12 @@ scripts/             CLI entrypoints and evaluation utilities
 test/                Unit tests and fixtures
 docs/                Design notes and experiment reports
 ```
+
+## GraphMem V2
+
+The additive `hierarchical_state_graph_v2` variant implements lossless leaves, atomic facts, compact routing cards, directed state chains, typed depth-2 retrieval, an evidence ledger, and separate 300K/10K DeepSeek token gates. See [docs/graphmem_v2.md](docs/graphmem_v2.md).
+
+```bash
+# Put DEEPSEEK_API_KEY in the ignored mode-0600 .env first.
+scripts/run_v2_longmemeval.sh /path/to/longmemeval_s_cleaned.json /path/to/output
+```

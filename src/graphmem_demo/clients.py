@@ -47,18 +47,29 @@ def parse_usage(usage: Any) -> dict[str, int]:
     data = _as_mapping(usage)
     prompt_details = _as_mapping(data.get("prompt_tokens_details"))
     completion_details = _as_mapping(data.get("completion_tokens_details"))
-    cache_hit = data.get("prompt_cache_hit_tokens")
-    cache_miss = data.get("prompt_cache_miss_tokens")
-    return {
-        "prompt_tokens": _int_value(data.get("prompt_tokens")),
-        "completion_tokens": _int_value(data.get("completion_tokens")),
-        "total_tokens": _int_value(data.get("total_tokens")),
-        "prompt_cache_hit_tokens": _int_value(
-            cache_hit if cache_hit is not None else prompt_details.get("cached_tokens")
-        ),
-        "prompt_cache_miss_tokens": _int_value(cache_miss),
+    prompt_tokens = _int_value(data.get("prompt_tokens"))
+    completion_tokens = _int_value(data.get("completion_tokens"))
+    cache_hit_raw = data.get("prompt_cache_hit_tokens")
+    cache_miss_raw = data.get("prompt_cache_miss_tokens")
+    cached_detail = prompt_details.get("cached_tokens")
+    cache_hit = _int_value(cache_hit_raw if cache_hit_raw is not None else cached_detail)
+    inferred = cache_miss_raw is None or (cache_hit_raw is None and cached_detail is None)
+    cache_miss = _int_value(cache_miss_raw) if cache_miss_raw is not None else max(0, prompt_tokens - cache_hit)
+    if cache_hit + cache_miss != prompt_tokens:
+        cache_miss = max(0, prompt_tokens - cache_hit)
+        inferred = True
+    total_tokens = _int_value(data.get("total_tokens")) or prompt_tokens + completion_tokens
+    result = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "prompt_cache_hit_tokens": cache_hit,
+        "prompt_cache_miss_tokens": cache_miss,
         "reasoning_tokens": _int_value(completion_details.get("reasoning_tokens")),
     }
+    if inferred:
+        result["breakdown_inferred"] = True
+    return result
 
 
 def cosine_similarity(left: list[float] | None, right: list[float] | None) -> float:
@@ -114,7 +125,7 @@ class DeepSeekClient:
         api_key = os.environ.get("DEEPSEEK_API_KEY")
         if not api_key:
             raise RuntimeError("DEEPSEEK_API_KEY is required for real DeepSeek calls")
-        self.model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
+        self.model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
         OpenAI = _openai_client_class()
         self.client = OpenAI(
             api_key=api_key,
@@ -220,6 +231,15 @@ class MockDeepSeekClient:
                     )
             else:
                 text = "Summary: " + compact
+        elif stage == "build_fact_extraction":
+            leaf_ids = re.findall(r"leaf_id=([^;\]]+)", prompt)
+            source_id = leaf_ids[0] if leaf_ids else f"{question_id}:mock:leaf:0"
+            text = json.dumps({
+                "routing_card": {"topics": ["mock"], "canonical_entities": ["user"], "key_events": [], "current_states": ["mock fact"], "time_range": "unknown"},
+                "facts": [{"subject": "user", "predicate": "stated", "object": "mock fact", "kind": "state", "polarity": "positive", "modality": "asserted", "state_op": "set", "context_key": "default", "item_key": "mock fact", "event_time": None, "valid_from": None, "valid_to": None, "source_leaf_ids": [source_id], "speaker": "user", "role": "user", "confidence": 0.9}]
+            })
+        elif stage == "build_fact_consolidation":
+            text = json.dumps({"aliases": {}, "predicate_aliases": {}, "relations": []})
         elif stage == "build_root_edge_anchor":
             text = json.dumps(
                 {
@@ -262,6 +282,7 @@ class MockDeepSeekClient:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
+            prompt_cache_miss_tokens=prompt_tokens,
             reasoning_tokens=reasoning_tokens,
             latency_sec=0.0,
             finish_reason="stop",
@@ -295,7 +316,7 @@ class EmbeddingClient:
         self.records: list[EmbeddingCallRecord] = []
         # 让 vLLM 对超过上下文上限的输入自动截断，而不是直接返回 400。
         # 取值应 <= embedding 服务的 max-model-len；用环境变量 EMBEDDING_TRUNCATE_TOKENS 配置。
-        self.truncate_prompt_tokens = _env_int("EMBEDDING_TRUNCATE_TOKENS", 0) or None
+        self.truncate_prompt_tokens = _env_int("EMBEDDING_TRUNCATE_TOKENS", 8000) or None
         # 连接类异常时，按 batch 拆分重试，减少“一个慢请求拖死整轮”。
         self.max_split_retries = _env_int("EMBEDDING_SPLIT_RETRIES", 2)
 

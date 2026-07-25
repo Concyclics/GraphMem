@@ -6,8 +6,11 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 
 ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env", override=False)
 sys.path.insert(0, str(ROOT / "src"))
 
 from graphmem_demo.pipeline import DemoConfig, run_demo  # noqa: E402
@@ -26,6 +29,7 @@ def parse_args() -> argparse.Namespace:
         ],
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--memory-cache-dir", type=Path)
     parser.add_argument("--deepseek-model")
     parser.add_argument(
         "--deepseek-base-url",
@@ -40,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-local-port", type=int, default=8001)
     parser.add_argument("--embedding-base-url", default="http://127.0.0.1:8002/v1")
     parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
-    parser.add_argument("--tree-mode", choices=["legacy_kway", "direct_session"])
+    parser.add_argument("--tree-mode", choices=["legacy_kway", "direct_session", "hierarchical_state_graph_v2"])
     parser.add_argument("--fanout-k", type=int, default=16)
     parser.add_argument("--max-group-rough-tokens", type=int, default=6000)
     parser.add_argument("--leaf-top-k", type=int, default=14)
@@ -58,11 +62,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compression-ratio", type=float, default=0.5)
     parser.add_argument("--max-questions", type=int, default=10)
     parser.add_argument("--question-workers", type=int, default=2)
-    parser.add_argument("--summary-workers", type=int, default=0)
-    parser.add_argument("--max-inflight-deepseek", type=int, default=0)
+    parser.add_argument("--summary-workers", type=int, default=32)
+    parser.add_argument("--max-inflight-deepseek", type=int, default=32)
     parser.add_argument(
         "--summary-schema",
-        choices=["minimal_memory_v1", "compact_memory_v2", "multilingual_memory_v1"],
+        choices=["minimal_memory_v1", "compact_memory_v2", "multilingual_memory_v1", "graphmem_v2"],
     )
     parser.add_argument(
         "--summarizer-kind",
@@ -369,6 +373,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow typed root edges even when session embeddings are dissimilar.",
     )
+    parser.add_argument("--reasoning-effort", choices=["none"], default="none")
+    parser.add_argument("--build-budget-tokens", type=int, default=300000)
+    parser.add_argument("--answer-budget-tokens", type=int, default=10000)
+    parser.add_argument("--v2-fact-extraction-max-tokens", type=int, default=3072)
+    parser.add_argument("--v2-consolidation-max-tokens", type=int, default=3072)
+    parser.add_argument("--v2-card-k", type=int, default=6)
+    parser.add_argument("--v2-fact-k", type=int, default=14)
+    parser.add_argument("--v2-leaf-k", type=int, default=12)
+    parser.add_argument("--v2-context-token-budget", type=int, default=8200)
+    parser.add_argument("--v2-semantic-k", type=int, default=3)
+    parser.add_argument("--v2-semantic-floor", type=float, default=0.55)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--mock-services",
@@ -398,6 +413,7 @@ def main() -> None:
     config = DemoConfig(
         data_path=args.data,
         output_dir=args.output_dir,
+        memory_cache_dir=args.memory_cache_dir,
         question_type=args.question_type,
         variants=tuple(args.variants),
         deepseek_model=deepseek_model,
@@ -518,6 +534,17 @@ def main() -> None:
         answer_include_raw_context_with_notes=args.answer_include_raw_context_with_notes,
         force_enhanced_retrieval=args.force_enhanced_retrieval,
         force_enhanced_qa=args.force_enhanced_qa,
+        reasoning_effort=args.reasoning_effort,
+        build_budget_tokens=args.build_budget_tokens,
+        answer_budget_tokens=args.answer_budget_tokens,
+        v2_fact_extraction_max_tokens=args.v2_fact_extraction_max_tokens,
+        v2_consolidation_max_tokens=args.v2_consolidation_max_tokens,
+        v2_card_k=args.v2_card_k,
+        v2_fact_k=args.v2_fact_k,
+        v2_leaf_k=args.v2_leaf_k,
+        v2_context_token_budget=args.v2_context_token_budget,
+        v2_semantic_k=args.v2_semantic_k,
+        v2_semantic_floor=args.v2_semantic_floor,
     )
     aggregates = run_demo(config)
     for aggregate in aggregates:
