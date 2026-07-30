@@ -985,6 +985,21 @@ def test_transaction_sum_binds_local_clauses_and_unit_prices() -> None:
     assert {row["source_turn_id"] for row in hint["operands"]} == {"q:m1", "q:m2", "q:m3"}
 
 
+def test_transaction_sum_accepts_thousands_separators() -> None:
+    index = _index()
+    template = index.turns[0]
+    index.turns = [
+        replace(template, node_id="q:m1", session_id="s1", transport_role="user", text="I sold equipment at the market and earned $1,200."),
+        replace(template, node_id="q:m2", session_id="s2", transport_role="user", text="I sold supplies at another market and earned $350."),
+    ]
+    ir = build_query_ir("What is the total amount of money I earned from selling products at the markets?")
+    hint = transaction_sum_from_sources_hint(
+        ir, index, [turn.node_id for turn in index.turns]
+    )
+    assert hint is not None
+    assert hint["value"] == 1550
+
+
 def test_explicit_currency_operands_bind_nearest_prices() -> None:
     index = _index()
     template = index.turns[0]

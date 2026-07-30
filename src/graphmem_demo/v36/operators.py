@@ -2262,7 +2262,7 @@ def transaction_sum_from_sources_hint(
                     "quantity_times_unit_price",
                 )
         amounts = [
-            float(value) for value in re.findall(
+            float(value.replace(",", "")) for value in re.findall(
                 r"[$]\s*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)", clause
             )
         ]
