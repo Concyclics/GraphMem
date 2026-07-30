@@ -29,6 +29,7 @@ The result uses the pinned Mem0 LongMemEval judge prompt at commit `bd063eea04de
 - Category acquisition requires both structured category membership and local source co-occurrence with the acquisition action; broad card context cannot become a member.
 - Provider abbreviations such as `Dr.` no longer split a dated visit away from its date.
 - Maintenance of a component can be normalized to its parent asset, while different assets remain distinct.
+- Shared V3.6 cache stores embeddings in a float32 `.npy` companion instead of decimal JSON. This is a persistence-only optimization: node IDs and vectors are restored on load, while the graph/retrieval behavior is unchanged.
 
 ## Remaining validation errors
 
@@ -40,6 +41,6 @@ The dominant residuals are long-span endpoint binding, incomplete collection clo
 
 ## Verification
 
-- Repository test suite: 688 passed.
+- Repository test suite: 689 passed.
 - Focused V3.6 tests: 89 passed.
 - Secrets scan: no API-key pattern found outside ignored local configuration/results.

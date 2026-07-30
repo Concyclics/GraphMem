@@ -10,8 +10,9 @@ from graphmem_demo.clients import (
 )
 from graphmem_demo.models import QuestionCase
 from graphmem_demo.pipeline import (
-    DemoConfig, InflightLimiter, _build_v36_memory, _memory_cache_fingerprint,
-    _v36_index_diagnostics_payload, run_case,
+    BuildMetrics, DemoConfig, InflightLimiter, MemoryBuild,
+    _build_v36_memory, _load_memory_cache, _memory_cache_fingerprint,
+    _v36_index_diagnostics_payload, _write_memory_cache, run_case,
 )
 from graphmem_demo.v36.build import (
     _attach_routing_relations, add_routing_semantic_edges,
@@ -874,3 +875,53 @@ def test_unrelated_collection_cannot_complete_query_roles() -> None:
     )
     assert not certificate.complete
     assert {"scope", "members"} <= set(certificate.missing_roles)
+
+
+
+def test_v36_memory_cache_stores_embeddings_in_binary_companion(tmp_path: Path) -> None:
+    case, index, _embedder = _parsed()
+    memory = MemoryBuild(
+        leaves=[], summaries=[], roots=[], edges=[], llm_records=[],
+        metrics=BuildMetrics(), build_latency_sec=0.0, v36_index=index,
+    )
+    config = DemoConfig(
+        data_path=tmp_path / "unused.json", output_dir=tmp_path / "out",
+        variants=("hierarchical_role_graph_v3_6",), mock_services=True,
+    )
+    path = tmp_path / "memory.json"
+    original = {
+        node.node_id: list(node.embedding or [])
+        for node in [
+            *index.turns, *index.frames, *index.routing_cards,
+            *index.evidence_groups,
+        ]
+    }
+    _write_memory_cache(
+        path, memory, case, "hierarchical_role_graph_v3_6", config,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["version"] == 5
+    assert payload["v36_vector_cache"] == "memory.json.vectors"
+    assert '"embedding": [' not in path.read_text(encoding="utf-8")
+    assert list((tmp_path / "memory.json.vectors").glob("*.npy"))
+    # The live index is restored after the temporary structure-only asdict.
+    assert all(
+        list(node.embedding or []) == original[node.node_id]
+        for node in [
+            *index.turns, *index.frames, *index.routing_cards,
+            *index.evidence_groups,
+        ]
+    )
+    loaded = _load_memory_cache(path)
+    assert loaded is not None and loaded.v36_index is not None
+    loaded_nodes = [
+        *loaded.v36_index.turns, *loaded.v36_index.frames,
+        *loaded.v36_index.routing_cards, *loaded.v36_index.evidence_groups,
+    ]
+    assert {node.node_id for node in loaded_nodes} == set(original)
+    for node in loaded_nodes:
+        assert len(node.embedding or []) == len(original[node.node_id])
+        assert all(
+            abs(actual - expected) < 1e-6
+            for actual, expected in zip(node.embedding or [], original[node.node_id])
+        )

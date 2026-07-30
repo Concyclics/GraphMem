@@ -7,6 +7,7 @@ import queue
 import re
 import threading
 import time
+import numpy as np
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
@@ -1112,8 +1113,31 @@ def _write_memory_cache(
     config: DemoConfig,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    v36_payload = None
+    v36_vector_cache = None
+    if memory.v36_index is not None:
+        # Embeddings dominate cache JSON size and float-to-decimal serialization
+        # time. Persist them as float32 rows and keep the structural JSON small.
+        # Nodes are private to this build until the cache write returns, so the
+        # temporary clearing below is safe and avoids asdict deep-copying vectors.
+        vector_directory = path.with_suffix(path.suffix + ".vectors")
+        persist_v36_vector_matrix(vector_directory, memory.v36_index)
+        searchable_nodes = [
+            *memory.v36_index.turns, *memory.v36_index.frames,
+            *memory.v36_index.routing_cards,
+            *memory.v36_index.evidence_groups,
+        ]
+        saved_embeddings = [node.embedding for node in searchable_nodes]
+        try:
+            for node in searchable_nodes:
+                node.embedding = None
+            v36_payload = asdict(memory.v36_index)
+        finally:
+            for node, embedding in zip(searchable_nodes, saved_embeddings):
+                node.embedding = embedding
+        v36_vector_cache = vector_directory.name
     payload = {
-        "version": 4 if variant == "hierarchical_role_graph_v3_6" else (3 if variant == "hierarchical_hypergraph_v3" else (2 if variant == "hierarchical_state_graph_v2" else 1)),
+        "version": 5 if variant == "hierarchical_role_graph_v3_6" else (3 if variant == "hierarchical_hypergraph_v3" else (2 if variant == "hierarchical_state_graph_v2" else 1)),
         "schema_version": GRAPHMEM_V36_SCHEMA if variant == "hierarchical_role_graph_v3_6" else (GRAPHMEM_V3_SCHEMA if variant == "hierarchical_hypergraph_v3" else (GRAPHMEM_V2_SCHEMA if variant == "hierarchical_state_graph_v2" else "graphmem_v1")),
         "memory_cache_key": case.memory_cache_key,
         "fingerprint": _memory_cache_fingerprint(config, case, variant),
@@ -1124,7 +1148,8 @@ def _write_memory_cache(
         "routing_cards": [asdict(card) for card in memory.routing_cards],
         "state_chains": [asdict(chain) for chain in memory.state_chains],
         "v3_index": asdict(memory.v3_index) if memory.v3_index is not None else None,
-        "v36_index": asdict(memory.v36_index) if memory.v36_index is not None else None,
+        "v36_index": v36_payload,
+        "v36_vector_cache": v36_vector_cache,
         "root_ids": [root.node_id for root in memory.roots],
         "edges": [asdict(edge) for edge in memory.edges],
         "llm_records": [asdict(record) for record in memory.llm_records],
@@ -1145,7 +1170,7 @@ def _write_memory_cache(
 def _load_memory_cache(path: Path) -> MemoryBuild | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("version") not in {1, 2, 3, 4}:
+        if payload.get("version") not in {1, 2, 3, 4, 5}:
             return None
         leaves = [LeafNode(**row) for row in payload.get("leaves", [])]
         summaries = [SummaryNode(**row) for row in payload.get("summaries", [])]
@@ -1156,6 +1181,29 @@ def _load_memory_cache(path: Path) -> MemoryBuild | None:
         v3_index = v3_index_from_dict(v3_payload) if isinstance(v3_payload, dict) else None
         v36_payload = payload.get("v36_index")
         v36_index = v36_index_from_dict(v36_payload) if isinstance(v36_payload, dict) else None
+        vector_cache_name = payload.get("v36_vector_cache")
+        if v36_index is not None and isinstance(vector_cache_name, str) and vector_cache_name:
+            vector_directory = path.parent / vector_cache_name
+            ids_paths = sorted(vector_directory.glob("*.ids.json"))
+            if len(ids_paths) != 1:
+                return None
+            ids_path = ids_paths[0]
+            stem = ids_path.name[:-len(".ids.json")]
+            matrix_path = vector_directory / f"{stem}.npy"
+            node_ids = json.loads(ids_path.read_text(encoding="utf-8"))
+            matrix = np.load(matrix_path, mmap_mode="r", allow_pickle=False)
+            if len(node_ids) != len(matrix):
+                return None
+            node_by_id = {
+                node.node_id: node for node in [
+                    *v36_index.turns, *v36_index.frames,
+                    *v36_index.routing_cards, *v36_index.evidence_groups,
+                ]
+            }
+            if any(node_id not in node_by_id for node_id in node_ids):
+                return None
+            for position, node_id in enumerate(node_ids):
+                node_by_id[node_id].embedding = matrix[position].tolist()
         summary_by_id = {summary.node_id: summary for summary in summaries}
         roots = [
             summary_by_id[root_id]
