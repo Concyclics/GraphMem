@@ -32,13 +32,13 @@ if [[ -f "${REPO}/.env" ]]; then
 fi
 
 # --- Required: provide API key via env or file ---
-API_KEY="${API_KEY:-${DEEPSEEK_API_KEY:-}}"
+API_KEY="${API_KEY:-${SGAO_API_KEY:-}}"
 API_KEY_FILE="${API_KEY_FILE:-}"
 
 # --- API/model config ---
-BASE_URL="${BASE_URL:-${DEEPSEEK_BASE_URL:-https://api.openai.com/v1}}"
-MODEL="${MODEL:-${DEEPSEEK_MODEL:-gpt-5.4-mini}}"
-REASONING_EFFORT="${REASONING_EFFORT:-low}"
+BASE_URL="${BASE_URL:-${SGAO_BASE_URL:-https://sub2api.sgao.me/v1/}}"
+MODEL="${MODEL:-${SGAO_MODEL:-gpt-5.4-mini}}"
+REASONING_EFFORT="${REASONING_EFFORT:-none}"
 
 # --- Experiment config (same as notes-reader Locomo run) ---
 # Use LOCOMO_DATA to override; ignore generic DATA from .env (often LongMemEval path).
@@ -67,8 +67,8 @@ if [[ -z "${API_KEY}" && -n "${API_KEY_FILE}" ]]; then
 fi
 
 if [[ -z "${API_KEY}" ]]; then
-  echo "[fatal] Missing API key. Set DEEPSEEK_API_KEY in .env, or pass API_KEY / API_KEY_FILE." >&2
-  echo "example: cp .env.example .env && fill in DEEPSEEK_API_KEY" >&2
+  echo "[fatal] Missing API key. Set SGAO_API_KEY in .env, or pass API_KEY / API_KEY_FILE." >&2
+  echo "example: cp .env.example .env && fill in SGAO_API_KEY" >&2
   exit 1
 fi
 
@@ -80,14 +80,15 @@ fi
 mkdir -p "${OUTDIR}"
 
 echo "=== [1/3] API smoke test ==="
-curl -sS "${BASE_URL}/responses" \
+curl -sS "${BASE_URL%/}/chat/completions" \
   -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
   -d "$(cat <<EOF
 {
   "model": "${MODEL}",
-  "reasoning": { "effort": "${REASONING_EFFORT}" },
-  "input": "Say hello and briefly confirm the API is working."
+  "reasoning_effort": "${REASONING_EFFORT}",
+  "messages": [{"role": "user", "content": "Reply OK."}],
+  "max_tokens": 8
 }
 EOF
 )" >/tmp/locomo_custom_api_smoke.json
@@ -95,9 +96,9 @@ echo "Smoke response saved: /tmp/locomo_custom_api_smoke.json"
 
 echo "=== [2/3] Run GraphMem on LoCoMo (${MAX_QUESTIONS} questions) ==="
 cd "${REPO}"
-export DEEPSEEK_API_KEY="${API_KEY}"
-export DEEPSEEK_BASE_URL="${BASE_URL}"
-export DEEPSEEK_MODEL="${MODEL}"
+export SGAO_API_KEY="${API_KEY}"
+export SGAO_BASE_URL="${BASE_URL}"
+export SGAO_MODEL="${MODEL}"
 
 python scripts/run_token_demo.py \
   --data "${DATA}" \
@@ -106,8 +107,8 @@ python scripts/run_token_demo.py \
   --question-workers "${QUESTION_WORKERS}" \
   --output-dir "${OUTDIR}" \
   --variants "${VARIANT}" \
-  --deepseek-base-url "${BASE_URL}" \
-  --deepseek-model "${MODEL}" \
+  --llm-base-url "${BASE_URL}" \
+  --llm-model "${MODEL}" \
   --enable-graph-first-retrieval \
   --enable-fusion-retrieval \
   --enable-answer-note-extraction \

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,7 +15,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from graphmem_demo.clients import DeepSeekClient, rough_token_count  # noqa: E402
+from graphmem_demo.clients import OpenAICompatibleClient, rough_token_count  # noqa: E402
 from graphmem_demo.data import load_longmemeval_cases  # noqa: E402
 
 
@@ -27,8 +28,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assistant-retrieval-results", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--variant", default="two_stage_answer")
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--base-url")
+    parser.add_argument("--model", default=os.environ.get("SGAO_MODEL", "gpt-5.4-mini"))
+    parser.add_argument("--base-url", default=os.environ.get("SGAO_BASE_URL", "https://sub2api.sgao.me/v1/"))
+    parser.add_argument("--api-key-env", default="SGAO_API_KEY")
     parser.add_argument("--question-type", default="all")
     parser.add_argument("--max-questions", type=int, default=60)
     parser.add_argument("--workers", type=int, default=8)
@@ -147,7 +149,9 @@ def answer_one(
     context, truncated = trim_rough_tokens(
         retrieval["context_text"], args.note_context_rough_tokens
     )
-    llm = DeepSeekClient(model=args.model, base_url=args.base_url)
+    llm = OpenAICompatibleClient(
+        model=args.model, base_url=args.base_url, api_key_env=args.api_key_env, request_profile="openai"
+    )
     started = time.perf_counter()
     note_result = llm.chat(
         question_id=case.question_id,

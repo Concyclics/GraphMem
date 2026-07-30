@@ -185,9 +185,9 @@ cmd_run() {
     export HF_HOME="${RUN_HF_HOME}"
     export HF_HUB_OFFLINE="0"
     mkdir -p "${RUN_HF_HOME}"
-    export DEEPSEEK_API_KEY="dummy"
-    export DEEPSEEK_BASE_URL="http://127.0.0.1:${LLM_PORT}/v1"
-    export DEEPSEEK_MODEL="${LLM_MODEL}"
+    export SGAO_API_KEY="dummy"
+    export SGAO_BASE_URL="http://127.0.0.1:${LLM_PORT}/v1"
+    export SGAO_MODEL="${LLM_MODEL}"
     # 超长输入让 vLLM 截断到 embedding 的上下文上限，避免 400。
     export EMBEDDING_TRUNCATE_TOKENS="${EMBED_MAXLEN}"
     # 批小一点，降低 embed 在与 llm 抢 GPU 时的单请求超时概率。

@@ -31,6 +31,27 @@ def _answer_session_ids(evidence: list[Any]) -> list[str]:
     return [f"session_{number}" for number in sorted(numbers)]
 
 
+def _media_captions(turn: dict[str, Any]) -> list[str]:
+    raw = turn.get("blip_caption")
+    values = raw if isinstance(raw, list) else [raw]
+    return list(dict.fromkeys(
+        str(value).strip()
+        for value in values
+        if value is not None and str(value).strip()
+    ))
+
+
+def _turn_content(turn: dict[str, Any]) -> str:
+    """Preserve textual and caption evidence without consulting QA answers."""
+    parts = [str(turn.get("text", "")).strip()]
+    speaker = str(turn.get("speaker", "participant")).strip() or "participant"
+    parts.extend(
+        f"[Media shared by {speaker}; caption: {caption}]"
+        for caption in _media_captions(turn)
+    )
+    return "\n".join(value for value in parts if value)
+
+
 def convert_sample(sample: dict[str, Any], sample_index: int) -> list[dict[str, Any]]:
     conversation = sample["conversation"]
     speaker_a = str(conversation["speaker_a"])
@@ -50,13 +71,21 @@ def convert_sample(sample: dict[str, Any], sample_index: int) -> list[dict[str, 
         for turn in conversation[session_id]:
             speaker = str(turn.get("speaker", "")).strip()
             listener = speaker_b if speaker == speaker_a else speaker_a
+            captions = _media_captions(turn)
+            raw_urls = turn.get("img_url")
+            image_urls = raw_urls if isinstance(raw_urls, list) else [raw_urls]
             messages.append(
                 {
                     "role": "user" if speaker == speaker_a else "assistant",
                     "speaker": speaker,
                     "listener": listener,
-                    "content": str(turn.get("text", "")),
+                    "content": _turn_content(turn),
                     "dia_id": turn.get("dia_id"),
+                    "media_captions": captions,
+                    "media_urls": [
+                        str(value) for value in image_urls
+                        if value is not None and str(value).strip()
+                    ],
                 }
             )
         sessions.append(messages)

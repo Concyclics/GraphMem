@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=False)
 sys.path.insert(0, str(ROOT / "src"))
 
-from graphmem_demo.clients import DeepSeekClient  # noqa: E402
+from graphmem_demo.clients import OpenAICompatibleClient  # noqa: E402
 
 
 DEFAULT_REPO = Path(
@@ -81,9 +81,14 @@ def main() -> None:
     parser.add_argument("--answers", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--memory-benchmarks-repo", type=Path, default=DEFAULT_REPO)
-    parser.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"))
+    parser.add_argument("--model", default=os.environ.get("SGAO_MODEL", "gpt-5.4-mini"))
     parser.add_argument(
-        "--base-url", default=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        "--base-url", default=os.environ.get("SGAO_BASE_URL", "https://sub2api.sgao.me/v1/")
+    )
+    parser.add_argument("--api-key-env", default="SGAO_API_KEY")
+    parser.add_argument(
+        "--request-profile", choices=["deepseek", "openai", "omit"],
+        default="openai",
     )
     parser.add_argument("--workers", type=int, default=64)
     parser.add_argument("--max-tokens", type=int, default=256)
@@ -112,7 +117,10 @@ def main() -> None:
         row["question_id"] for row in _read_jsonl(eval_path)
     } if eval_path.exists() else set()
     selected = [item for item in selected if item[0] not in completed]
-    client = DeepSeekClient(model=args.model, base_url=args.base_url)
+    client = OpenAICompatibleClient(
+        model=args.model, base_url=args.base_url,
+        api_key_env=args.api_key_env, request_profile=args.request_profile,
+    )
 
     def judge(item: tuple[str, dict[str, Any], dict[str, Any]]):
         question_id, case, answer_row = item
@@ -189,8 +197,10 @@ def main() -> None:
         "category_5_excluded_by_repository": True,
         "with_evidence": False,
         "model": args.model,
-        "thinking": {"type": "disabled"},
-        "reasoning_effort_field_sent": False,
+        "thinking_request_profile": args.request_profile,
+        "thinking": {"type": "disabled"} if args.request_profile == "deepseek" else None,
+        "reasoning_effort": "none" if args.request_profile == "openai" else None,
+        "reasoning_effort_field_sent": args.request_profile == "openai",
         "excluded_from_build_and_answer_budgets": True,
         "question_count": len(evaluations),
         "correct": correct,

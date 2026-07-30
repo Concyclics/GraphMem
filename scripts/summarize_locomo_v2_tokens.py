@@ -39,6 +39,46 @@ def _percentiles(values: list[int]) -> dict[str, float | int]:
     }
 
 
+def _call_usage_valid(call: dict[str, Any]) -> bool:
+    hit = int(call.get("prompt_cache_hit_tokens", 0))
+    miss = int(call.get("prompt_cache_miss_tokens", 0))
+    prompt = int(call.get("prompt_tokens", 0))
+    output = int(call.get("completion_tokens", 0))
+    total = int(call.get("total_tokens", 0))
+    return hit + miss == prompt and prompt + output == total
+
+
+def _usage(calls: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "cache_miss_input_tokens": sum(
+            int(call.get("prompt_cache_miss_tokens", 0)) for call in calls
+        ),
+        "cache_hit_input_tokens": sum(
+            int(call.get("prompt_cache_hit_tokens", 0)) for call in calls
+        ),
+        "output_tokens": sum(int(call.get("completion_tokens", 0)) for call in calls),
+        "total_tokens": sum(int(call.get("total_tokens", 0)) for call in calls),
+        "reasoning_tokens": sum(int(call.get("reasoning_tokens", 0)) for call in calls),
+        "breakdown_inferred_calls": sum(
+            bool(call.get("breakdown_inferred", False)) for call in calls
+        ),
+    }
+
+
+def _matches_stats(
+    stats: dict[str, Any], prefix: str, usage: dict[str, int]
+) -> bool:
+    return all(
+        int(stats.get(f"{prefix}_{suffix}", -1)) == usage[key]
+        for suffix, key in (
+            ("cache_miss_input_tokens", "cache_miss_input_tokens"),
+            ("cache_hit_input_tokens", "cache_hit_input_tokens"),
+            ("output_tokens", "output_tokens"),
+            ("total_tokens", "total_tokens"),
+        )
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Write per-conversation build and per-question answer token reports."
@@ -76,6 +116,17 @@ def main() -> None:
             if str(call.get("stage", "")).startswith("build_")
             and not call.get("excluded_from_budget", False)
         ]
+        build_usage = _usage(build_calls)
+        build_accounting_valid = (
+            len(owners) == 1
+            and bool(build_calls)
+            and all(_call_usage_valid(call) for call in build_calls)
+            and _matches_stats(build, "build", build_usage)
+            and build_usage["cache_miss_input_tokens"]
+            + build_usage["cache_hit_input_tokens"]
+            + build_usage["output_tokens"]
+            == build_usage["total_tokens"]
+        )
         conversation_rows.append(
             {
                 "conversation_id": conversation_id,
@@ -89,17 +140,13 @@ def main() -> None:
                 "build_cache_hit_input_tokens": int(build.get("build_cache_hit_input_tokens", 0)),
                 "build_output_tokens": int(build.get("build_output_tokens", 0)),
                 "build_total_tokens": int(build.get("build_total_tokens", 0)),
-                "build_reasoning_tokens": sum(int(call.get("reasoning_tokens", 0)) for call in build_calls),
-                "build_budget_pass": bool(build.get("build_budget_pass", False)),
-                "token_accounting_valid": all(
-                    int(call.get("prompt_cache_hit_tokens", 0))
-                    + int(call.get("prompt_cache_miss_tokens", 0))
-                    == int(call.get("prompt_tokens", 0))
-                    and int(call.get("prompt_tokens", 0))
-                    + int(call.get("completion_tokens", 0))
-                    == int(call.get("total_tokens", 0))
-                    for call in build_calls
-                ),
+                "build_reasoning_tokens": build_usage["reasoning_tokens"],
+                "build_breakdown_inferred_calls": build_usage[
+                    "breakdown_inferred_calls"
+                ],
+                "build_budget_pass": bool(build.get("build_budget_pass", False))
+                and build_usage["total_tokens"] <= 300_000,
+                "token_accounting_valid": build_accounting_valid,
             }
         )
     conversation_rows.sort(key=lambda row: row["sample_index"])
@@ -116,6 +163,16 @@ def main() -> None:
             if str(call.get("stage", "")).startswith("answer_")
             and not call.get("excluded_from_budget", False)
         ]
+        answer_usage = _usage(answer_calls)
+        answer_accounting_valid = (
+            len(answer_calls) == 1
+            and all(_call_usage_valid(call) for call in answer_calls)
+            and _matches_stats(stats, "answer", answer_usage)
+            and answer_usage["cache_miss_input_tokens"]
+            + answer_usage["cache_hit_input_tokens"]
+            + answer_usage["output_tokens"]
+            == answer_usage["total_tokens"]
+        )
         question_rows.append(
             {
                 "question_id": question_id,
@@ -127,11 +184,13 @@ def main() -> None:
                 "answer_cache_hit_input_tokens": int(stats.get("answer_cache_hit_input_tokens", 0)),
                 "answer_output_tokens": int(stats.get("answer_output_tokens", 0)),
                 "answer_total_tokens": int(stats.get("answer_total_tokens", 0)),
-                "answer_reasoning_tokens": sum(
-                    int(call.get("reasoning_tokens", 0)) for call in answer_calls
-                ),
-                "answer_budget_pass": bool(stats.get("answer_budget_pass", False)),
-                "token_accounting_valid": bool(stats.get("token_accounting_valid", False)),
+                "answer_reasoning_tokens": answer_usage["reasoning_tokens"],
+                "answer_breakdown_inferred_calls": answer_usage[
+                    "breakdown_inferred_calls"
+                ],
+                "answer_budget_pass": bool(stats.get("answer_budget_pass", False))
+                and answer_usage["total_tokens"] <= 10_000,
+                "token_accounting_valid": answer_accounting_valid,
                 "retrieved_answer_session_hit": bool(
                     stats.get("retrieved_answer_session_hit", False)
                 ),
@@ -159,6 +218,28 @@ def main() -> None:
         ),
         "build_tokens": _percentiles(build_values),
         "answer_tokens": _percentiles(answer_values),
+        "build_token_components": {
+            "cache_miss_input_tokens": sum(
+                int(row["build_cache_miss_input_tokens"]) for row in conversation_rows
+            ),
+            "cache_hit_input_tokens": sum(
+                int(row["build_cache_hit_input_tokens"]) for row in conversation_rows
+            ),
+            "output_tokens": sum(
+                int(row["build_output_tokens"]) for row in conversation_rows
+            ),
+        },
+        "answer_token_components": {
+            "cache_miss_input_tokens": sum(
+                int(row["answer_cache_miss_input_tokens"]) for row in question_rows
+            ),
+            "cache_hit_input_tokens": sum(
+                int(row["answer_cache_hit_input_tokens"]) for row in question_rows
+            ),
+            "output_tokens": sum(
+                int(row["answer_output_tokens"]) for row in question_rows
+            ),
+        },
         "build_budget_limit": 300000,
         "answer_budget_limit": 10000,
         "build_budget_pass": all(row["build_budget_pass"] for row in conversation_rows),
@@ -172,6 +253,12 @@ def main() -> None:
         ],
         "build_reasoning_tokens": sum(row["build_reasoning_tokens"] for row in conversation_rows),
         "answer_reasoning_tokens": sum(row["answer_reasoning_tokens"] for row in question_rows),
+        "build_breakdown_inferred_calls": sum(
+            row["build_breakdown_inferred_calls"] for row in conversation_rows
+        ),
+        "answer_breakdown_inferred_calls": sum(
+            row["answer_breakdown_inferred_calls"] for row in question_rows
+        ),
         "token_accounting_valid": all(row["token_accounting_valid"] for row in conversation_rows)
         and all(row["token_accounting_valid"] for row in question_rows),
         "judge_excluded_from_budget": True,
@@ -184,7 +271,7 @@ def main() -> None:
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     markdown = [
-        "# LoCoMo GraphMem V2 token report",
+        "# LoCoMo GraphMem V3 token report",
         "",
         f"- Conversations: {len(conversation_rows)}/{len(groups)}",
         f"- Questions: {len(question_rows)}/{len(cases)}",

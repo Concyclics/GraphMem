@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .clients import (
-    DeepSeekClient,
+    OpenAICompatibleClient,
     EmbeddingClient,
     LLMLinguaCompressor,
     LocalSummarizer,
@@ -79,6 +79,39 @@ from .hierarchical_v2 import (
     session_extraction_messages as v2_session_extraction_messages,
     validate_provenance as validate_v2_provenance,
 )
+from .v3 import (
+    GRAPHMEM_V3_SCHEMA,
+    V3_BUILD_VERSION,
+    V3_PROMPT_VERSION,
+    V3_RETRIEVAL_VERSION,
+    V3Index,
+    answer_messages as v3_answer_messages,
+    authoritative_catalog_answer as v3_authoritative_catalog_answer,
+    build_hypergraph as build_v3_hypergraph,
+    build_query_frame as build_v3_query_frame,
+    build_turn_nodes as build_v3_turn_nodes,
+    parse_session_extraction as parse_v3_session_extraction,
+    retrieve as retrieve_v3,
+    session_extraction_messages as v3_session_extraction_messages,
+)
+from .v3.build import clone_index as clone_v3_index
+from .v3.build import prompt_hash as v3_prompt_hash
+from .v3.runtime import build_index as build_v3_index
+from .v3.query_planning import query_views as v3_query_views
+from .v3.schema import index_from_dict as v3_index_from_dict
+from .v36 import (
+    GRAPHMEM_V36_SCHEMA, V36_BUILD_VERSION, V36_PROMPT_VERSION,
+    V36Index, answer_messages as v36_answer_messages,
+    build_query_ir as build_v36_query_ir, clone_index as clone_v36_index,
+    prompt_hash as v36_prompt_hash, query_views as v36_query_views,
+    retrieve as retrieve_v36,
+)
+from .v36.persistence import (
+    persist_retrieval_index as persist_v36_retrieval_index,
+    persist_vector_matrix as persist_v36_vector_matrix,
+)
+from .v36.runtime import build_index as build_v36_index
+from .v36.schema import index_from_dict as v36_index_from_dict
 from .stats import (
     aggregate_variant_stats,
     build_question_stats,
@@ -106,6 +139,16 @@ class VariantSpec:
 
 
 VARIANT_SPECS = {
+    "hierarchical_role_graph_v3_6": VariantSpec(
+        "hierarchical_role_graph_v3_6", False, True,
+        summary_schema="graphmem_v3_6", hybrid_retrieval=True,
+        enhanced_retrieval=True, enhanced_qa=True,
+    ),
+    "hierarchical_hypergraph_v3": VariantSpec(
+        "hierarchical_hypergraph_v3", False, True,
+        summary_schema="graphmem_v3", hybrid_retrieval=True,
+        enhanced_retrieval=True, enhanced_qa=True,
+    ),
     "hierarchical_state_graph_v2": VariantSpec(
         "hierarchical_state_graph_v2", False, True,
         summary_schema="graphmem_v2", hybrid_retrieval=True,
@@ -226,8 +269,10 @@ class DemoConfig:
     )
     deepseek_model: str | None = None
     deepseek_base_url: str | None = None
-    embedding_base_url: str = "http://127.0.0.1:8002/v1"
-    embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
+    llm_api_key_env: str = "SGAO_API_KEY"
+    llm_request_profile: str = "openai"
+    embedding_base_url: str = "http://127.0.0.1:8001/v1"
+    embedding_model: str = "Qwen3-Embedding-0.6B"
     tree_mode: str | None = None
     fanout_k: int = 16
     max_group_rough_tokens: int = 6000
@@ -388,6 +433,14 @@ class DemoConfig:
     v2_context_token_budget: int = 7600
     v2_semantic_k: int = 3
     v2_semantic_floor: float = 0.55
+    v3_session_extraction_max_tokens: int = 3072
+    v3_context_token_budget: int = 3600
+    v36_session_extraction_max_tokens: int = 4096
+    v36_context_token_budget: int = 8000
+    v36_answer_hard_budget_tokens: int = 10500
+    # Persist the V3 index and retrieval ledger without spending tokens on the
+    # built-in base answer. The graph navigator can then be the sole reader.
+    retrieval_only: bool = False
 
     def __post_init__(self) -> None:
         unknown = set(self.variants) - VARIANTS
@@ -401,14 +454,16 @@ class DemoConfig:
             raise ValueError("question_workers must be at least 1")
         if self.summary_workers < 0 or self.max_inflight_deepseek < 0:
             raise ValueError("summary_workers and max_inflight_deepseek cannot be negative")
-        if self.tree_mode is not None and self.tree_mode not in {"legacy_kway", "direct_session", "hierarchical_state_graph_v2"}:
-            raise ValueError("tree_mode must be legacy_kway, direct_session, or hierarchical_state_graph_v2")
+        if self.tree_mode is not None and self.tree_mode not in {"legacy_kway", "direct_session", "hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6"}:
+            raise ValueError("tree_mode must be legacy_kway, direct_session, hierarchical_state_graph_v2, or hierarchical_hypergraph_v3, or hierarchical_role_graph_v3_6")
         if self.summary_schema not in {
             None,
             "minimal_memory_v1",
             "compact_memory_v2",
             "multilingual_memory_v1",
             "graphmem_v2",
+            "graphmem_v3",
+            "graphmem_v3_6",
         }:
             raise ValueError(
                 "summary_schema must be minimal_memory_v1, compact_memory_v2, or multilingual_memory_v1"
@@ -525,8 +580,19 @@ class DemoConfig:
         if self.coverage_rerank_pool_k < 2:
             raise ValueError("coverage_rerank_pool_k must be at least 2")
 
+        if self.v36_session_extraction_max_tokens < 256:
+            raise ValueError("v36_session_extraction_max_tokens must be at least 256")
+        if self.v36_context_token_budget < 1000:
+            raise ValueError("v36_context_token_budget must be at least 1000")
+        if self.v36_answer_hard_budget_tokens < self.answer_budget_tokens:
+            raise ValueError("V3.6 hard answer budget cannot be below target budget")
+
         if self.reasoning_effort != "none":
-            raise ValueError("reasoning_effort must be none; it maps to thinking.type=disabled and is omitted from the API request")
+            raise ValueError("reasoning_effort must be none")
+        if self.llm_request_profile not in {"deepseek", "openai", "omit"}:
+            raise ValueError("llm_request_profile must be deepseek, openai, or omit")
+        if not self.llm_api_key_env:
+            raise ValueError("llm_api_key_env cannot be empty")
         if self.build_budget_tokens < 1 or self.answer_budget_tokens < 1:
             raise ValueError("token budgets must be positive")
         if not 0.0 <= self.v2_semantic_floor <= 1.0 or self.v2_semantic_k < 1:
@@ -535,6 +601,10 @@ class DemoConfig:
             raise ValueError("V2 retrieval limits must be positive")
         if self.v2_context_token_budget < 1000:
             raise ValueError("v2_context_token_budget must be at least 1000")
+        if self.v3_session_extraction_max_tokens < 256:
+            raise ValueError("v3_session_extraction_max_tokens must be at least 256")
+        if self.v3_context_token_budget < 1000:
+            raise ValueError("v3_context_token_budget must be at least 1000")
 
     def use_mock_llm(self) -> bool:
         return self.mock_services or self.mock_llm
@@ -565,6 +635,8 @@ class CaseRun:
     routing_cards: list[RoutingCardNode] = field(default_factory=list)
     state_chains: list[StateChain] = field(default_factory=list)
     index_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    v3_index: V3Index | None = None
+    v36_index: V36Index | None = None
 
 
 @dataclass
@@ -579,6 +651,8 @@ class MemoryBuild:
     facts: list[AtomicFactNode] = field(default_factory=list)
     routing_cards: list[RoutingCardNode] = field(default_factory=list)
     state_chains: list[StateChain] = field(default_factory=list)
+    v3_index: V3Index | None = None
+    v36_index: V36Index | None = None
 
 
 @dataclass
@@ -679,7 +753,9 @@ def run_demo(
                 variant,
                 variant_dir,
                 limiter,
-                allow_memory_cache_read=config.resume,
+                allow_memory_cache_read=(
+                    config.resume or config.memory_cache_dir is not None
+                ),
                 llm=llm,
                 embedder=embedder,
                 compressor=compressor,
@@ -758,6 +834,13 @@ def run_demo(
         query_payload["local_summarizer_by_stage"] = local_summary_totals
         _write_json(variant_dir / "build_stats.json", build_payload)
         _write_json(variant_dir / "query_stats.json", query_payload)
+        if variant == "hierarchical_role_graph_v3_6":
+            _write_json(
+                variant_dir / "index_diagnostics.json",
+                _v36_index_diagnostics_payload(
+                    _read_jsonl(variant_dir / "index_diagnostics.jsonl")
+                ),
+            )
         if variant in {
             "direct_session_k16_compact_graphmem",
             "qwen35_2b_summary_graphmem",
@@ -789,9 +872,11 @@ def _complete_services(
     summarizer_model = config.summarizer_model or spec.default_summarizer_model or "Qwen/Qwen3.5-2B"
     return (
         llm
-        or (MockDeepSeekClient() if config.use_mock_llm() else DeepSeekClient(
+        or (MockDeepSeekClient() if config.use_mock_llm() else OpenAICompatibleClient(
             model=config.deepseek_model,
             base_url=config.deepseek_base_url,
+            api_key_env=config.llm_api_key_env,
+            request_profile=config.llm_request_profile,
         )),
         embedder
         or (
@@ -842,6 +927,18 @@ def _records_since(service: Any, start: int) -> list[Any]:
     return list(records[start:])
 
 
+def _close_owned_services(*services: tuple[Any, bool]) -> None:
+    """Close HTTP pools created by this worker, never caller-injected services."""
+    closed: set[int] = set()
+    for service, owned in services:
+        if not owned or service is None or id(service) in closed:
+            continue
+        close = getattr(getattr(service, "client", None), "close", None)
+        if callable(close):
+            close()
+            closed.add(id(service))
+
+
 def _memory_cache_path(
     config: DemoConfig,
     variant_dir: Path,
@@ -872,6 +969,40 @@ def _memory_cache_fingerprint(config: DemoConfig, case: QuestionCase, variant: s
     data_hash = hashlib.sha256(
         json.dumps(data_payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
     ).hexdigest()
+    if variant == "hierarchical_role_graph_v3_6":
+        payload = {
+            "version": 4, "variant": variant,
+            "schema_version": GRAPHMEM_V36_SCHEMA,
+            "v36_prompt_hash": v36_prompt_hash(),
+            "v36_prompt_version": V36_PROMPT_VERSION,
+            "v36_build_version": V36_BUILD_VERSION,
+            "v36_session_extraction_max_tokens": config.v36_session_extraction_max_tokens,
+            "deepseek_model": config.deepseek_model,
+            "embedding_model": config.embedding_model,
+            "data_hash": data_hash,
+            "llm_base_url": config.deepseek_base_url.rstrip("/") if config.deepseek_base_url else None,
+            "llm_request_profile": config.llm_request_profile,
+            "llm_api_key_env": config.llm_api_key_env,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+    if variant == "hierarchical_hypergraph_v3":
+        payload = {
+            "version": 3, "variant": variant, "schema_version": GRAPHMEM_V3_SCHEMA,
+            "v3_prompt_hash": v3_prompt_hash(), "v3_prompt_version": V3_PROMPT_VERSION,
+            "v3_build_version": V3_BUILD_VERSION,
+            "v3_session_extraction_max_tokens": config.v3_session_extraction_max_tokens,
+            "deepseek_model": config.deepseek_model, "embedding_model": config.embedding_model,
+            "data_hash": data_hash,
+        }
+        payload.update({
+            "llm_base_url": (
+                config.deepseek_base_url.rstrip("/")
+                if config.deepseek_base_url else None
+            ),
+            "llm_request_profile": config.llm_request_profile,
+            "llm_api_key_env": config.llm_api_key_env,
+        })
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
     if variant == "hierarchical_state_graph_v2":
         payload = {
             "version": 3, "variant": variant, "schema_version": GRAPHMEM_V2_SCHEMA,
@@ -982,8 +1113,8 @@ def _write_memory_cache(
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": 2 if variant == "hierarchical_state_graph_v2" else 1,
-        "schema_version": GRAPHMEM_V2_SCHEMA if variant == "hierarchical_state_graph_v2" else "graphmem_v1",
+        "version": 4 if variant == "hierarchical_role_graph_v3_6" else (3 if variant == "hierarchical_hypergraph_v3" else (2 if variant == "hierarchical_state_graph_v2" else 1)),
+        "schema_version": GRAPHMEM_V36_SCHEMA if variant == "hierarchical_role_graph_v3_6" else (GRAPHMEM_V3_SCHEMA if variant == "hierarchical_hypergraph_v3" else (GRAPHMEM_V2_SCHEMA if variant == "hierarchical_state_graph_v2" else "graphmem_v1")),
         "memory_cache_key": case.memory_cache_key,
         "fingerprint": _memory_cache_fingerprint(config, case, variant),
         "source_question_id": case.question_id,
@@ -992,6 +1123,8 @@ def _write_memory_cache(
         "facts": [asdict(fact) for fact in memory.facts],
         "routing_cards": [asdict(card) for card in memory.routing_cards],
         "state_chains": [asdict(chain) for chain in memory.state_chains],
+        "v3_index": asdict(memory.v3_index) if memory.v3_index is not None else None,
+        "v36_index": asdict(memory.v36_index) if memory.v36_index is not None else None,
         "root_ids": [root.node_id for root in memory.roots],
         "edges": [asdict(edge) for edge in memory.edges],
         "llm_records": [asdict(record) for record in memory.llm_records],
@@ -1012,13 +1145,17 @@ def _write_memory_cache(
 def _load_memory_cache(path: Path) -> MemoryBuild | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("version") not in {1, 2}:
+        if payload.get("version") not in {1, 2, 3, 4}:
             return None
         leaves = [LeafNode(**row) for row in payload.get("leaves", [])]
         summaries = [SummaryNode(**row) for row in payload.get("summaries", [])]
         facts = [AtomicFactNode(**row) for row in payload.get("facts", [])]
         routing_cards = [RoutingCardNode(**row) for row in payload.get("routing_cards", [])]
         state_chains = [StateChain(**row) for row in payload.get("state_chains", [])]
+        v3_payload = payload.get("v3_index")
+        v3_index = v3_index_from_dict(v3_payload) if isinstance(v3_payload, dict) else None
+        v36_payload = payload.get("v36_index")
+        v36_index = v36_index_from_dict(v36_payload) if isinstance(v36_payload, dict) else None
         summary_by_id = {summary.node_id: summary for summary in summaries}
         roots = [
             summary_by_id[root_id]
@@ -1055,6 +1192,8 @@ def _load_memory_cache(path: Path) -> MemoryBuild | None:
             facts=facts,
             routing_cards=routing_cards,
             state_chains=state_chains,
+            v3_index=v3_index,
+            v36_index=v36_index,
         )
     except Exception:
         return None
@@ -1073,27 +1212,35 @@ def _run_case_with_services(
     case_llm, case_embedder, case_compressor, case_summarizer = _complete_services(
         config, variant, llm, embedder, compressor, summarizer
     )
-    embedding_start = _record_start(case_embedder)
-    compression_start = _record_start(case_compressor)
-    summarizer_start = _record_start(case_summarizer)
-    run = run_case(
-        config,
-        case,
-        variant,
-        case_llm,
-        case_embedder,
-        case_compressor,
-        limiter,
-        summarizer=case_summarizer,
-    )
-    return (
-        run,
-        _records_since(case_embedder, embedding_start),
-        [
-            *_records_since(case_compressor, compression_start),
-            *_records_since(case_summarizer, summarizer_start),
-        ],
-    )
+    try:
+        embedding_start = _record_start(case_embedder)
+        compression_start = _record_start(case_compressor)
+        summarizer_start = _record_start(case_summarizer)
+        run = run_case(
+            config,
+            case,
+            variant,
+            case_llm,
+            case_embedder,
+            case_compressor,
+            limiter,
+            summarizer=case_summarizer,
+        )
+        return (
+            run,
+            _records_since(case_embedder, embedding_start),
+            [
+                *_records_since(case_compressor, compression_start),
+                *_records_since(case_summarizer, summarizer_start),
+            ],
+        )
+    finally:
+        _close_owned_services(
+            (case_llm, llm is None),
+            (case_embedder, embedder is None),
+            (case_compressor, compressor is None),
+            (case_summarizer, summarizer is None),
+        )
 
 
 def _has_memory_cache_keys(cases: list[QuestionCase]) -> bool:
@@ -1138,9 +1285,7 @@ def _run_cases_with_memory_cache(
             question_workers=max(1, config.question_workers // worker_count),
         )
 
-        output_queue: queue.Queue[tuple[str, Any]] = queue.Queue(
-            maxsize=max(64, worker_count * 4)
-        )
+        output_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
 
         def run_group(group_cases: list[QuestionCase]) -> None:
             try:
@@ -1162,16 +1307,29 @@ def _run_cases_with_memory_cache(
                 for group_cases in grouped.values()
             }
             remaining = len(futures)
+            first_error: BaseException | None = None
             while remaining:
                 kind, payload = output_queue.get()
                 if kind == "item":
                     yield payload
                 elif kind == "error":
-                    raise payload
+                    if first_error is None:
+                        first_error = payload
+                        # Pending groups have not acquired resources and can be
+                        # cancelled immediately. Running groups are allowed to
+                        # publish their final item/done rows before the error is
+                        # re-raised, so no producer can block on an abandoned
+                        # queue during executor shutdown.
+                        for future in futures:
+                            if future.cancel():
+                                remaining -= 1
                 else:
                     remaining -= 1
             for future in futures:
-                future.result()
+                if not future.cancelled():
+                    future.result()
+            if first_error is not None:
+                raise first_error
         return
 
     for group_cases in grouped.values():
@@ -1206,27 +1364,35 @@ def _run_cases_with_memory_cache(
             build_llm, build_embedder, build_compressor, build_summarizer = _complete_services(
                 config, variant, llm, embedder, compressor, summarizer
             )
-            build_embedding_start = _record_start(build_embedder)
-            build_compression_start = _record_start(build_compressor)
-            build_summarizer_start = _record_start(build_summarizer)
-            memory = build_memory(
-                config,
-                build_case,
-                variant,
-                build_llm,
-                build_embedder,
-                build_compressor,
-                limiter,
-                summarizer=build_summarizer,
-            )
-            build_embedding_records = _records_since(build_embedder, build_embedding_start)
-            build_compression_records = [
-                *_records_since(build_compressor, build_compression_start),
-                *_records_since(build_summarizer, build_summarizer_start),
-            ]
-            _write_memory_cache(memory_cache_path, memory, build_case, variant, config)
+            try:
+                build_embedding_start = _record_start(build_embedder)
+                build_compression_start = _record_start(build_compressor)
+                build_summarizer_start = _record_start(build_summarizer)
+                memory = build_memory(
+                    config,
+                    build_case,
+                    variant,
+                    build_llm,
+                    build_embedder,
+                    build_compressor,
+                    limiter,
+                    summarizer=build_summarizer,
+                )
+                build_embedding_records = _records_since(build_embedder, build_embedding_start)
+                build_compression_records = [
+                    *_records_since(build_compressor, build_compression_start),
+                    *_records_since(build_summarizer, build_summarizer_start),
+                ]
+                _write_memory_cache(memory_cache_path, memory, build_case, variant, config)
+            finally:
+                _close_owned_services(
+                    (build_llm, llm is None),
+                    (build_embedder, embedder is None),
+                    (build_compressor, compressor is None),
+                    (build_summarizer, summarizer is None),
+                )
         build_record_question_id: str | None = build_case.question_id
-        if loaded_from_cache and variant == "hierarchical_state_graph_v2":
+        if loaded_from_cache and variant in {"hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6"}:
             # A partial resume in the same output directory may already contain
             # the original build owner. Do not attach saved build records to the
             # first pending question a second time.
@@ -1253,7 +1419,7 @@ def _run_cases_with_memory_cache(
             for case in group_cases:
                 include_build_records = (
                     case.question_id == build_record_question_id
-                    and (not loaded_from_cache or variant == "hierarchical_state_graph_v2")
+                    and (not loaded_from_cache or variant in {"hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6"})
                 )
                 run, embedding_records, compression_records = _run_case_with_cached_memory(
                     config,
@@ -1281,7 +1447,7 @@ def _run_cases_with_memory_cache(
                     variant,
                     limiter,
                     memory,
-                    (case.question_id == build_record_question_id and (not loaded_from_cache or variant == "hierarchical_state_graph_v2")),
+                    (case.question_id == build_record_question_id and (not loaded_from_cache or variant in {"hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6"})),
                     (
                         group_build_started
                         if case.question_id == build_record_question_id
@@ -1315,19 +1481,27 @@ def _run_case_with_cached_memory(
     case_llm, case_embedder, _compressor, _summarizer = _complete_services(
         config, variant, llm, embedder
     )
-    embedding_start = _record_start(case_embedder)
-    run = run_case_with_memory(
-        config,
-        case,
-        variant,
-        memory,
-        case_llm,
-        case_embedder,
-        limiter,
-        include_build_records=include_build_records,
-        case_started=case_started,
-    )
-    return run, _records_since(case_embedder, embedding_start), []
+    try:
+        embedding_start = _record_start(case_embedder)
+        run = run_case_with_memory(
+            config,
+            case,
+            variant,
+            memory,
+            case_llm,
+            case_embedder,
+            limiter,
+            include_build_records=include_build_records,
+            case_started=case_started,
+        )
+        if variant == "hierarchical_role_graph_v3_6":
+            _attach_v36_offline_gold_metrics(case, run)
+        return run, _records_since(case_embedder, embedding_start), []
+    finally:
+        _close_owned_services(
+            (case_llm, llm is None),
+            (case_embedder, embedder is None),
+        )
 
 
 def _write_case_outputs(
@@ -1351,6 +1525,48 @@ def _write_case_outputs(
     # still write retrieval, answer, and token records below.
     persist_shared_index = not case.memory_cache_key or run.stats.build_total_tokens > 0
     if persist_shared_index:
+        if run.v36_index is not None:
+            _append_jsonl(
+                variant_dir / "nodes.jsonl",
+                [_node_row(item) for item in [
+                    *run.v36_index.turns, *run.v36_index.frames,
+                    *run.v36_index.routing_cards, *run.v36_index.evidence_groups,
+                ]],
+            )
+            _append_jsonl(
+                variant_dir / "edges.jsonl",
+                [asdict(item) for item in run.v36_index.edges],
+            )
+            _append_jsonl(
+                variant_dir / "state_chains.jsonl",
+                [asdict(item) for item in run.v36_index.state_chains],
+            )
+            _append_jsonl(
+                variant_dir / "coverage.jsonl",
+                [asdict(item) for item in run.v36_index.coverage],
+            )
+            persist_v36_retrieval_index(
+                variant_dir / "retrieval.sqlite", run.v36_index
+            )
+            persist_v36_vector_matrix(
+                variant_dir / "vectors", run.v36_index
+            )
+        if run.v3_index is not None:
+            _append_jsonl(
+                variant_dir / "nodes.jsonl",
+                [_node_row(item) for item in [
+                    *run.v3_index.turns, *run.v3_index.claims, *run.v3_index.events,
+                    *run.v3_index.event_entities,
+                    *run.v3_index.episodes, *run.v3_index.themes,
+                    *run.v3_index.event_frames, *run.v3_index.operands,
+                ]],
+            )
+            _append_jsonl(variant_dir / "episodes.jsonl", [{key: value for key, value in asdict(item).items() if key != "embedding"} for item in run.v3_index.episodes])
+            _append_jsonl(variant_dir / "themes.jsonl", [{key: value for key, value in asdict(item).items() if key != "embedding"} for item in run.v3_index.themes])
+            _append_jsonl(variant_dir / "event_frames.jsonl", [{key: value for key, value in asdict(item).items() if key != "embedding"} for item in run.v3_index.event_frames])
+            _append_jsonl(variant_dir / "operands.jsonl", [{key: value for key, value in asdict(item).items() if key not in {"embedding", "object_embedding"}} for item in run.v3_index.operands])
+            _append_jsonl(variant_dir / "hyperedges.jsonl", [{key: value for key, value in asdict(item).items() if key != "embedding"} for item in run.v3_index.hyperedges])
+            _append_jsonl(variant_dir / "state_chains.jsonl", [asdict(item) for item in run.v3_index.state_chains])
         _append_jsonl(
             variant_dir / "nodes.jsonl",
             [_node_row(item) for item in [*run.leaves, *run.summaries, *run.routing_cards, *run.facts]],
@@ -1389,7 +1605,7 @@ def _write_case_outputs(
 def _print_case_progress(stats: QuestionStats) -> None:
     print(
         f"{stats.variant}: question={stats.question_id} "
-        f"calls={stats.deepseek_call_count} deepseek_tokens={stats.total_deepseek_tokens}",
+        f"calls={stats.deepseek_call_count} llm_tokens={stats.total_deepseek_tokens}",
         flush=True,
     )
 
@@ -1416,7 +1632,7 @@ def run_case(
         limiter,
         summarizer=summarizer,
     )
-    return run_case_with_memory(
+    run = run_case_with_memory(
         config,
         case,
         variant,
@@ -1426,6 +1642,126 @@ def run_case(
         limiter,
         include_build_records=True,
         case_started=case_started,
+    )
+    if variant == "hierarchical_role_graph_v3_6":
+        _attach_v36_offline_gold_metrics(case, run)
+    return run
+
+
+def _build_v36_memory(
+    config: DemoConfig,
+    case: QuestionCase,
+    variant: str,
+    llm: Any,
+    embedder: Any,
+    limiter: InflightLimiter,
+    metrics: BuildMetrics,
+    build_started: float,
+) -> MemoryBuild:
+    def chat(*, stage: str, messages: list[dict[str, str]], max_tokens: int, json_mode: bool) -> Any:
+        return _tracked_chat(
+            llm, limiter, metrics, question_id=case.question_id, variant=variant,
+            stage=stage, thinking_mode="none", messages=messages,
+            max_tokens=max_tokens, json_mode=json_mode,
+        )
+
+    def embed(nodes: list[Any], attr: str, target_attr: str = "embedding") -> None:
+        if nodes:
+            _embed_nodes(
+                nodes, embedder, case.question_id, variant,
+                attr=attr, target_attr=target_attr,
+            )
+
+    checkpoint_root = (
+        config.memory_cache_dir
+        if config.memory_cache_dir is not None
+        else config.output_dir / variant / "memory_cache"
+    )
+    checkpoint_namespace = hashlib.sha256(json.dumps(
+        {
+            "schema": GRAPHMEM_V36_SCHEMA,
+            "prompt_version": V36_PROMPT_VERSION,
+            "model": config.deepseek_model,
+            "base_url": config.deepseek_base_url,
+            "session_max_tokens": config.v36_session_extraction_max_tokens,
+            "build_budget_tokens": config.build_budget_tokens,
+        },
+        sort_keys=True, ensure_ascii=True,
+    ).encode("utf-8")).hexdigest()[:16]
+    checkpoint_key = (
+        f"{_safe_cache_part(case.memory_cache_key or case.question_id)}-"
+        f"{checkpoint_namespace}"
+    )
+    checkpoint_dir = checkpoint_root / ".v36_call_checkpoints" / checkpoint_key
+    result = build_v36_index(
+        case=case, variant=variant, chat=chat, embed=embed,
+        max_tokens=config.v36_session_extraction_max_tokens,
+        workers=min(32, config.summary_workers or 32),
+        build_budget_tokens=config.build_budget_tokens,
+        checkpoint_dir=checkpoint_dir,
+    )
+    metrics.summary_parse_error_count += result.parse_error_count
+    metrics.index_diagnostics.extend(result.diagnostics)
+    build_total = sum(
+        record.total_tokens for record in result.records
+        if not record.excluded_from_budget
+    )
+    if build_total > config.build_budget_tokens:
+        raise RuntimeError(
+            f"build token budget exceeded for {case.question_id}: "
+            f"{build_total}>{config.build_budget_tokens}"
+        )
+    return MemoryBuild(
+        leaves=[], summaries=[], roots=[], edges=[], llm_records=result.records,
+        metrics=metrics, build_latency_sec=time.perf_counter() - build_started,
+        v36_index=result.index,
+    )
+
+
+def _build_v3_memory(
+    config: DemoConfig,
+    case: QuestionCase,
+    variant: str,
+    llm: Any,
+    embedder: Any,
+    limiter: InflightLimiter,
+    metrics: BuildMetrics,
+    build_started: float,
+) -> MemoryBuild:
+    def chat(*, stage: str, messages: list[dict[str, str]], max_tokens: int, json_mode: bool) -> Any:
+        return _tracked_chat(
+            llm, limiter, metrics, question_id=case.question_id, variant=variant,
+            stage=stage, thinking_mode="none", messages=messages,
+            max_tokens=max_tokens, json_mode=json_mode,
+        )
+
+    def embed(nodes: list[Any], attr: str, target_attr: str = "embedding") -> None:
+        _embed_nodes(
+            nodes, embedder, case.question_id, variant,
+            attr=attr, target_attr=target_attr,
+        )
+
+    result = build_v3_index(
+        case=case, variant=variant, chat=chat, embed=embed,
+        max_tokens=config.v3_session_extraction_max_tokens,
+        workers=min(32, config.summary_workers or 32),
+        build_budget_tokens=config.build_budget_tokens,
+    )
+    metrics.summary_parse_error_count += result.parse_error_count
+    metrics.index_diagnostics.extend(result.diagnostics)
+    build_total = sum(
+        record.total_tokens for record in result.records
+        if not record.excluded_from_budget
+    )
+    if build_total > config.build_budget_tokens:
+        raise RuntimeError(
+            f"build token budget exceeded for {case.question_id}: "
+            f"{build_total}>{config.build_budget_tokens}"
+        )
+    return MemoryBuild(
+        leaves=[], summaries=[], roots=[], edges=[], llm_records=result.records,
+        metrics=metrics, build_latency_sec=time.perf_counter() - build_started,
+        v3_index=result.index,
     )
 
 
@@ -1556,6 +1892,14 @@ def build_memory(
     llm_records: list[DeepSeekCallRecord] = []
     build_started = time.perf_counter()
     leaves = build_leaf_nodes(case)
+    if variant == "hierarchical_role_graph_v3_6":
+        return _build_v36_memory(
+            config, case, variant, llm, embedder, limiter, metrics, build_started
+        )
+    if variant == "hierarchical_hypergraph_v3":
+        return _build_v3_memory(
+            config, case, variant, llm, embedder, limiter, metrics, build_started
+        )
     if variant == "hierarchical_state_graph_v2":
         return _build_v2_memory(
             config, case, variant, leaves, llm, embedder, limiter, metrics, build_started
@@ -1685,6 +2029,219 @@ def _clone_v2_nodes(memory: MemoryBuild, question_id: str):
     return leaves, cards, facts, chains, edges
 
 
+_V3_OBJECT_EMBED_LOCK = threading.Lock()
+
+
+def _attach_v36_offline_gold_metrics(case: QuestionCase, run: CaseRun) -> None:
+    """Attach benchmark-only recall diagnostics after the online answer is immutable."""
+    gold = set(case.answer_session_ids)
+    retrieved = {
+        re.sub(r"__occ\d+$", "", session_id)
+        for session_id in run.retrieval.retrieved_session_ids
+    }
+    hits = len(retrieved & gold)
+    recall = hits / len(gold) if gold else 0.0
+    run.retrieval.answer_session_hit = bool(hits)
+    run.retrieval.answer_session_all_hit = bool(gold) and hits == len(gold)
+    run.retrieval.answer_session_recall = recall
+    run.retrieval.retrieved_answer_session_count = hits
+    run.retrieval.gold_answer_session_count = len(gold)
+    run.stats.retrieved_answer_session_hit = bool(hits)
+    run.stats.retrieved_answer_session_all_hit = bool(gold) and hits == len(gold)
+    run.stats.retrieved_answer_session_recall = recall
+    run.stats.retrieved_answer_session_count = hits
+    run.stats.gold_answer_session_count = len(gold)
+
+
+def _run_v36_case_with_memory(
+    config: DemoConfig, case: QuestionCase, variant: str, memory: MemoryBuild,
+    llm: Any, embedder: Any, limiter: InflightLimiter, *, include_build_records: bool,
+    case_started: float,
+) -> CaseRun:
+    if memory.v36_index is None:
+        raise ValueError("V3.6 memory cache is missing v36_index")
+    answer_metrics = BuildMetrics()
+    llm_records = (
+        [replace(record, question_id=case.question_id) for record in memory.llm_records]
+        if include_build_records else []
+    )
+    index = clone_v36_index(memory.v36_index, case.question_id)
+    query_ir = build_v36_query_ir(case.question)
+    query_vectors = embedder.embed(
+        v36_query_views(query_ir), question_id=case.question_id, variant=variant
+    )
+    retrieval = retrieve_v36(
+        case=case, variant=variant, index=index, query_vectors=query_vectors,
+        token_budget=config.v36_context_token_budget,
+    )
+    answer_started = time.perf_counter()
+    answer_text = ""
+    if config.retrieval_only:
+        retrieval.retrieval_trace["answer_mode"] = "retrieval_only"
+    else:
+        # Operators are evidence-producing tools only. The single backbone
+        # answer call validates semantic scope, provenance and lifecycle for
+        # every V3.6 question; no deterministic hint bypasses this boundary.
+        answer_text = None
+    if not config.retrieval_only and answer_text is None:
+        result = _tracked_chat(
+            llm, limiter, answer_metrics, question_id=case.question_id, variant=variant,
+            stage="answer_qa", thinking_mode="none",
+            messages=v36_answer_messages(case, retrieval),
+            max_tokens=min(512, config.qa_max_tokens),
+        )
+        llm_records.append(result.record)
+        answer_text = result.text.strip()
+        retrieval.retrieval_trace["answer_mode"] = "llm_from_role_complete_evidence"
+    answer_latency = time.perf_counter() - answer_started
+    # Gold annotations are intentionally unavailable to the online V3.6 path.
+    # Offline reporting attaches session-recall metrics after the answer is fixed.
+    hit_count = 0
+    build_metrics = memory.metrics if include_build_records else BuildMetrics()
+    stats = build_question_stats(
+        question_id=case.question_id, variant=variant,
+        session_count=len(case.haystack_session_ids), leaf_count=len(index.turns),
+        summary_count=(len(index.frames) + len(index.routing_cards) + len(index.evidence_groups)),
+        edge_count=len(index.edges), records=llm_records,
+        build_latency_sec=memory.build_latency_sec if include_build_records else 0.0,
+        retrieval_latency_sec=retrieval.latency_sec, answer_latency_sec=answer_latency,
+        answer_session_hit=retrieval.answer_session_hit,
+        answer_session_all_hit=retrieval.answer_session_all_hit,
+        answer_session_recall=retrieval.answer_session_recall,
+        retrieved_answer_session_count=0, gold_answer_session_count=0,
+        wall_time_sec=time.perf_counter() - case_started,
+        summary_parse_error_count=build_metrics.summary_parse_error_count,
+        summary_truncation_count=build_metrics.summary_truncation_count,
+        ready_job_counts=build_metrics.ready_job_counts,
+        peak_inflight_deepseek=max(
+            build_metrics.peak_inflight_deepseek, answer_metrics.peak_inflight_deepseek
+        ),
+        build_budget_tokens=config.build_budget_tokens,
+        answer_budget_tokens=config.v36_answer_hard_budget_tokens,
+    )
+    retrieval.retrieval_trace["answer_target_budget_pass"] = (
+        stats.answer_total_tokens <= config.answer_budget_tokens
+    )
+    retrieval.retrieval_trace["answer_target_budget_tokens"] = config.answer_budget_tokens
+    retrieval.retrieval_trace["answer_hard_budget_tokens"] = config.v36_answer_hard_budget_tokens
+    if not stats.build_budget_pass or not stats.answer_budget_pass:
+        raise RuntimeError(
+            f"V3.6 token budget exceeded for {case.question_id}: "
+            f"build={stats.build_total_tokens}, answer={stats.answer_total_tokens}"
+        )
+    if not stats.token_accounting_valid:
+        raise RuntimeError(f"invalid LLM token accounting for {case.question_id}")
+    return CaseRun(
+        leaves=[], summaries=[], edges=[], retrieval=retrieval, answer=answer_text,
+        llm_records=llm_records, stats=stats,
+        index_diagnostics=list(memory.metrics.index_diagnostics), v36_index=index,
+    )
+
+
+def _run_v3_case_with_memory(
+    config: DemoConfig, case: QuestionCase, variant: str, memory: MemoryBuild,
+    llm: Any, embedder: Any, limiter: InflightLimiter, *, include_build_records: bool,
+    case_started: float,
+) -> CaseRun:
+    if memory.v3_index is None:
+        raise ValueError("V3 memory cache is missing v3_index")
+    # Older V3 caches predate the object-only semantic channel. Backfill once
+    # on the shared immutable memory with local embeddings; no LLM tokens are used.
+    if any(item.object_embedding is None for item in memory.v3_index.operands):
+        with _V3_OBJECT_EMBED_LOCK:
+            missing = [
+                item for item in memory.v3_index.operands
+                if item.object_embedding is None
+            ]
+            if missing:
+                _embed_nodes(
+                    missing, embedder, case.question_id, variant,
+                    attr="object_text", target_attr="object_embedding",
+                )
+    answer_metrics = BuildMetrics()
+    llm_records = (
+        [replace(record, question_id=case.question_id) for record in memory.llm_records]
+        if include_build_records
+        else []
+    )
+    index = clone_v3_index(memory.v3_index, case.question_id)
+    query_texts = v3_query_views(build_v3_query_frame(case.question))
+    query_vectors = embedder.embed(
+        query_texts, question_id=case.question_id, variant=variant
+    )
+    query_vector = query_vectors[0]
+    retrieval = retrieve_v3(
+        case=case, variant=variant, index=index, query_vector=query_vector,
+        query_vectors=query_vectors,
+        token_budget=config.v3_context_token_budget,
+    )
+    answer_started = time.perf_counter()
+    answer_text = ""
+    if config.retrieval_only:
+        retrieval.retrieval_trace["answer_mode"] = "retrieval_only"
+    else:
+        answer_text = v3_authoritative_catalog_answer(retrieval.retrieval_trace)
+    if not config.retrieval_only and answer_text is None:
+        result = _tracked_chat(
+            llm, limiter, answer_metrics, question_id=case.question_id, variant=variant,
+            stage="answer_qa", thinking_mode="none",
+            messages=v3_answer_messages(
+                case, retrieval,
+                max_prompt_tokens=max(
+                    3000, int((config.answer_budget_tokens - min(512, config.qa_max_tokens) - 300) * 0.9)
+                ),
+            ),
+            max_tokens=min(512, config.qa_max_tokens),
+        )
+        llm_records.append(result.record)
+        answer_text = result.text.strip()
+        retrieval.retrieval_trace["answer_mode"] = "llm_from_evidence"
+    elif not config.retrieval_only:
+        retrieval.retrieval_trace["answer_mode"] = "authoritative_operator"
+    answer_latency = time.perf_counter() - answer_started
+    gold = set(case.answer_session_ids)
+    hit_count = len(set(retrieval.retrieved_session_ids) & gold)
+    retrieval.answer_session_hit = bool(hit_count)
+    retrieval.answer_session_all_hit = bool(gold) and hit_count == len(gold)
+    retrieval.answer_session_recall = hit_count / len(gold) if gold else 0.0
+    retrieval.retrieved_answer_session_count = hit_count
+    retrieval.gold_answer_session_count = len(gold)
+    build_metrics = memory.metrics if include_build_records else BuildMetrics()
+    stats = build_question_stats(
+        question_id=case.question_id, variant=variant,
+        session_count=len(case.haystack_session_ids), leaf_count=len(index.turns),
+        summary_count=len(index.claims) + len(index.events) + len(index.episodes) + len(index.themes),
+        edge_count=len(index.hyperedges), records=llm_records,
+        build_latency_sec=memory.build_latency_sec if include_build_records else 0.0,
+        retrieval_latency_sec=retrieval.latency_sec, answer_latency_sec=answer_latency,
+        answer_session_hit=retrieval.answer_session_hit,
+        answer_session_all_hit=retrieval.answer_session_all_hit,
+        answer_session_recall=retrieval.answer_session_recall,
+        retrieved_answer_session_count=hit_count, gold_answer_session_count=len(gold),
+        wall_time_sec=time.perf_counter() - case_started,
+        summary_parse_error_count=build_metrics.summary_parse_error_count,
+        summary_truncation_count=build_metrics.summary_truncation_count,
+        ready_job_counts=build_metrics.ready_job_counts,
+        peak_inflight_deepseek=max(
+            build_metrics.peak_inflight_deepseek, answer_metrics.peak_inflight_deepseek
+        ),
+        build_budget_tokens=config.build_budget_tokens,
+        answer_budget_tokens=config.answer_budget_tokens,
+    )
+    if not stats.build_budget_pass or not stats.answer_budget_pass:
+        raise RuntimeError(
+            f"V3 token budget exceeded for {case.question_id}: "
+            f"build={stats.build_total_tokens}, answer={stats.answer_total_tokens}"
+        )
+    if not stats.token_accounting_valid:
+        raise RuntimeError(f"invalid LLM token accounting for {case.question_id}")
+    return CaseRun(
+        leaves=[], summaries=[], edges=[], retrieval=retrieval, answer=answer_text,
+        llm_records=llm_records, stats=stats,
+        index_diagnostics=list(memory.metrics.index_diagnostics), v3_index=index,
+    )
+
+
 def _run_v2_case_with_memory(
     config: DemoConfig, case: QuestionCase, variant: str, memory: MemoryBuild,
     llm: Any, embedder: Any, limiter: InflightLimiter, *, include_build_records: bool,
@@ -1739,7 +2296,7 @@ def _run_v2_case_with_memory(
     if not stats.answer_budget_pass:
         raise RuntimeError(f"answer token budget exceeded for {case.question_id}: {stats.answer_total_tokens}>{config.answer_budget_tokens}")
     if not stats.token_accounting_valid:
-        raise RuntimeError(f"invalid DeepSeek token accounting for {case.question_id}")
+        raise RuntimeError(f"invalid LLM token accounting for {case.question_id}")
     return CaseRun(
         leaves=leaves, summaries=[], edges=edges, retrieval=retrieval, answer=answer_text,
         llm_records=llm_records, stats=stats, facts=facts, routing_cards=cards, state_chains=chains,
@@ -1762,6 +2319,16 @@ def run_case_with_memory(
     case_started = case_started if case_started is not None else time.perf_counter()
     spec = _variant_spec(config, variant)
     answer_metrics = BuildMetrics()
+    if variant == "hierarchical_role_graph_v3_6":
+        return _run_v36_case_with_memory(
+            config, case, variant, memory, llm, embedder, limiter,
+            include_build_records=include_build_records, case_started=case_started,
+        )
+    if variant == "hierarchical_hypergraph_v3":
+        return _run_v3_case_with_memory(
+            config, case, variant, memory, llm, embedder, limiter,
+            include_build_records=include_build_records, case_started=case_started,
+        )
     if variant == "hierarchical_state_graph_v2":
         return _run_v2_case_with_memory(
             config, case, variant, memory, llm, embedder, limiter,
@@ -3654,14 +4221,17 @@ def _edge_expansion_sort_key(edge: GraphEdge) -> tuple[float, float, str, str, s
     )
 
 
-def _embed_nodes(nodes: list[Any], embedder: Any, question_id: str, variant: str, attr: str) -> None:
+def _embed_nodes(
+    nodes: list[Any], embedder: Any, question_id: str, variant: str, attr: str,
+    target_attr: str = "embedding",
+) -> None:
     if not nodes:
         return
     vectors = embedder.embed(
         [getattr(node, attr) for node in nodes], question_id=question_id, variant=variant
     )
     for node, vector in zip(nodes, vectors):
-        node.embedding = vector
+        setattr(node, target_attr, vector)
 
 
 def _effective_typed_root_edges(config: DemoConfig) -> bool:
@@ -5893,9 +6463,21 @@ def _node_row(node: LeafNode | SummaryNode | RoutingCardNode | AtomicFactNode) -
         row["node_type"] = "routing_card"
     elif isinstance(node, AtomicFactNode):
         row["node_type"] = "atomic_fact"
+    elif getattr(node, "schema_version", "") == GRAPHMEM_V36_SCHEMA:
+        row["node_type"] = {
+            "TurnNodeV36": "turn", "RoleFrameNode": "role_frame",
+            "RoutingCard": "routing_card", "EvidenceGroup": "evidence_group",
+        }.get(type(node).__name__, type(node).__name__.casefold())
+    elif getattr(node, "schema_version", "") == GRAPHMEM_V3_SCHEMA:
+        row["node_type"] = {
+            "TurnNode": "turn", "ClaimNode": "claim", "EventNode": "event",
+            "EventEntityNode": "event_entity",
+            "EpisodeNode": "episode", "ThemeNode": "theme",
+        }.get(type(node).__name__, type(node).__name__.casefold())
     else:
         row["node_type"] = "summary"
     row.pop("embedding", None)
+    row.pop("object_embedding", None)
     return row
 
 
@@ -5905,7 +6487,11 @@ def _reset_jsonl_outputs(directory: Path) -> None:
         "embedding_calls.jsonl",
         "compression_stats.jsonl",
         "nodes.jsonl",
+        "episodes.jsonl",
+        "themes.jsonl",
+        "hyperedges.jsonl",
         "state_chains.jsonl",
+        "coverage.jsonl",
         "index_diagnostics.jsonl",
         "edges.jsonl",
         "question_stats.jsonl",
@@ -5986,6 +6572,52 @@ def _local_summary_stage_totals(rows: list[dict[str, Any]]) -> dict[str, dict[st
             bool(row.get("error_status"))
         )
     return totals
+
+
+def _v36_index_diagnostics_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        marker = json.dumps(row, sort_keys=True, ensure_ascii=True)
+        if marker not in seen:
+            seen.add(marker)
+            unique.append(row)
+    sessions = [row for row in unique if row.get("stage") == "v36_session_extraction"]
+    indexes = [row for row in unique if row.get("stage") == "v36_index"]
+    failures = [
+        row for row in sessions
+        if row.get("parse_error") in {
+            "invalid_json", "empty_frames", "coverage_gap",
+        }
+    ]
+    return {
+        "schema_version": GRAPHMEM_V36_SCHEMA,
+        "summary": {
+            "session_count": len(sessions),
+            "parse_validation_failure_count": len(failures),
+            "parse_validation_failure_rate": len(failures) / len(sessions) if sessions else 0.0,
+            "invalid_json_count": sum(
+                row.get("parse_error") == "invalid_json" for row in failures
+            ),
+            "empty_frames_count": sum(
+                row.get("parse_error") == "empty_frames" for row in failures
+            ),
+            "coverage_gap_count": sum(
+                row.get("parse_error") == "coverage_gap" for row in failures
+            ),
+            "local_lossless_frame_count": sum(
+                int(row.get("local_lossless_frame_count") or 0) for row in sessions
+            ),
+            "lossless_only_turn_count": sum(int(row.get("lossless_only_count") or 0) for row in sessions),
+            "provider_output_cap_violation_count": sum(not bool(row.get("provider_output_cap_honored", True)) for row in sessions),
+            "node_count": sum(int(row.get("turn_count") or 0) + int(row.get("frame_count") or 0) + int(row.get("routing_card_count") or 0) + int(row.get("evidence_group_count") or 0) for row in indexes),
+            "edge_count": sum(int(row.get("edge_count") or 0) for row in indexes),
+            "max_node_degree": max((int(row.get("max_node_degree") or 0) for row in indexes), default=0),
+            "participant_edge_count": sum(int(row.get("participant_edge_count") or 0) for row in indexes),
+            "temporal_scope_edge_count": sum(int(row.get("temporal_scope_edge_count") or 0) for row in indexes),
+        },
+        "rows": unique,
+    }
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:

@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=False)
 sys.path.insert(0, str(ROOT / "src"))
 
-from graphmem_demo.clients import DeepSeekClient  # noqa: E402
+from graphmem_demo.clients import OpenAICompatibleClient  # noqa: E402
 from graphmem_demo.mem0_longmemeval_prompts import get_judge_prompt  # noqa: E402
 
 PINNED_COMMIT = "bd063eea04de4f8a19927beea155afa094a01905"
@@ -28,8 +28,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--answers", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--metadata-jsonl", type=Path, help="Optional prior eval JSONL used only to restore question_type/date metadata.")
-    parser.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"))
-    parser.add_argument("--base-url", default=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
+    parser.add_argument("--model", default=os.environ.get("SGAO_MODEL", "gpt-5.4-mini"))
+    parser.add_argument("--base-url", default=os.environ.get("SGAO_BASE_URL", "https://sub2api.sgao.me/v1/"))
+    parser.add_argument("--api-key-env", default="SGAO_API_KEY")
+    parser.add_argument(
+        "--request-profile", choices=["deepseek", "openai", "omit"],
+        default="openai",
+    )
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--mode", choices=["answer","retrieval-sufficiency"], default="answer")
     parser.add_argument("--max-tokens", type=int, default=2048)
@@ -72,7 +77,10 @@ def main() -> None:
     if args.metadata_jsonl:
         metadata={str(row["question_id"]):row for row in read_jsonl(args.metadata_jsonl)}
         rows=[{**metadata.get(str(row["question_id"]),{}),**row} for row in rows]
-    client=DeepSeekClient(model=args.model, base_url=args.base_url)
+    client=OpenAICompatibleClient(
+        model=args.model, base_url=args.base_url,
+        api_key_env=args.api_key_env, request_profile=args.request_profile,
+    )
 
     def judge(row: dict):
         if args.mode=="answer":
@@ -118,7 +126,10 @@ def main() -> None:
     for bucket in by_type.values(): bucket["accuracy"]=bucket["correct"]/bucket["total"] if bucket["total"] else 0.0
     stats={
         "excluded_from_build_and_answer_budgets":True, "model":args.model,
-        "thinking":{"type":"disabled"}, "reasoning_effort_field_sent":False,
+        "thinking_request_profile": args.request_profile,
+        "thinking": {"type": "disabled"} if args.request_profile == "deepseek" else None,
+        "reasoning_effort": "none" if args.request_profile == "openai" else None,
+        "reasoning_effort_field_sent": args.request_profile == "openai",
         "judge_mode":args.mode, "prompt_commit":PINNED_COMMIT if args.mode=="answer" else None, "prompt_source_sha256":PROMPT_SOURCE_SHA256 if args.mode=="answer" else None,
         "question_count":len(evaluations), "correct":sum(int(row["correct"]) for row in evaluations),
         "accuracy":sum(int(row["correct"]) for row in evaluations)/len(evaluations) if evaluations else 0.0,

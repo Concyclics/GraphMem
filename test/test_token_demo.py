@@ -15,6 +15,7 @@ import graphmem_demo.clients as clients_module
 import graphmem_demo.pipeline as pipeline_module
 from graphmem_demo.clients import (
     DeepSeekClient,
+    EmbeddingClient,
     LLMResult,
     MockCompressor,
     MockDeepSeekClient,
@@ -73,6 +74,23 @@ from graphmem_demo.stats import aggregate_variant_stats, build_question_stats
 
 GRAPHMEM_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = GRAPHMEM_ROOT / "test" / "fixtures"
+
+
+def test_close_owned_services_closes_only_owned_http_pools_once() -> None:
+    class Pool:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    owned = SimpleNamespace(client=Pool())
+    injected = SimpleNamespace(client=Pool())
+    pipeline_module._close_owned_services(
+        (owned, True), (owned, True), (injected, False)
+    )
+    assert owned.client.closed == 1
+    assert injected.client.closed == 0
 
 
 def _load_generic_ops_module():
@@ -2330,3 +2348,19 @@ class _SlowTrackingLLM(MockDeepSeekClient):
                 self._active -= 1
                 self.calls.append((stage, start, end))
         return result
+
+
+def test_embedding_client_uses_environment_key_and_explicit_override(monkeypatch) -> None:
+    captured: list[str] = []
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            captured.append(str(kwargs["api_key"]))
+
+    monkeypatch.setattr(clients_module, "_openai_client_class", lambda: FakeOpenAI)
+    monkeypatch.setenv("EMBEDDING_API_KEY", "environment-key")
+    EmbeddingClient("http://127.0.0.1:8001/v1", "embedding-model")
+    EmbeddingClient(
+        "http://127.0.0.1:8001/v1", "embedding-model", api_key="explicit-key"
+    )
+    assert captured == ["environment-key", "explicit-key"]

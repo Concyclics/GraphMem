@@ -89,9 +89,9 @@ fi
   export HF_HOME="${RUN_HF_HOME}"
   export HF_HUB_OFFLINE="0"
   mkdir -p "${RUN_HF_HOME}"
-  export DEEPSEEK_API_KEY="dummy"
-  export DEEPSEEK_BASE_URL="http://127.0.0.1:${LLM_PORT}/v1"
-  export DEEPSEEK_MODEL="${LLM_MODEL}"
+  export SGAO_API_KEY="dummy"
+  export SGAO_BASE_URL="http://127.0.0.1:${LLM_PORT}/v1"
+  export SGAO_MODEL="${LLM_MODEL}"
   export EMBEDDING_TRUNCATE_TOKENS="${EMBED_TRUNCATE_TOKENS}"
   export EMBEDDING_BATCH_SIZE="${EMBED_BATCH_SIZE}"
   python scripts/run_token_demo.py \

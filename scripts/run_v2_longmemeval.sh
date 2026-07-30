@@ -13,7 +13,7 @@ if [[ ! -f "${DATA}" ]]; then echo "LongMemEval data not found: ${DATA}" >&2; ex
 "${REPO}/.venv/bin/python" "${REPO}/scripts/check_v2_services.py"
 "${REPO}/.venv/bin/python" "${REPO}/scripts/run_token_demo.py" \
   --data "${DATA}" --question-type all --variants hierarchical_state_graph_v2 \
-  --output-dir "${OUT}" --memory-cache-dir "${MEMORY_CACHE_DIR:-${REPO}/runs/v2_memory_cache}" --deepseek-model deepseek-v4-flash --deepseek-base-url https://api.deepseek.com \
+  --output-dir "${OUT}" --memory-cache-dir "${MEMORY_CACHE_DIR:-${REPO}/runs/v2_memory_cache}" --llm-model gpt-5.4-mini --llm-base-url https://sub2api.sgao.me/v1/ \
   --embedding-base-url http://127.0.0.1:8001/v1 --embedding-model Qwen3-Embedding-0.6B \
   --max-questions "${MAX_QUESTIONS}" --question-workers "${QUESTION_WORKERS}" --summary-workers "${BUILD_LLM_MAX_INFLIGHT}" --max-inflight-deepseek "${BUILD_LLM_MAX_INFLIGHT}" \
   --reasoning-effort none --build-budget-tokens 300000 --answer-budget-tokens 10000 \
@@ -22,5 +22,5 @@ if [[ ! -f "${DATA}" ]]; then echo "LongMemEval data not found: ${DATA}" >&2; ex
 if [[ "${RUN_JUDGE:-1}" == "1" ]]; then
   "${REPO}/.venv/bin/python" "${REPO}/scripts/evaluate_mem0_judge.py" \
     --answers "${OUT}/hierarchical_state_graph_v2/answers.jsonl" --output-dir "${OUT}/mem0_judge" \
-    --model deepseek-v4-flash --base-url https://api.deepseek.com --workers "${JUDGE_WORKERS}" --resume
+    --model gpt-5.4-mini --base-url https://sub2api.sgao.me/v1/ --workers "${JUDGE_WORKERS}" --resume
 fi
