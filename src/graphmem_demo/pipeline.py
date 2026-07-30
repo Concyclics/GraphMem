@@ -113,6 +113,18 @@ from .v36.persistence import (
 )
 from .v36.runtime import build_index as build_v36_index
 from .v36.schema import index_from_dict as v36_index_from_dict
+from .v4 import (
+    GRAPHMEM_V4_SCHEMA,
+    V4_BUILD_VERSION,
+    CapabilityViewV4,
+    answer_messages as v4_answer_messages,
+    build_capability_view as build_v4_capability_view,
+    build_query_ir as build_v4_query_ir,
+    capability_view_from_dict,
+    query_views as v4_query_views,
+    retrieve as retrieve_v4,
+    validate_capability_view as validate_v4_capability_view,
+)
 from .stats import (
     aggregate_variant_stats,
     build_question_stats,
@@ -140,6 +152,11 @@ class VariantSpec:
 
 
 VARIANT_SPECS = {
+    "hierarchical_hybrid_graph_v4_0": VariantSpec(
+        "hierarchical_hybrid_graph_v4_0", False, True,
+        summary_schema="graphmem_v4_0", hybrid_retrieval=True,
+        enhanced_retrieval=True, enhanced_qa=True,
+    ),
     "hierarchical_role_graph_v3_6": VariantSpec(
         "hierarchical_role_graph_v3_6", False, True,
         summary_schema="graphmem_v3_6", hybrid_retrieval=True,
@@ -455,8 +472,8 @@ class DemoConfig:
             raise ValueError("question_workers must be at least 1")
         if self.summary_workers < 0 or self.max_inflight_deepseek < 0:
             raise ValueError("summary_workers and max_inflight_deepseek cannot be negative")
-        if self.tree_mode is not None and self.tree_mode not in {"legacy_kway", "direct_session", "hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6"}:
-            raise ValueError("tree_mode must be legacy_kway, direct_session, hierarchical_state_graph_v2, or hierarchical_hypergraph_v3, or hierarchical_role_graph_v3_6")
+        if self.tree_mode is not None and self.tree_mode not in {"legacy_kway", "direct_session", "hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
+            raise ValueError("tree_mode must be legacy_kway, direct_session, hierarchical_state_graph_v2, or hierarchical_hypergraph_v3, or hierarchical_role_graph_v3_6, or hierarchical_hybrid_graph_v4_0")
         if self.summary_schema not in {
             None,
             "minimal_memory_v1",
@@ -465,9 +482,10 @@ class DemoConfig:
             "graphmem_v2",
             "graphmem_v3",
             "graphmem_v3_6",
+            "graphmem_v4_0",
         }:
             raise ValueError(
-                "summary_schema must be minimal_memory_v1, compact_memory_v2, or multilingual_memory_v1"
+                "summary_schema must be a supported memory schema through graphmem_v4_0"
             )
         if self.summarizer_kind not in {"auto", "none", "llmlingua2", "qwen_local"}:
             raise ValueError("summarizer_kind must be auto, none, llmlingua2, or qwen_local")
@@ -638,6 +656,7 @@ class CaseRun:
     index_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     v3_index: V3Index | None = None
     v36_index: V36Index | None = None
+    v4_capability_view: CapabilityViewV4 | None = None
 
 
 @dataclass
@@ -654,6 +673,7 @@ class MemoryBuild:
     state_chains: list[StateChain] = field(default_factory=list)
     v3_index: V3Index | None = None
     v36_index: V36Index | None = None
+    v4_capability_view: CapabilityViewV4 | None = None
 
 
 @dataclass
@@ -835,7 +855,7 @@ def run_demo(
         query_payload["local_summarizer_by_stage"] = local_summary_totals
         _write_json(variant_dir / "build_stats.json", build_payload)
         _write_json(variant_dir / "query_stats.json", query_payload)
-        if variant == "hierarchical_role_graph_v3_6":
+        if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
             _write_json(
                 variant_dir / "index_diagnostics.json",
                 _v36_index_diagnostics_payload(
@@ -970,10 +990,11 @@ def _memory_cache_fingerprint(config: DemoConfig, case: QuestionCase, variant: s
     data_hash = hashlib.sha256(
         json.dumps(data_payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
     ).hexdigest()
-    if variant == "hierarchical_role_graph_v3_6":
+    if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
         payload = {
-            "version": 4, "variant": variant,
-            "schema_version": GRAPHMEM_V36_SCHEMA,
+            "version": (5 if variant == "hierarchical_hybrid_graph_v4_0" else 4), "variant": variant,
+            "schema_version": (GRAPHMEM_V4_SCHEMA if variant == "hierarchical_hybrid_graph_v4_0" else GRAPHMEM_V36_SCHEMA),
+            "v4_build_version": (V4_BUILD_VERSION if variant == "hierarchical_hybrid_graph_v4_0" else None),
             "v36_prompt_hash": v36_prompt_hash(),
             "v36_prompt_version": V36_PROMPT_VERSION,
             "v36_build_version": V36_BUILD_VERSION,
@@ -1137,8 +1158,8 @@ def _write_memory_cache(
                 node.embedding = embedding
         v36_vector_cache = vector_directory.name
     payload = {
-        "version": 5 if variant == "hierarchical_role_graph_v3_6" else (3 if variant == "hierarchical_hypergraph_v3" else (2 if variant == "hierarchical_state_graph_v2" else 1)),
-        "schema_version": GRAPHMEM_V36_SCHEMA if variant == "hierarchical_role_graph_v3_6" else (GRAPHMEM_V3_SCHEMA if variant == "hierarchical_hypergraph_v3" else (GRAPHMEM_V2_SCHEMA if variant == "hierarchical_state_graph_v2" else "graphmem_v1")),
+        "version": 6 if variant == "hierarchical_hybrid_graph_v4_0" else (5 if variant == "hierarchical_role_graph_v3_6" else (3 if variant == "hierarchical_hypergraph_v3" else (2 if variant == "hierarchical_state_graph_v2" else 1))),
+        "schema_version": GRAPHMEM_V4_SCHEMA if variant == "hierarchical_hybrid_graph_v4_0" else (GRAPHMEM_V36_SCHEMA if variant == "hierarchical_role_graph_v3_6" else (GRAPHMEM_V3_SCHEMA if variant == "hierarchical_hypergraph_v3" else (GRAPHMEM_V2_SCHEMA if variant == "hierarchical_state_graph_v2" else "graphmem_v1"))),
         "memory_cache_key": case.memory_cache_key,
         "fingerprint": _memory_cache_fingerprint(config, case, variant),
         "source_question_id": case.question_id,
@@ -1149,6 +1170,10 @@ def _write_memory_cache(
         "state_chains": [asdict(chain) for chain in memory.state_chains],
         "v3_index": asdict(memory.v3_index) if memory.v3_index is not None else None,
         "v36_index": v36_payload,
+        "v4_capability_view": (
+            asdict(memory.v4_capability_view)
+            if memory.v4_capability_view is not None else None
+        ),
         "v36_vector_cache": v36_vector_cache,
         "root_ids": [root.node_id for root in memory.roots],
         "edges": [asdict(edge) for edge in memory.edges],
@@ -1170,7 +1195,7 @@ def _write_memory_cache(
 def _load_memory_cache(path: Path) -> MemoryBuild | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("version") not in {1, 2, 3, 4, 5}:
+        if payload.get("version") not in {1, 2, 3, 4, 5, 6}:
             return None
         leaves = [LeafNode(**row) for row in payload.get("leaves", [])]
         summaries = [SummaryNode(**row) for row in payload.get("summaries", [])]
@@ -1181,6 +1206,11 @@ def _load_memory_cache(path: Path) -> MemoryBuild | None:
         v3_index = v3_index_from_dict(v3_payload) if isinstance(v3_payload, dict) else None
         v36_payload = payload.get("v36_index")
         v36_index = v36_index_from_dict(v36_payload) if isinstance(v36_payload, dict) else None
+        v4_view_payload = payload.get("v4_capability_view")
+        v4_capability_view = (
+            capability_view_from_dict(v4_view_payload)
+            if isinstance(v4_view_payload, dict) else None
+        )
         vector_cache_name = payload.get("v36_vector_cache")
         if v36_index is not None and isinstance(vector_cache_name, str) and vector_cache_name:
             vector_directory = path.parent / vector_cache_name
@@ -1242,6 +1272,7 @@ def _load_memory_cache(path: Path) -> MemoryBuild | None:
             state_chains=state_chains,
             v3_index=v3_index,
             v36_index=v36_index,
+            v4_capability_view=v4_capability_view,
         )
     except Exception:
         return None
@@ -1542,7 +1573,7 @@ def _run_case_with_cached_memory(
             include_build_records=include_build_records,
             case_started=case_started,
         )
-        if variant == "hierarchical_role_graph_v3_6":
+        if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
             _attach_v36_offline_gold_metrics(case, run)
         return run, _records_since(case_embedder, embedding_start), []
     finally:
@@ -1599,6 +1630,17 @@ def _write_case_outputs(
             persist_v36_vector_matrix(
                 variant_dir / "vectors", run.v36_index
             )
+            if run.v4_capability_view is not None:
+                _append_jsonl(
+                    variant_dir / "v4_capability_views.jsonl",
+                    [{
+                        "schema_version": GRAPHMEM_V4_SCHEMA,
+                        "base_schema_version": GRAPHMEM_V36_SCHEMA,
+                        "build_version": V4_BUILD_VERSION,
+                        "question_id": case.question_id,
+                        "capability_view": asdict(run.v4_capability_view),
+                    }],
+                )
         if run.v3_index is not None:
             _append_jsonl(
                 variant_dir / "nodes.jsonl",
@@ -1691,7 +1733,7 @@ def run_case(
         include_build_records=True,
         case_started=case_started,
     )
-    if variant == "hierarchical_role_graph_v3_6":
+    if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
         _attach_v36_offline_gold_metrics(case, run)
     return run
 
@@ -1727,8 +1769,8 @@ def _build_v36_memory(
     )
     checkpoint_namespace = hashlib.sha256(json.dumps(
         {
-            "schema": GRAPHMEM_V36_SCHEMA,
-            "prompt_version": V36_PROMPT_VERSION,
+            "schema": (GRAPHMEM_V4_SCHEMA if variant == "hierarchical_hybrid_graph_v4_0" else GRAPHMEM_V36_SCHEMA),
+            "prompt_version": (V4_BUILD_VERSION if variant == "hierarchical_hybrid_graph_v4_0" else V36_PROMPT_VERSION),
             "model": config.deepseek_model,
             "base_url": config.deepseek_base_url,
             "session_max_tokens": config.v36_session_extraction_max_tokens,
@@ -1750,6 +1792,17 @@ def _build_v36_memory(
     )
     metrics.summary_parse_error_count += result.parse_error_count
     metrics.index_diagnostics.extend(result.diagnostics)
+    v4_capability_view = None
+    if variant == "hierarchical_hybrid_graph_v4_0":
+        v4_capability_view = build_v4_capability_view(result.index)
+        capability_errors = validate_v4_capability_view(result.index, v4_capability_view)
+        if capability_errors:
+            raise ValueError(f"V4 capability validation failed: {capability_errors[:8]}")
+        metrics.index_diagnostics.append({
+            "stage": "v4_capability_projection",
+            **v4_capability_view.diagnostics,
+            "topology_mode": v4_capability_view.topology_mode,
+        })
     build_total = sum(
         record.total_tokens for record in result.records
         if not record.excluded_from_budget
@@ -1762,7 +1815,7 @@ def _build_v36_memory(
     return MemoryBuild(
         leaves=[], summaries=[], roots=[], edges=[], llm_records=result.records,
         metrics=metrics, build_latency_sec=time.perf_counter() - build_started,
-        v36_index=result.index,
+        v36_index=result.index, v4_capability_view=v4_capability_view,
     )
 
 
@@ -1940,7 +1993,7 @@ def build_memory(
     llm_records: list[DeepSeekCallRecord] = []
     build_started = time.perf_counter()
     leaves = build_leaf_nodes(case)
-    if variant == "hierarchical_role_graph_v3_6":
+    if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
         return _build_v36_memory(
             config, case, variant, llm, embedder, limiter, metrics, build_started
         )
@@ -2107,21 +2160,42 @@ def _run_v36_case_with_memory(
     case_started: float,
 ) -> CaseRun:
     if memory.v36_index is None:
-        raise ValueError("V3.6 memory cache is missing v36_index")
+        raise ValueError("role-graph memory cache is missing v36_index")
+    is_v4 = variant == "hierarchical_hybrid_graph_v4_0"
+    v4_capability_view = memory.v4_capability_view
+    if is_v4 and v4_capability_view is None:
+        v4_capability_view = build_v4_capability_view(memory.v36_index)
+        capability_errors = validate_v4_capability_view(
+            memory.v36_index, v4_capability_view
+        )
+        if capability_errors:
+            raise ValueError(f"V4 capability validation failed: {capability_errors[:8]}")
     answer_metrics = BuildMetrics()
     llm_records = (
         [replace(record, question_id=case.question_id) for record in memory.llm_records]
         if include_build_records else []
     )
     index = clone_v36_index(memory.v36_index, case.question_id)
-    query_ir = build_v36_query_ir(case.question)
+    query_ir = (
+        build_v4_query_ir(case.question) if is_v4
+        else build_v36_query_ir(case.question)
+    )
+    query_views = v4_query_views(query_ir) if is_v4 else v36_query_views(query_ir)
     query_vectors = embedder.embed(
-        v36_query_views(query_ir), question_id=case.question_id, variant=variant
+        query_views, question_id=case.question_id, variant=variant
     )
-    retrieval = retrieve_v36(
-        case=case, variant=variant, index=index, query_vectors=query_vectors,
-        token_budget=config.v36_context_token_budget,
-    )
+    if is_v4:
+        assert v4_capability_view is not None
+        retrieval = retrieve_v4(
+            case=case, variant=variant, index=index,
+            capability_view=v4_capability_view, query_vectors=query_vectors,
+            token_budget=config.v36_context_token_budget,
+        )
+    else:
+        retrieval = retrieve_v36(
+            case=case, variant=variant, index=index, query_vectors=query_vectors,
+            token_budget=config.v36_context_token_budget,
+        )
     answer_started = time.perf_counter()
     answer_text = ""
     if config.retrieval_only:
@@ -2135,7 +2209,7 @@ def _run_v36_case_with_memory(
         result = _tracked_chat(
             llm, limiter, answer_metrics, question_id=case.question_id, variant=variant,
             stage="answer_qa", thinking_mode="none",
-            messages=v36_answer_messages(case, retrieval),
+            messages=(v4_answer_messages(case, retrieval) if is_v4 else v36_answer_messages(case, retrieval)),
             max_tokens=min(512, config.qa_max_tokens),
         )
         llm_records.append(result.record)
@@ -2183,6 +2257,7 @@ def _run_v36_case_with_memory(
         leaves=[], summaries=[], edges=[], retrieval=retrieval, answer=answer_text,
         llm_records=llm_records, stats=stats,
         index_diagnostics=list(memory.metrics.index_diagnostics), v36_index=index,
+        v4_capability_view=v4_capability_view,
     )
 
 
@@ -2367,7 +2442,7 @@ def run_case_with_memory(
     case_started = case_started if case_started is not None else time.perf_counter()
     spec = _variant_spec(config, variant)
     answer_metrics = BuildMetrics()
-    if variant == "hierarchical_role_graph_v3_6":
+    if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
         return _run_v36_case_with_memory(
             config, case, variant, memory, llm, embedder, limiter,
             include_build_records=include_build_records, case_started=case_started,

@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-local-port", type=int, default=8001)
     parser.add_argument("--embedding-base-url", default=os.environ.get("EMBEDDING_BASE_URL", "http://127.0.0.1:8001/v1"))
     parser.add_argument("--embedding-model", default=os.environ.get("EMBEDDING_MODEL", "Qwen3-Embedding-0.6B"))
-    parser.add_argument("--tree-mode", choices=["legacy_kway", "direct_session", "hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6"])
+    parser.add_argument("--tree-mode", choices=["legacy_kway", "direct_session", "hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"])
     parser.add_argument("--fanout-k", type=int, default=16)
     parser.add_argument("--max-group-rough-tokens", type=int, default=6000)
     parser.add_argument("--leaf-top-k", type=int, default=14)
@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-inflight-deepseek", type=int, default=32)
     parser.add_argument(
         "--summary-schema",
-        choices=["minimal_memory_v1", "compact_memory_v2", "multilingual_memory_v1", "graphmem_v2", "graphmem_v3", "graphmem_v3_6"],
+        choices=["minimal_memory_v1", "compact_memory_v2", "multilingual_memory_v1", "graphmem_v2", "graphmem_v3", "graphmem_v3_6", "graphmem_v4_0"],
     )
     parser.add_argument(
         "--summarizer-kind",

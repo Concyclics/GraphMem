@@ -21,6 +21,10 @@ _ACTION_FAMILIES = {
         "assemble", "assembled", "build", "built", "complete", "completed",
         "finish", "finished", "work", "worked", "working",
     },
+    "prepare": {
+        "bake", "baked", "baking", "cook", "cooked", "cooking",
+        "make", "made", "making", "prepare", "prepared", "preparing",
+    },
     "encounter": {
         "chat", "chatted", "conversation", "converse", "conversed",
         "encounter", "encountered", "meet", "meets", "met", "talk", "talked",
@@ -35,15 +39,18 @@ _ACTION_FAMILIES = {
         "removed", "lose", "lost", "return", "returned", "sell", "sold",
     },
     "repair": {
-        "fix", "fixed", "mend", "mended", "repair", "repaired", "restore",
-        "restored",
+        "clean", "cleaned", "fix", "fixed", "lubricate", "lubricated",
+        "maintain", "maintained", "mend", "mended", "repair", "repaired",
+        "replace", "replaced", "restore", "restored", "service", "serviced",
+        "tune", "tuned",
     },
     "travel": {
         "fly", "flew", "flight", "flown", "travel", "traveled",
         "travelled",
     },
     "use": {
-        "play", "played", "spend", "spent", "take", "took", "use", "used",
+        "operate", "operated", "play", "played", "spend", "spent", "take",
+        "took", "use", "used", "wear", "wearing", "wore",
     },
 }
 

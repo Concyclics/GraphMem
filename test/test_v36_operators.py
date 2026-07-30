@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 
 from graphmem_demo.v36.operators import (
-    evaluate_operators, query_bound_collection_ledger, counterfactual_dependency_hint, record_time_source_hint, temporal_order_source_hint,
+    evaluate_operators, exact_entity_absence_hint, query_bound_collection_ledger, counterfactual_dependency_hint, record_time_source_hint, temporal_order_source_hint,
     temporal_source_pair_hint, transaction_sum_from_sources_hint,
     dated_event_count_from_sources_hint, same_unit_state_difference_hint,
-    maintenance_entity_count_hint, pending_operation_target_pairs_hint,
+    category_acquisition_members_hint, maintenance_entity_count_hint,
+    pending_operation_target_pairs_hint,
 )
 from graphmem_demo.v36.retrieval import authoritative_operator_answer, build_query_ir
 from graphmem_demo.v36.schema import CompletenessCertificate
@@ -1123,3 +1124,128 @@ def test_pending_operation_pairs_keep_return_and_replacement_pickup_distinct() -
         ("pickup", "navy coat"), ("return", "shoes"),
         ("pickup", "replacement shoes"),
     }
+
+
+def test_maintenance_count_recovers_parent_asset_from_lossless_source() -> None:
+    index = _index()
+    turn = replace(
+        index.turns[0], node_id="q:tire", transport_role="user",
+        text="I plan to replace the front tire on my commuter bike this month.",
+    )
+    index.turns = [turn]
+    frame = index.frames[0]
+    frame.owner_key = "participant 1"
+    frame.entity_key = "front tire"
+    frame.predicate_key = "replacement planned"
+    frame.retrieval_text = "front tire replacement planned"
+    frame.source_turn_ids = [turn.node_id]
+    index.frames = [frame]
+    hint = maintenance_entity_count_hint(
+        build_query_ir("How many bikes did I service or plan to service?"),
+        index, [turn.node_id],
+    )
+    assert hint is not None
+    assert [row["identity"] for row in hint["members"]] == ["commuter bike"]
+
+
+def test_acquisition_splits_compound_members_from_one_source() -> None:
+    index = _index()
+    turn = replace(
+        index.turns[0], node_id="q:plants", transport_role="user",
+        text="I bought the peace lily and a succulent plant two weeks ago.",
+    )
+    index.turns = [turn]
+    first, second = index.frames[:2]
+    for frame in (first, second):
+        frame.owner_key = "participant 1"
+        frame.source_turn_ids = [turn.node_id]
+        frame.semantic_type_keys = ["plant"]
+    first.entity_key = "peace lily"
+    second.entity_key = "succulent plant acquired with peace lily"
+    index.frames = [first, second]
+    hint = category_acquisition_members_hint(
+        build_query_ir("How many plants did I acquire?"),
+        index, [turn.node_id],
+    )
+    assert hint is not None
+    assert {row["identity"] for row in hint["members"]} == {
+        "peace lily", "succulent",
+    }
+
+
+def test_temporal_order_converts_past_duration_to_start_endpoint() -> None:
+    index = _index()
+    template = index.turns[0]
+    index.turns = [
+        replace(
+            template, node_id="q:festival", session_id="s1",
+            transport_role="user", session_date="2023/05/27 (Sat) 21:39",
+            text="I attended a cultural festival yesterday.",
+        ),
+        replace(
+            template, node_id="q:spanish", session_id="s2",
+            transport_role="user", session_date="2023/05/27 (Sat) 14:08",
+            text="I have been taking Spanish classes for the past three months.",
+        ),
+    ]
+    ir = build_query_ir(
+        "Which event happened first, my attendance at a cultural festival "
+        "or the start of my Spanish classes?"
+    )
+    hint = temporal_order_source_hint(
+        ir, index, ["q:festival", "q:spanish"],
+    )
+    assert hint is not None
+    assert hint["selected_target"] == "start spanish classes"
+    assert hint["selected_source_turn_id"] == "q:spanish"
+
+
+def test_exact_entity_absence_uses_named_relation_near_match() -> None:
+    index = _index()
+    template = index.turns[0]
+    index.turns = [
+        replace(
+            template, node_id="q:smith", transport_role="user",
+            text="I see Dr. Smith every two weeks.",
+        )
+    ]
+    hint = exact_entity_absence_hint(
+        build_query_ir("How often do I see Dr. Johnson?"), index,
+    )
+    assert hint is not None
+    assert hint["required_marker"] == "johnson"
+    assert hint["value"] == "insufficient"
+
+
+def test_exact_entity_absence_does_not_reject_new_recommendation_target() -> None:
+    index = _index()
+    template = index.turns[0]
+    index.turns = [
+        replace(
+            template, node_id="q:hotel", transport_role="user",
+            text="I prefer hotels with ocean views and rooftop pools.",
+        )
+    ]
+    assert exact_entity_absence_hint(
+        build_query_ir("Can you recommend a hotel in Miami?"), index,
+    ) is None
+
+
+def test_exact_entity_absence_rejects_compound_partial_match() -> None:
+    index = _index()
+    template = index.turns[0]
+    index.turns = [
+        replace(
+            template, node_id="q:tennis", transport_role="user",
+            text="I play tennis with my friends at the local park every other week.",
+        )
+    ]
+    hint = exact_entity_absence_hint(
+        build_query_ir(
+            "How often do I play table tennis with my friends at the local park?"
+        ),
+        index,
+    )
+    assert hint is not None
+    assert hint["required_phrase"] == "table tenni"
+    assert hint["value"] == "insufficient"

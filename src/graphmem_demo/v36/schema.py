@@ -214,6 +214,37 @@ class QueryIR:
 
 
 @dataclass
+class SourceSpanCandidate:
+    source_turn_id: str
+    session_id: str
+    span_index: int
+    text: str
+    speaker_key: str
+    transport_role: str
+    target_terms: list[str]
+    relation_terms: list[str]
+    action_families: list[str]
+    roles: list[str]
+    lifecycle_status: str
+    polarity: str
+    event_time_text: str
+    identity_keys: list[str]
+    score: float
+    provenance_complete: bool = True
+
+
+@dataclass
+class SourceSpanClosure:
+    candidates: list[SourceSpanCandidate]
+    selected_source_turn_ids: list[str]
+    present_roles: list[str]
+    missing_roles: list[str]
+    target_support: dict[str, list[str]]
+    complete: bool
+    schema_version: str = GRAPHMEM_V36_SCHEMA
+
+
+@dataclass
 class CompletenessCertificate:
     entity_match: bool
     relation_match: bool

@@ -192,16 +192,28 @@ def _turn_observed_time(turn: Any) -> datetime | None:
 def _relative_event_time(text: str, observed: datetime) -> datetime | None:
     lowered = text.casefold()
     match = re.search(
-        r"\b(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+        r"\b(\d+|a|an|few|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
         r"(hours?|days?|weeks?|months?)\s+ago\b", lowered,
     )
     if match:
         amount = (
             int(match.group(1)) if match.group(1).isdigit()
             else 1 if match.group(1) in {"a", "an"}
+            else 3 if match.group(1) == "few"
             else _NUMBER_WORDS[match.group(1)]
         )
         unit = match.group(2).rstrip("s")
+        if unit == "month":
+            return observed - timedelta(days=30 * amount)
+        return observed - timedelta(**{f"{unit}s": amount})
+    duration = re.search(
+        r"\b(?:for\s+(?:the\s+)?(?:past|last)?|during\s+the\s+(?:past|last))\s*"
+        r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+        r"(hours?|days?|weeks?|months?)\b", lowered,
+    )
+    if duration:
+        amount = int(duration.group(1)) if duration.group(1).isdigit() else _NUMBER_WORDS[duration.group(1)]
+        unit = duration.group(2).rstrip("s")
         if unit == "month":
             return observed - timedelta(days=30 * amount)
         return observed - timedelta(**{f"{unit}s": amount})
@@ -1133,8 +1145,6 @@ def exact_entity_absence_hint(
         if re.search(r"\d", token)
         or bool(re.search(r"[a-z][A-Z]|^[a-z][A-Z]", token))
     ]
-    if not distinctive_positions:
-        return None
     user_texts = [
         re.sub(r"[-_]", " ", turn.text.casefold())
         for turn in index.turns if turn.transport_role == "user"
@@ -1166,6 +1176,109 @@ def exact_entity_absence_hint(
                 "required_modifier": marker,
                 "required_head": head,
                 "excluded_near_match_source_turn_ids": near_matches[:12],
+                "binding_complete": True,
+                "certified": True,
+            }
+    if ir.requested_value_type in {"preference", "recommendation"} or re.search(
+        r"\b(?:recommend|suggest|advice|tips?)\b", ir.raw_question,
+        re.IGNORECASE,
+    ):
+        return None
+    if not re.search(r"\b(?:i|my|me|we|our)\b", ir.raw_question, re.IGNORECASE):
+        return None
+    raw_words = re.findall(r"[A-Za-z][A-Za-z0-9+.-]*", ir.raw_question)
+    ignored_names = {
+        "Can", "Did", "Do", "Does", "How", "I", "In", "Is", "My",
+        "The", "What", "When", "Where", "Which", "Who", "Why",
+    }
+    markers = [
+        word for position, word in enumerate(raw_words)
+        if word not in ignored_names
+        and len(word) > 2
+        and (word[0].isupper() or any(character.isdigit() for character in word))
+        and position > 0
+    ]
+    query_context = {
+        _stem_word(word) for word in re.findall(r"[A-Za-z]+", ir.raw_question.casefold())
+        if len(word) > 2 and word not in {
+            "current", "currently", "information", "many", "much",
+            "name", "what", "when", "where", "which",
+        }
+    }
+    for marker in markers:
+        normalized_marker = marker.casefold()
+        if any(normalized_marker in text for text in user_texts):
+            continue
+        near_matches: list[tuple[int, str]] = []
+        for turn, normalized in zip(
+            (turn for turn in index.turns if turn.transport_role == "user"),
+            user_texts,
+        ):
+            terms = {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", normalized)
+            }
+            overlap = len(query_context & terms)
+            if overlap:
+                near_matches.append((overlap, turn.node_id))
+        if near_matches:
+            near_matches.sort(reverse=True)
+            return {
+                "operation": "exact_entity_absence",
+                "value": "insufficient",
+                "required_marker": normalized_marker,
+                "reason": "named entity absent while relation-near alternatives exist",
+                "excluded_near_match_source_turn_ids": [
+                    source_id for _score, source_id in near_matches[:12]
+                ],
+                "binding_complete": True,
+                "certified": True,
+            }
+    pair_stop = {
+        "attend", "been", "book", "collect", "current", "currently",
+        "different", "first", "have", "live", "meet", "play",
+        "how", "last", "local", "many", "much", "new", "past", "total",
+        "see", "start", "visit", "watch", "what", "when", "where",
+        "which", "work",
+    }
+    lowered_words = [
+        _stem_word(word)
+        for word in re.findall(r"[A-Za-z]+", ir.raw_question.casefold())
+    ]
+    pairs = [
+        (left, right)
+        for left, right in zip(lowered_words, lowered_words[1:])
+        if len(left) >= 4 and len(right) >= 4
+        and left not in pair_stop and right not in pair_stop
+    ]
+    for left, right in pairs:
+        phrase = f"{left} {right}"
+        if any(phrase in text for text in user_texts):
+            continue
+        near_matches: list[tuple[int, str]] = []
+        for turn, normalized in zip(
+            (turn for turn in index.turns if turn.transport_role == "user"),
+            user_texts,
+        ):
+            terms = {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", normalized)
+            }
+            if not ({left, right} & terms):
+                continue
+            overlap = len(query_context & terms)
+            if overlap >= 2:
+                near_matches.append((overlap, turn.node_id))
+        if near_matches:
+            near_matches.sort(reverse=True)
+            return {
+                "operation": "exact_entity_absence",
+                "value": "insufficient",
+                "required_phrase": phrase,
+                "reason": "compound entity absent while a relation-near partial match exists",
+                "excluded_near_match_source_turn_ids": [
+                    source_id for _score, source_id in near_matches[:12]
+                ],
                 "binding_complete": True,
                 "certified": True,
             }
@@ -1632,6 +1745,35 @@ def maintenance_entity_count_hint(
             "identity": identity, "source_turn_id": source_id,
             "evidence": (source.text if source else frame.retrieval_text)[:360],
         })
+    # Extraction may put a serviced component in the frame entity while its
+    # parent asset remains only in the lossless source.
+    parent_pattern = re.compile(
+        rf"\b(?:my|the|a|an)\s+((?:[A-Za-z0-9'-]+\s+){{0,3}}{re.escape(head)}(?:s|es)?)\b",
+        re.IGNORECASE,
+    )
+    for source_id in allowed_sources:
+        source = turn_by_id.get(source_id)
+        if source is None or source.transport_role != "user":
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", source.text)
+        for index_position, sentence in enumerate(sentences):
+            window = " ".join(sentences[index_position:index_position + 2])
+            if not action.search(window):
+                continue
+            for match in parent_pattern.finditer(window):
+                identity = match.group(1).strip()
+                prefix = window[max(0, match.start() - 48):match.start()]
+                if re.search(
+                    r"\b(?:rack|lock|computer|light|shop|route|accessor)\w*\s+(?:for|of)\s*$",
+                    prefix, re.IGNORECASE,
+                ):
+                    continue
+                key = _operator_identity_key(identity)
+                if key and key != head:
+                    members.setdefault(key, {
+                        "identity": identity, "source_turn_id": source_id,
+                        "evidence": window[:360],
+                    })
     if not members:
         return None
     return {
@@ -1676,6 +1818,15 @@ def category_acquisition_members_hint(
         if len(words) >= 2 and _stem_word(words[-1]) == category:
             words.pop()
         return " ".join(words).strip()
+
+    def split_compound_entity(entity: str) -> list[str]:
+        parts = re.split(
+            r"\s+(?:acquired|bought|received|got|inherited)\s+with\s+",
+            entity, maxsplit=1, flags=re.IGNORECASE,
+        )
+        if len(parts) == 2 and all(part.strip() for part in parts):
+            return [clean_entity(part) for part in parts if clean_entity(part)]
+        return [entity]
 
     for frame in index.frames:
         if not allowed_sources.intersection(frame.source_turn_ids):
@@ -1726,15 +1877,21 @@ def category_acquisition_members_hint(
                 entity_terms = [word for word in re.findall(r"[a-z0-9]+", entity.casefold()) if len(word) > 2]
                 if entity_terms and all(term in window.casefold() for term in entity_terms[-2:]):
                     matched.append((len(entity_terms), entity))
-            # Keep the most specific identity in the acquisition window.
             if matched:
-                _size, entity = max(matched)
-                key = _operator_identity_key(entity)
-                if key and category not in {_stem_word(w) for w in re.findall(r"[\w'-]+", entity.casefold()) if len(entity.split()) == 1}:
-                    members.setdefault(key, {
-                        "identity": entity, "source_turn_id": source_id,
-                        "evidence": window[:420],
-                    })
+                for _size, entity in matched:
+                    for identity in split_compound_entity(entity):
+                        key = _operator_identity_key(identity)
+                        if key and not (
+                            len(identity.split()) == 1
+                            and category in {
+                                _stem_word(word)
+                                for word in re.findall(r"[\\w'-]+", identity.casefold())
+                            }
+                        ):
+                            members.setdefault(key, {
+                                "identity": identity, "source_turn_id": source_id,
+                                "evidence": window[:420],
+                            })
     if not members:
         return None
     return {

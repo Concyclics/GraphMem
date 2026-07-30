@@ -8,6 +8,14 @@ It builds a hierarchical memory graph from dialogue sessions, retrieves evidence
 
 See [`docs/2026-07-08_graphmem_architecture_overview.md`](docs/2026-07-08_graphmem_architecture_overview.md) for the current design overview.
 
+## GraphMem V4.0
+
+The `hierarchical_hybrid_graph_v4_0` variant uses one physical RoleFrame graph with topology-aware state/collection/temporal and peer-dialogue capability projections. See [the V4.0 design and reproducibility guide](docs/graphmem_v4_0.md).
+
+```bash
+DATA=data/longmemeval_s_cleaned.json bash scripts/run_v4_benchmark.sh
+```
+
 ## Setup
 
 ```bash

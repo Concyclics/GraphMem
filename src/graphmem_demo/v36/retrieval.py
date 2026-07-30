@@ -6,12 +6,17 @@ import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable
 
 from ..clients import cosine_similarity, rough_token_count
 from ..models import QuestionCase, RetrievedContext
 from ..v3.build import canonical_key
+from ..v3.action_semantics import action_families
+from .source_spans import (
+    binding_tokens, build_source_span_closure, fuzzy_term_overlap, query_binding_terms,
+)
+from .dialogue_topology import infer_dialogue_topology, is_memory_source
 from .operators import (
     evaluate_operators, query_bound_collection_ledger, counterfactual_dependency_hint, record_time_source_hint, temporal_order_source_hint,
     temporal_source_pair_hint, relative_time_from_sources_hint,
@@ -38,7 +43,7 @@ from .schema import (
 )
 
 
-V36_RETRIEVAL_VERSION = "graphmem_v36_generic_evidence_closure_20260730_locked"
+V36_RETRIEVAL_VERSION = "graphmem_v36_atomic_question_time_closure_20260730"
 
 _WORD_RE = re.compile(r"[\w'-]+", re.UNICODE)
 _FUNCTION_WORDS = {
@@ -396,7 +401,13 @@ def query_views(ir: QueryIR) -> list[str]:
     )))
     if compact and compact != ir.raw_question:
         views.append(compact)
-    return views
+    target_terms, relation_terms = query_binding_terms(ir)
+    if target_terms:
+        views.append("target " + " ".join(sorted(target_terms)))
+    relation_view = [*sorted(action_families(ir.raw_question)), *sorted(relation_terms)]
+    if relation_view:
+        views.append("relation " + " ".join(dict.fromkeys(relation_view)))
+    return list(dict.fromkeys(views))
 
 
 def _node_id(node: Any) -> str:
@@ -1333,7 +1344,7 @@ def _focused_turn_text(ir: QueryIR, turn: TurnNodeV36, max_chars: int = 1800) ->
         scored.append((overlap + phrase_bonus, index))
     anchors = [index for score, index in sorted(scored, key=lambda row: (-row[0], row[1])) if score > 0][:4]
     if not anchors:
-        anchors = [0]
+        return turn.text[:max_chars]
     selected: set[int] = set(anchors)
     for index in anchors:
         if segments[index].lstrip().startswith("|"):
@@ -1351,7 +1362,7 @@ def _focused_turn_text(ir: QueryIR, turn: TurnNodeV36, max_chars: int = 1800) ->
     return text[:max_chars]
 
 
-def _ranked_source_turns(
+def _legacy_ranked_source_turns(
     index: V36Index, ir: QueryIR, query_vectors: list[list[float]],
     selected_cards: list[RoutingCard], fine_ranked: list[tuple[str, float]],
 ) -> list[tuple[TurnNodeV36, float]]:
@@ -1512,6 +1523,238 @@ def _ranked_source_turns(
         (turn_by_id[node_id], fine_scores.get(node_id, 0.0))
         for node_id in chosen if node_id in turn_by_id
     ]
+
+
+def _ranked_source_turns(
+    index: V36Index, ir: QueryIR, query_vectors: list[list[float]],
+    selected_cards: list[RoutingCard], fine_ranked: list[tuple[str, float]],
+) -> list[tuple[TurnNodeV36, float]]:
+    """Rank lossless turns globally, then expand only local dialogue neighbors.
+
+    Routing cards constrain and boost the search region, but they do not force a
+    fixed per-card quota.  This prevents weak cards from displacing a decisive
+    source turn while still allowing a strong exact/BM25/dense hit outside the
+    initial coarse scope to rescue routing.
+    """
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    frame_by_id = {frame.frame_id: frame for frame in index.frames}
+    group_by_id = {group.group_id: group for group in index.evidence_groups}
+    routed_rank = {
+        card.session_id: rank for rank, card in enumerate(selected_cards)
+    }
+    global_fused, channels = _rrf({
+        "exact": _exact_rank(index.turns, ir),
+        "bm25": _bm25_rank(index.turns, ir.raw_question, 120),
+        "dense": _dense_rank(index.turns, query_vectors, 120),
+    }, rrf_k=10)
+    fused_score = dict(global_fused)
+
+    # Project high-ranked frames/groups back to their lossless sources.  The
+    # projection is bounded and only affects ranking; source turns remain the
+    # evidence ultimately shown to the answer model.
+    source_projection: dict[str, float] = defaultdict(float)
+    for position, (node_id, score) in enumerate(fine_ranked[:80]):
+        node = frame_by_id.get(node_id) or group_by_id.get(node_id)
+        sources = list(getattr(node, "source_turn_ids", []) or [])
+        if node_id in turn_by_id:
+            sources.append(node_id)
+        boost = max(0.25, 3.0 - position / 32.0) + 20.0 * score
+        for source_id in sources:
+            source_projection[source_id] = max(
+                source_projection[source_id], boost
+            )
+
+    query_terms = {
+        _certificate_term(token) for token in _content_tokens(ir.raw_question)
+    }
+    relation_terms = {
+        _certificate_term(token) for token in _content_tokens(ir.target_relation)
+    }
+    first_person = bool(re.search(
+        r"\b(?:i|me|my|mine)\b", ir.raw_question, re.IGNORECASE
+    ))
+    dialogue_lookup = bool(
+        _DIALOGUE_RE.search(ir.raw_question)
+        or _ORDINAL_RE.search(ir.raw_question)
+        or re.search(
+            r"\b(?:previous chat|earlier chat|you provided|you gave|you created)\b",
+            ir.raw_question, re.IGNORECASE,
+        )
+    )
+    temporal_lookup = ir.requested_value_type in {
+        "date", "duration", "temporal_order", "state",
+    }
+    structured_lookup = ir.requested_value_type in {
+        "count", "list", "aggregate", "duration", "temporal_order",
+        "state", "preference", "recommendation",
+    }
+
+    candidate_ids = [node_id for node_id, _score in global_fused]
+    candidate_ids.extend(
+        source_id for source_id in source_projection
+        if source_id not in fused_score
+    )
+    scored: list[tuple[float, TurnNodeV36]] = []
+    for node_id in dict.fromkeys(candidate_ids):
+        turn = turn_by_id.get(node_id)
+        if turn is None:
+            continue
+        ranks = channels.get(node_id, {})
+        routed = turn.session_id in routed_rank
+        if not routed and not (
+            len(ranks) >= 2
+            or ranks.get("exact", 10**9) <= 4
+            or ranks.get("bm25", 10**9) <= 4
+            or source_projection.get(node_id, 0.0) >= 2.0
+        ):
+            continue
+        turn_terms = {
+            _certificate_term(token)
+            for token in _content_tokens(
+                f"{turn.speaker} {turn.listener} {turn.text}"
+            )
+        }
+        overlap = len(query_terms & turn_terms)
+        relation_overlap = len(relation_terms & turn_terms)
+        score = 100.0 * fused_score.get(node_id, 0.0)
+        score += source_projection.get(node_id, 0.0)
+        score += 1.4 * overlap + 0.5 * relation_overlap
+        score += 0.8 * sum(rank <= 8 for rank in ranks.values())
+        if routed:
+            score += max(0.25, 2.0 - 0.25 * routed_rank[turn.session_id])
+        else:
+            score -= 1.5
+        if ir.target_owner:
+            if turn.speaker_key == ir.target_owner:
+                score += 5.0
+            elif canonical_key(turn.listener) == ir.target_owner:
+                score += 0.5
+            elif ir.target_owner in turn_terms:
+                score += 2.0
+            else:
+                score -= 1.0
+        elif first_person and turn.transport_role == "user":
+            score += 1.5
+        if dialogue_lookup and turn.transport_role == "assistant":
+            score += 1.0
+        if temporal_lookup and (
+            turn.session_date
+            or re.search(
+                r"\b(?:today|yesterday|tomorrow|ago|last|next|since|before|after|"
+                r"january|february|march|april|may|june|july|august|september|"
+                r"october|november|december|19\d{2}|20\d{2})\b",
+                turn.text, re.IGNORECASE,
+            )
+        ):
+            score += 0.75
+        scored.append((score, turn))
+    scored.sort(key=lambda row: (-row[0], row[1].session_id, row[1].turn_index))
+
+    # Temporal comparisons need one independently matched anchor per named side.
+    protected_ids: list[str] = []
+    for target in ir.comparison_targets[:2]:
+        target_terms = {
+            _certificate_term(token) for token in _content_tokens(target)
+        }
+        matches = [
+            (len(target_terms & {
+                _certificate_term(token)
+                for token in _content_tokens(turn.text)
+            }), score, turn.node_id)
+            for score, turn in scored
+        ]
+        matches = [row for row in matches if row[0] > 0]
+        if matches:
+            protected_ids.append(max(matches)[2])
+
+    anchor_limit = 12 if structured_lookup else 8
+    per_session_limit = 4 if structured_lookup else 3
+    anchors: list[TurnNodeV36] = []
+    per_session: Counter[str] = Counter()
+    by_scored_id = {turn.node_id: (score, turn) for score, turn in scored}
+    for node_id in protected_ids:
+        row = by_scored_id.get(node_id)
+        if row and node_id not in {turn.node_id for turn in anchors}:
+            anchors.append(row[1])
+            per_session[row[1].session_id] += 1
+    for score, turn in scored:
+        if len(anchors) >= anchor_limit:
+            break
+        if turn.node_id in {item.node_id for item in anchors}:
+            continue
+        if per_session[turn.session_id] >= per_session_limit:
+            continue
+        anchors.append(turn)
+        per_session[turn.session_id] += 1
+
+    session_turns: dict[str, list[TurnNodeV36]] = defaultdict(list)
+    for turn in index.turns:
+        session_turns[turn.session_id].append(turn)
+    for rows in session_turns.values():
+        rows.sort(key=lambda item: item.turn_index)
+    position = {
+        turn.node_id: index
+        for rows in session_turns.values()
+        for index, turn in enumerate(rows)
+    }
+    expand_neighbors = (
+        dialogue_lookup
+        or ir.requested_value_type in {
+            "entity", "location", "date", "span", "preference",
+            "recommendation", "state", "temporal_order",
+        }
+    )
+    chosen: list[tuple[TurnNodeV36, float]] = []
+    chosen_ids: set[str] = set()
+    for anchor in anchors:
+        anchor_score = by_scored_id.get(anchor.node_id, (0.0, anchor))[0]
+        if anchor.node_id not in chosen_ids:
+            chosen.append((anchor, anchor_score))
+            chosen_ids.add(anchor.node_id)
+        if not expand_neighbors:
+            continue
+        rows = session_turns[anchor.session_id]
+        center = position[anchor.node_id]
+        # Preserve the prompt/reply pair and one continuation turn.  This is
+        # bounded local expansion, never a participant/theme hub traversal.
+        offsets = (-1, 1, 2) if dialogue_lookup else (-1, 1)
+        for offset in offsets:
+            neighbor_index = center + offset
+            if not 0 <= neighbor_index < len(rows):
+                continue
+            neighbor = rows[neighbor_index]
+            if neighbor.node_id in chosen_ids:
+                continue
+            chosen.append((neighbor, anchor_score - 0.25 * abs(offset)))
+            chosen_ids.add(neighbor.node_id)
+            if len(chosen) >= 24:
+                break
+        if len(chosen) >= 24:
+            break
+    # Fuse the proposition-focused rank with the previous routed-coverage rank.
+    # This is a generic rank ensemble: it preserves strong global lossless hits
+    # while restoring one-per-region coverage for collections and multi-session facts.
+    legacy_ranked = _legacy_ranked_source_turns(
+        index, ir, query_vectors, selected_cards, fine_ranked,
+    )
+    combined = list(chosen[:8])
+    remaining_new = list(chosen[8:])
+    remaining_legacy = [
+        row for row in legacy_ranked
+        if row[0].node_id not in {item[0].node_id for item in combined}
+    ]
+    while len(combined) < 24 and (remaining_legacy or remaining_new):
+        if remaining_legacy:
+            row = remaining_legacy.pop(0)
+            if row[0].node_id not in {item[0].node_id for item in combined}:
+                combined.append(row)
+        if len(combined) >= 24:
+            break
+        if remaining_new:
+            row = remaining_new.pop(0)
+            if row[0].node_id not in {item[0].node_id for item in combined}:
+                combined.append(row)
+    return combined[:24]
 
 
 _AGGREGATE_RANK_STOP = {
@@ -1912,6 +2155,502 @@ def _pack(
     )
 
 
+
+def _compact_frame_block(frame: RoleFrameNode) -> str:
+    temporal = (
+        frame.temporal.event_time or frame.temporal.start
+        or frame.temporal.observed_at or frame.temporal.end or "unknown"
+    )
+    quantity = ""
+    if frame.quantity.value is not None:
+        quantity = f"; quantity={frame.quantity.value} {frame.quantity.unit}".rstrip()
+    return (
+        f"[BOUND_FRAME {frame.frame_id} sources={','.join(frame.source_turn_ids)}]\n"
+        f"kind={frame.frame_kind}; owner={frame.owner_key}; entity={frame.entity_key}; "
+        f"predicate={frame.predicate_key}; object={frame.object_key}; "
+        f"polarity={frame.polarity}; status={frame.lifecycle_status}; "
+        f"operation={frame.state_op}; time={temporal}{quantity}"
+    )
+
+
+def _pack_lossless_first(
+    *,
+    cards: list[RoutingCard],
+    ranked_groups: list[tuple[EvidenceGroup, float]],
+    ranked_frames: list[tuple[RoleFrameNode, float]],
+    ranked_turns: list[tuple[TurnNodeV36, float]] | None = None,
+    priority_frame_ids: list[str] | None = None,
+    ir: QueryIR | None = None,
+    turn_by_id: dict[str, TurnNodeV36],
+    token_budget: int,
+) -> tuple[
+    str, list[EvidenceGroup], list[RoleFrameNode], list[str],
+    list[dict[str, Any]],
+]:
+    """Pack authoritative lossless spans before compact structural hints.
+
+    Routing cards remain available in the retrieval trace but are intentionally
+    absent from the answer context.  Frames and groups are compact navigation
+    records and are admitted only when at least one cited source turn is packed.
+    """
+    del cards  # coarse routing is trace metadata, not answer evidence
+    parts: list[str] = []
+    used_tokens = 0
+    source_ids: list[str] = []
+    selected_frames: list[RoleFrameNode] = []
+    selected_groups: list[EvidenceGroup] = []
+    ledger: list[dict[str, Any]] = []
+    frame_by_id = {frame.frame_id: frame for frame, _score in ranked_frames}
+    score_by_frame = {frame.frame_id: score for frame, score in ranked_frames}
+
+    structured = ir is not None and ir.requested_value_type in {
+        "count", "list", "aggregate", "duration", "temporal_order", "state",
+        "preference", "recommendation",
+    }
+    source_limit = 18 if structured else 12
+
+    def add_source(turn: TurnNodeV36, score: float, reason: str) -> bool:
+        nonlocal used_tokens
+        if turn.node_id in source_ids:
+            return True
+        if ir is not None and (
+            _ORDINAL_RE.search(ir.raw_question)
+            or (_DIALOGUE_RE.search(ir.raw_question) and turn.transport_role == "assistant")
+        ):
+            focused = turn.text[:5000]
+        else:
+            focused = (
+                _focused_turn_text(ir, turn, max_chars=2200 if structured else 1800)
+                if ir is not None else turn.text[:1800]
+            )
+        block = (
+            f"[SOURCE_EVIDENCE {turn.node_id}]\n"
+            f"date={turn.session_date or 'unknown'}; speaker={turn.speaker}; "
+            f"listener={turn.listener or 'unknown'}; role={turn.transport_role}\n"
+            f"{focused}"
+        )
+        cost = rough_token_count(block)
+        if used_tokens + cost > token_budget:
+            return False
+        parts.append(block)
+        used_tokens += cost
+        source_ids.append(turn.node_id)
+        ledger.append({
+            "source_turn_id": turn.node_id,
+            "score": score,
+            "selection_reason": reason,
+            "focused_lossless": True,
+            "provenance_complete": True,
+        })
+        return True
+
+    for turn, score in ranked_turns or []:
+        add_source(turn, score, "lossless_binding_rank")
+        if len(source_ids) >= source_limit:
+            break
+
+    # Query-bound frames can rescue an answer-bearing source that narrowly
+    # missed the turn rank.  Add the source first, then only a compact frame.
+    ordered_frame_ids = list(dict.fromkeys([
+        *(priority_frame_ids or []),
+        *[frame.frame_id for frame, _score in ranked_frames],
+    ]))
+    for frame_id in ordered_frame_ids:
+        frame = frame_by_id.get(frame_id)
+        if frame is None or frame in selected_frames or not frame.source_turn_ids:
+            continue
+        if not set(frame.source_turn_ids).intersection(source_ids):
+            for source_id in frame.source_turn_ids[:2]:
+                source = turn_by_id.get(source_id)
+                if source is not None:
+                    add_source(
+                        source, score_by_frame.get(frame_id, 0.0),
+                        "frame_source_projection",
+                    )
+        if not set(frame.source_turn_ids).intersection(source_ids):
+            continue
+        block = _compact_frame_block(frame)
+        cost = rough_token_count(block)
+        if used_tokens + cost > token_budget:
+            continue
+        parts.append(block)
+        used_tokens += cost
+        selected_frames.append(frame)
+        ledger.append({
+            "frame_id": frame.frame_id,
+            "frame_kind": frame.frame_kind,
+            "source_turn_ids": frame.source_turn_ids,
+            "score": score_by_frame.get(frame.frame_id, 0.0),
+            "compact_navigation_only": True,
+            "provenance_complete": True,
+        })
+        if len(selected_frames) >= 14:
+            break
+
+    for group, score in ranked_groups:
+        if not group.provenance_complete:
+            continue
+        overlap = [source for source in group.source_turn_ids if source in source_ids]
+        if not overlap:
+            continue
+        member_rows = [
+            _compact_frame_block(frame_by_id[frame_id]).split("\n", 1)[1]
+            for frame_id in group.member_frame_ids
+            if frame_id in frame_by_id
+        ]
+        if not member_rows:
+            continue
+        block = (
+            f"[BOUND_GROUP {group.group_id} kind={group.group_kind} "
+            f"sources={','.join(group.source_turn_ids)}]\n"
+            + "\n".join(member_rows)
+        )
+        cost = rough_token_count(block)
+        if used_tokens + cost > token_budget:
+            continue
+        parts.append(block)
+        used_tokens += cost
+        selected_groups.append(group)
+        for frame_id in group.member_frame_ids:
+            frame = frame_by_id.get(frame_id)
+            if frame is not None and frame not in selected_frames:
+                selected_frames.append(frame)
+        ledger.append({
+            "group_id": group.group_id,
+            "group_kind": group.group_kind,
+            "frame_ids": group.member_frame_ids,
+            "source_turn_ids": group.source_turn_ids,
+            "score": score,
+            "compact_navigation_only": True,
+            "provenance_complete": True,
+        })
+        if len(selected_groups) >= 6:
+            break
+    return "\n\n".join(parts), selected_groups, selected_frames, source_ids, ledger
+
+
+def _source_binding_certificate(
+    ir: QueryIR, turns: list[TurnNodeV36],
+) -> dict[str, Any]:
+    """Measure whether packed lossless spans bind the query roles together."""
+    query_terms = {
+        _certificate_term(token) for token in _content_tokens(ir.raw_question)
+    }
+    relation_terms = {
+        _certificate_term(token) for token in _content_tokens(ir.target_relation)
+    }
+    owner = canonical_key(ir.target_owner or "")
+    rows: list[dict[str, Any]] = []
+    for turn in turns:
+        turn_terms = {
+            _certificate_term(token)
+            for token in _content_tokens(
+                f"{turn.speaker} {turn.listener} {turn.text}"
+            )
+        }
+        overlap_terms = sorted(query_terms & turn_terms)
+        relation_overlap = sorted(relation_terms & turn_terms)
+        owner_match = not owner or (
+            turn.speaker_key == owner
+            or canonical_key(turn.listener) == owner
+            or owner in turn_terms
+        )
+        rows.append({
+            "source_turn_id": turn.node_id,
+            "owner_match": owner_match,
+            "query_overlap": overlap_terms[:12],
+            "relation_overlap": relation_overlap[:8],
+            "speaker_key": turn.speaker_key,
+        })
+
+    informative = [row for row in rows if len(row["query_overlap"]) >= 2]
+    owner_rows = [row for row in rows if row["owner_match"]]
+    entity_match = bool(owner_rows if owner else informative)
+    relation_match = bool(
+        not relation_terms
+        or any(row["relation_overlap"] for row in rows)
+        or any(len(row["query_overlap"]) >= 3 for row in rows)
+    )
+    target_support: dict[str, list[str]] = {}
+    for target in ir.comparison_targets[:2]:
+        target_terms = {
+            _certificate_term(token) for token in _content_tokens(target)
+        }
+        target_support[target] = [
+            turn.node_id for turn in turns
+            if target_terms.intersection({
+                _certificate_term(token)
+                for token in _content_tokens(turn.text)
+            })
+        ][:4]
+    comparison_complete = not target_support or all(target_support.values())
+    binding_source_ids = list(dict.fromkeys(
+        row["source_turn_id"] for row in rows
+        if row in informative and row["owner_match"]
+    ))
+    return {
+        "entity_match": entity_match,
+        "relation_match": relation_match,
+        "comparison_complete": comparison_complete,
+        "provenance_complete": bool(turns),
+        "binding_complete": bool(
+            entity_match and relation_match and comparison_complete and turns
+        ),
+        "binding_source_ids": binding_source_ids[:12],
+        "target_support": target_support,
+        "source_rows": rows[:16],
+    }
+
+
+def _parse_observed_date(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    match = re.match(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", value)
+    if match is None:
+        return None
+    return datetime(*(int(part) for part in match.groups()))
+
+
+def _question_relative_target(question: str, question_date: str | None) -> datetime | None:
+    observed = _parse_observed_date(question_date)
+    if observed is None:
+        return None
+    words = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12, "couple": 2, "few": 3,
+    }
+    match = re.search(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|a\s+couple(?:\s+of)?|(?:a\s+)?few)\s+"
+        r"(days?|weeks?|months?|years?)\s+ago\b",
+        question, re.IGNORECASE,
+    )
+    if match:
+        raw = match.group(1).casefold()
+        amount = int(raw) if raw.isdigit() else 2 if raw.startswith("a couple") else 3 if raw.endswith("few") else words[raw]
+        unit = match.group(2).casefold().rstrip("s")
+        days = amount * {"day": 1, "week": 7, "month": 30, "year": 365}[unit]
+        return observed - timedelta(days=days)
+    weekdays = {
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
+    }
+    match = re.search(r"\blast\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", question, re.IGNORECASE)
+    if match:
+        target = weekdays[match.group(1).casefold()]
+        delta = (observed.weekday() - target) % 7 or 7
+        return observed - timedelta(days=delta)
+    return None
+
+
+def _session_binding_units(index: V36Index) -> dict[str, list[str]]:
+    """Keep event-local units separate; session concatenation creates false joins."""
+    values: dict[str, list[str]] = defaultdict(list)
+    for frame in index.frames:
+        text = " ".join([
+            frame.entity_key, frame.predicate_key, frame.object_key,
+            frame.context_key, " ".join(frame.semantic_type_keys),
+            frame.retrieval_text,
+        ])
+        for session_id in frame.session_ids:
+            values[session_id].append(text)
+    for turn in index.turns:
+        if turn.transport_role == "user":
+            values[turn.session_id].append(turn.text)
+    return values
+
+
+def _relative_time_card_protection(
+    *, case: QuestionCase, ir: QueryIR, index: V36Index,
+    card_ranked: list[tuple[str, float]],
+    card_channels: dict[str, dict[str, int]],
+    selected_card_ids: list[str],
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    """Protect date-near cards only when they also bind the requested event."""
+    target = _question_relative_target(case.question, case.question_date)
+    if target is None:
+        return selected_card_ids, [], []
+    rank = {card_id: position for position, (card_id, _score) in enumerate(card_ranked)}
+    card_by_session = {card.session_id: card for card in index.routing_cards}
+    frames_by_source: dict[str, list[RoleFrameNode]] = defaultdict(list)
+    for frame in index.frames:
+        for source_id in frame.source_turn_ids:
+            frames_by_source[source_id].append(frame)
+    target_terms, relation_terms = query_binding_terms(ir)
+    requested_families = action_families(case.question)
+    rows: list[tuple[int, int, int, int, str, str]] = []
+    for turn in index.turns:
+        if turn.transport_role != "user":
+            continue
+        card = card_by_session.get(turn.session_id)
+        if card is None:
+            continue
+        observed = _parse_observed_date(turn.session_date)
+        if observed is None:
+            continue
+        event_time = _question_relative_target(turn.text, turn.session_date) or observed
+        local_frames = frames_by_source.get(turn.node_id, [])
+        frame_text = " ".join(frame.retrieval_text for frame in local_frames)
+        text = f"{turn.text} {frame_text}"
+        terms = binding_tokens(text)
+        family_overlap = requested_families & action_families(text)
+        target_overlap = fuzzy_term_overlap(target_terms, terms)
+        relation_overlap = relation_terms & terms
+        semantic_rank = min(
+            (
+                value for key, value in card_channels.get(card.card_id, {}).items()
+                if "dense" in key
+            ),
+            default=10**6,
+        )
+        if requested_families and not family_overlap:
+            continue
+        if (
+            not target_overlap and not family_overlap
+            and len(relation_overlap) < 2 and semantic_rank > 6
+        ):
+            continue
+        distance = abs((event_time.date() - target.date()).days)
+        if distance > 2:
+            continue
+        compatibility = (
+            4 * len(family_overlap) + 3 * len(target_overlap)
+            + len(relation_overlap) + int(semantic_rank <= 6)
+        )
+        card_position = rank.get(card.card_id, 10**6)
+        rows.append((distance, -compatibility, -len(target_overlap), card_position, card.card_id, turn.node_id))
+    protected: list[str] = []
+    trace: list[dict[str, Any]] = []
+    sources_per_card: dict[str, int] = defaultdict(int)
+    for distance, negative_compatibility, negative_target, card_position, card_id, source_id in sorted(rows):
+        if sources_per_card[card_id] >= 2:
+            continue
+        if card_id not in protected:
+            if len(protected) >= 6:
+                continue
+            protected.append(card_id)
+        sources_per_card[card_id] += 1
+        trace.append({
+            "card_id": card_id, "source_turn_id": source_id,
+            "target_date": target.date().isoformat(), "distance_days": distance,
+            "binding_score": -negative_compatibility,
+            "target_overlap": -negative_target, "coarse_rank": card_position,
+        })
+    result = list(selected_card_ids)
+    for card_id in protected:
+        if card_id not in result:
+            result.append(card_id)
+    return result[:14], protected, trace
+
+
+def _comparison_card_protection(
+    *, ir: QueryIR, index: V36Index,
+    card_ranked: list[tuple[str, float]], selected_card_ids: list[str],
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    """Protect one independently bound coarse card for each comparison side."""
+    targets = ir.comparison_targets[:2]
+    if len(targets) < 2:
+        return selected_card_ids, [], []
+    rank = {card_id: position for position, (card_id, _score) in enumerate(card_ranked)}
+    session_units = _session_binding_units(index)
+    cards = {card.session_id: card for card in index.routing_cards}
+    token_sets = [binding_tokens(target) for target in targets]
+    shared = set.intersection(*token_sets) if token_sets else set()
+    protected: list[str] = []
+    trace: list[dict[str, Any]] = []
+    for target, terms in zip(targets, token_sets):
+        distinctive = terms - shared or terms
+        rows: list[tuple[int, int, int, str]] = []
+        for session_id, units in session_units.items():
+            card = cards.get(session_id)
+            if card is None:
+                continue
+            unit_rows = [
+                (
+                    int(target.casefold() in unit.casefold()),
+                    len(distinctive & binding_tokens(unit)),
+                )
+                for unit in units
+            ]
+            exact, overlap_size = max(unit_rows, default=(0, 0))
+            if overlap_size < 1:
+                continue
+            rows.append((-exact, -overlap_size, rank.get(card.card_id, 10**6), card.card_id))
+        if not rows:
+            continue
+        exact_rank, negative_overlap, coarse_rank, card_id = min(rows)
+        if card_id not in protected:
+            protected.append(card_id)
+        trace.append({
+            "target": target, "card_id": card_id,
+            "distinctive_overlap": -negative_overlap,
+            "exact_phrase": bool(-exact_rank), "coarse_rank": coarse_rank,
+        })
+    result = list(selected_card_ids)
+    for card_id in protected:
+        if card_id not in result:
+            result.append(card_id)
+    return result[:14], protected, trace
+
+
+def _semantic_rerank_source_closure(
+    ir: QueryIR,
+    closure: Any,
+    turn_by_id: dict[str, TurnNodeV36],
+    query_vectors: list[list[float]],
+) -> list[dict[str, Any]]:
+    # Rerank an already bounded source closure; never widen its route.
+    if not closure.candidates or not query_vectors:
+        return []
+    views = query_views(ir)
+    target_positions = [
+        position for position, view in enumerate(views)
+        if view.startswith("target ") and position < len(query_vectors)
+    ]
+    target_vectors = [query_vectors[position] for position in target_positions]
+    raw_vector = query_vectors[0]
+    diagnostics: list[dict[str, Any]] = []
+    scores: dict[str, float] = {}
+    for candidate in closure.candidates:
+        turn = turn_by_id.get(candidate.source_turn_id)
+        if turn is None or turn.embedding is None:
+            semantic = 0.0
+            target_score = 0.0
+        else:
+            raw_score = cosine_similarity(raw_vector, turn.embedding)
+            target_score = max(
+                (cosine_similarity(vector, turn.embedding) for vector in target_vectors),
+                default=raw_score,
+            )
+            semantic = 0.65 * target_score + 0.35 * raw_score
+        combined = semantic + 0.05 * candidate.score
+        scores[candidate.source_turn_id] = max(
+            scores.get(candidate.source_turn_id, float("-inf")), combined,
+        )
+        diagnostics.append({
+            "source_turn_id": candidate.source_turn_id,
+            "semantic_score": round(semantic, 6),
+            "target_dense_score": round(target_score, 6),
+            "combined_score": round(combined, 6),
+        })
+    closure.candidates.sort(key=lambda row: (
+        -scores.get(row.source_turn_id, 0.0), -row.score,
+        row.session_id, row.span_index,
+    ))
+    ordered = list(dict.fromkeys(
+        candidate.source_turn_id for candidate in closure.candidates
+    ))
+    seen = set(ordered)
+    ordered.extend(
+        source_id for source_id in closure.selected_source_turn_ids
+        if source_id not in seen
+    )
+    closure.selected_source_turn_ids = ordered
+    diagnostics.sort(key=lambda row: -row["combined_score"])
+    return diagnostics
+
+
 def _global_lossless_safety_hint(
     ir: QueryIR, index: V36Index, limit: int = 8,
 ) -> dict[str, Any] | None:
@@ -1977,6 +2716,7 @@ def retrieve(
     token_budget: int = 8800,
 ) -> RetrievedContext:
     started = time.perf_counter()
+    dialogue_topology = infer_dialogue_topology(index.turns)
     ir = build_query_ir(case.question)
     card_by_id = {card.card_id: card for card in index.routing_cards}
     card_by_session = {card.session_id: card for card in index.routing_cards}
@@ -1988,6 +2728,18 @@ def retrieve(
     selected_card_ids = _adaptive_cards(card_ranked, ir, card_channels)
     selected_card_ids, structural_scope_trace = _collection_scope_cards(
         index, ir, selected_card_ids
+    )
+    selected_card_ids, relative_time_card_ids, relative_time_scope_trace = (
+        _relative_time_card_protection(
+            case=case, ir=ir, index=index, card_ranked=card_ranked,
+            card_channels=card_channels, selected_card_ids=selected_card_ids,
+        )
+    )
+    selected_card_ids, comparison_card_ids, comparison_scope_trace = (
+        _comparison_card_protection(
+            ir=ir, index=index, card_ranked=card_ranked,
+            selected_card_ids=selected_card_ids,
+        )
     )
     selected_cards = [
         card_by_id[node_id] for node_id in selected_card_ids
@@ -2049,7 +2801,7 @@ def retrieve(
                 })
     routed_sessions = {card.session_id for card in selected_cards}
     card_score = dict(card_ranked)
-    protected_card_ids = set(selected_card_ids[:2])
+    protected_card_ids = set([*selected_card_ids[:2], *relative_time_card_ids, *comparison_card_ids])
     retired_card_ids: set[str] = set()
     fine_nodes = _fine_scope_nodes(index, routed_sessions)
     fine_ranked, fine_channels = _fine_rankings(
@@ -2240,9 +2992,50 @@ def retrieve(
             if frame_id in frame_by_id and frame_id not in known_frame_ids:
                 ranked_frames.append((frame_by_id[frame_id], 0.0))
                 known_frame_ids.add(frame_id)
+    comparison_session_hints = {
+        row["target"]: card_by_id[row["card_id"]].session_id
+        for row in comparison_scope_trace
+        if row.get("target") and row.get("card_id") in card_by_id
+    }
+    source_span_closure = build_source_span_closure(
+        ir, index.turns, set(routed_sessions),
+        frames=index.frames, question_date=case.question_date,
+        target_session_hints=comparison_session_hints,
+        preferred_source_turn_ids=[
+            row["source_turn_id"] for row in relative_time_scope_trace
+            if row.get("source_turn_id")
+        ],
+        max_candidates=24,
+    )
+    source_span_semantic_trace = (
+        _semantic_rerank_source_closure(
+            ir, source_span_closure, turn_by_id, query_vectors,
+        )
+        if ir.temporal_constraints else []
+    )
     ranked_turns = _ranked_source_turns(
         index, ir, query_vectors, selected_cards, fine_ranked
     )
+    # Question-time closure ranks relation-bound source spans before broader
+    # semantic neighbors. It never introduces a source outside routed scope.
+    span_score = {
+        candidate.source_turn_id: candidate.score
+        for candidate in source_span_closure.candidates
+    }
+    span_priority = [
+        (turn_by_id[source_id], span_score.get(source_id, 0.0))
+        for source_id in source_span_closure.selected_source_turn_ids
+        if source_id in turn_by_id
+    ]
+    ranked_turns = [
+        *span_priority,
+        *[
+            row for row in ranked_turns
+            if row[0].node_id not in {
+                turn.node_id for turn, _score in span_priority
+            }
+        ],
+    ]
     priority_pool = [
         (frame, fine_score.get(frame.frame_id, 0.0))
         for frame in index.frames
@@ -2288,7 +3081,8 @@ def retrieve(
         and re.search(r"\bfrom\b.+\bto\b", ir.raw_question, re.IGNORECASE)
     ):
         ledger_reserve = 2500
-    context, packed_groups, packed_frames, source_ids, ledger = _pack(
+    ledger_reserve = max(ledger_reserve, 2200 if ir.temporal_constraints else 1200)
+    context, packed_groups, packed_frames, source_ids, ledger = _pack_lossless_first(
         cards=selected_cards,
         ranked_groups=ranked_groups,
         ranked_frames=ranked_frames,
@@ -2301,6 +3095,28 @@ def retrieve(
             token_budget - ledger_reserve,
         ),
     )
+    packed_span_rows = [
+        {
+            "source_turn_id": candidate.source_turn_id,
+            "source_text": candidate.text[:420],
+            "roles": candidate.roles,
+            "target_terms": candidate.target_terms,
+            "relation_terms": candidate.relation_terms,
+            "action_families": candidate.action_families,
+            "lifecycle_status": candidate.lifecycle_status,
+            "polarity": candidate.polarity,
+            "event_time_text": candidate.event_time_text,
+            "identity_keys": candidate.identity_keys,
+            "score": candidate.score,
+        }
+        for candidate in source_span_closure.candidates
+        if candidate.source_turn_id in source_ids
+    ][:14]
+    if packed_span_rows:
+        context += (
+            "\n\n[RELATION_BOUND_SOURCE_SPANS]\n"
+            + json.dumps(packed_span_rows, ensure_ascii=False, separators=(",", ":"))
+        )
     excluded = [
         node_id for node_id, _score in fine_ranked
         if node_id not in {
@@ -2315,6 +3131,9 @@ def retrieve(
         excluded=excluded,
         expansion_rounds=expansion_rounds,
     )
+    source_binding = _source_binding_certificate(
+        ir, [turn_by_id[source_id] for source_id in source_ids if source_id in turn_by_id],
+    )
     # Fine packing may omit the one decisive user proposition from a routed
     # memory region. Operators inspect all user turns inside the bounded coarse
     # route, while their local binders still require entity/relation evidence.
@@ -2322,26 +3141,42 @@ def retrieve(
     routed_user_source_ids = [
         turn.node_id for turn in index.turns
         if turn.session_id in routed_session_set
-        and turn.transport_role == "user"
+        and is_memory_source(turn, dialogue_topology)
     ]
     # Typed binders are strict enough to use a lossless global safety pool.
     # Coarse routing remains the normal path; this pool only prevents a missed
     # card from hiding an exact entity/date/operand source from an operator.
     all_user_source_ids = [
         turn.node_id for turn in index.turns
-        if turn.transport_role == "user"
+        if is_memory_source(turn, dialogue_topology)
     ]
     operator_source_ids = list(dict.fromkeys([
         *source_ids, *routed_user_source_ids, *all_user_source_ids,
     ]))
-    temporal_hint = temporal_source_pair_hint(ir, index, operator_source_ids)
+    temporal_operator_source_ids = list(dict.fromkeys([
+        *source_span_closure.selected_source_turn_ids, *source_ids,
+        *routed_user_source_ids,
+    ]))
+    if ir.comparison_targets and all(
+        source_span_closure.target_support.get(target)
+        for target in ir.comparison_targets
+    ):
+        temporal_operator_source_ids = list(
+            source_span_closure.selected_source_turn_ids
+        )
+    temporal_hint = temporal_source_pair_hint(
+        ir, index, temporal_operator_source_ids
+    )
     relative_time_hint = relative_time_from_sources_hint(
-        ir, index, operator_source_ids, case.question_date,
+        ir, index, temporal_operator_source_ids, case.question_date,
     )
     transaction_sum_hint = transaction_sum_from_sources_hint(
         ir, index, operator_source_ids,
     )
-    exact_absence_hint = exact_entity_absence_hint(ir, index)
+    exact_absence_hint = (
+        None if dialogue_topology.peer_dialogue
+        else exact_entity_absence_hint(ir, index)
+    )
     named_members_hint = named_individual_event_members_hint(
         ir, index, list(dict.fromkeys([*source_ids, *routed_user_source_ids])),
     )
@@ -2393,9 +3228,12 @@ def retrieve(
     pending_pairs_hint = pending_operation_target_pairs_hint(
         ir, index, operator_source_ids,
     )
-    relative_anchor_hint = relative_anchor_source_hint(
-        ir, index, case.question_date,
-        allowed_session_ids={card.session_id for card in selected_cards},
+    relative_anchor_hint = (
+        None if dialogue_topology.peer_dialogue
+        else relative_anchor_source_hint(
+            ir, index, case.question_date,
+            allowed_session_ids={card.session_id for card in selected_cards},
+        )
     )
     record_hint = record_time_source_hint(ir, index, source_ids)
     collection_ledger = query_bound_collection_ledger(
@@ -2416,15 +3254,22 @@ def retrieve(
         certificate.complete = not certificate.missing_roles
     if temporal_hint is None:
         temporal_hint = temporal_order_source_hint(
-            ir, index, operator_source_ids
+            ir, index, temporal_operator_source_ids
         )
-    if (
+    temporal_binding_complete = bool(
         temporal_hint is not None
-        and certificate.entity_match
-        and certificate.relation_match
-        and certificate.scope_match
-        and certificate.provenance_complete
-    ):
+        and temporal_hint.get("binding_complete", True)
+        and temporal_hint.get("certified") is True
+        and (
+            (certificate.entity_match and certificate.relation_match
+             and certificate.scope_match and certificate.provenance_complete)
+            or (ir.comparison_targets and all(
+                source_span_closure.target_support.get(target)
+                for target in ir.comparison_targets
+            ))
+        )
+    )
+    if temporal_binding_complete:
         endpoint_roles = (
             {"events", "times"}
             if temporal_hint.get("operation")
@@ -2494,7 +3339,7 @@ def retrieve(
         operator_hints.insert(0, counterfactual_hint)
     if record_hint is not None and certificate.complete:
         operator_hints.insert(0, record_hint)
-    if temporal_hint is not None and certificate.complete:
+    if temporal_hint is not None and temporal_binding_complete:
         operator_hints = [
             hint for hint in operator_hints
             if hint.get("operation") not in {"duration_total", "time_difference"}
@@ -2568,13 +3413,6 @@ def retrieve(
             context += (
                 "\n\n[PROVENANCE_BOUND_OPERATOR_LEDGER]\n"
                 + "\n".join(str(hint) for hint in bound_hints)
-            )
-        if candidate_hints:
-            context += (
-                "\n\n[UNVERIFIED_OPERATOR_CANDIDATES]\n"
-                "These calculations do not prove operand scope closure. "
-                "Do not copy their value; recompute from matching source facts.\n"
-                + "\n".join(str(hint) for hint in candidate_hints)
             )
     if incomplete_terminal_hint is not None:
         context += (
@@ -2650,6 +3488,12 @@ def retrieve(
     ]))
     trace = {
         "query_ir": asdict(ir),
+        "dialogue_topology": asdict(dialogue_topology),
+        "hybrid_operator_policy": (
+            "lossless_peer_dialogue"
+            if dialogue_topology.peer_dialogue
+            else "lossless_plus_certified_v2_algebra"
+        ),
         "coarse_channels": card_channels,
         "fine_channels": fine_channels,
         "coarse_ranked_ids": [node_id for node_id, _ in card_ranked[:24]],
@@ -2660,7 +3504,12 @@ def retrieve(
         "graph_expansion": graph_trace,
         "coarse_semantic_extension": coarse_semantic_trace,
         "scope_adjustment": scope_adjustment_trace,
+        "relative_time_scope": relative_time_scope_trace,
+        "comparison_scope": comparison_scope_trace,
         "completeness_certificate": asdict(certificate),
+        "source_binding_certificate": source_binding,
+        "source_span_closure": asdict(source_span_closure),
+        "source_span_semantic_ranking": source_span_semantic_trace,
         "packed_group_ids": [group.group_id for group in packed_groups],
         "packed_frame_ids": [frame.frame_id for frame in packed_frames],
         "packed_source_turn_ids": source_ids,
@@ -2777,235 +3626,115 @@ def answer_messages(
     case: QuestionCase,
     retrieval: RetrievedContext,
 ) -> list[dict[str, str]]:
+    """Build one compact, source-first answer call."""
     trace = retrieval.retrieval_trace or {}
     ir = trace.get("query_ir") or {}
-    terminal_incomplete = any(
-        hint.get("operation") == "terminal_event_completion_check"
-        and hint.get("value") == "insufficient"
-        for hint in (trace.get("generic_operator_hints") or [])
-        if isinstance(hint, dict)
-    )
-    if terminal_incomplete:
+    required_roles = set(ir.get("required_roles") or [])
+    if ir.get("temporal_constraints") and retrieval.query_kind not in {"count", "list", "aggregate", "duration", "temporal_order"}:
         class_policy = (
-            "This is a bounded-interval question whose explicitly named terminal event "
-            "was not completed. The provenance-bound terminal_event_completion_check is "
-            "decisive: answer that the information is insufficient. Do not calculate to a "
-            "different degree, phase, current date, or most recent completed endpoint. "
-        )
-    elif retrieval.query_kind == "recommendation":
-        class_policy = (
-            "This is a personalized recommendation request. Bind the answer to "
-            "every explicit owner, place, object, activity and other constraint "
-            "in the question. Never substitute a similar option in a different "
-            "city or for a different entity. Infer useful constraints from "
-            "user-owned experiences, successes, dislikes, skills, resources and "
-            "current needs. A recommendation need not have appeared verbatim in "
-            "memory, and it need not claim live availability; give a concise "
-            "memory-grounded suggestion when the supported constraints suffice. "
-            "If the question introduces a new place or future situation, transfer "
-            "the supported feature preferences without claiming live availability. "
-            "For a future recommendation, the requested destination or target is "
-            "where the recommendation will be used, not an evidence entity that must "
-            "already occur in memory. Transfer supported preference attributes from "
-            "analogous past choices, but never return the old target as the answer. "
-            "If no named option is grounded, recommend a property or option profile "
-            "that satisfies those supported features instead of abstaining. Explicitly "
-            "mention the relevant contrasted options or features found in evidence. "
-            "When prior evidence compares named candidate options, name those options "
-            "and compare their supported attributes rather than giving generic tips. "
+            "Resolve the requested relative date against the question date. For this "
+            "relative-time lookup, RELATION_BOUND_SOURCE_SPANS is the exhaustive answer "
+            "candidate table; treat other frames, cards and source turns only as navigation "
+            "context. Filter candidates by event_time_text first, then require the same "
+            "source span to match the requested entity or semantic type, relation, owner "
+            "and lifecycle. Return that span’s requested value. Do not pick an out-of-window "
+            "or different same-day event merely because it ranks earlier."
         )
     elif retrieval.query_kind in {"count", "list", "aggregate", "duration"}:
         class_policy = (
-            "This is a structured quantity or collection question. Bind every operand "
-            "to the requested owner, entity, relation, time range and lifecycle. "
-            "When a PROVENANCE_BOUND_OPERATOR_LEDGER has binding_complete=true, its "
-            "source-cited operand/member set and arithmetic are the closed result for that "
-            "operation; verify the cited rows, then use it instead of a noisier incomplete "
-            "frame count. A terminal_event_completion_check with value=insufficient means "
-            "the named endpoint was never completed, so do not substitute a different degree "
-            "or interval endpoint. "
-            "Deduplicate alternate frames from the same source fact. Exclude budgets, "
-            "goals, examples, suggestions, cancelled items, and quantities with a wrong "
-            "unit or relation. Preserve whether a duration is per direction, per "
-            "occurrence, or already a total. For how-many-days-ago, subtract the named "
-            "event date from the Question date, not from the source session date. For "
-            "how long something had lasted when another event happened, subtract the "
-            "event recency from the current tenure. For time worked before a current "
-            "job, subtract current-job tenure from total professional tenure. Enumerate "
-            "valid operands before answering. For how-many-units older than an "
-            "earlier event, the answer is the elapsed time since that event. "
-            "For frequency, distinguish distinct days from the number of classes "
-            "or sessions held on those days. A query-bound collection ledger is "
-            "a compact provenance view, not proof of scope closure: enumerate every "
-            "structured member candidate first, then inspect every unframed lossless "
-            "candidate and every explicit relation-closure candidate for an omitted "
-            "member. When a worked-on project explicitly features, contains, or includes "
-            "a collection-typed artifact, treat that artifact as the operation target. "
-            "A single source can establish multiple named members. Treat every "
-            "ledger row as a candidate rather than a complete checklist or certified "
-            "count. Re-read the cited owner source, derive the concrete member identity, "
-            "and match the requested counting unit: when the question counts people or "
-            "other individuals, every separately named member of a plural group (including "
-            "twins or siblings) is one member, not one group event. For acquire, receive, "
-            "or inherit relations, a direct ownership-provenance statement such as an item "
-            "being from or having belonged to a named source establishes acquisition when "
-            "the owner and requested provenance scope match, even if the same sentence does "
-            "not repeat the query verb. Then reject category labels, background activities, "
-            "goals, contexts, and "
-            "nearby entities that do not themselves satisfy the requested operation. "
-            "A member name need not repeat the collection head when its source or routing "
-            "context establishes the semantic type. For distinct taxonomy or category "
-            "counts, map each source-confirmed named instance to its category (for example, "
-            "a named dish to its cuisine) even when the sentence omits the category label; "
-            "show the instance-to-category mapping before deduplication. Build the final set across every "
-            "routed owner source, then deduplicate source-confirmed aliases by entity "
-            "identity; never answer from the number of ledger rows. "
-            "Merge only source-confirmed aliases, apply "
-            "add/remove/cancel and lifecycle semantics, then answer from the resulting "
-            "operation-target or distinct-member set. Count pending operation-target pairs, "
-            "not merely distinct entity labels: when evidence distinguishes an old "
-            "item to return from its replacement to pick up, they remain separate "
-            "members. If the ledger supplies a "
-            "derived weekly-occurrence or bounded-interval value, verify its cited "
-            "days or endpoints and prefer it over counting distinct labels or adding "
-            "overlapping phase durations. "
+            "Enumerate source-bound operands or members first. Match owner, relation, "
+            "scope, unit, time and lifecycle; apply add/remove/cancel; deduplicate only "
+            "source-confirmed aliases; then compute the requested set or quantity. "
+            "Treat lossless collection-ledger rows as candidates to verify, including "
+            "fallback rows. One source may contain several conjoined members. Acquisition "
+            "includes explicit got/bought/received provenance; maintenance of a component "
+            "counts its parent asset; include planned actions only when the question asks."
         )
-    elif "members" in set(ir.get("required_roles") or []):
+    elif retrieval.query_kind in {"date", "temporal_order"}:
         class_policy = (
-            "This is a scoped collection question. Enumerate every distinct member "
-            "supported by owner-bound frames and lossless sources across all routed "
-            "sessions. A named member remains valid when its source establishes the "
-            "requested relation even if the frame uses a paraphrase. Preserve positive "
-            "and negative preference polarity and the stated owner/subject. Merge only "
-            "source-confirmed aliases, preserve provenance, and omit suggestions or "
-            "hypothetical examples. "
-        )
-    elif retrieval.query_kind == "span" and bool(ir.get("temporal_constraints")):
-        class_policy = (
-            "This is a source-dated past-event lookup. Resolve relative time against "
-            "the Question date and source date, and select the closest supported "
-            "event. Natural-language week counts are rounded calendar intervals; "
-            "four weeks ago may be 27-29 days earlier. "
-        )
-    elif retrieval.query_kind in {"entity", "date"}:
-        class_policy = (
-            "This is a fact lookup with possible relative time. Treat today, "
-            "yesterday, or ago in a source as anchored to that source date, then "
-            "compare it with the Question date. Return the entity from the source "
-            "whose anchored event satisfies the requested interval. "
-        )
-    elif {"condition", "effect"} <= set(ir.get("required_roles") or []):
-        class_policy = (
-            "This is a counterfactual dependency question. Identify the stated "
-            "condition and the supported motive, cause, or enabling relation for the "
-            "effect. Return a likely yes/no only when the sources establish that "
-            "dependency. Explicit causal language such as because, made, motivated, "
-            "led to, instrumental, or so I started establishes a dependency when it "
-            "connects the named condition and effect; for a positive cause of the effect, "
-            "negating that cause implies a likely no. Reverse the effect under the "
-            "negated condition without "
-            "inventing a new cause. Otherwise state that the memory is insufficient. "
+            "Bind each named event independently to its dated source, resolve relative "
+            "time against that source date, then compare or calculate the endpoints."
         )
     elif retrieval.query_kind == "state":
         class_policy = (
-            "This is a state question. Compare only values for the same entity and "
-            "attribute. For highest, lowest, best, or record questions use the supported "
-            "numeric extreme, not merely the latest mention. For a ratio A per B, a "
-            "smaller B denominator means less B per A. Ignore same-topic evidence with "
-            "a different predicate. "
+            "Compare only values with the same owner, entity, attribute and context. "
+            "Use lifecycle and time to choose the latest valid state, or the numeric "
+            "extreme when the question explicitly asks for one."
+        )
+    elif retrieval.query_kind in {"preference", "recommendation"}:
+        class_policy = (
+            "Preserve preference owner, polarity and context. A recommendation may "
+            "transfer source-supported traits and constraints to a new target; it need "
+            "not have appeared verbatim in memory."
+        )
+    elif {"condition", "effect"} <= required_roles:
+        class_policy = (
+            "Bind the named condition to a source-supported cause, motive or enabling "
+            "relation before answering the counterfactual with a concise likely yes/no."
+        )
+    elif retrieval.query_kind == "span":
+        class_policy = (
+            "For dialogue or ordinal lookup, preserve local turn order and pair the "
+            "request with its reply; return the exact requested item or span."
         )
     else:
         class_policy = (
-            "For previous-chat, ordinal, or sequence questions, use the lossless source "
-            "and preserve list position and turn order exactly: locate the requested "
-            "numbered item, requested version, or item immediately after the anchor. "
-            "When asked what comes after a quoted sequence anchor, return the next item, "
-            "not the final token inside the anchor. Treat an activity or entity name with "
-            "an extra lexical modifier as distinct unless evidence explicitly aliases it; "
-            "for example, a compound activity is not established by its head word alone. "
-            "Exclude hypothetical examples and unexecuted assistant suggestions. "
-            "If the question says initially, first, or earlier, use the earliest "
-            "valid assertion in the requested scope rather than the latest state. "
+            "Answer the requested entity, attribute or relation from the strongest "
+            "owner-bound lossless source, resolving aliases only when evidence supports it."
         )
-    compact_bound_hints = []
+
+    compact_bound_hints: list[dict[str, Any]] = []
     compact_keys = {
         "operation", "value", "unit", "selected_target", "answer_candidate",
         "parent_count", "subset_count", "current_age", "event_age",
         "required_terminal_event", "reason", "left_value", "right_value",
         "event_a_time", "event_b_time", "selected_time",
     }
-    for hint in (trace.get("generic_operator_hints") or []):
+    for hint in trace.get("generic_operator_hints") or []:
         if not isinstance(hint, dict) or hint.get("binding_complete") is not True:
             continue
         compact = {key: hint[key] for key in compact_keys if key in hint}
-        if "selected_target" in hint:
-            compact["answer_value"] = hint["selected_target"]
-        elif "answer_candidate" in hint:
-            compact["answer_value"] = hint["answer_candidate"]
-        elif "value" in hint:
-            compact["answer_value"] = hint["value"]
         for list_key in ("members", "operands"):
             if isinstance(hint.get(list_key), list):
-                compact[list_key] = [
-                    {key: value for key, value in row.items() if key in {
-                        "identity", "category", "target", "value", "value_minutes",
-                        "source_turn_id", "source_turn_ids", "derivation",
-                    }} if isinstance(row, dict) else row
-                    for row in hint[list_key][:16]
-                ]
+                compact[list_key] = hint[list_key][:16]
         compact_bound_hints.append(compact)
-    decisive_block = (
-        json.dumps(compact_bound_hints, ensure_ascii=False)
-        if compact_bound_hints else "none"
-    )
+    binding = trace.get("source_binding_certificate") or {}
+    binding_summary = {
+        key: binding.get(key) for key in (
+            "entity_match", "relation_match", "comparison_complete",
+            "binding_complete", "binding_source_ids", "target_support",
+        ) if key in binding
+    }
     return [
         {
             "role": "system",
             "content": (
-                "Answer the memory question using only the supplied routing cards, "
-                "role frames, complete evidence groups, and source turns. Routing "
-                "cards locate evidence but are not themselves proof. Respect fact "
-                "ownership, negation, lifecycle status, collection operations and "
-                "time. Resolve relative dates against the date shown on their source turn. "
-                "An operator row with binding_complete=True is a provenance-bound "
-                "deterministic calculation whose cited operands have been matched to "
-                "the requested relation and scope. Prefer its computed result unless "
-                "a cited direct source contradicts the binding. When a bound temporal "
-                "anchor row includes answer_candidate, that field is the requested role "
-                "extracted from its date-matched source. Operator candidates "
-                "without binding_complete=True are diagnostic only: never copy their "
-                "value, and recompute from matching source facts instead. "
-                "Direct lossless sources override a duplicated or mismatched operator. For aggregate, comparison, or "
-                "ordering questions, do not guess when the evidence-completeness "
-                "record lists a required role as missing. Match the complete requested "
-                "entity expression; do not infer identity from a partial lexical "
-                "match alone. A common unambiguous alias or containment relation may "
-                "be used when the cited evidence supports that interpretation. "
-                "For a temporal-order comparison, compare only the two named "
-                "alternatives and bind each one to its own dated source. "
-                "For count or list questions, treat each supported operation-target "
-                "pair as a distinct candidate; different operations and explicitly "
-                "old/new versions remain distinct unless the source identifies the "
-                "same outstanding item. "
-                f"{class_policy}When dated user-owned values conflict, prefer the latest "
-                "valid direct assertion. A value presupposed as the baseline of a goal "
-                "still establishes that baseline, while the goal itself is not a "
-                "completed result. A concrete fact used as the premise of a user "
-                "request (for example, an owned entity described by an attribute) "
-                "is a user assertion and may establish that fact. "
-                "Prefer a complete evidence group over an isolated similar "
-                "sentence. Do not reveal hidden reasoning. If the evidence and "
-                "provenance are insufficient, say that the memory does not establish "
-                "the answer. Return only a concise answer."
+                "Answer the memory question only from the supplied SOURCE_EVIDENCE. "
+                "BOUND_FRAME and BOUND_GROUP records are navigation summaries; a source "
+                "turn is authoritative when they differ. Keep speaker and fact owner "
+                "distinct, preserve negation, uncertainty, lifecycle and exact units, "
+                "and resolve relative dates from the displayed source date. "
+                "A provenance-bound ledger may be used only after its cited source facts "
+                "match the question. Ignore unverified calculations. When a certified "
+                "exact_entity_absence ledger says value=insufficient, the named entity "
+                "was checked against user memory: do not substitute a relation-near entity; "
+                "answer that the requested information is insufficient. "
+                f"{class_policy} "
+                "Do not abstain merely because a structural role certificate is incomplete; "
+                "answer whenever a supplied source or verified bound ledger establishes the "
+                "target. Abstain only when none of them supports it. Do not reveal reasoning. "
+                "Return only a concise answer."
             ),
         },
         {
             "role": "user",
             "content": (
-                f"Question date:\n{case.question_date or 'unknown'}\n\n"
-                f"Question:\n{case.question}\n\n"
-                "Decisive provenance-bound ledger (verify cited sources, then use it):\n"
-                f"{decisive_block}\n\n"
+                f"Question date: {case.question_date or 'unknown'}\n"
+                f"Question: {case.question}\n\n"
+                "Source-binding diagnostic (ranking aid, not answer evidence):\n"
+                f"{json.dumps(binding_summary, ensure_ascii=False)}\n\n"
+                "Verified deterministic ledger:\n"
+                f"{json.dumps(compact_bound_hints, ensure_ascii=False)}\n\n"
                 f"Memory evidence:\n{retrieval.context_text}"
             ),
         },

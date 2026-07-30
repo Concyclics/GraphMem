@@ -8,7 +8,7 @@ from pathlib import Path
 from graphmem_demo.clients import (
     MockCompressor, MockDeepSeekClient, MockEmbeddingClient,
 )
-from graphmem_demo.models import QuestionCase
+from graphmem_demo.models import QuestionCase, RetrievedContext
 from graphmem_demo.pipeline import (
     BuildMetrics, DemoConfig, InflightLimiter, MemoryBuild,
     _build_v36_memory, _load_memory_cache, _memory_cache_fingerprint,
@@ -24,9 +24,12 @@ from graphmem_demo.v36.build import (
 )
 from graphmem_demo.v36.retrieval import (
     _adaptive_cards, _certificate, _content_tokens, _focused_turn_text, _pack,
-    _structured_rank, build_query_ir, retrieve,
+    _pack_lossless_first, _source_binding_certificate, _structured_rank,
+    answer_messages, build_query_ir, retrieve,
 )
-from graphmem_demo.v36.schema import EvidenceGroup, RoleFrameNode, RoutingCard
+from graphmem_demo.v36.schema import (
+    EvidenceGroup, QueryIR, RoleFrameNode, RoutingCard,
+)
 
 
 def _case(question: str = "What did Alice buy?") -> QuestionCase:
@@ -925,3 +928,78 @@ def test_v36_memory_cache_stores_embeddings_in_binary_companion(tmp_path: Path) 
             abs(actual - expected) < 1e-6
             for actual, expected in zip(node.embedding or [], original[node.node_id])
         )
+
+
+def test_v36_lossless_pack_precedes_compact_navigation() -> None:
+    case, index, _embedder = _parsed()
+    turns, frames, card = index.turns, index.frames, index.routing_cards[0]
+    context, _groups, packed_frames, sources, _ledger = _pack_lossless_first(
+        cards=[card],
+        ranked_groups=[],
+        ranked_frames=[(frames[1], 1.0)],
+        ranked_turns=[(turns[1], 1.0)],
+        priority_frame_ids=[frames[1].frame_id],
+        ir=build_query_ir(case.question),
+        turn_by_id={turn.node_id: turn for turn in turns},
+        token_budget=2000,
+    )
+    assert context.startswith("[SOURCE_EVIDENCE")
+    assert "[ROUTING_CARD" not in context
+    assert "[BOUND_FRAME" in context
+    assert sources == [turns[1].node_id]
+    assert packed_frames == [frames[1]]
+
+
+def test_v36_source_binding_requires_both_comparison_anchors() -> None:
+    _case_value, index, _embedder = _parsed()
+    turns = index.turns
+    ir = QueryIR(
+        raw_question="Was the Lumina X2 recommended before the Nova Z5?",
+        target_entities=["Lumina X2", "Nova Z5"],
+        target_relation="recommended before",
+        target_owner="Bob",
+        requested_value_type="temporal_order",
+        temporal_constraints=["before"],
+        state_constraints=[],
+        collection_constraints=[],
+        polarity="unknown",
+        required_roles=["event_a", "event_b", "time_a", "time_b"],
+        comparison_targets=["Lumina X2", "Nova Z5"],
+    )
+    certificate = _source_binding_certificate(ir, turns)
+    assert certificate["comparison_complete"] is False
+    turns[0].text += " The Nova Z5 was discussed later."
+    certificate = _source_binding_certificate(ir, turns)
+    assert certificate["comparison_complete"] is True
+
+
+def test_v36_answer_prompt_is_source_first_and_does_not_force_role_abstention() -> None:
+    case = _case()
+    retrieval = RetrievedContext(
+        question_id=case.question_id,
+        variant="hierarchical_role_graph_v3_6",
+        summary_node_ids=[],
+        leaf_node_ids=["source"],
+        edge_count=0,
+        context_text="[SOURCE_EVIDENCE source]\nAlice bought a camera.",
+        answer_session_hit=False,
+        retrieved_session_ids=["s"],
+        latency_sec=0.0,
+        query_kind="entity",
+        retrieval_trace={
+            "query_ir": {"required_roles": ["entity"]},
+            "source_binding_certificate": {"binding_complete": True},
+            "generic_operator_hints": [
+                {"operation": "noisy", "value": 99, "binding_complete": False}
+            ],
+        },
+    )
+    prompt = "\n".join(
+        message["content"] for message in answer_messages(case, retrieval)
+    )
+    assert (
+        "Do not abstain merely because a structural role certificate is incomplete"
+        in prompt
+    )
+    assert "UNVERIFIED_OPERATOR_CANDIDATES" not in prompt
+    assert '"value": 99' not in prompt

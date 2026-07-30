@@ -1,0 +1,23 @@
+{
+  "variant": "hierarchical_hybrid_graph_v4_0",
+  "schema_version": "graphmem_v4_0",
+  "backbone_model": "gpt-5.4-mini",
+  "judge_model": "gpt-5.4-mini",
+  "thinking": "disabled",
+  "embedding_base_url": "http://127.0.0.1:8001/v1",
+  "embedding_model": "Qwen3-Embedding-0.6B",
+  "build_budget_tokens": 300000,
+  "answer_target_tokens": 10000,
+  "answer_hard_limit_tokens": 12100,
+  "qa_max_tokens": 512,
+  "question_workers": 32,
+  "build_workers": 32,
+  "design": {
+    "physical_index": "lossless_turns_plus_role_frames",
+    "assistant_mediated_projection": "state_collection_temporal",
+    "peer_dialogue_projection": "dialogue_pair_reference_adjacency",
+    "query_controller": "topology_and_required_roles",
+    "operator_output": "evidence_only",
+    "final_answer": "single_llm_call"
+  }
+}
