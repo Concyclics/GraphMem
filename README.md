@@ -1,12 +1,34 @@
 # GraphMem
 
-GraphMem is a graph-structured long-term memory system for conversational QA benchmarks such as [LongMemEval](https://github.com/LongMemEval/LongMemEval) and LoCoMo.
+GraphMem builds a hierarchical state graph from multi-session dialogue and answers long-horizon questions on benchmarks such as [LongMemEval](https://github.com/LongMemEval/LongMemEval) and [LoCoMo](https://github.com/snap-research/locomo).
 
-It builds a hierarchical memory graph from dialogue sessions, retrieves evidence with hybrid semantic / structured / graph signals, and answers questions with timeline-aware context assembly.
+This repository’s **default and maintained path is GraphMem V2** (`hierarchical_state_graph_v2`): lossless leaves, atomic facts, routing cards, directed state chains, typed retrieval, an evidence ledger, and hard per-question token budgets.
+
+Design reference: [`docs/graphmem_v2.md`](docs/graphmem_v2.md).
 
 ## Architecture
 
-See [`docs/2026-07-08_graphmem_architecture_overview.md`](docs/2026-07-08_graphmem_architecture_overview.md) for the current design overview.
+```text
+Sessions ──► Build
+              L0 LeafNode          lossless user/assistant turns
+              L1 AtomicFactNode    source-grounded facts
+              L2 RoutingCardNode   compact session routing (≤ ~180 tokens)
+              L3 StateChain        current/history state over
+                                   (subject, predicate, context)
+                    │
+Question ──► Retrieve
+              deterministic query plan (no gold leakage)
+              dense + BM25 + entity/predicate RRF
+              typed best-first expansion (depth ≤ 2)
+                    │
+             Pack   routing cards + facts + evidence ledger + short L0 excerpts
+                    │
+             Answer one DeepSeek call (thinking off, max_tokens=512)
+```
+
+Every L1 fact cites an existing L0 source. Consolidation may normalize aliases and propose relations but cannot invent facts or unknown IDs. Gold support-session IDs are read only after answering, for offline recall metrics.
+
+Build and answer phases separately report cache-miss / cache-hit input, output, and total tokens. Default hard gates: **300,000** build tokens and **10,000** answer tokens per question.
 
 ## Setup
 
@@ -14,54 +36,57 @@ See [`docs/2026-07-08_graphmem_architecture_overview.md`](docs/2026-07-08_graphm
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # then fill in your API keys
+cp .env.example .env   # set DEEPSEEK_API_KEY; chmod 600 .env recommended
 ```
+
+Required local embedding service (runner health-checks it; does not start/stop it):
+
+| Setting | Value |
+| --- | --- |
+| Model | `Qwen3-Embedding-0.6B` |
+| Endpoint | `http://127.0.0.1:8001/v1` |
+| Dimension | 1024 |
 
 ## Data
 
-Benchmark datasets are not bundled in this repo. Place converted JSON files under `data/`, for example:
+Datasets are not bundled. Place converted JSON under `data/`, for example:
 
 - `data/longmemeval_s_cleaned.json` — LongMemEval-S (cleaned)
-- `data/locomo10_graphmem.json` — LoCoMo converted to GraphMem format
-
-Use `scripts/build_eval_subset.py` to create a fixed evaluation subset once you have the source benchmark file.
+- `data/locomo10_graphmem.json` — LoCoMo via `scripts/convert_locomo10.py`
 
 ## Quick start
 
-Run the main demo CLI:
+LongMemEval:
 
 ```bash
-python scripts/run_token_demo.py \
-  --data data/longmemeval_s_subset50_balanced.json \
-  --output-dir runs/my_run \
-  --variants direct_session_k16_compact_graphmem \
-  --max-questions 10
+scripts/run_v2_longmemeval.sh /path/to/longmemeval_s_cleaned.json /path/to/output
 ```
 
-Evaluate generated answers:
+LoCoMo:
 
 ```bash
-python scripts/evaluate_answers.py \
-  --answers runs/my_run/direct_session_k16_compact_graphmem/answers.jsonl \
-  --data data/longmemeval_s_subset50_balanced.json \
-  --output-jsonl runs/my_run/direct_session_k16_compact_graphmem/auto_eval.jsonl \
-  --output-md runs/my_run/direct_session_k16_compact_graphmem/auto_eval.md
+scripts/run_v2_locomo.sh
 ```
 
-## Local vLLM workflow
-
-For fully local runs with embedding + LLM services:
+Custom OpenAI-compatible API (optional):
 
 ```bash
-scripts/smoke_longmemeval.sh up      # start services
-scripts/smoke_longmemeval.sh run     # smoke test (3 questions)
-scripts/smoke_longmemeval.sh stop    # stop services
+scripts/run_v2_custom_api.sh
+scripts/run_v2_locomo_custom_api.sh
 ```
 
-For a fixed 50-question subset with judging and stage audit:
+Runs are resumable. Judge scoring uses the pinned Mem0 LongMemEval prompts in `src/graphmem_demo/mem0_longmemeval_prompts.py`.
+
+Structural QA, recall proxies, packer retention, and token percentiles:
 
 ```bash
-scripts/run_subset_eval.sh
+python scripts/analyze_v2_pipeline.py --help
+```
+
+Service check before a run:
+
+```bash
+python scripts/check_v2_services.py
 ```
 
 ## Tests
@@ -70,22 +95,43 @@ scripts/run_subset_eval.sh
 python -m pytest test/ -q
 ```
 
-Unit tests use synthetic fixtures under `test/fixtures/` and do not require benchmark data.
+Tests use synthetic fixtures under `test/fixtures/` and do not require benchmark data.
 
 ## Project layout
 
 ```
-src/graphmem_demo/   Core library (build, retrieve, answer pipeline)
-scripts/             CLI entrypoints and evaluation utilities
-test/                Unit tests and fixtures
-docs/                Design notes and experiment reports
+src/graphmem_demo/
+  hierarchical_v2.py   V2 index / retrieval / packing
+  pipeline.py          shared runner; V2 variant = hierarchical_state_graph_v2
+scripts/
+  run_v2_*.sh          LongMemEval / LoCoMo entrypoints
+  check_v2_services.py
+  analyze_v2_pipeline.py
+  evaluate_mem0_judge.py
+docs/
+  graphmem_v2.md
+  graphmem_v2_final_500_report_20260725.md
+  locomo_v2_full_report_20260725.md
+test/
 ```
 
-## GraphMem V2
+## Results
 
-The additive `hierarchical_state_graph_v2` variant implements lossless leaves, atomic facts, compact routing cards, directed state chains, typed depth-2 retrieval, an evidence ledger, and separate 300K/10K DeepSeek token gates. See [docs/graphmem_v2.md](docs/graphmem_v2.md).
+LongMemEval-S, 500 questions (2026-07-25): **462/500 (92.4%)** under the pinned Mem0 judge; all questions passed the 300K/10K token gates.
 
-```bash
-# Put DEEPSEEK_API_KEY in the ignored mode-0600 .env first.
-scripts/run_v2_longmemeval.sh /path/to/longmemeval_s_cleaned.json /path/to/output
-```
+Details: [`docs/graphmem_v2_final_500_report_20260725.md`](docs/graphmem_v2_final_500_report_20260725.md), LoCoMo: [`docs/locomo_v2_full_report_20260725.md`](docs/locomo_v2_full_report_20260725.md).
+
+---
+
+## Appendix: Legacy V1
+
+Earlier GraphMem variants (`direct_session_*`, `summary_tree_*`, etc.) remain in the codebase for compatibility and ablation. They are **not** the recommended path.
+
+| | V1 (legacy) | V2 (this README) |
+| --- | --- | --- |
+| Variant | `direct_session_*`, `summary_tree_*`, … | `hierarchical_state_graph_v2` |
+| Index | Session root + leaf summaries | L0 → L1 → L2 → L3 state graph |
+| Retrieval | Hybrid / PPR-style | RRF + typed depth-2 + evidence ledger |
+| Budgets | Soft / script-level | Hard 300K build / 10K answer |
+
+Do not use V1 scripts (`run_subset_eval.sh`, `smoke_longmemeval.sh`, …) for new experiments. Historical notes: [`docs/2026-07-08_graphmem_architecture_overview.md`](docs/2026-07-08_graphmem_architecture_overview.md).
