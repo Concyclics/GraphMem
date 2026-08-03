@@ -5,7 +5,7 @@ from typing import Any
 
 
 GRAPHMEM_V41_SCHEMA = "graphmem_v4_1_query"
-V41_POLICY_VERSION = "4.1.79"
+V41_POLICY_VERSION = "4.1.80"
 
 
 @dataclass(frozen=True)

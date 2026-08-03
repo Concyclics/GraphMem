@@ -29,7 +29,7 @@ from graphmem_demo.v36.retrieval import (
     answer_messages, build_query_ir, retrieve,
 )
 from graphmem_demo.v36.schema import (
-    EvidenceGroup, QueryIR, RoleFrameNode, RoutingCard,
+    EvidenceGroup, QueryIR, RoleFrameNode, RoutingCard, TurnNodeV36,
 )
 
 
@@ -463,6 +463,26 @@ def test_v36_mock_pipeline_is_single_version_and_budgeted(tmp_path: Path) -> Non
     assert run.retrieval.schema_version == "graphmem_v3_6"
     assert run.retrieval.retrieval_trace["answer_target_budget_pass"]
     assert all(record.reasoning_tokens == 0 for record in run.llm_records)
+
+
+def test_focused_turn_text_preserves_inflected_identity_clause() -> None:
+    turn = TurnNodeV36(
+        node_id="q:session:turn:0", question_id="q",
+        session_id="session", session_date="2023-07-06",
+        turn_index=0, speaker="Person", speaker_key="person",
+        listener="Friend", transport_role="assistant",
+        text=(
+            "I loved reading \"A Named Book\" as a kid. "
+            "It showed how friendship can make a difference.\n"
+            "[Media shared by Person; caption: a photo of a book cover]"
+        ),
+        retrieval_text="",
+    )
+    focused = _focused_turn_text(
+        build_query_ir("What books has Person read?"), turn, max_chars=900,
+    )
+    assert "\"A Named Book\"" in focused
+    assert "book cover" in focused
 
 
 def test_explicit_non_durable_session_does_not_create_noise_frames() -> None:

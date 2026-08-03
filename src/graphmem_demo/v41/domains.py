@@ -231,7 +231,21 @@ def augment_query(ir: QueryIR) -> QueryAugmentationV41:
         and token_set.intersection({"now", "current", "currently", "latest"})
         and "different" not in token_set
     )
-    if inferential and value not in {
+    reference_identity = bool(
+        value == "span"
+        and re.match(
+            r"\s*(?:what|which)\s+(?:is|was|are|were)\s+"
+            r"(?:the|a|an)\s+(?:[a-z0-9'-]+\s+){0,3}"
+            r"(?:game|activity|sport|exercise|device|tool|instrument|object|"
+            r"item|book|novel|movie|film|song|place|location|vehicle|animal|"
+            r"food|dish|plant|organization|company|method|technique)\s+"
+            r"(?:with|where)\b",
+            ir.raw_question.casefold(),
+        )
+    )
+    if reference_identity:
+        algebra = "reference_identity"
+    elif inferential and value not in {
         "count", "list", "aggregate", "date", "duration", "temporal_order",
     }:
         algebra = "inferential_profile"
@@ -293,6 +307,7 @@ def augment_query(ir: QueryIR) -> QueryAugmentationV41:
         "dialogue_lookup": ("request", "reply", "reply_content", "source"),
         "multi_hop": ("entity", "relation", "support", "source"),
         "inferential_profile": ("owner", "profile_fact", "support", "source"),
+        "reference_identity": ("reference", "identity", "source"),
         "direct_fact": ("entity", "relation", "value", "source"),
     }
     required = list(dict.fromkeys([*ir.required_roles, *role_map[algebra]]))
@@ -325,6 +340,7 @@ def augment_query(ir: QueryIR) -> QueryAugmentationV41:
             algebra in {
                 "collection", "temporal_comparison", "state_update",
                 "dialogue_lookup", "multi_hop", "inferential_profile",
+                "reference_identity",
             }
             or (algebra == "temporal_lookup" and value == "duration")
         ),

@@ -414,6 +414,16 @@ def build_query_ir(question: str) -> QueryIR:
         roles = ["current_state", "time", "source"]
         if re.search(r"\b(?:changed|updated|switch(?:ed|ing)?|became|become|no longer)\b", lowered):
             roles.insert(0, "previous_state")
+    elif re.match(
+        r"\s*(?:what|which)\s+(?:is|was|are|were)\s+"
+        r"(?:the|a|an)\s+(?:[a-z0-9'-]+\s+){0,3}"
+        r"(?:game|activity|sport|exercise|device|tool|instrument|object|item|"
+        r"book|novel|movie|film|song|place|location|vehicle|animal|food|dish|"
+        r"plant|organization|company|method|technique)\s+(?:with|where)\b",
+        lowered,
+    ):
+        value_type = "span"
+        roles = ["reference", "identity", "source"]
     elif temporal and re.match(r"\s*(?:which|who)\b", lowered):
         value_type = "entity"
         roles = ["entity", "event", "time", "source"]
@@ -1449,12 +1459,23 @@ def _focused_turn_text(ir: QueryIR, turn: TurnNodeV36, max_chars: int = 1800) ->
     segments = [segment.strip() for segment in re.split(r"(?<=[.!?])\s+|\n+", turn.text) if segment.strip()]
     if not segments:
         return turn.text[:max_chars]
-    terms = set(ir.target_entities)
+    terms = {
+        _certificate_term(term)
+        for entity in ir.target_entities
+        for term in _content_tokens(entity)
+    }
+    relation_terms = {
+        _certificate_term(term)
+        for term in _content_tokens(ir.target_relation)
+    }
     scored = []
     for index, segment in enumerate(segments):
-        tokens = set(_content_tokens(segment))
+        tokens = {
+            _certificate_term(token)
+            for token in _content_tokens(segment)
+        }
         overlap = len(tokens & terms)
-        phrase_bonus = int(bool(ir.target_relation) and ir.target_relation in " ".join(_content_tokens(segment)))
+        phrase_bonus = int(bool(relation_terms) and relation_terms <= tokens)
         scored.append((overlap + phrase_bonus, index))
     anchors = [index for score, index in sorted(scored, key=lambda row: (-row[0], row[1])) if score > 0][:4]
     if not anchors:

@@ -53,6 +53,67 @@ def test_v41_domain_query_plan_is_generic_and_role_based() -> None:
     assert query_views(ir, plan)
 
 
+def test_v41_reference_identity_is_generic_and_planner_bound() -> None:
+    from graphmem_demo.v41 import planner_messages
+
+    question = (
+        "What is the device with rotating blades where air is moved "
+        "across a room?"
+    )
+    ir = build_query_ir(question)
+    plan = build_query_plan(ir)
+    assert ir.requested_value_type == "span"
+    assert {"reference", "identity", "source"}.issubset(ir.required_roles)
+    assert plan.answer_algebra == "reference_identity"
+    assert plan.planner_required is True
+    prompt = planner_messages(
+        type("Case", (), {"question": question, "question_date": "2023-01-01"})(),
+        ir, plan, {"present_roles": [], "missing_roles": ["identity"]}, [],
+    )[0]["content"]
+    assert "every distinctive descriptive clue" in prompt
+    assert "lookup table" in prompt
+    from graphmem_demo.clients import rough_token_count
+    messages = planner_messages(
+        type("Case", (), {"question": question, "question_date": "2023-01-01"})(),
+        ir, plan, {"present_roles": [], "missing_roles": ["identity"]}, [],
+    )
+    assert rough_token_count("\n".join(row["content"] for row in messages)) <= 700
+
+
+def test_v41_reference_identity_planner_keeps_same_session_descriptions() -> None:
+    from graphmem_demo.v41.retrieval import _planner_evidence_candidates
+    from graphmem_demo.v41.schema import QuerySidecarV41, SidecarDocumentV41
+
+    distractor = "q:devices:turn:0"
+    descriptive = "q:devices:turn:2"
+    documents = {
+        distractor: SidecarDocumentV41(
+            node_id=distractor, node_type="turn", session_ids=["devices"],
+            source_turn_ids=[distractor],
+            text="We also used the named kitchen device Turbo Mixer.",
+        ),
+        descriptive: SidecarDocumentV41(
+            node_id=descriptive, node_type="turn", session_ids=["devices"],
+            source_turn_ids=[descriptive],
+            text=("It has rotating blades that move air across a room and cool people."),
+        ),
+    }
+    sidecar = QuerySidecarV41(
+        index_hash="test", policy_version="test", documents=documents,
+        inverted={}, adjacency={},
+    )
+    ir = build_query_ir(
+        "What is the device with rotating blades where air is moved "
+        "across a room?"
+    )
+    rows = _planner_evidence_candidates(
+        [distractor, descriptive], ir, sidecar, limit=2,
+        preferred_source_ids=[], session_diverse=False,
+    )
+    assert rows[0]["source_turn_id"] == descriptive
+    assert {row["source_turn_id"] for row in rows} == {distractor, descriptive}
+
+
 def test_v41_retrieval_only_appends_sources_and_respects_budget() -> None:
     case, index, embedder = _parsed("Which camera did Bob recommend?")
     view = build_capability_view(index)

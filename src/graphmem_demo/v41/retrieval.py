@@ -1769,6 +1769,7 @@ def _source_owner_compatible(
 def _planner_evidence_candidates(
     source_ids: list[str], ir: QueryIR, sidecar: QuerySidecarV41,
     limit: int = 8, *, preferred_source_ids: list[str] | None = None,
+    session_diverse: bool = True,
 ) -> list[dict[str, str]]:
     """Compact, query-bound evidence for the optional planner.
 
@@ -1796,8 +1797,15 @@ def _planner_evidence_candidates(
         })
 
     content_terms = _query_content_terms(ir)
+    candidate_source_ids = list(dict.fromkeys([*preferred, *source_ids]))
+    term_frequency: Counter[str] = Counter()
+    for source_id in candidate_source_ids:
+        document = sidecar.documents.get(source_id)
+        if document is None or document.node_type != "turn":
+            continue
+        term_frequency.update(_semantic_overlap(ir, _tokens(document.text)))
     ranked: list[tuple[float, bool, str, str, str]] = []
-    for source_id in dict.fromkeys([*preferred, *source_ids]):
+    for source_id in candidate_source_ids:
         document = sidecar.documents.get(source_id)
         if document is None or document.node_type != "turn":
             continue
@@ -1816,6 +1824,7 @@ def _planner_evidence_candidates(
         score = (
             5.0 * len(overlap) + 2.0 * int(modal)
             + 10.0 * int(candidate_like)
+            + sum(8.0 / (1.0 + term_frequency[token]) for token in overlap)
         )
         session_id = document.session_ids[0] if document.session_ids else ""
         ranked.append((score, candidate_like, session_id, source_id, document.text))
@@ -1831,7 +1840,11 @@ def _planner_evidence_candidates(
     for row in ordered:
         if row in selected:
             continue
-        if row[2] in seen_sessions and len(selected) < max(2, limit - 1):
+        if (
+            session_diverse
+            and row[2] in seen_sessions
+            and len(selected) < max(2, limit - 1)
+        ):
             continue
         selected.append(row)
         seen_sessions.add(row[2])
@@ -1839,7 +1852,7 @@ def _planner_evidence_candidates(
             break
     existing = {row["source_turn_id"] for row in rows}
     rows.extend([
-        {"source_turn_id": source_id, "text": text[:140]}
+        {"source_turn_id": source_id, "text": text[:280]}
         for _score, _candidate_like, _session_id, source_id, text in selected
         if source_id not in existing
     ][:max(0, limit - len(rows))])
@@ -1869,12 +1882,15 @@ def _append_compact_answer_bearing_sources(
             document = sidecar.documents.get(source_id)
             if turn is None or document is None or document.node_type != "turn":
                 continue
-            excerpt = _best_query_clause(document.text, ir)[:240]
+            # A selected source is authoritative at turn granularity. Keeping
+            # only one best clause can drop an identity/value in an adjacent
+            # sentence while retaining a generic explanation or media caption.
+            evidence_text = turn.text[:900]
             block = (
                 f"[SOURCE_EVIDENCE {source_id}; added_by=v41_answer_bearing_span]\n"
                 f"date={turn.session_date or 'unknown'}; speaker={turn.speaker}; "
                 f"listener={turn.listener}; role={turn.transport_role}\n"
-                f"{excerpt}"
+                f"{evidence_text}"
             )
             cost = rough_token_count(block)
             if result.packed_rough_tokens + cost > token_budget:
@@ -3664,6 +3680,7 @@ def retrieve(
             certificate.dialogue_complete, not certificate.missing_roles,
         ))
     inferential_identity = is_inferential_question(query_ir.raw_question)
+    reference_identity = augmentation.answer_algebra == "reference_identity"
     certified_source_bound_date = any(
         isinstance(hint, dict)
         and hint.get("operation") == "source_bound_explicit_date"
@@ -3683,7 +3700,7 @@ def retrieve(
     )
     hard_relation_plan = augmentation.answer_algebra in {
         "temporal_lookup", "temporal_comparison", "multi_hop",
-        "state_update",
+        "state_update", "reference_identity",
     } and not (
         augmentation.answer_algebra == "temporal_lookup"
         and certified_source_bound_date
@@ -3725,7 +3742,14 @@ def retrieve(
         # retrieval channels even when their full source blocks missed the main
         # pack budget. Channel quotas prevent one dense/BM25 family from
         # monopolising this compact hand-off.
-        if augmentation.answer_algebra == "inferential_profile":
+        if reference_identity:
+            channel_rows = [
+                *answer_bearing_evidence[:6],
+                *reply_bound_evidence[:4],
+                *semantic_turn_evidence[:6],
+                *scene_window_evidence[:2],
+            ]
+        elif augmentation.answer_algebra == "inferential_profile":
             channel_rows = [
                 *semantic_turn_evidence[:5],
                 *reply_bound_evidence[:1],
@@ -3758,8 +3782,13 @@ def retrieve(
                 if row.get("source_turn_id")
             ],
         ]))
+        if reference_identity:
+            # A named but merely topical item is often a distractor for a
+            # description-to-identity question. Rank all descriptive sources
+            # by conjunctive clue coverage instead of pinning that item first.
+            planner_channel_source_ids = []
         owner_sensitive_plan = augmentation.answer_algebra in {
-            "state_update", "inferential_profile",
+            "state_update", "inferential_profile", "reference_identity",
         }
         if owner_sensitive_plan:
             planner_channel_source_ids = [
@@ -3774,6 +3803,7 @@ def retrieve(
             ],
             query_ir, sidecar, limit=10,
             preferred_source_ids=planner_channel_source_ids,
+            session_diverse=not reference_identity,
         )
     planner_selected_evidence: list[dict[str, Any]] = []
     offered_ids = {
@@ -3818,7 +3848,7 @@ def retrieve(
     ) if augmentation.answer_algebra == "collection" else []
     verified_inference_candidates = _verified_inference_candidates(
         planner, planner_allowed_source_ids, query_ir, sidecar,
-    ) if inferential_identity else []
+    ) if (inferential_identity or reference_identity) else []
     verified_slot_candidates = _verified_planner_slot_candidates(
         planner, planner_allowed_source_ids, query_ir, sidecar,
         require_owner=augmentation.answer_algebra in {
@@ -3919,6 +3949,7 @@ def planner_messages(
     evidence_candidates: list[dict[str, str]] | None = None,
 ) -> list[dict[str, str]]:
     inferential_identity = is_inferential_question(case.question)
+    reference_identity = augmentation.answer_algebra == "reference_identity"
     source_named_candidates: list[str] = []
     modal_pattern = re.compile(
         r"\b(?:want|wanted|wish|dream|hope|like|liked|love|cool|interested)\b",
@@ -4009,7 +4040,8 @@ def planner_messages(
             "time-bearing source and any required endpoint, and never substitute the "
             "date of a nearby event. For multi-hop questions select one source per "
             "required relation hop. When "
-            "answer_algebra is inferential_profile, inference_candidates may contain up "
+            "answer_algebra is inferential_profile, "
+            "inference_candidates may contain up "
             "to three concrete ordinary-knowledge candidates that satisfy every semantic "
             "constraint in the question and are consistent with the source-supported "
             "profile. A candidate must fill the requested slot: name a real book/title, "
@@ -4032,6 +4064,23 @@ def planner_messages(
             'Schema: {"alternative_entities":[],"event_aliases":[],"relations":[],'
             '"temporal_constraints":[],"missing_roles":[],"selected_source_ids":[],'
             '"slot_candidates":[["verbatim value","source_turn_id"]],"inference_candidates":[]}.'
+        )
+    if reference_identity:
+        system_content = (
+            "Return only compact JSON. This is reference_identity retrieval, not direct "
+            "answering. Select source IDs only from evidence_candidates. First select one "
+            "source scene satisfying every distinctive descriptive clue; a merely topical "
+            "named item is a distractor. inference_candidates may contain up to three "
+            "canonical identities inferred from that description and ordinary knowledge. "
+            "Enforce medium and form factor, prefer the canonical prototype, and reject "
+            "unsupported variants. Never use benchmark metadata or a lookup table. "
+            "Preserve speaker ownership and never infer sensitive identity without direct "
+            "self-identification. Schema: {\"alternative_entities\":[],"
+            "\"event_aliases\":[],\"relations\":[],"
+            "\"temporal_constraints\":[],\"missing_roles\":[],"
+            "\"selected_source_ids\":[],"
+            "\"slot_candidates\":[[\"verbatim value\",\"source_turn_id\"]],"
+            "\"inference_candidates\":[]}."
         )
     return [
         {"role": "system", "content": system_content},
@@ -4196,6 +4245,7 @@ _FOCUSED_EVIDENCE_ALGEBRAS = {
     "state_update",
     "temporal_comparison",
     "temporal_lookup",
+    "reference_identity",
 }
 
 
@@ -4511,7 +4561,7 @@ def answer_messages(
         dialogue_highlights[:3]
         if algebra in {
             "dialogue_lookup", "direct_fact", "preference_recommendation",
-            "inferential_profile",
+            "inferential_profile", "reference_identity",
         }
         else []
     )
@@ -4708,7 +4758,7 @@ def answer_messages(
         "self-identification. When the question asks which named thing, occupation, "
         "place, title, product, exercise, or activity, return the most concrete "
         "source-supported candidate rather than only a generic category. "
-        if algebra == "inferential_profile" else ""
+        if algebra in {"inferential_profile", "reference_identity"} else ""
     )
     algebra_policy = (
         "For preference or recommendation questions, a future visit or intended purchase is framing, not a memory fact that must be independently verified. "
@@ -4727,7 +4777,7 @@ def answer_messages(
         + "Resolve relative dates such as next month or last week against the cited source turn date, and report the resulting calendar month or date when the question asks when. For first/earliest/latest/order questions, compare the source dates or event times of the exact requested completed events; an earlier mention, a future plan, or a merely topical event does not outrank a later explicit participation date. "
         + "For quantitative questions, identify the requested operation before choosing a number. Words such as each, per, average, total, combined, difference, remaining, and how many times are not interchangeable. Use only operands bound to the same entity and scope; divide a group total by its explicit item count for each/per, sum only requested components for total/combined, and subtract the named endpoints for difference/remaining. Briefly verify the operation against the wording and never return a nearby total when a per-item value was requested. When latest_valid_state includes change_direction and the question asks more versus less, answer that direction exactly; do not state the opposite in a lead sentence. "
         + "PLANNER_SELECTED_SOURCE_EVIDENCE contains source IDs revalidated against the exact planner candidate set and lossless source provenance; packed_in_main_context may be false because this compact source view is the budget-safe hand-off from a bounded retrieval channel. PLANNER_VERIFIED_SLOT_CANDIDATES contains only phrases locally matched back to those lossless sources; use them as high-priority candidates only when their source has the requested owner, relation, scope and lifecycle. Prefer the candidate from the exact event or dialogue scene over a merely topical value, and never mix a value from one row with the date or owner of another. For collections this duplicate block is intentionally empty: FOCUSED_SOURCE_EVIDENCE is the full typed source closure. Apply entity, relation, owner, scope, lifecycle and time constraints. A planner_verified_collection_members constraint contains individually source-verified member identities: do not omit one unless it is a duplicate of another listed identity, and still scan FOCUSED_SOURCE_EVIDENCE for additional valid members because candidate_pool_complete is false. "
-        + "When FOCUSED_SOURCE_EVIDENCE is present, treat it as the primary candidate set and the larger memory block only as fallback. INFERENCE_PLANNER_CANDIDATES are advisory ordinary-knowledge options, not memory facts: for inferential-profile questions, choose the candidate that satisfies every requested semantic constraint and best fits the source-supported profile. Reject a candidate that merely repeats a participant, broad category, or goal. Do not use advisory candidates to infer sensitive identity, religion, or membership without direct self-identification. If and only if the question explicitly requests a suspected or possible health problem, infer a non-definitive ordinary condition from a direct source-supported physical sign, symptom, limitation, or risk and state uncertainty; never present it as a confirmed diagnosis. Distinguish generalized body-size, weight, fitness, or exercise evidence from localized pain, numbness, or injury; do not infer a hand or joint disorder from size alone. The question wording is the selection predicate: match exact entity, owner, relation, temporal scope and lifecycle before using recency or topical similarity. Current or now selects the latest valid state; initial, first, previous, or an explicitly bounded period selects the matching historical source and must not be replaced by a later broader value. A correction or explicit replacement selects the new value and treats the named old value as superseded. For a collection, enumerate distinct source-bound members or use an explicitly stated total only when its scope exactly matches the question. For a temporal calculation, bind both requested endpoints before calculating. "
+        + "When FOCUSED_SOURCE_EVIDENCE is present, treat it as the primary candidate set and the larger memory block only as fallback. INFERENCE_PLANNER_CANDIDATES are advisory ordinary-knowledge options, not memory facts: for inferential-profile or reference-identity questions, choose the candidate that satisfies every requested semantic constraint and best fits one source-supported profile or description. For reference identity, all discriminating clues must be supported by the same source scene; an explicitly named but merely topical item does not outrank the unnamed matching description. Enforce the requested medium or form factor: do not answer a board, tabletop, or card-game question with a digital-only video or mobile title, and do not substitute a book, film, device, or place across semantic types. For an unnamed description, prefer the canonical widely recognized prototype over a branded adaptation, spin-off, subtitle variant, or obscure near match unless the source gives the variant-specific feature. Reject a candidate that merely repeats a participant, broad category, or goal. Do not use advisory candidates to infer sensitive identity, religion, or membership without direct self-identification. If and only if the question explicitly requests a suspected or possible health problem, infer a non-definitive ordinary condition from a direct source-supported physical sign, symptom, limitation, or risk and state uncertainty; never present it as a confirmed diagnosis. Distinguish generalized body-size, weight, fitness, or exercise evidence from localized pain, numbness, or injury; do not infer a hand or joint disorder from size alone. The question wording is the selection predicate: match exact entity, owner, relation, temporal scope and lifecycle before using recency or topical similarity. Current or now selects the latest valid state; initial, first, previous, or an explicitly bounded period selects the matching historical source and must not be replaced by a later broader value. A correction or explicit replacement selects the new value and treats the named old value as superseded. For a collection, enumerate distinct source-bound members or use an explicitly stated total only when its scope exactly matches the question. For a temporal calculation, bind both requested endpoints before calculating. "
         + "Answer the requested semantic slot at the most specific source-supported granularity: when a prompt/reply supplies concrete components, members, a proper name, or a named result, copy that exact concrete value rather than restating only the action or broad category. If the question asks which company, organization, title, place, product, person, or other named entity, a generic descriptor is not an answer whenever any matching source names a candidate. Preserve attribution: first-person statements belong to their speaker, not their listener, and being addressed by name does not transfer the speaker's identity, preference, health, membership, location, or action. Satisfy every descriptive clue conjunctively; a candidate matching the topic but missing a discriminating attribute such as fruit, location, lifecycle, or medium loses to a candidate that matches all attributes. If the question asks worth or value in terms of the amount paid and the source states a relative multiplier, return that multiplier relation rather than the purchase price alone. "
         + "If V4.1_CONSTRAINT_OVERRIDE is present, ignore the older exact_entity_absence row named by that override. Only rows copied into ANSWER_CONSTRAINT are mandatory; an older operator ledger certified label is not sufficient by itself. "
         "A value, date, member set, or state in ANSWER_CONSTRAINT is mandatory "
