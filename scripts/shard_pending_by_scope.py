@@ -90,3 +90,7 @@ def main() -> None:
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8",
     )
     print(json.dumps(manifest, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
