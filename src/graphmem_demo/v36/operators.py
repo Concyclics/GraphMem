@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import calendar
 import re
 from typing import Any
@@ -144,7 +144,10 @@ def _parse_time(value: str | None) -> datetime | None:
         return None
     normalized = value.replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(normalized)
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
     except ValueError:
         for pattern in (
             "%I:%M %p on %d %B, %Y",

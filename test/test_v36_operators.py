@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 
+from graphmem_demo.v36.operators import _parse_time
 from graphmem_demo.v36.operators import (
     evaluate_operators, exact_entity_absence_hint, query_bound_collection_ledger, counterfactual_dependency_hint, record_time_source_hint, temporal_order_source_hint,
     open_temporal_sequence_from_sources_hint,
@@ -3007,3 +3009,11 @@ def test_cookie_preference_ranks_transferable_ingredient_fact_first() -> None:
     )
     assert hint is not None
     assert hint["value"][0]["source_turn_id"] == "q:fact"
+
+
+def test_parse_time_normalizes_aware_iso_for_mixed_timestamp_sorting() -> None:
+    aware = _parse_time("2024-01-02T03:00:00+02:00")
+    naive = _parse_time("2024-01-02T02:00:00")
+    assert aware == datetime(2024, 1, 2, 1, 0, 0)
+    assert aware is not None and aware.tzinfo is None
+    assert sorted([naive, aware]) == [aware, naive]
