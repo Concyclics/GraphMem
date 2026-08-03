@@ -646,8 +646,8 @@ class DemoConfig:
 
         if self.reasoning_effort != "none":
             raise ValueError("reasoning_effort must be none")
-        if self.llm_request_profile not in {"deepseek", "openai", "omit"}:
-            raise ValueError("llm_request_profile must be deepseek, openai, or omit")
+        if self.llm_request_profile not in {"deepseek", "openai", "qwen", "omit"}:
+            raise ValueError("llm_request_profile must be deepseek, openai, qwen, or omit")
         if not self.llm_api_key_env:
             raise ValueError("llm_api_key_env cannot be empty")
         if self.build_budget_tokens < 1 or self.answer_budget_tokens < 1:

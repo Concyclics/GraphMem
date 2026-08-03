@@ -45,9 +45,9 @@ def parse_args() -> argparse.Namespace:
         help="Environment variable containing the OpenAI-compatible LLM API key.",
     )
     parser.add_argument(
-        "--llm-request-profile", choices=["deepseek", "openai", "omit"],
+        "--llm-request-profile", choices=["deepseek", "openai", "qwen", "omit"],
         default="openai",
-        help="Map no-reasoning to DeepSeek thinking.disabled, OpenAI reasoning_effort=none, or no field.",
+        help="Map no-reasoning to DeepSeek thinking.disabled, OpenAI reasoning_effort=none, Qwen enable_thinking=false, or no field.",
     )
     parser.add_argument(
         "--llm-local",

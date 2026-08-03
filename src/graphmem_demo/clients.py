@@ -142,7 +142,7 @@ class OpenAICompatibleClient:
         api_key = os.environ.get(api_key_env)
         if not api_key:
             raise RuntimeError(f"{api_key_env} is required for real LLM calls")
-        if request_profile not in {"deepseek", "openai", "omit"}:
+        if request_profile not in {"deepseek", "openai", "qwen", "omit"}:
             raise ValueError(f"Unsupported request_profile: {request_profile}")
         self.model = model or os.environ.get("SGAO_MODEL", "gpt-5.4-mini")
         self.request_profile = request_profile
@@ -187,11 +187,19 @@ class OpenAICompatibleClient:
                         request["reasoning_effort"] = "high"
                     elif self.request_profile == "openai":
                         request["reasoning_effort"] = "high"
+                    elif self.request_profile == "qwen":
+                        request["extra_body"] = {
+                            "chat_template_kwargs": {"enable_thinking": True}
+                        }
                 elif thinking_mode in {"disabled", "none"}:
                     if self.request_profile == "deepseek":
                         request["extra_body"] = {"thinking": {"type": "disabled"}}
                     elif self.request_profile == "openai":
                         request["reasoning_effort"] = "none"
+                    elif self.request_profile == "qwen":
+                        request["extra_body"] = {
+                            "chat_template_kwargs": {"enable_thinking": False}
+                        }
                 else:
                     raise ValueError(f"Unsupported thinking_mode: {thinking_mode}")
                 if max_tokens is not None:
