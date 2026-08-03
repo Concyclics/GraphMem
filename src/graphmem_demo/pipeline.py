@@ -1405,6 +1405,27 @@ def _has_memory_cache_keys(cases: list[QuestionCase]) -> bool:
     return any(case.memory_cache_key for case in cases)
 
 
+def _completed_question_results(futures: dict[Any, QuestionCase]) -> Any:
+    """Yield every successful question result before reporting batch failures."""
+    failures: list[tuple[str, Exception]] = []
+    for future in as_completed(futures):
+        case = futures[future]
+        try:
+            result = future.result()
+        except Exception as exc:
+            failures.append((case.question_id, exc))
+            continue
+        yield case, result
+    if failures:
+        failed_ids = ", ".join(question_id for question_id, _ in failures[:8])
+        if len(failures) > 8:
+            failed_ids += f", ... (+{len(failures) - 8} more)"
+        raise RuntimeError(
+            f"{len(failures)} question worker(s) failed after successful "
+            f"results were yielded: {failed_ids}"
+        ) from failures[0][1]
+
+
 def _run_cases_with_memory_cache(
     config: DemoConfig,
     cases: list[QuestionCase],
@@ -1645,9 +1666,8 @@ def _run_cases_with_memory_cache(
                 ): case
                 for case in group_cases
             }
-            for future in as_completed(futures):
-                case = futures[future]
-                run, embedding_records, compression_records = future.result()
+            for case, result in _completed_question_results(futures):
+                run, embedding_records, compression_records = result
                 if not loaded_from_cache and case.question_id == build_record_question_id:
                     embedding_records = [*build_embedding_records, *embedding_records]
                     compression_records = [*build_compression_records, *compression_records]
