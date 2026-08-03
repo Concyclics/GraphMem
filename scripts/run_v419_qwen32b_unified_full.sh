@@ -12,6 +12,7 @@ LOCOMO_INFLIGHT_PER_SHARD="${LOCOMO_INFLIGHT_PER_SHARD:-8}"
 QUERY_HARD_LIMIT="${QUERY_HARD_LIMIT:-14000}"
 SHARD_RETRIES="${SHARD_RETRIES:-6}"
 RUN_JUDGE="${RUN_JUDGE:-1}"
+BENCHMARKS="${BENCHMARKS:-both}"
 
 set -a
 source "${REPO}/.env"
@@ -20,6 +21,12 @@ set +a
 if [[ "${RUN_JUDGE}" == "1" ]]; then
   : "${SGAO_API_KEY:?SGAO_API_KEY is required when RUN_JUDGE=1}"
 fi
+case "${BENCHMARKS}" in
+  both|lme|locomo) ;;
+  *) echo "BENCHMARKS must be one of: both, lme, locomo" >&2; exit 2 ;;
+esac
+[[ "${RUN_JUDGE}" != "1" || "${BENCHMARKS}" == "both" ]] || {
+  echo "RUN_JUDGE=1 requires BENCHMARKS=both" >&2; exit 2; }
 : "${QWEN_API_KEY:?QWEN_API_KEY is required}"
 : "${EMBEDDING_API_KEY:?EMBEDDING_API_KEY is required}"
 
@@ -131,10 +138,16 @@ run_locomo() {
     --variant hierarchical_hybrid_graph_v4_1_query --expected-questions 1540
 }
 
-run_lme >"${RUN_ROOT}/lme/full.log" 2>&1 & lme_pid=$!
-run_locomo >"${RUN_ROOT}/locomo/full.log" 2>&1 & locomo_pid=$!
-wait "${lme_pid}"
-wait "${locomo_pid}"
+case "${BENCHMARKS}" in
+  both)
+    run_lme >"${RUN_ROOT}/lme/full.log" 2>&1 & lme_pid=$!
+    run_locomo >"${RUN_ROOT}/locomo/full.log" 2>&1 & locomo_pid=$!
+    wait "${lme_pid}"
+    wait "${locomo_pid}"
+    ;;
+  lme) run_lme >"${RUN_ROOT}/lme/full.log" 2>&1 ;;
+  locomo) run_locomo >"${RUN_ROOT}/locomo/full.log" 2>&1 ;;
+esac
 
 if [[ "${RUN_JUDGE}" != "1" ]]; then
   echo "Unified Qwen3-32B-FP8 memory run complete; judge skipped: ${RUN_ROOT}"
