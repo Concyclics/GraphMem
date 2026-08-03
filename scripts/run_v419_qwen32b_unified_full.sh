@@ -7,6 +7,7 @@ DATA_ROOT="${DATA_ROOT:-/home/chenhan/GraphMem-Qwen/benchmark_data}"
 LME_SHARD_ROOT="${LME_SHARD_ROOT:-${DATA_ROOT}/lme_query_shards}"
 LME_PARALLEL_SHARDS="${LME_PARALLEL_SHARDS:-8}"
 LME_INFLIGHT_PER_SHARD="${LME_INFLIGHT_PER_SHARD:-16}"
+LME_QUESTION_WORKERS="${LME_QUESTION_WORKERS:-20}"
 LOCOMO_PARALLEL_SHARDS="${LOCOMO_PARALLEL_SHARDS:-10}"
 LOCOMO_INFLIGHT_PER_SHARD="${LOCOMO_INFLIGHT_PER_SHARD:-8}"
 QUERY_HARD_LIMIT="${QUERY_HARD_LIMIT:-14000}"
@@ -99,7 +100,7 @@ run_lme() {
       --data "${LME_SHARD_ROOT}/lme_${index}.json" \
       --output-dir "${shard_out}" \
       --memory-cache-dir "${RUN_ROOT}/memory_cache_lme" \
-      --max-questions 20 --question-workers 20 \
+      --max-questions 20 --question-workers "${LME_QUESTION_WORKERS}" \
       --max-inflight-deepseek "${LME_INFLIGHT_PER_SHARD}" \
       "${COMMON_ARGS[@]}" &
     pids+=("$!") labels+=("lme_${index}")
