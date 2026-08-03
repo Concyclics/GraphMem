@@ -533,6 +533,16 @@ def _fallback(
     return frames, card, coverage
 
 
+def lossless_session_extraction(
+    *, question_id: str, session_id: str, turns: list[TurnNodeV36],
+) -> tuple[list[RoleFrameNode], RoutingCard, list[CoverageEntry], str]:
+    """Build a provenance-complete coarse route without an LLM extraction."""
+    frames, card, coverage = _fallback(
+        question_id=question_id, session_id=session_id, turns=turns,
+    )
+    return frames, card, coverage, "selective_lossless"
+
+
 def _routing_card(
     *,
     question_id: str,

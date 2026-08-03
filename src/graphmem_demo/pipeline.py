@@ -484,6 +484,7 @@ class DemoConfig:
     v3_session_extraction_max_tokens: int = 3072
     v3_context_token_budget: int = 3600
     v36_session_extraction_max_tokens: int = 4096
+    v36_llm_session_cap: int = 0
     v36_context_token_budget: int = 8000
     v36_answer_hard_budget_tokens: int = 10500
     v41_normal_context_target: int = 8400
@@ -643,6 +644,8 @@ class DemoConfig:
 
         if self.v36_session_extraction_max_tokens < 256:
             raise ValueError("v36_session_extraction_max_tokens must be at least 256")
+        if self.v36_llm_session_cap < 0:
+            raise ValueError("v36_llm_session_cap cannot be negative")
         if self.v36_context_token_budget < 1000:
             raise ValueError("v36_context_token_budget must be at least 1000")
         if self.v36_answer_hard_budget_tokens < self.answer_budget_tokens:
@@ -1078,6 +1081,7 @@ def _memory_cache_fingerprint(config: DemoConfig, case: QuestionCase, variant: s
             "v36_prompt_version": V36_PROMPT_VERSION,
             "v36_build_version": V36_BUILD_VERSION,
             "v36_session_extraction_max_tokens": config.v36_session_extraction_max_tokens,
+            "v36_llm_session_cap": config.v36_llm_session_cap,
             "deepseek_model": config.deepseek_model,
             "embedding_model": config.embedding_model,
             "data_hash": data_hash,
@@ -1930,6 +1934,7 @@ def _build_v36_memory(
         workers=min(32, config.summary_workers or 32),
         build_budget_tokens=config.build_budget_tokens,
         checkpoint_dir=checkpoint_dir,
+        llm_session_cap=config.v36_llm_session_cap,
     )
     metrics.summary_parse_error_count += result.parse_error_count
     metrics.index_diagnostics.extend(result.diagnostics)

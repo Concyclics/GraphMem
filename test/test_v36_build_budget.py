@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,7 +12,7 @@ from graphmem_demo.v36.runtime import (
     _BUDGET_RESERVE, _CONSOLIDATION_RESERVE, _HARD_SAFETY_RESERVE,
     _REPAIR_RESERVE, _completion_caps, _consolidation_budget_remaining,
     _load_call_checkpoint, _repair_budget_remaining, _repair_positions,
-    _save_call_checkpoint,
+    _save_call_checkpoint, _select_llm_sessions,
 )
 
 
@@ -134,3 +135,23 @@ def test_parallel_group_error_cancels_pending_work_without_queue_deadlock(
             allow_memory_cache_read=True,
         ))
     assert time.perf_counter() - started < 2.0
+
+
+def test_selective_llm_sessions_are_density_ranked_with_timeline_coverage() -> None:
+    grouped = {
+        f"s{index}": [SimpleNamespace(text=("fact " * (index % 4 + 1)))]
+        for index in range(12)
+    }
+    selected = _select_llm_sessions(grouped, 3)
+    assert selected == {"s3", "s7", "s11"}
+    assert _select_llm_sessions(grouped, 0) == set(grouped)
+    assert _select_llm_sessions(grouped, 20) == set(grouped)
+
+
+def test_selective_llm_session_cap_rejects_negative_values(tmp_path) -> None:
+    with pytest.raises(ValueError, match="v36_llm_session_cap"):
+        DemoConfig(
+            data_path=tmp_path / "data.json", output_dir=tmp_path / "out",
+            variants=("hierarchical_hybrid_graph_v4_1_query",),
+            v36_llm_session_cap=-1, mock_services=True,
+        )

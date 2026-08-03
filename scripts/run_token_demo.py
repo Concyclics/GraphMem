@@ -400,6 +400,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v3-session-extraction-max-tokens", type=int, default=3072)
     parser.add_argument("--v3-context-token-budget", type=int, default=3600)
     parser.add_argument("--v36-session-extraction-max-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--v36-llm-session-cap", type=int, default=0,
+        help="Question-independent cap on LLM-corrected sessions; 0 extracts all.",
+    )
     parser.add_argument("--v36-context-token-budget", type=int, default=8000)
     parser.add_argument("--v36-answer-hard-budget-tokens", type=int, default=10500)
     parser.add_argument("--v41-normal-context-target", type=int, default=8400)
@@ -589,6 +593,7 @@ def main() -> None:
         v3_session_extraction_max_tokens=args.v3_session_extraction_max_tokens,
         v3_context_token_budget=args.v3_context_token_budget,
         v36_session_extraction_max_tokens=args.v36_session_extraction_max_tokens,
+        v36_llm_session_cap=args.v36_llm_session_cap,
         v36_context_token_budget=args.v36_context_token_budget,
         v36_answer_hard_budget_tokens=args.v36_answer_hard_budget_tokens,
         v41_normal_context_target=args.v41_normal_context_target,

@@ -17,6 +17,7 @@ from .build import (
     build_index as assemble_index,
     build_inverted_indexes,
     build_turn_nodes,
+    lossless_session_extraction,
     parse_session_extraction,
     session_extraction_messages,
     validate_index,
@@ -43,6 +44,35 @@ _HARD_SAFETY_RESERVE = 5_000
 _BUDGET_RESERVE = (
     _REPAIR_RESERVE + _CONSOLIDATION_RESERVE + _HARD_SAFETY_RESERVE
 )
+
+
+def _session_information_density(turns: list[Any]) -> tuple[int, int, int]:
+    text = " ".join(str(getattr(turn, "text", "") or "") for turn in turns)
+    terms = re.findall(r"[\w'-]+", text.casefold())
+    return len(set(terms)), len(terms), len(text)
+
+
+def _select_llm_sessions(
+    grouped: dict[str, list[Any]], cap: int,
+) -> set[str]:
+    """Select question-independent, timeline-stratified high-density sessions."""
+    ordered = list(grouped)
+    if cap <= 0 or cap >= len(ordered):
+        return set(ordered)
+    selected: set[str] = set()
+    total = len(ordered)
+    for bucket in range(cap):
+        start = bucket * total // cap
+        end = (bucket + 1) * total // cap
+        candidates = ordered[start:end]
+        selected.add(max(
+            candidates,
+            key=lambda session_id: (
+                _session_information_density(grouped[session_id]),
+                -ordered.index(session_id),
+            ),
+        ))
+    return selected
 
 
 def _message_token_estimate(messages: list[dict[str, str]]) -> int:
@@ -474,11 +504,13 @@ def build_index(
     workers: int,
     build_budget_tokens: int = 300_000,
     checkpoint_dir: Path | None = None,
+    llm_session_cap: int = 0,
 ) -> V36BuildResult:
     turns = build_turn_nodes(case)
     grouped: dict[str, list[Any]] = {}
     for turn in turns:
         grouped.setdefault(turn.session_id, []).append(turn)
+    llm_sessions = _select_llm_sessions(grouped, llm_session_cap)
     session_dates = {
         session_id: session_turns[0].session_date
         for session_id, session_turns in grouped.items() if session_turns
@@ -489,12 +521,21 @@ def build_index(
         )
         for session_id, session_turns in grouped.items()
     }
-    estimates = {session_id: _message_token_estimate(messages[session_id]) for session_id in grouped}
+    estimates = {
+        session_id: _message_token_estimate(value)
+        for session_id, value in messages.items()
+    }
     completion_caps = _completion_caps(
         estimates, requested=max_tokens, budget=build_budget_tokens
     )
 
     def extract(session_id: str) -> tuple[Any, ...]:
+        if session_id not in llm_sessions:
+            frames, card, coverage, error = lossless_session_extraction(
+                question_id=case.question_id, session_id=session_id,
+                turns=grouped[session_id],
+            )
+            return session_id, frames, card, coverage, error, None
         session_messages = [dict(item) for item in messages[session_id]]
         session_messages[0]["content"] += (
             f" Output JSON budget: at most {completion_caps[session_id]} tokens. "
@@ -542,7 +583,7 @@ def build_index(
         for order, session_id in enumerate(grouped)
     }
     extracted.sort(key=lambda row: session_order[row[0]])
-    records = [row[5] for row in extracted]
+    records = [row[5] for row in extracted if row[5] is not None]
     spent = sum(record.total_tokens for record in records)
     diagnostics: list[dict[str, Any]] = []
 
@@ -703,12 +744,15 @@ def build_index(
         ),
         "coverage_protocol": "source_derived_v2",
         "parse_error": row[4],
-        "prompt_tokens": row[5].prompt_tokens,
-        "completion_tokens": row[5].completion_tokens,
-        "total_tokens": row[5].total_tokens,
-        "requested_completion_cap": completion_caps[row[0]],
-        "provider_output_cap_honored": row[5].completion_tokens <= completion_caps[row[0]],
-        "finish_reason": row[5].finish_reason,
+        "extraction_mode": ("llm" if row[5] is not None else "lossless_deterministic"),
+        "prompt_tokens": (row[5].prompt_tokens if row[5] is not None else 0),
+        "completion_tokens": (row[5].completion_tokens if row[5] is not None else 0),
+        "total_tokens": (row[5].total_tokens if row[5] is not None else 0),
+        "requested_completion_cap": completion_caps.get(row[0], 0),
+        "provider_output_cap_honored": (
+            row[5] is None or row[5].completion_tokens <= completion_caps[row[0]]
+        ),
+        "finish_reason": (row[5].finish_reason if row[5] is not None else None),
     } for row in extracted)
     edge_relation_counts = Counter(edge.relation for edge in index.edges)
     node_degree: Counter[str] = Counter()
@@ -737,7 +781,13 @@ def build_index(
         "provenance_incomplete_group_count": sum(not group.provenance_complete for group in index.evidence_groups),
         "lossless_only_turn_count": sum(item.coverage_class == "lossless_only" for item in index.coverage),
         "durable_covered_turn_count": sum(item.coverage_class == "memory_frame" and bool(item.frame_ids) for item in index.coverage),
-        "provider_output_cap_violation_count": sum(row[5].completion_tokens > completion_caps[row[0]] for row in extracted),
+        "provider_output_cap_violation_count": sum(
+            row[5] is not None and row[5].completion_tokens > completion_caps[row[0]]
+            for row in extracted
+        ),
+        "llm_session_cap": llm_session_cap,
+        "llm_selected_session_count": len(llm_sessions),
+        "deterministic_lossless_session_count": len(grouped) - len(llm_sessions),
         "routing_card_max_chars": max((len(card.routing_text) for card in index.routing_cards), default=0),
         "build_total_tokens": spent,
         "session_completion_cap_min": min(completion_caps.values(), default=0),
