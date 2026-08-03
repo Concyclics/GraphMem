@@ -1796,6 +1796,32 @@ def test_v41_collection_planner_can_return_retrieval_aliases() -> None:
     assert "member_candidates" in system
 
 
+def test_v41_collection_planner_requires_category_child_terms_on_role_gap() -> None:
+    from graphmem_demo.clients import rough_token_count
+    from graphmem_demo.models import QuestionCase
+    from graphmem_demo.v41.retrieval import planner_messages
+
+    case = QuestionCase(
+        question_id="q:category", question_type="count",
+        question="How many kinds of musical instruments have I repaired?",
+        question_date=None, answer="", answer_session_ids=[],
+        haystack_sessions=[], haystack_session_ids=[], haystack_dates=[],
+    )
+    ir = build_query_ir(case.question)
+    plan = build_query_plan(ir)
+    messages = planner_messages(
+        case, ir, plan,
+        {"present_roles": ["source"], "missing_roles": ["scope", "members"]},
+        [],
+    )
+    system = messages[0]["content"]
+    payload = messages[1]["content"]
+    assert "up to eight common child-type names" in system
+    assert "even without evidence candidates" in system
+    assert "\"missing_roles\": [\"scope\", \"members\"]" in payload
+    assert rough_token_count("\n".join(row["content"] for row in messages)) <= 700
+
+
 def test_v41_geographic_state_is_not_a_lifecycle_state() -> None:
     ir = build_query_ir("What state did Nate visit during his trip?")
     plan = build_query_plan(ir)

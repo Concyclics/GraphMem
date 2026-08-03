@@ -4171,9 +4171,11 @@ def planner_messages(
             "Return only compact JSON with no prose or whitespace formatting: "
             '{"alternative_entities":[],"event_aliases":[],"relations":[],'
             '"member_candidates":[["value","source_turn_id"],...]}. '
-            "First produce concise semantic aliases for the requested member type and "
-            "action so a second retrieval pass can find paraphrases; aliases are query "
-            "terms only and never answers. Inspect every evidence candidate. "
+            "alternative_entities must contain compact morphological aliases and, "
+            "when collection_head is a category, up to eight common child-type names. "
+            "They are retrieval terms, never evidence or answers. Produce them even "
+            "without evidence candidates whenever member or scope roles are missing. "
+            "Inspect every evidence candidate. "
             "collection_head is the member type; "
             "query_aliases are valid category/action paraphrases and "
             "requested_action_families name the lifecycle relation. scope_boundary is "
