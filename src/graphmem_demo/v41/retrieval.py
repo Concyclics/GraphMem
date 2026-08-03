@@ -7,7 +7,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta
 from typing import Any
 
-from ..clients import rough_token_count
+from ..clients import cosine_similarity, rough_token_count
 from ..models import QuestionCase, RetrievedContext
 from ..v3.action_semantics import action_families
 from ..v36.operators import (
@@ -3054,6 +3054,78 @@ def _collection_source_candidates(
     return [turn.node_id for _score, turn, _features in selected], evidence
 
 
+def _owner_lifecycle_dense_turn_rank(
+    index: V36Index,
+    ir: QueryIR,
+    augmentation: QueryAugmentationV41,
+    query_vectors: list[list[float]],
+    routed_sessions: set[str],
+    limit: int = 8,
+) -> list[tuple[str, float]]:
+    """Dense collection recall constrained by source owner and lifecycle.
+
+    Generic assistant recommendations often outrank terse first-person facts.
+    This channel searches only lossless user assertions inside the already
+    routed region, rejects plans, questions, and negations, and diversifies by
+    session. It proposes evidence only; normal source certificates still apply.
+    """
+    if (
+        augmentation.answer_algebra != "collection"
+        or not query_vectors
+        or not routed_sessions
+    ):
+        return []
+    requested_families = action_families(ir.raw_question)
+    owner_terms = _tokens(ir.target_owner) - _QUERY_STOP_TERMS
+    planned = re.compile(
+        r"\b(?:plan(?:ning|ned)?|want(?:ed)?|will|might|consider(?:ing)?|"
+        r"thinking\s+of|going\s+to|hope(?:d)?\s+to|next|upcoming)\b|"
+        r"\bi(?:ll|’ll)\b",
+        re.IGNORECASE,
+    )
+    negated = re.compile(
+        r"\b(?:never|not|didn’t|didnt|haven’t|havent|hadn’t|hadnt)\b.{0,28}"
+        r"\b(?:use|make|buy|purchase|receive|own|attend|visit|watch|read|"
+        r"play|service|repair|write|bake|cook)\w*\b",
+        re.IGNORECASE,
+    )
+    completed = re.compile(
+        r"\b(?:already|recently|yesterday|last\s+\w+|ago|used|made|bought|"
+        r"purchased|received|owned|attended|visited|watched|saw|read|played|"
+        r"serviced|repaired|wrote|written|baked|cooked|completed|finished|"
+        r"downloaded|created|built|tried|worked\s+on)\b",
+        re.IGNORECASE,
+    )
+    by_session: defaultdict[str, list[tuple[str, float]]] = defaultdict(list)
+    for turn in index.turns:
+        if (
+            turn.session_id not in routed_sessions
+            or turn.transport_role != "user"
+            or turn.embedding is None
+            or "?" in turn.text
+            or planned.search(turn.text)
+            or negated.search(turn.text)
+            or not completed.search(turn.text)
+        ):
+            continue
+        if owner_terms and not _fuzzy_overlap(
+            owner_terms, _tokens(f"{turn.speaker} {turn.speaker_key}"),
+        ):
+            continue
+        observed_families = action_families(turn.text)
+        family_overlap = requested_families & observed_families
+        if requested_families and not family_overlap:
+            continue
+        score = max(
+            cosine_similarity(vector, turn.embedding)
+            for vector in query_vectors
+        ) + 0.03 * len(family_overlap)
+        by_session[turn.session_id].append((turn.node_id, score))
+    ranked: list[tuple[str, float]] = []
+    for rows in by_session.values():
+        ranked.extend(sorted(rows, key=lambda row: (-row[1], row[0]))[:2])
+    return sorted(ranked, key=lambda row: (-row[1], row[0]))[:limit]
+
 def _labeled_collection_subtotals_hint(
     index: V36Index, ir: QueryIR,
 ) -> dict[str, Any] | None:
@@ -3537,6 +3609,19 @@ def retrieve(
             pack_limit, len(answer_bearing_nodes),
         ) if answer_bearing_nodes else ([], [])
     )
+    owner_lifecycle_dense_ranked = _owner_lifecycle_dense_turn_rank(
+        index, query_ir, augmentation, query_vectors,
+        set(result.retrieved_session_ids), limit=8,
+    )
+    owner_lifecycle_dense_nodes = [
+        node_id for node_id, _score in owner_lifecycle_dense_ranked
+    ]
+    owner_lifecycle_dense_added, owner_lifecycle_dense_decisions = (
+        _append_compact_answer_bearing_sources(
+            result, index, sidecar, owner_lifecycle_dense_nodes, query_ir,
+            pack_limit, 6,
+        ) if owner_lifecycle_dense_nodes else ([], [])
+    )
     collection_source_nodes, collection_source_evidence = (
         _collection_source_candidates(
             index, query_ir, augmentation, case.question_date,
@@ -3550,7 +3635,9 @@ def retrieve(
     )
     collection_prompt_sources = set(
         result.leaf_node_ids
-    ) | set(original_sources) | set(collection_source_added)
+    ) | set(original_sources) | set(owner_lifecycle_dense_added) | set(
+        collection_source_added
+    )
     collection_source_evidence = [
         row for row in collection_source_evidence
         if row.get("source_turn_id") in collection_prompt_sources
@@ -3583,7 +3670,8 @@ def retrieve(
     )
     general_scene_nodes = _scene_window_nodes(
         list(dict.fromkeys([
-            *original_sources, *collection_source_added, *candidate_added,
+            *original_sources, *owner_lifecycle_dense_added,
+            *collection_source_added, *candidate_added,
             *candidates[:24],
         ])),
         query_ir, sidecar, limit=10,
@@ -4022,7 +4110,8 @@ def retrieve(
         *[
             document.session_ids[0]
             for source_id in [
-                *expanded_added, *answer_bearing_added, *collection_source_added,
+                *expanded_added, *answer_bearing_added,
+                *owner_lifecycle_dense_added, *collection_source_added,
             *candidate_added, *scene_added, *overlay_added, *projected_added,
             *pair_completion_added, *closure_added, *late_scene_added,
             *temporal_operator_added,
@@ -4041,7 +4130,8 @@ def retrieve(
         },
         "v41_candidate_trace": candidate_trace,
         "v41_optional_stage_order": [
-            "typed_expansion", "answer_bearing", "collection_source",
+            "typed_expansion", "answer_bearing",
+            "owner_lifecycle_dense", "collection_source",
             "multichannel", "scene_window", "lossless_overlay",
             "source_projection", "dialogue_pair", "dialogue_closure",
             "late_scene", "temporal_operator",
@@ -4057,6 +4147,14 @@ def retrieve(
         "v41_answer_bearing_evidence": answer_bearing_evidence,
         "v41_reply_bound_evidence": reply_bound_evidence,
         "v41_semantic_turn_evidence": semantic_turn_evidence,
+
+        "v41_owner_lifecycle_dense_ranked": [
+            {"source_turn_id": node_id, "score": round(score, 6)}
+            for node_id, score in owner_lifecycle_dense_ranked
+        ],
+        "v41_owner_lifecycle_dense_node_ids": owner_lifecycle_dense_nodes,
+        "v41_owner_lifecycle_dense_source_ids": owner_lifecycle_dense_added,
+        "v41_owner_lifecycle_dense_decisions": owner_lifecycle_dense_decisions,
         "v41_collection_source_node_ids": collection_source_nodes,
         "v41_collection_source_ids": collection_source_added,
         "v41_collection_source_decisions": collection_source_decisions,
@@ -4087,7 +4185,7 @@ def retrieve(
         "v41_original_source_ids": original_sources,
         "v41_original_frame_ids": original_frames,
         "v41_source_additions": [
-            *expanded_added, *answer_bearing_added, *collection_source_added,
+            *expanded_added, *answer_bearing_added, *owner_lifecycle_dense_added, *collection_source_added,
             *candidate_added, *scene_added, *overlay_added, *projected_added,
             *pair_completion_added, *closure_added, *late_scene_added,
             *temporal_operator_added,

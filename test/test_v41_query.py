@@ -1822,6 +1822,52 @@ def test_v41_collection_planner_requires_category_child_terms_on_role_gap() -> N
     assert rough_token_count("\n".join(row["content"] for row in messages)) <= 700
 
 
+
+
+def test_v41_owner_lifecycle_dense_channel_excludes_plans_and_wrong_roles() -> None:
+    from graphmem_demo.v36.schema import TurnNodeV36, V36Index
+    from graphmem_demo.v41.retrieval import _owner_lifecycle_dense_turn_rank
+
+    def turn(
+        node_id: str, session: str, role: str, text: str,
+        embedding: list[float],
+    ) -> TurnNodeV36:
+        return TurnNodeV36(
+            node_id=node_id, question_id="q", session_id=session,
+            session_date="2026-01-15", turn_index=0, speaker="Dana",
+            speaker_key="dana", listener="Riley", transport_role=role,
+            text=text, retrieval_text=text, embedding=embedding,
+        )
+
+    kept_a = turn(
+        "q:s1:turn:0", "s1", "user",
+        "I repaired my wooden flute yesterday.", [1.0, 0.0],
+    )
+    kept_b = turn(
+        "q:s1:turn:1", "s1", "user",
+        "I repaired my brass horn last week.", [0.9, 0.1],
+    )
+    index = V36Index(turns=[
+        kept_a,
+        kept_b,
+        turn("q:s1:turn:2", "s1", "user",
+             "I plan to repair my drum next week.", [1.0, 0.0]),
+        turn("q:s1:turn:3", "s1", "user",
+             "I never repaired the borrowed violin.", [1.0, 0.0]),
+        turn("q:s1:turn:4", "s1", "assistant",
+             "I repaired a cello yesterday.", [1.0, 0.0]),
+        turn("q:s2:turn:0", "s2", "user",
+             "I repaired a saxophone yesterday.", [1.0, 0.0]),
+    ])
+    ir = build_query_ir("How many musical instruments have I repaired?")
+    plan = build_query_plan(ir)
+    ranked = _owner_lifecycle_dense_turn_rank(
+        index, ir, plan, [[1.0, 0.0]], {"s1"}, limit=8,
+    )
+    assert [node_id for node_id, _score in ranked] == [
+        kept_a.node_id, kept_b.node_id,
+    ]
+
 def test_v41_geographic_state_is_not_a_lifecycle_state() -> None:
     ir = build_query_ir("What state did Nate visit during his trip?")
     plan = build_query_plan(ir)
