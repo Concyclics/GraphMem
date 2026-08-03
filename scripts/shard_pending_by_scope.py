@@ -66,6 +66,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--completed-root", type=Path, required=True)
+    parser.add_argument(
+        "--additional-completed-root", type=Path, action="append", default=[],
+        help="Additional completed shard root; may be repeated.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--variant", default="hierarchical_hybrid_graph_v4_1_query")
     parser.add_argument("--scope-field", default="locomo_sample_id")
@@ -74,7 +78,9 @@ def main() -> None:
     if args.shards_per_scope < 1:
         raise SystemExit("--shards-per-scope must be positive")
     rows = json.loads(args.data.read_text(encoding="utf-8"))
-    completed = completed_question_ids(args.completed_root, args.variant)
+    completed = set()
+    for root in [args.completed_root, *args.additional_completed_root]:
+        completed.update(completed_question_ids(root, args.variant))
     shards, manifest = shard_pending(
         rows, completed,
         scope_field=args.scope_field,
