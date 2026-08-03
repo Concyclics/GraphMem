@@ -14,6 +14,10 @@ from typing import Any, Iterable
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument(
+        "--additional-shard-root", type=Path, action="append", default=[],
+        help="Additional directory containing disjoint shard_* outputs; may be repeated.",
+    )
     parser.add_argument("--benchmark", choices=["longmemeval", "locomo"], required=True)
     parser.add_argument("--judge", type=Path)
     parser.add_argument("--variant", default="hierarchical_hybrid_graph_v4_1_query")
@@ -101,9 +105,12 @@ def question_group(
 
 def main() -> None:
     args = parse_args()
+    shard_roots = [args.run_root / "shards", *args.additional_shard_root]
     variant_dirs = sorted(
-        path for path in args.run_root.glob(f"shards/shard_*/{args.variant}")
-        if path.is_dir()
+        path / args.variant
+        for root in shard_roots
+        for path in root.glob("shard_*")
+        if (path / args.variant).is_dir()
     )
     answer_rows: list[dict[str, Any]] = []
     stat_rows: list[dict[str, Any]] = []
