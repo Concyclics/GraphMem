@@ -4,6 +4,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_ROOT="${RUN_ROOT:-/home/chenhan/graphmem_v419_qwen32b_unified_full_20260803}"
 DATA_ROOT="${DATA_ROOT:-/home/chenhan/GraphMem-Qwen/benchmark_data}"
+LME_SHARD_ROOT="${LME_SHARD_ROOT:-${DATA_ROOT}/lme_query_shards}"
 LME_PARALLEL_SHARDS="${LME_PARALLEL_SHARDS:-8}"
 LME_INFLIGHT_PER_SHARD="${LME_INFLIGHT_PER_SHARD:-16}"
 LOCOMO_PARALLEL_SHARDS="${LOCOMO_PARALLEL_SHARDS:-10}"
@@ -81,7 +82,7 @@ run_lme() {
     mkdir -p "${shard_out}"
     run_with_retries "lme_${index}" "${shard_out}/run.log" \
       "${REPO}/.venv/bin/python" "${REPO}/scripts/run_token_demo.py" \
-      --data "${DATA_ROOT}/query_shards/lme_${index}.json" \
+      --data "${LME_SHARD_ROOT}/lme_${index}.json" \
       --output-dir "${shard_out}" \
       --memory-cache-dir "${RUN_ROOT}/memory_cache_lme" \
       --max-questions 20 --question-workers 20 \
