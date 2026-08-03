@@ -46,7 +46,12 @@ def load_indexes(dirs,wanted):
  if missing: raise RuntimeError(f'missing persisted indexes: {missing}')
  result={}
  for q,p in payloads.items():
-  index=index_from_dict(p);key=hashlib.sha256(vector_keys[q].encode()).hexdigest()[:20];vd=sources[q]/'vectors';ids=json.loads((vd/f'{key}.ids.json').read_text());matrix=np.load(vd/f'{key}.npy',mmap_mode='r',allow_pickle=False);vectors={node_id:matrix[i].tolist() for i,node_id in enumerate(ids)}
+  index=index_from_dict(p);key=hashlib.sha256(vector_keys[q].encode()).hexdigest()[:20];vd=sources[q]/'vectors'
+  if not (vd/f'{key}.ids.json').exists():
+   matches=list((sources[q]/'memory_indices').glob(f'*/vectors/{key}.ids.json'))
+   if len(matches)!=1: raise RuntimeError(f'expected one vector map for {q}, got {matches}')
+   vd=matches[0].parent
+  ids=json.loads((vd/f'{key}.ids.json').read_text());matrix=np.load(vd/f'{key}.npy',mmap_mode='r',allow_pickle=False);vectors={node_id:matrix[i].tolist() for i,node_id in enumerate(ids)}
   for node in [*index.routing_cards,*index.frames,*index.evidence_groups,*index.turns]: node.embedding=vectors.get(node.node_id)
   build_inverted_indexes(index);result[q]=index
  return result

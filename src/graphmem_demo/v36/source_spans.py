@@ -14,7 +14,7 @@ from .dialogue_topology import infer_dialogue_topology
 
 _WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'_-]*")
 _STOP = {"a","an","and","are","as","at","be","been","by","can","did","do","does","for","from","had","has","have","how","i","in","is","it","me","my","of","on","or","the","to","was","were","what","when","where","which","who","with","would","you","your"}
-_GENERIC = {"all","answer","count","current","currently","different","each","fact","latest","many","memory","number","previous","recent","recently","remind","some","tell","total"}
+_GENERIC = {"all","answer","count","current","currently","different","each","fact","latest","many","memory","number","previous","recent","recently","remind","some","tell","time","times","total","up"}
 _DATE_RE = re.compile(r"\b(?:19|20)\d{2}(?:[-/]\d{1,2}(?:[-/]\d{1,2})?)?\b|\b(?:today|yesterday|tomorrow|last|past|next|ago|before|after|january|february|march|april|may|june|july|august|september|october|november|december)\b", re.I)
 _NUMBER_RE = re.compile(r"(?:[$€£¥]\s*)?\b\d[\d,]*(?:\.\d+)?(?:\s*%)?\b")
 _NEGATIVE_RE = re.compile(r"\b(?:not|never|no longer|without|dislike|hate|avoid|cancelled|canceled)\b", re.I)
@@ -34,6 +34,8 @@ def _stem(token: str) -> str:
         return irregular[value]
     if value in {"anything", "everything", "nothing", "something"}:
         return value
+    if len(value) > 4 and value.endswith("ies"):
+        return value[:-3] + "y"
     if len(value) > 5 and value.endswith("ing"):
         return value[:-3]
     if len(value) > 4 and value.endswith("ed"):
@@ -73,9 +75,22 @@ def query_binding_terms(ir: QueryIR) -> tuple[set[str], set[str]]:
     )
     if match:
         target = _tokens(match.group(1)) - {
-            "amount", "different", "item", "kind", "number", "piece", "type",
+            "amount", "different", "item", "kind", "number", "piece", "time", "type",
         }
         return target, _tokens(match.group("relation")) - _GENERIC
+
+    total_number = re.search(
+        r"\b(?:what\s+(?:is|was)\s+)?(?:the\s+)?total\s+number\s+of\s+"
+        r"(.+?)\s+(?:i(?:'ve|\s+have)|we(?:'ve|\s+have)|i|we)\s+"
+        r"(.+?)(?:\?|$)", question, re.I,
+    )
+    if total_number:
+        target = _tokens(total_number.group(1)) - {
+            "amount", "different", "item", "kind", "number", "piece",
+            "time", "type",
+        }
+        relation = _tokens(total_number.group(2)) - _GENERIC
+        return target, relation
 
     # Direct slot questions expose a target phrase before the auxiliary and
     # the requested relation after it. This prevents temporal words such as
@@ -128,7 +143,11 @@ def relative_target_date(text: str, observed_at: str | None) -> datetime | None:
     match = re.match(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", observed_at)
     if match is None:
         return None
-    observed = datetime(*(int(part) for part in match.groups()))
+    try:
+        observed = datetime(*(int(part) for part in match.groups()))
+    except ValueError:
+        # Preserve malformed source dates as lexical evidence without aborting retrieval.
+        return None
     lowered = text.casefold()
     if re.search(r"\btoday\b", lowered):
         return observed

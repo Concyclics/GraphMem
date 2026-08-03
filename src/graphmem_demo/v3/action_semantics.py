@@ -6,20 +6,33 @@ from collections.abc import Iterable
 
 _ACTION_FAMILIES = {
     "acquire": {
-        "acquire", "acquired", "buy", "bought", "get", "got", "order",
-        "ordered", "pick", "picked", "purchase", "purchased", "receive",
-        "received",
+        "acquire", "acquired", "acquisition", "buy", "bought", "download",
+        "downloaded", "get", "got", "obtain", "obtained", "order", "ordered",
+        "pick", "picked", "purchase", "purchased", "receive", "received",
     },
     "attend": {
-        "attend", "attended", "go", "gone", "participate", "participated",
-        "visit", "visited", "volunteer", "volunteered", "went",
+        "attend", "attendance", "attended", "go", "gone", "host", "hosted",
+        "organize", "organized", "participate",
+        "participated", "see", "seen", "saw", "tour", "toured", "view",
+        "viewed", "visit", "visited", "volunteer", "volunteered", "went",
     },
     "complete": {
         "complete", "completed", "finish", "finished",
     },
+    "birth": {
+        "birth", "born", "deliver", "delivered", "gave", "newborn",
+        "welcomed",
+    },
     "project_work": {
         "assemble", "assembled", "build", "built", "complete", "completed",
         "finish", "finished", "work", "worked", "working",
+    },
+    "possess": {
+        "own", "owned", "possess", "possessed",
+    },
+    "care_encounter": {
+        "appointment", "biopsy", "consult", "consulted", "diagnose", "diagnosed",
+        "prescribe", "prescribed", "treat", "treated",
     },
     "prepare": {
         "bake", "baked", "baking", "cook", "cooked", "cooking",
@@ -54,11 +67,10 @@ _ACTION_FAMILIES = {
     },
 }
 
-_TOKEN_TO_FAMILY = {
-    token: family
-    for family, tokens in _ACTION_FAMILIES.items()
-    for token in tokens
-}
+_TOKEN_TO_FAMILIES: dict[str, set[str]] = {}
+for _family, _tokens in _ACTION_FAMILIES.items():
+    for _token in _tokens:
+        _TOKEN_TO_FAMILIES.setdefault(_token, set()).add(_family)
 
 
 def action_families(value: str | Iterable[str]) -> set[str]:
@@ -66,6 +78,7 @@ def action_families(value: str | Iterable[str]) -> set[str]:
     if isinstance(value, str):
         # “got back from” denotes completed travel/attendance, not acquisition.
         normalized = re.sub(r"\bgot\s+back\s+from\b", " went ", value.casefold())
+        normalized = re.sub(r"[_-]+", " ", normalized)
         tokens = re.findall(r"[\w']+", normalized)
     else:
         tokens = [str(item).casefold() for item in value]
@@ -80,7 +93,7 @@ def action_families(value: str | Iterable[str]) -> set[str]:
     return {
         family
         for token in normalized
-        if (family := _TOKEN_TO_FAMILY.get(token)) is not None
+        for family in _TOKEN_TO_FAMILIES.get(token, set())
     }
 
 

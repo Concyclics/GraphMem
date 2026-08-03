@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-local-port", type=int, default=8001)
     parser.add_argument("--embedding-base-url", default=os.environ.get("EMBEDDING_BASE_URL", "http://127.0.0.1:8001/v1"))
     parser.add_argument("--embedding-model", default=os.environ.get("EMBEDDING_MODEL", "Qwen3-Embedding-0.6B"))
-    parser.add_argument("--tree-mode", choices=["legacy_kway", "direct_session", "hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"])
+    parser.add_argument("--tree-mode", choices=["legacy_kway", "direct_session", "hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0", "hierarchical_hybrid_graph_v4_1_query"])
     parser.add_argument("--fanout-k", type=int, default=16)
     parser.add_argument("--max-group-rough-tokens", type=int, default=6000)
     parser.add_argument("--leaf-top-k", type=int, default=14)
@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-inflight-deepseek", type=int, default=32)
     parser.add_argument(
         "--summary-schema",
-        choices=["minimal_memory_v1", "compact_memory_v2", "multilingual_memory_v1", "graphmem_v2", "graphmem_v3", "graphmem_v3_6", "graphmem_v4_0"],
+        choices=["minimal_memory_v1", "compact_memory_v2", "multilingual_memory_v1", "graphmem_v2", "graphmem_v3", "graphmem_v3_6", "graphmem_v4_0", "graphmem_v4_1_query"],
     )
     parser.add_argument(
         "--summarizer-kind",
@@ -402,6 +402,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v36-session-extraction-max-tokens", type=int, default=4096)
     parser.add_argument("--v36-context-token-budget", type=int, default=8000)
     parser.add_argument("--v36-answer-hard-budget-tokens", type=int, default=10500)
+    parser.add_argument("--v41-normal-context-target", type=int, default=8400)
+    parser.add_argument("--v41-complex-context-target", type=int, default=9200)
+    parser.add_argument("--v41-planner-prompt-max", type=int, default=700)
+    parser.add_argument("--v41-planner-output-max", type=int, default=256)
+    parser.add_argument("--v41-query-target-tokens", type=int, default=10000)
+    parser.add_argument("--v41-query-hard-limit-tokens", type=int, default=13000)
+    parser.add_argument("--disable-v41-planner", action="store_true")
     parser.add_argument(
         "--retrieval-only",
         action="store_true",
@@ -576,6 +583,13 @@ def main() -> None:
         v36_session_extraction_max_tokens=args.v36_session_extraction_max_tokens,
         v36_context_token_budget=args.v36_context_token_budget,
         v36_answer_hard_budget_tokens=args.v36_answer_hard_budget_tokens,
+        v41_normal_context_target=args.v41_normal_context_target,
+        v41_complex_context_target=args.v41_complex_context_target,
+        v41_planner_prompt_max=args.v41_planner_prompt_max,
+        v41_planner_output_max=args.v41_planner_output_max,
+        v41_query_target_tokens=args.v41_query_target_tokens,
+        v41_query_hard_limit_tokens=args.v41_query_hard_limit_tokens,
+        v41_enable_planner=not args.disable_v41_planner,
         retrieval_only=args.retrieval_only,
     )
     aggregates = run_demo(config)

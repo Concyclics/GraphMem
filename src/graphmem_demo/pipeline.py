@@ -125,6 +125,17 @@ from .v4 import (
     retrieve as retrieve_v4,
     validate_capability_view as validate_v4_capability_view,
 )
+from .v41 import (
+    GRAPHMEM_V41_SCHEMA, V41_POLICY_VERSION, QueryPolicyV41, QuerySidecarV41,
+    answer_messages as v41_answer_messages,
+    build_query_plan as build_v41_query_plan,
+    build_sidecar as build_v41_sidecar,
+    parse_planner_result as parse_v41_planner_result,
+    planner_messages as v41_planner_messages,
+    persist_sidecar as persist_v41_sidecar,
+    query_views as v41_query_views, retrieve as retrieve_v41,
+    trim_latest_addition as trim_v41_latest_addition,
+)
 from .stats import (
     aggregate_variant_stats,
     build_question_stats,
@@ -152,6 +163,11 @@ class VariantSpec:
 
 
 VARIANT_SPECS = {
+    "hierarchical_hybrid_graph_v4_1_query": VariantSpec(
+        "hierarchical_hybrid_graph_v4_1_query", False, True,
+        summary_schema="graphmem_v4_1_query", hybrid_retrieval=True,
+        enhanced_retrieval=True, enhanced_qa=True,
+    ),
     "hierarchical_hybrid_graph_v4_0": VariantSpec(
         "hierarchical_hybrid_graph_v4_0", False, True,
         summary_schema="graphmem_v4_0", hybrid_retrieval=True,
@@ -272,6 +288,20 @@ VARIANT_SPECS = {
     "summary_tree_no_compress": VariantSpec("legacy_kway", False, False),
     "token_efficient_graphmem": VariantSpec("legacy_kway", True, True),
 }
+V4_VARIANTS = frozenset({
+    "hierarchical_hybrid_graph_v4_0",
+    "hierarchical_hybrid_graph_v4_1_query",
+})
+ROLE_GRAPH_VARIANTS = frozenset({
+    "hierarchical_role_graph_v3_6", *V4_VARIANTS,
+})
+
+def _is_v4_variant(variant: str) -> bool:
+    return variant in V4_VARIANTS
+
+def _is_v41_variant(variant: str) -> bool:
+    return variant == "hierarchical_hybrid_graph_v4_1_query"
+
 VARIANTS = set(VARIANT_SPECS)
 
 
@@ -456,6 +486,13 @@ class DemoConfig:
     v36_session_extraction_max_tokens: int = 4096
     v36_context_token_budget: int = 8000
     v36_answer_hard_budget_tokens: int = 10500
+    v41_normal_context_target: int = 8400
+    v41_complex_context_target: int = 9200
+    v41_planner_prompt_max: int = 700
+    v41_planner_output_max: int = 256
+    v41_query_target_tokens: int = 10000
+    v41_query_hard_limit_tokens: int = 13000
+    v41_enable_planner: bool = True
     # Persist the V3 index and retrieval ledger without spending tokens on the
     # built-in base answer. The graph navigator can then be the sole reader.
     retrieval_only: bool = False
@@ -472,8 +509,8 @@ class DemoConfig:
             raise ValueError("question_workers must be at least 1")
         if self.summary_workers < 0 or self.max_inflight_deepseek < 0:
             raise ValueError("summary_workers and max_inflight_deepseek cannot be negative")
-        if self.tree_mode is not None and self.tree_mode not in {"legacy_kway", "direct_session", "hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
-            raise ValueError("tree_mode must be legacy_kway, direct_session, hierarchical_state_graph_v2, or hierarchical_hypergraph_v3, or hierarchical_role_graph_v3_6, or hierarchical_hybrid_graph_v4_0")
+        if self.tree_mode is not None and self.tree_mode not in {"legacy_kway", "direct_session", "hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0", "hierarchical_hybrid_graph_v4_1_query"}:
+            raise ValueError("tree_mode must be legacy_kway, direct_session, hierarchical_state_graph_v2, or hierarchical_hypergraph_v3, or hierarchical_role_graph_v3_6, or hierarchical_hybrid_graph_v4_0, or hierarchical_hybrid_graph_v4_1_query")
         if self.summary_schema not in {
             None,
             "minimal_memory_v1",
@@ -483,9 +520,10 @@ class DemoConfig:
             "graphmem_v3",
             "graphmem_v3_6",
             "graphmem_v4_0",
+            "graphmem_v4_1_query",
         }:
             raise ValueError(
-                "summary_schema must be a supported memory schema through graphmem_v4_0"
+                "summary_schema must be a supported memory schema through graphmem_v4_1_query"
             )
         if self.summarizer_kind not in {"auto", "none", "llmlingua2", "qwen_local"}:
             raise ValueError("summarizer_kind must be auto, none, llmlingua2, or qwen_local")
@@ -657,6 +695,7 @@ class CaseRun:
     v3_index: V3Index | None = None
     v36_index: V36Index | None = None
     v4_capability_view: CapabilityViewV4 | None = None
+    v41_sidecar: QuerySidecarV41 | None = None
 
 
 @dataclass
@@ -674,6 +713,7 @@ class MemoryBuild:
     v3_index: V3Index | None = None
     v36_index: V36Index | None = None
     v4_capability_view: CapabilityViewV4 | None = None
+    v41_sidecar: QuerySidecarV41 | None = None
 
 
 @dataclass
@@ -855,7 +895,7 @@ def run_demo(
         query_payload["local_summarizer_by_stage"] = local_summary_totals
         _write_json(variant_dir / "build_stats.json", build_payload)
         _write_json(variant_dir / "query_stats.json", query_payload)
-        if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
+        if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0", "hierarchical_hybrid_graph_v4_1_query"}:
             _write_json(
                 variant_dir / "index_diagnostics.json",
                 _v36_index_diagnostics_payload(
@@ -970,9 +1010,44 @@ def _memory_cache_path(
         raise ValueError("memory_cache_key is required for memory cache path")
     key = _safe_cache_part(case.memory_cache_key)
     fingerprint = _memory_cache_fingerprint(config, case, variant)
+    cache_variant = (
+        "hierarchical_hybrid_graph_v4_0"
+        if _is_v41_variant(variant) else variant
+    )
     if config.memory_cache_dir is not None:
-        return config.memory_cache_dir / variant / f"{key}-{fingerprint[:16]}.json"
+        return config.memory_cache_dir / cache_variant / f"{key}-{fingerprint[:16]}.json"
     return variant_dir / "memory_cache" / f"{key}-{fingerprint[:16]}.json"
+
+
+def _v41_compatible_cache_candidates(
+    expected_path: Path, case: QuestionCase,
+) -> list[Path]:
+    """Find legacy V4 build caches for a query-only V4.1 policy.
+
+    Query policy edits must not force an LLM graph rebuild.  The fallback is
+    intentionally narrow: the explicit memory key, V4 schema/version, and a
+    structural V3.6 index must all match, and callers only accept one valid
+    candidate.  Other variants retain exact fingerprint semantics.
+    """
+    key = _safe_cache_part(case.memory_cache_key or "")
+    if not key or not expected_path.parent.exists():
+        return []
+    candidates: list[Path] = []
+    for path in sorted(expected_path.parent.glob(f"{key}-*.json")):
+        if path == expected_path:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if (
+            payload.get("version") == 6
+            and payload.get("schema_version") == GRAPHMEM_V4_SCHEMA
+            and payload.get("memory_cache_key") == case.memory_cache_key
+            and isinstance(payload.get("v36_index"), dict)
+        ):
+            candidates.append(path)
+    return candidates
 
 
 def _safe_cache_part(value: str) -> str:
@@ -990,11 +1065,11 @@ def _memory_cache_fingerprint(config: DemoConfig, case: QuestionCase, variant: s
     data_hash = hashlib.sha256(
         json.dumps(data_payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
     ).hexdigest()
-    if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
+    if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0", "hierarchical_hybrid_graph_v4_1_query"}:
         payload = {
-            "version": (5 if variant == "hierarchical_hybrid_graph_v4_0" else 4), "variant": variant,
-            "schema_version": (GRAPHMEM_V4_SCHEMA if variant == "hierarchical_hybrid_graph_v4_0" else GRAPHMEM_V36_SCHEMA),
-            "v4_build_version": (V4_BUILD_VERSION if variant == "hierarchical_hybrid_graph_v4_0" else None),
+            "version": (5 if _is_v4_variant(variant) else 4), "variant": ("hierarchical_hybrid_graph_v4_0" if _is_v4_variant(variant) else variant),
+            "schema_version": (GRAPHMEM_V4_SCHEMA if _is_v4_variant(variant) else GRAPHMEM_V36_SCHEMA),
+            "v4_build_version": (V4_BUILD_VERSION if _is_v4_variant(variant) else None),
             "v36_prompt_hash": v36_prompt_hash(),
             "v36_prompt_version": V36_PROMPT_VERSION,
             "v36_build_version": V36_BUILD_VERSION,
@@ -1158,8 +1233,8 @@ def _write_memory_cache(
                 node.embedding = embedding
         v36_vector_cache = vector_directory.name
     payload = {
-        "version": 6 if variant == "hierarchical_hybrid_graph_v4_0" else (5 if variant == "hierarchical_role_graph_v3_6" else (3 if variant == "hierarchical_hypergraph_v3" else (2 if variant == "hierarchical_state_graph_v2" else 1))),
-        "schema_version": GRAPHMEM_V4_SCHEMA if variant == "hierarchical_hybrid_graph_v4_0" else (GRAPHMEM_V36_SCHEMA if variant == "hierarchical_role_graph_v3_6" else (GRAPHMEM_V3_SCHEMA if variant == "hierarchical_hypergraph_v3" else (GRAPHMEM_V2_SCHEMA if variant == "hierarchical_state_graph_v2" else "graphmem_v1"))),
+        "version": 6 if _is_v4_variant(variant) else (5 if variant == "hierarchical_role_graph_v3_6" else (3 if variant == "hierarchical_hypergraph_v3" else (2 if variant == "hierarchical_state_graph_v2" else 1))),
+        "schema_version": GRAPHMEM_V4_SCHEMA if _is_v4_variant(variant) else (GRAPHMEM_V36_SCHEMA if variant == "hierarchical_role_graph_v3_6" else (GRAPHMEM_V3_SCHEMA if variant == "hierarchical_hypergraph_v3" else (GRAPHMEM_V2_SCHEMA if variant == "hierarchical_state_graph_v2" else "graphmem_v1"))),
         "memory_cache_key": case.memory_cache_key,
         "fingerprint": _memory_cache_fingerprint(config, case, variant),
         "source_question_id": case.question_id,
@@ -1436,6 +1511,32 @@ def _run_cases_with_memory_cache(
             if allow_memory_cache_read and memory_cache_path.exists()
             else None
         )
+        if (
+            memory is None
+            and allow_memory_cache_read
+            and _is_v41_variant(variant)
+        ):
+            compatible_paths = _v41_compatible_cache_candidates(
+                memory_cache_path, build_case,
+            )
+            compatible_memories: list[MemoryBuild] = []
+            for compatible_path in compatible_paths:
+                candidate = _load_memory_cache(compatible_path)
+                if candidate is None or candidate.v36_index is None:
+                    continue
+                expected_sessions = set(build_case.haystack_session_ids)
+                cached_sessions = {
+                    card.session_id
+                    for card in candidate.v36_index.routing_cards
+                }
+                if (
+                    expected_sessions and cached_sessions
+                    and not expected_sessions.issubset(cached_sessions)
+                ):
+                    continue
+                compatible_memories.append(candidate)
+            if len(compatible_memories) == 1:
+                memory = compatible_memories[0]
         loaded_from_cache = memory is not None
         build_embedding_records: list[Any] = []
         build_compression_records: list[Any] = []
@@ -1470,8 +1571,11 @@ def _run_cases_with_memory_cache(
                     (build_compressor, compressor is None),
                     (build_summarizer, summarizer is None),
                 )
+        if variant == "hierarchical_hybrid_graph_v4_1_query" and memory.v41_sidecar is None:
+            memory.v41_sidecar = build_v41_sidecar(memory.v36_index)
+
         build_record_question_id: str | None = build_case.question_id
-        if loaded_from_cache and variant in {"hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6"}:
+        if loaded_from_cache and variant in {"hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0", "hierarchical_hybrid_graph_v4_1_query"}:
             # A partial resume in the same output directory may already contain
             # the original build owner. Do not attach saved build records to the
             # first pending question a second time.
@@ -1498,7 +1602,7 @@ def _run_cases_with_memory_cache(
             for case in group_cases:
                 include_build_records = (
                     case.question_id == build_record_question_id
-                    and (not loaded_from_cache or variant in {"hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6"})
+                    and (not loaded_from_cache or variant in {"hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0", "hierarchical_hybrid_graph_v4_1_query"})
                 )
                 run, embedding_records, compression_records = _run_case_with_cached_memory(
                     config,
@@ -1526,7 +1630,7 @@ def _run_cases_with_memory_cache(
                     variant,
                     limiter,
                     memory,
-                    (case.question_id == build_record_question_id and (not loaded_from_cache or variant in {"hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6"})),
+                    (case.question_id == build_record_question_id and (not loaded_from_cache or variant in {"hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0", "hierarchical_hybrid_graph_v4_1_query"})),
                     (
                         group_build_started
                         if case.question_id == build_record_question_id
@@ -1573,7 +1677,7 @@ def _run_case_with_cached_memory(
             include_build_records=include_build_records,
             case_started=case_started,
         )
-        if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
+        if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0", "hierarchical_hybrid_graph_v4_1_query"}:
             _attach_v36_offline_gold_metrics(case, run)
         return run, _records_since(case_embedder, embedding_start), []
     finally:
@@ -1581,6 +1685,14 @@ def _run_case_with_cached_memory(
             (case_llm, llm is None),
             (case_embedder, embedder is None),
         )
+
+
+def _memory_artifact_dir(variant_dir: Path, case: QuestionCase) -> Path:
+    if not case.memory_cache_key:
+        return variant_dir
+    digest = hashlib.sha256(case.memory_cache_key.encode("utf-8")).hexdigest()[:16]
+    label = _safe_cache_part(case.memory_cache_key)[:80]
+    return variant_dir / "memory_indices" / f"{label}-{digest}"
 
 
 def _write_case_outputs(
@@ -1604,6 +1716,7 @@ def _write_case_outputs(
     # still write retrieval, answer, and token records below.
     persist_shared_index = not case.memory_cache_key or run.stats.build_total_tokens > 0
     if persist_shared_index:
+        artifact_dir = _memory_artifact_dir(variant_dir, case)
         if run.v36_index is not None:
             _append_jsonl(
                 variant_dir / "nodes.jsonl",
@@ -1625,10 +1738,10 @@ def _write_case_outputs(
                 [asdict(item) for item in run.v36_index.coverage],
             )
             persist_v36_retrieval_index(
-                variant_dir / "retrieval.sqlite", run.v36_index
+                artifact_dir / "retrieval.sqlite", run.v36_index
             )
             persist_v36_vector_matrix(
-                variant_dir / "vectors", run.v36_index
+                artifact_dir / "vectors", run.v36_index
             )
             if run.v4_capability_view is not None:
                 _append_jsonl(
@@ -1640,6 +1753,10 @@ def _write_case_outputs(
                         "question_id": case.question_id,
                         "capability_view": asdict(run.v4_capability_view),
                     }],
+                )
+            if run.v41_sidecar is not None:
+                persist_v41_sidecar(
+                    artifact_dir / "retrieval_v41.sqlite", run.v41_sidecar
                 )
         if run.v3_index is not None:
             _append_jsonl(
@@ -1733,7 +1850,7 @@ def run_case(
         include_build_records=True,
         case_started=case_started,
     )
-    if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
+    if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0", "hierarchical_hybrid_graph_v4_1_query"}:
         _attach_v36_offline_gold_metrics(case, run)
     return run
 
@@ -1769,8 +1886,8 @@ def _build_v36_memory(
     )
     checkpoint_namespace = hashlib.sha256(json.dumps(
         {
-            "schema": (GRAPHMEM_V4_SCHEMA if variant == "hierarchical_hybrid_graph_v4_0" else GRAPHMEM_V36_SCHEMA),
-            "prompt_version": (V4_BUILD_VERSION if variant == "hierarchical_hybrid_graph_v4_0" else V36_PROMPT_VERSION),
+            "schema": (GRAPHMEM_V4_SCHEMA if _is_v4_variant(variant) else GRAPHMEM_V36_SCHEMA),
+            "prompt_version": (V4_BUILD_VERSION if _is_v4_variant(variant) else V36_PROMPT_VERSION),
             "model": config.deepseek_model,
             "base_url": config.deepseek_base_url,
             "session_max_tokens": config.v36_session_extraction_max_tokens,
@@ -1793,7 +1910,7 @@ def _build_v36_memory(
     metrics.summary_parse_error_count += result.parse_error_count
     metrics.index_diagnostics.extend(result.diagnostics)
     v4_capability_view = None
-    if variant == "hierarchical_hybrid_graph_v4_0":
+    if _is_v4_variant(variant):
         v4_capability_view = build_v4_capability_view(result.index)
         capability_errors = validate_v4_capability_view(result.index, v4_capability_view)
         if capability_errors:
@@ -1993,7 +2110,7 @@ def build_memory(
     llm_records: list[DeepSeekCallRecord] = []
     build_started = time.perf_counter()
     leaves = build_leaf_nodes(case)
-    if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
+    if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0", "hierarchical_hybrid_graph_v4_1_query"}:
         return _build_v36_memory(
             config, case, variant, llm, embedder, limiter, metrics, build_started
         )
@@ -2161,7 +2278,8 @@ def _run_v36_case_with_memory(
 ) -> CaseRun:
     if memory.v36_index is None:
         raise ValueError("role-graph memory cache is missing v36_index")
-    is_v4 = variant == "hierarchical_hybrid_graph_v4_0"
+    is_v4 = _is_v4_variant(variant)
+    is_v41 = _is_v41_variant(variant)
     v4_capability_view = memory.v4_capability_view
     if is_v4 and v4_capability_view is None:
         v4_capability_view = build_v4_capability_view(memory.v36_index)
@@ -2175,16 +2293,114 @@ def _run_v36_case_with_memory(
         [replace(record, question_id=case.question_id) for record in memory.llm_records]
         if include_build_records else []
     )
-    index = clone_v36_index(memory.v36_index, case.question_id)
+    # V4/V4.1 indices are immutable at query time. Keep build-time IDs stable
+    # so shared capability projections and sidecars address the same nodes.
+    index = (
+        memory.v36_index
+        if is_v4
+        else clone_v36_index(memory.v36_index, case.question_id)
+    )
     query_ir = (
         build_v4_query_ir(case.question) if is_v4
         else build_v36_query_ir(case.question)
     )
-    query_views = v4_query_views(query_ir) if is_v4 else v36_query_views(query_ir)
+    v41_plan = build_v41_query_plan(query_ir) if is_v41 else None
+    query_views = (
+        v41_query_views(query_ir, v41_plan)
+        if is_v41 and v41_plan is not None
+        else v4_query_views(query_ir) if is_v4
+        else v36_query_views(query_ir)
+    )
     query_vectors = embedder.embed(
         query_views, question_id=case.question_id, variant=variant
     )
-    if is_v4:
+    v41_policy = QueryPolicyV41(
+        normal_context_target=config.v41_normal_context_target,
+        complex_context_target=config.v41_complex_context_target,
+        planner_prompt_max=config.v41_planner_prompt_max,
+        planner_output_max=config.v41_planner_output_max,
+        query_target=config.v41_query_target_tokens,
+        query_hard_limit=config.v41_query_hard_limit_tokens,
+    )
+    if is_v41:
+        assert v4_capability_view is not None
+        try:
+            sidecar = memory.v41_sidecar
+            if sidecar is None:
+                sidecar = build_v41_sidecar(index)
+                memory.v41_sidecar = sidecar
+        except Exception as error:
+            sidecar = None
+            retrieval = retrieve_v4(
+                case=case, variant=variant, index=index,
+                capability_view=v4_capability_view,
+                query_vectors=query_vectors,
+                token_budget=config.v41_normal_context_target,
+            )
+            retrieval.variant = variant
+            retrieval.retrieval_trace["v41_sidecar_fallback"] = {
+                "active": True,
+                "reason": type(error).__name__,
+                "fallback_variant": "hierarchical_hybrid_graph_v4_0",
+            }
+        else:
+            retrieval = retrieve_v41(
+                case=case, variant=variant, index=index,
+                capability_view=v4_capability_view, sidecar=sidecar,
+                query_ir=query_ir, query_vectors=query_vectors,
+                token_budget=config.v41_complex_context_target, policy=v41_policy,
+            )
+        if (
+            sidecar is not None
+            and config.v41_enable_planner
+            and retrieval.retrieval_trace.get("planner_required") is True
+            and v41_plan is not None
+        ):
+            planner_call = _tracked_chat(
+                llm, limiter, answer_metrics, question_id=case.question_id,
+                variant=variant, stage="answer_query_planner",
+                thinking_mode="none",
+                messages=v41_planner_messages(
+                    case, query_ir, v41_plan,
+                    retrieval.retrieval_trace.get("v41_evidence_certificate") or {},
+                    retrieval.retrieval_trace.get("v41_planner_evidence") or [],
+                ),
+                max_tokens=config.v41_planner_output_max, json_mode=True,
+            )
+            llm_records.append(planner_call.record)
+            planner_result = parse_v41_planner_result(planner_call.text)
+            offered_planner_source_ids = {
+                str(row.get("source_turn_id") or "")
+                for row in (
+                    retrieval.retrieval_trace.get("v41_planner_evidence") or []
+                )
+            }
+            planner_result.selected_source_ids = [
+                source_id for source_id in planner_result.selected_source_ids
+                if source_id in offered_planner_source_ids
+            ]
+            planner_result.member_candidates = [
+                row for row in planner_result.member_candidates
+                if row.get("source_turn_id") in offered_planner_source_ids
+            ]
+            remaining_context = max(
+                config.v41_normal_context_target,
+                config.v41_complex_context_target - planner_call.record.total_tokens,
+            )
+            retrieval = retrieve_v41(
+                case=case, variant=variant, index=index,
+                capability_view=v4_capability_view, sidecar=sidecar,
+                query_ir=query_ir, query_vectors=query_vectors,
+                token_budget=remaining_context, policy=v41_policy,
+                planner=planner_result,
+            )
+            retrieval.retrieval_trace["planner_token_usage"] = {
+                "cache_miss_input_tokens": planner_call.record.prompt_cache_miss_tokens,
+                "cache_hit_input_tokens": planner_call.record.prompt_cache_hit_tokens,
+                "output_tokens": planner_call.record.completion_tokens,
+                "total_tokens": planner_call.record.total_tokens,
+            }
+    elif is_v4:
         assert v4_capability_view is not None
         retrieval = retrieve_v4(
             case=case, variant=variant, index=index,
@@ -2205,11 +2421,56 @@ def _run_v36_case_with_memory(
         # answer call validates semantic scope, provenance and lifecycle for
         # every V3.6 question; no deterministic hint bypasses this boundary.
         answer_text = None
+    answer_messages_value = (
+        v41_answer_messages(case, retrieval) if is_v41
+        else v4_answer_messages(case, retrieval) if is_v4
+        else v36_answer_messages(case, retrieval)
+    )
+    if is_v41 and not config.retrieval_only:
+        planner_tokens = int(
+            (retrieval.retrieval_trace.get("planner_token_usage") or {}).get("total_tokens") or 0
+        )
+        answer_algebra = str(
+            (retrieval.retrieval_trace.get("v41_query_augmentation") or {}).get(
+                "answer_algebra"
+            ) or ""
+        )
+        complex_query = bool(planner_tokens) or answer_algebra in {
+            "collection", "temporal_comparison", "state_update",
+            "multi_hop_explanation",
+        }
+        preflight_total_limit = min(
+            config.v41_query_hard_limit_tokens,
+            12000 if complex_query else config.v41_query_target_tokens,
+        )
+        max_prompt_tokens = max(
+            1000, preflight_total_limit - planner_tokens - min(512, config.qa_max_tokens)
+        )
+        estimate = provider_token_estimate("\n".join(
+            message.get("content", "") for message in answer_messages_value
+        ))
+        while estimate > max_prompt_tokens:
+            if trim_v41_latest_addition(retrieval) is None:
+                break
+            answer_messages_value = v41_answer_messages(case, retrieval)
+            estimate = provider_token_estimate("\n".join(
+                message.get("content", "") for message in answer_messages_value
+            ))
+        retrieval.retrieval_trace["v41_preflight_budget"] = {
+            "provider_prompt_estimate": estimate,
+            "max_prompt_tokens": max_prompt_tokens,
+            "preflight_total_limit": preflight_total_limit,
+            "complex_query": complex_query,
+            "planner_tokens": planner_tokens,
+            "trimmed_source_ids": retrieval.retrieval_trace.get(
+                "v41_budget_trimmed_source_ids", []
+            ),
+        }
     if not config.retrieval_only and answer_text is None:
         result = _tracked_chat(
             llm, limiter, answer_metrics, question_id=case.question_id, variant=variant,
             stage="answer_qa", thinking_mode="none",
-            messages=(v4_answer_messages(case, retrieval) if is_v4 else v36_answer_messages(case, retrieval)),
+            messages=answer_messages_value,
             max_tokens=min(512, config.qa_max_tokens),
         )
         llm_records.append(result.record)
@@ -2239,16 +2500,45 @@ def _run_v36_case_with_memory(
             build_metrics.peak_inflight_deepseek, answer_metrics.peak_inflight_deepseek
         ),
         build_budget_tokens=config.build_budget_tokens,
-        answer_budget_tokens=config.v36_answer_hard_budget_tokens,
+        answer_budget_tokens=(
+            config.v41_query_hard_limit_tokens if is_v41
+            else config.v36_answer_hard_budget_tokens
+        ),
     )
+    if is_v41:
+        query_records = [
+            record for record in llm_records
+            if record.stage in {"answer_query_planner", "answer_qa"}
+            and not record.excluded_from_budget
+        ]
+        query_usage = {
+            "cache_miss_input_tokens": sum(record.prompt_cache_miss_tokens for record in query_records),
+            "cache_hit_input_tokens": sum(record.prompt_cache_hit_tokens for record in query_records),
+            "output_tokens": sum(record.completion_tokens for record in query_records),
+            "reasoning_tokens": sum(record.reasoning_tokens for record in query_records),
+            "total_tokens": sum(record.total_tokens for record in query_records),
+        }
+        query_usage.update({
+            "over_10k": query_usage["total_tokens"] > 10000,
+            "over_12k": query_usage["total_tokens"] > 12000,
+            "over_13k": query_usage["total_tokens"] > 13000,
+        })
+        retrieval.retrieval_trace["v41_query_token_usage"] = query_usage
     retrieval.retrieval_trace["answer_target_budget_pass"] = (
-        stats.answer_total_tokens <= config.answer_budget_tokens
+        stats.answer_total_tokens <= (
+            config.v41_query_target_tokens if is_v41 else config.answer_budget_tokens
+        )
     )
-    retrieval.retrieval_trace["answer_target_budget_tokens"] = config.answer_budget_tokens
-    retrieval.retrieval_trace["answer_hard_budget_tokens"] = config.v36_answer_hard_budget_tokens
+    retrieval.retrieval_trace["answer_target_budget_tokens"] = (
+        config.v41_query_target_tokens if is_v41 else config.answer_budget_tokens
+    )
+    retrieval.retrieval_trace["answer_hard_budget_tokens"] = (
+        config.v41_query_hard_limit_tokens if is_v41
+        else config.v36_answer_hard_budget_tokens
+    )
     if not stats.build_budget_pass or not stats.answer_budget_pass:
         raise RuntimeError(
-            f"V3.6 token budget exceeded for {case.question_id}: "
+            f"role-graph query budget exceeded for {case.question_id}: "
             f"build={stats.build_total_tokens}, answer={stats.answer_total_tokens}"
         )
     if not stats.token_accounting_valid:
@@ -2258,6 +2548,7 @@ def _run_v36_case_with_memory(
         llm_records=llm_records, stats=stats,
         index_diagnostics=list(memory.metrics.index_diagnostics), v36_index=index,
         v4_capability_view=v4_capability_view,
+        v41_sidecar=(sidecar if is_v41 else None),
     )
 
 
@@ -2442,7 +2733,7 @@ def run_case_with_memory(
     case_started = case_started if case_started is not None else time.perf_counter()
     spec = _variant_spec(config, variant)
     answer_metrics = BuildMetrics()
-    if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0"}:
+    if variant in {"hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0", "hierarchical_hybrid_graph_v4_1_query"}:
         return _run_v36_case_with_memory(
             config, case, variant, memory, llm, embedder, limiter,
             include_build_records=include_build_records, case_started=case_started,

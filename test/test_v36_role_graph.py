@@ -12,7 +12,8 @@ from graphmem_demo.models import QuestionCase, RetrievedContext
 from graphmem_demo.pipeline import (
     BuildMetrics, DemoConfig, InflightLimiter, MemoryBuild,
     _build_v36_memory, _load_memory_cache, _memory_cache_fingerprint,
-    _v36_index_diagnostics_payload, _write_memory_cache, run_case,
+    _v36_index_diagnostics_payload, _v41_compatible_cache_candidates,
+    _write_memory_cache, run_case,
 )
 from graphmem_demo.v36.build import (
     _attach_routing_relations, add_routing_semantic_edges,
@@ -1003,3 +1004,49 @@ def test_v36_answer_prompt_is_source_first_and_does_not_force_role_abstention() 
     )
     assert "UNVERIFIED_OPERATOR_CANDIDATES" not in prompt
     assert '"value": 99' not in prompt
+
+
+
+def test_v41_query_can_resolve_one_schema_compatible_v4_cache(
+    tmp_path: Path,
+) -> None:
+    case = _case()
+    case.memory_cache_key = "memory:shared"
+    expected = tmp_path / "memory_shared-newfingerprint.json"
+    compatible = tmp_path / "memory_shared-oldfingerprint.json"
+    compatible.write_text(json.dumps({
+        "version": 6,
+        "schema_version": "graphmem_v4_0",
+        "memory_cache_key": "memory:shared",
+        "v36_index": {},
+    }))
+    wrong = tmp_path / "memory_shared-wrong.json"
+    wrong.write_text(json.dumps({
+        "version": 6,
+        "schema_version": "graphmem_v4_0",
+        "memory_cache_key": "different",
+        "v36_index": {},
+    }))
+    assert _v41_compatible_cache_candidates(expected, case) == [compatible]
+
+
+def test_v41_compatible_cache_rejects_old_schema_and_missing_index(
+    tmp_path: Path,
+) -> None:
+    case = _case()
+    case.memory_cache_key = "memory:shared"
+    expected = tmp_path / "memory_shared-newfingerprint.json"
+    for name, payload in {
+        "schema": {
+            "version": 6, "schema_version": "graphmem_v3_6",
+            "memory_cache_key": "memory:shared", "v36_index": {},
+        },
+        "index": {
+            "version": 6, "schema_version": "graphmem_v4_0",
+            "memory_cache_key": "memory:shared", "v36_index": None,
+        },
+    }.items():
+        (tmp_path / f"memory_shared-{name}.json").write_text(
+            json.dumps(payload)
+        )
+    assert _v41_compatible_cache_candidates(expected, case) == []

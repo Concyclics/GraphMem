@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import math
 import re
 import time
@@ -19,18 +20,42 @@ from .source_spans import (
 from .dialogue_topology import infer_dialogue_topology, is_memory_source
 from .operators import (
     evaluate_operators, query_bound_collection_ledger, counterfactual_dependency_hint, record_time_source_hint, temporal_order_source_hint,
+    open_temporal_sequence_from_sources_hint,
     temporal_source_pair_hint, relative_time_from_sources_hint,
     transaction_sum_from_sources_hint, exact_entity_absence_hint,
     named_individual_event_members_hint, repeated_event_total_from_sources_hint,
-    age_arithmetic_from_sources_hint, incomplete_terminal_event_hint,
+    age_arithmetic_from_sources_hint, advance_booking_recency_from_sources_hint,
+    current_role_duration_from_sources_hint, weekly_schedule_days_from_sources_hint,
+    family_relation_total_from_sources_hint, linked_event_date_from_sources_hint,
+    latest_category_start_from_sources_hint, scoped_completed_event_members_hint,
+    preference_constraints_from_sources_hint, dialogue_attribute_match_hint,
+    currency_extreme_entity_from_sources_hint,
+    presupposed_event_absence_hint,
+    dialogue_final_choice_from_sources_hint,
+    completed_item_metric_total_from_sources_hint,
+    scoped_completed_duration_total_from_sources_hint,
+    relative_value_multiplier_from_sources_hint,
+    relative_duration_at_event_from_sources_hint,
+    prior_candidate_count_from_sources_hint,
+    completed_carrier_sequence_from_sources_hint,
+    event_endpoint_difference_from_sources_hint,
+    travel_arrival_time_from_sources_hint,
+    completed_work_subtype_total_from_sources_hint,
+    incomplete_terminal_event_hint,
     state_change_members_from_sources_hint, provenance_acquisition_members_hint,
     explicit_cuisine_categories_hint, subset_percentage_from_sources_hint,
     excluded_collection_members_hint, paired_metric_total_from_sources_hint,
+    binary_savings_from_sources_hint, temporal_predecessor_entity_hint,
     labeled_scalar_difference_from_sources_hint,
     repeated_activity_duration_total_hint, relative_anchor_source_hint,
-    dated_event_count_from_sources_hint, same_unit_state_difference_hint,
+    dated_event_count_from_sources_hint, named_event_attendance_count_hint,
+    same_unit_state_difference_hint,
     maintenance_entity_count_hint, category_acquisition_members_hint,
     pending_operation_target_pairs_hint,
+    latest_scalar_state_from_sources_hint,
+    threshold_progress_remaining_hint, latest_approx_scalar_state_hint,
+    latest_labeled_currency_state_hint, latest_weekly_schedule_time_hint,
+    same_unit_acquisition_total_hint,
 )
 from .schema import (
     CompletenessCertificate,
@@ -44,6 +69,24 @@ from .schema import (
 
 
 V36_RETRIEVAL_VERSION = "graphmem_v36_atomic_question_time_closure_20260730"
+
+
+def _navigation_repair_enabled() -> bool:
+    return os.environ.get("GRAPHMEM_V36_NAVIGATION_REPAIR", "").casefold() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _atomic_group_repair_enabled() -> bool:
+    return os.environ.get("GRAPHMEM_V36_ATOMIC_GROUP_REPAIR", "").casefold() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _dialogue_closure_enabled() -> bool:
+    return os.environ.get("GRAPHMEM_V36_DIALOGUE_CLOSURE", "").casefold() in {
+        "1", "true", "yes", "on",
+    }
 
 _WORD_RE = re.compile(r"[\w'-]+", re.UNICODE)
 _FUNCTION_WORDS = {
@@ -102,6 +145,7 @@ _RECOMMENDATION_RE = re.compile(
     r"\bany\s+(?:ideas?|suggestions?)\b|"
     r"\b(?:would|is)\s+it\s+(?:be\s+)?a\s+good\s+idea\b|"
     r"\bwhat\s+should\s+(?:i|we)\b|"
+    r"\bwhat\s+(?:[A-Za-z'-]+\s+){1,4}should\s+(?:i|we)\s+(?:use|choose|pick|try|make|do)\b|"
     r"\bwhat\s+(?:could|can)\s+(?:i|we)\s+(?:serve|make|do|try|watch|read)\b",
     re.IGNORECASE,
 )
@@ -225,10 +269,42 @@ def _difference_targets(question: str) -> list[str]:
         " ".join(_content_tokens(match.group(2))),
     ]
 
+
+def _relative_event_targets(question: str) -> list[str]:
+    """Bind the requested event and an explicit before/after boundary.
+
+    This is intentionally limited to date questions.  A bare relative marker is
+    not enough: both sides must contain durable content terms, so ordinary uses
+    such as "after work" do not manufacture a temporal comparison.
+    """
+    match = re.search(
+        r"^\s*(?:when|what\s+date)\s+"
+        r"(?:(?:did|does|was|were|has|have)\s+)?"
+        r"(.+?)\s+\b(?:after|before)\b\s+(.+?)(?:[?.!]|$)",
+        question, re.IGNORECASE,
+    )
+    if match is None:
+        return []
+    targets = [" ".join(_content_tokens(value)) for value in match.groups()]
+    return targets if all(targets) else []
+
+
+def _normalized_owner_candidate(value: str) -> str:
+    candidate = canonical_key(
+        re.sub(r"(?:['’]s)$", "", value.strip(), flags=re.IGNORECASE)
+    )
+    return "" if candidate in {
+        "a", "all", "an", "any", "both", "either", "neither", "some", "the",
+    } else candidate
+
+
 def build_query_ir(question: str) -> QueryIR:
     content = _content_tokens(question)
     lowered = question.casefold()
     comparison_targets = _comparison_targets(question)
+    relative_event_targets = _relative_event_targets(question)
+    if not comparison_targets and relative_event_targets:
+        comparison_targets = relative_event_targets
     sequence_targets = (
         _quoted_targets(question) if _TEMPORAL_SEQUENCE_RE.search(question)
         else []
@@ -251,6 +327,12 @@ def build_query_ir(question: str) -> QueryIR:
         r"\bhow many\s+(?:days|weeks|months|years)\s+(?:older|younger)\b",
         lowered,
     ))
+    geographic_state_lookup = bool(re.search(
+        r"\b(?:u\.?s\.?|united states|american)\s+state\b|"
+        r"\bwhat\s+state\s+(?:did|does|is|was|were|has|have)\b.{0,80}"
+        r"\b(?:visit|travel|live|reside|move|stay|meet|go|went)\b",
+        lowered,
+    ))
     if len(sequence_targets) >= 2:
         comparison_targets = sequence_targets
         value_type = "temporal_order"
@@ -261,7 +343,7 @@ def build_query_ir(question: str) -> QueryIR:
     elif _TEMPORAL_LATEST_RE.search(question):
         value_type = "temporal_order"
         roles = ["events", "times", "source"]
-    elif _TEMPORAL_AFTER_FIRST_RE.search(question):
+    elif _TEMPORAL_AFTER_FIRST_RE.search(question) or relative_event_targets:
         value_type = "temporal_order"
         roles = ["event_a", "event_b", "time_a", "time_b", "identity", "source"]
     elif comparison_targets:
@@ -321,6 +403,11 @@ def build_query_ir(question: str) -> QueryIR:
     elif _RECOMMENDATION_RE.search(question):
         value_type = "recommendation"
         roles = ["current_state", "context", "source"]
+    elif geographic_state_lookup:
+        # State is also a geographic answer type. Do not compile a question
+        # such as "What state did X visit?" into lifecycle-chain navigation.
+        value_type = "location"
+        roles = ["event", "location", "source"]
     elif _STATE_RE.search(question) or _RECORD_STATE_RE.search(question):
         value_type = "state"
         roles = ["current_state", "time", "source"]
@@ -363,13 +450,33 @@ def build_query_ir(question: str) -> QueryIR:
             "reference", "identity", "source", *roles
         ]))
     relation = " ".join(content)
+    # Keep case sensitivity on the captured name.  The former IGNORECASE
+    # pattern accepted function words (notably "both") as people and retained
+    # possessive suffixes such as ``Caroline's`` in the canonical owner key.
     owner_match = re.search(
-        r"\b(?:did|does|is|was|has|have|can|could|would|will|should)\s+([A-Z][\w'-]+)\b",
-        question, re.IGNORECASE,
+        r"(?i:\b(?:did|does|is|was|has|have|can|could|would|will|should|"
+        r"might|may)\s+)"
+        r"([A-Z][\w'’-]+)\b",
+        question,
     )
-    target_owner = (
-        canonical_key(owner_match.group(1)) if owner_match else ""
+    target_owner = _normalized_owner_candidate(
+        owner_match.group(1) if owner_match else ""
     )
+    if not target_owner:
+        relative_owner = re.search(
+            r"(?i:\b(?:that|which|for)\s+)"
+            r"([A-Z][\w'’-]+)\s+"
+            r"(?i:might|may|would|could|can|will|should|to)\b",
+            question,
+        )
+        if relative_owner:
+            target_owner = _normalized_owner_candidate(relative_owner.group(1))
+    if not target_owner:
+        possessive_owner = re.search(
+            r"\b([A-Z][\w'-]+?)(?:['’]s)\b", question,
+        )
+        if possessive_owner:
+            target_owner = _normalized_owner_candidate(possessive_owner.group(1))
     return QueryIR(
         raw_question=question,
         target_entities=content,
@@ -1211,6 +1318,10 @@ def _certificate(
 
 def _relations_for_missing(missing: set[str]) -> set[str]:
     allowed = {"source"}
+    if _navigation_repair_enabled() and missing & {"fact", "event", "condition", "effect"}:
+        allowed.add("dialogue_pair")
+    if _navigation_repair_enabled() and missing & {"condition", "effect"}:
+        allowed.update({"reference", "same_event"})
     if missing & {"prompt_turn", "reply_turn", "reply_content"}:
         allowed.update({"dialogue_pair", "next_turn"})
     if missing & {"reference", "identity", "location"}:
@@ -1241,7 +1352,9 @@ def _typed_expand(
         adjacency[edge.src].append(edge)
         # Reliable structural relations can be inspected from either member, but
         # the stored edge remains directed and routing_contains is never reversed.
-        if edge.relation != "source":
+        if edge.relation != "source" or _navigation_repair_enabled():
+            # Experimental inverse provenance projection: a lossless turn hit may
+            # enter its source-bound frame before following typed relations.
             adjacency[edge.dst].append(edge)
     reached = set(seed_ids)
     frontier = set(seed_ids)
@@ -2209,7 +2322,10 @@ def _pack_lossless_first(
     }
     source_limit = 18 if structured else 12
 
-    def add_source(turn: TurnNodeV36, score: float, reason: str) -> bool:
+    def add_source(
+        turn: TurnNodeV36, score: float, reason: str,
+        max_chars: int | None = None,
+    ) -> bool:
         nonlocal used_tokens
         if turn.node_id in source_ids:
             return True
@@ -2223,6 +2339,8 @@ def _pack_lossless_first(
                 _focused_turn_text(ir, turn, max_chars=2200 if structured else 1800)
                 if ir is not None else turn.text[:1800]
             )
+        if max_chars is not None:
+            focused = focused[:max_chars]
         block = (
             f"[SOURCE_EVIDENCE {turn.node_id}]\n"
             f"date={turn.session_date or 'unknown'}; speaker={turn.speaker}; "
@@ -2293,6 +2411,18 @@ def _pack_lossless_first(
         overlap = [source for source in group.source_turn_ids if source in source_ids]
         if not overlap:
             continue
+        if _atomic_group_repair_enabled() and group.group_kind in {
+            "dialogue_pair", "state_transition", "temporal_pair",
+            "collection", "reference_chain",
+        }:
+            # Evidence groups are atomic: once one member source is selected,
+            # include every cited source or omit the compact group entirely.
+            for source_id in group.source_turn_ids:
+                source = turn_by_id.get(source_id)
+                if source is not None:
+                    add_source(source, score, f"atomic_{group.group_kind}_source")
+            if not set(group.source_turn_ids).issubset(source_ids):
+                continue
         member_rows = [
             _compact_frame_block(frame_by_id[frame_id]).split("\n", 1)[1]
             for frame_id in group.member_frame_ids
@@ -2326,6 +2456,71 @@ def _pack_lossless_first(
         })
         if len(selected_groups) >= 6:
             break
+
+    if _dialogue_closure_enabled():
+        # Append bounded dialogue context only after the baseline source/frame/group
+        # pack is frozen, so closure can never evict existing evidence.
+        initial_source_ids = list(source_ids)
+        candidate_scores: dict[str, tuple[int, int, int]] = {}
+        query_terms = {
+            _certificate_term(token)
+            for token in _content_tokens(ir.raw_question if ir is not None else "")
+        }
+        for group, _score in ranked_groups:
+            if group.group_kind == "dialogue_pair" and set(
+                group.source_turn_ids
+            ).intersection(initial_source_ids):
+                for source_id in group.source_turn_ids:
+                    if source_id not in source_ids:
+                        candidate_scores[source_id] = (1, 0, 0)
+        turns_by_session: dict[str, list[TurnNodeV36]] = defaultdict(list)
+        for candidate in turn_by_id.values():
+            turns_by_session[candidate.session_id].append(candidate)
+        for values in turns_by_session.values():
+            values.sort(key=lambda item: item.turn_index)
+        for source_rank, source_id in enumerate(initial_source_ids):
+            source = turn_by_id.get(source_id)
+            if source is None:
+                continue
+            values = turns_by_session.get(source.session_id, [])
+            position = next((
+                i for i, row in enumerate(values) if row.node_id == source_id
+            ), -1)
+            if position < 0:
+                continue
+            for candidate_position in (position - 1, position + 1):
+                if not 0 <= candidate_position < len(values):
+                    continue
+                candidate = values[candidate_position]
+                if candidate.node_id in source_ids:
+                    continue
+                candidate_terms = {
+                    _certificate_term(token)
+                    for token in _content_tokens(candidate.text)
+                }
+                overlap = len(query_terms & candidate_terms)
+                role_complement = int(
+                    candidate.transport_role != source.transport_role
+                )
+                score = (0, overlap, role_complement - source_rank)
+                candidate_scores[candidate.node_id] = max(
+                    candidate_scores.get(candidate.node_id, score), score,
+                )
+        added = 0
+        for source_id in sorted(
+            candidate_scores,
+            key=lambda value: (candidate_scores[value], value),
+            reverse=True,
+        ):
+            if source_id in source_ids:
+                continue
+            source = turn_by_id.get(source_id)
+            if source is not None and add_source(
+                source, 0.0, "bounded_dialogue_closure", max_chars=900,
+            ):
+                added += 1
+            if added >= 8:
+                break
     return "\n\n".join(parts), selected_groups, selected_frames, source_ids, ledger
 
 
@@ -2816,6 +3011,13 @@ def retrieve(
         *[frame.frame_id for frame, _score in ranked_frames[:14]],
         *[group.group_id for group, _score in ranked_groups[:8]],
     }
+    if _navigation_repair_enabled():
+        # Fine dense/FTS can rank a lossless turn above its normalized frame.
+        # Admit those turns as graph seeds, then use inverse provenance locally.
+        seed_ids.update(
+            node_id for node_id, _score in fine_ranked[:32]
+            if node_id in turn_by_id
+        )
     preliminary = _certificate(
         ir,
         [frame for frame, _score in ranked_frames[:14]],
@@ -2830,18 +3032,20 @@ def retrieve(
     reached = set(seed_ids)
     expansion_rounds = 0
     for expansion_rounds in range(1, 3):
+        expansion_roles = set(preliminary.missing_roles)
         if preliminary.complete:
             expansion_rounds -= 1
             break
         reached, rows = _typed_expand(
-            index, reached, set(preliminary.missing_roles), max_depth=1
+            index, reached, expansion_roles,
+            max_depth=2 if _navigation_repair_enabled() else 1,
         )
         graph_trace.extend(rows)
         # A typed relation may reach evidence in another session. Expand the
         # coarse scope to that exact owning card before accepting the evidence;
         # this is deterministic scope completion, not reverse graph traversal.
         scope_changed = False
-        missing_now = set(preliminary.missing_roles)
+        missing_now = expansion_roles
         for node_id in sorted(reached):
             node = frame_by_id.get(node_id) or group_by_id.get(node_id)
             if isinstance(node, RoleFrameNode):
@@ -3165,7 +3369,7 @@ def retrieve(
             source_span_closure.selected_source_turn_ids
         )
     temporal_hint = temporal_source_pair_hint(
-        ir, index, temporal_operator_source_ids
+        ir, index, operator_source_ids
     )
     relative_time_hint = relative_time_from_sources_hint(
         ir, index, temporal_operator_source_ids, case.question_date,
@@ -3184,6 +3388,69 @@ def retrieve(
         ir, index, operator_source_ids,
     )
     age_arithmetic_hint = age_arithmetic_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    advance_booking_hint = advance_booking_recency_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    current_role_duration_hint = current_role_duration_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    schedule_days_hint = weekly_schedule_days_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    family_total_hint = family_relation_total_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    linked_event_date_hint = linked_event_date_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    latest_category_start_hint = latest_category_start_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    scoped_event_members_hint = scoped_completed_event_members_hint(
+        ir, index, operator_source_ids, case.question_date,
+    )
+    preference_constraints_hint = preference_constraints_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    dialogue_attribute_hint = dialogue_attribute_match_hint(ir, index)
+    currency_extreme_hint = currency_extreme_entity_from_sources_hint(
+        ir, index,
+        [turn.node_id for turn in index.turns
+         if turn.transport_role == "user"],
+        case.question_date,
+    )
+    presupposed_absence_hint = (
+        None if dialogue_topology.peer_dialogue
+        else presupposed_event_absence_hint(ir, index)
+    )
+    dialogue_final_choice_hint = dialogue_final_choice_from_sources_hint(ir, index)
+    completed_metric_total_hint = completed_item_metric_total_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    scoped_duration_total_hint = scoped_completed_duration_total_from_sources_hint(
+        ir, index, operator_source_ids, case.question_date,
+    )
+    relative_value_hint = relative_value_multiplier_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    relative_duration_event_hint = relative_duration_at_event_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    prior_candidate_count_hint = prior_candidate_count_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    completed_carrier_sequence_hint = completed_carrier_sequence_from_sources_hint(
+        ir, index, operator_source_ids, case.question_date,
+    )
+    endpoint_difference_hint = event_endpoint_difference_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    travel_arrival_hint = travel_arrival_time_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    completed_work_total_hint = completed_work_subtype_total_from_sources_hint(
         ir, index, operator_source_ids,
     )
     incomplete_terminal_hint = incomplete_terminal_event_hint(
@@ -3207,6 +3474,30 @@ def retrieve(
     paired_metric_hint = paired_metric_total_from_sources_hint(
         ir, index, operator_source_ids,
     )
+    binary_savings_hint = binary_savings_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    temporal_predecessor_hint = temporal_predecessor_entity_hint(
+        ir, index, operator_source_ids,
+    )
+    latest_scalar_hint = latest_scalar_state_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    threshold_progress_hint = threshold_progress_remaining_hint(
+        ir, index, operator_source_ids,
+    )
+    approx_scalar_hint = latest_approx_scalar_state_hint(
+        ir, index, operator_source_ids,
+    )
+    labeled_currency_hint = latest_labeled_currency_state_hint(
+        ir, index, operator_source_ids,
+    )
+    weekly_schedule_hint = latest_weekly_schedule_time_hint(
+        ir, index, operator_source_ids,
+    )
+    acquisition_total_hint = same_unit_acquisition_total_hint(
+        ir, index, operator_source_ids, case.question_date,
+    )
     labeled_difference_hint = labeled_scalar_difference_from_sources_hint(
         ir, index, operator_source_ids,
     )
@@ -3214,6 +3505,9 @@ def retrieve(
         ir, index, operator_source_ids,
     )
     dated_event_hint = dated_event_count_from_sources_hint(
+        ir, index, operator_source_ids,
+    )
+    named_attendance_hint = named_event_attendance_count_hint(
         ir, index, operator_source_ids,
     )
     same_unit_difference_hint = same_unit_state_difference_hint(
@@ -3232,7 +3526,6 @@ def retrieve(
         None if dialogue_topology.peer_dialogue
         else relative_anchor_source_hint(
             ir, index, case.question_date,
-            allowed_session_ids={card.session_id for card in selected_cards},
         )
     )
     record_hint = record_time_source_hint(ir, index, source_ids)
@@ -3252,21 +3545,36 @@ def retrieve(
             if role not in {"condition", "effect", "source"}
         ]
         certificate.complete = not certificate.missing_roles
+    if completed_carrier_sequence_hint is not None:
+        temporal_hint = completed_carrier_sequence_hint
+    if endpoint_difference_hint is not None:
+        temporal_hint = endpoint_difference_hint
     if temporal_hint is None:
         temporal_hint = temporal_order_source_hint(
             ir, index, temporal_operator_source_ids
+        )
+    if temporal_hint is None:
+        temporal_hint = open_temporal_sequence_from_sources_hint(
+            ir, index, operator_source_ids, case.question_date,
         )
     temporal_binding_complete = bool(
         temporal_hint is not None
         and temporal_hint.get("binding_complete", True)
         and temporal_hint.get("certified") is True
         and (
-            (certificate.entity_match and certificate.relation_match
-             and certificate.scope_match and certificate.provenance_complete)
-            or (ir.comparison_targets and all(
-                source_span_closure.target_support.get(target)
-                for target in ir.comparison_targets
-            ))
+            (
+                temporal_hint.get("operation")
+                == "temporal_sequence_from_lossless_sources"
+                and len(temporal_hint.get("source_turn_ids") or []) >= 2
+                and len(temporal_hint.get("event_times") or [])
+                == len(temporal_hint.get("source_turn_ids") or [])
+            )
+            or (
+                temporal_hint.get("event_a_source_turn_id")
+                and temporal_hint.get("event_b_source_turn_id")
+                and temporal_hint.get("event_a_time")
+                and temporal_hint.get("event_b_time")
+            )
         )
     )
     if temporal_binding_complete:
@@ -3345,7 +3653,7 @@ def retrieve(
             if hint.get("operation") not in {"duration_total", "time_difference"}
         ]
         operator_hints.insert(0, temporal_hint)
-    if relative_time_hint is not None:
+    if relative_time_hint is not None and not temporal_binding_complete:
         operator_hints = [
             hint for hint in operator_hints
             if hint.get("operation") not in {"duration_total", "event_time"}
@@ -3364,17 +3672,37 @@ def retrieve(
     if repeated_event_hint is not None:
         operator_hints.insert(0, repeated_event_hint)
     for typed_hint in (
-        age_arithmetic_hint, incomplete_terminal_hint, state_change_hint,
+        age_arithmetic_hint, advance_booking_hint, current_role_duration_hint,
+        schedule_days_hint, family_total_hint, linked_event_date_hint,
+        latest_category_start_hint, scoped_event_members_hint,
+        preference_constraints_hint, dialogue_attribute_hint,
+        currency_extreme_hint, dialogue_final_choice_hint,
+        completed_metric_total_hint, scoped_duration_total_hint,
+        relative_value_hint, relative_duration_event_hint,
+        prior_candidate_count_hint, travel_arrival_hint,
+        completed_work_total_hint,
+        presupposed_absence_hint, incomplete_terminal_hint, state_change_hint,
         provenance_acquisition_hint, cuisine_categories_hint,
         subset_percentage_hint, excluded_collection_hint, paired_metric_hint,
-        labeled_difference_hint, repeated_duration_hint, dated_event_hint,
-        same_unit_difference_hint, maintenance_count_hint,
+        binary_savings_hint, temporal_predecessor_hint, latest_scalar_hint,
+        threshold_progress_hint,
+        approx_scalar_hint, labeled_currency_hint, weekly_schedule_hint,
+        acquisition_total_hint, labeled_difference_hint, repeated_duration_hint,
+        dated_event_hint,
+        named_attendance_hint, same_unit_difference_hint,
+        maintenance_count_hint,
         category_acquisition_hint, pending_pairs_hint,
     ):
         if typed_hint is not None:
             operator_hints.insert(0, typed_hint)
-    if exact_absence_hint is not None:
+    if exact_absence_hint is not None and dialogue_final_choice_hint is None:
         operator_hints.insert(0, exact_absence_hint)
+    if presupposed_absence_hint is not None:
+        operator_hints = [
+            hint for hint in operator_hints
+            if hint.get("operation") != "exact_entity_absence"
+        ]
+        operator_hints.insert(0, presupposed_absence_hint)
     if incomplete_terminal_hint is not None:
         operator_hints = [
             hint for hint in operator_hints
@@ -3384,10 +3712,23 @@ def retrieve(
             }
         ]
     elif any(hint is not None for hint in (
+        schedule_days_hint, family_total_hint, linked_event_date_hint,
+        latest_category_start_hint, scoped_event_members_hint,
+        dialogue_attribute_hint, currency_extreme_hint,
+        dialogue_final_choice_hint, completed_metric_total_hint,
+        scoped_duration_total_hint, relative_value_hint,
+        relative_duration_event_hint, prior_candidate_count_hint,
+        travel_arrival_hint, completed_work_total_hint,
+        presupposed_absence_hint,
         state_change_hint, cuisine_categories_hint, subset_percentage_hint,
-        excluded_collection_hint, paired_metric_hint, labeled_difference_hint,
-        repeated_duration_hint, dated_event_hint, same_unit_difference_hint,
-        maintenance_count_hint, category_acquisition_hint, pending_pairs_hint,
+        excluded_collection_hint, paired_metric_hint, binary_savings_hint,
+        temporal_predecessor_hint, latest_scalar_hint,
+        threshold_progress_hint, approx_scalar_hint,
+        labeled_currency_hint, weekly_schedule_hint, acquisition_total_hint,
+        labeled_difference_hint, repeated_duration_hint, dated_event_hint,
+        named_attendance_hint,
+        same_unit_difference_hint, maintenance_count_hint,
+        category_acquisition_hint, pending_pairs_hint,
     )):
         operator_hints = [
             hint for hint in operator_hints
@@ -3709,9 +4050,12 @@ def answer_messages(
         {
             "role": "system",
             "content": (
-                "Answer the memory question only from the supplied SOURCE_EVIDENCE. "
-                "BOUND_FRAME and BOUND_GROUP records are navigation summaries; a source "
-                "turn is authoritative when they differ. Keep speaker and fact owner "
+                "Answer the memory question from the supplied provenance-bearing memory evidence. "
+                "SOURCE_EVIDENCE is authoritative. A BOUND_FRAME or BOUND_GROUP with cited "
+                "source IDs may also supply a normalized value, relation, quantity, lifecycle, "
+                "or date when the cited source is elliptical or the fact is distributed across "
+                "turns; use it unless source text directly contradicts it. Routing cards and "
+                "unbound diagnostics are navigation only. Keep speaker and fact owner "
                 "distinct, preserve negation, uncertainty, lifecycle and exact units, "
                 "and resolve relative dates from the displayed source date. "
                 "A provenance-bound ledger may be used only after its cited source facts "
@@ -3721,8 +4065,13 @@ def answer_messages(
                 "answer that the requested information is insufficient. "
                 f"{class_policy} "
                 "Do not abstain merely because a structural role certificate is incomplete; "
-                "answer whenever a supplied source or verified bound ledger establishes the "
-                "target. Abstain only when none of them supports it. Do not reveal reasoning. "
+                "answer whenever a source, provenance-bound frame/group, or verified ledger supports "
+                "a unique best answer. A partial but directly relevant statement is preferable "
+                "to an unsupported refusal. Abstain only for a certified exact absence or when "
+                "all provenance-bearing candidates fail to establish the requested entity and "
+                "relation. Silently bind owner, entity and relation; resolve lifecycle and time; "
+                "and verify any set or arithmetic result against cited members or operands. "
+                "Do not reveal reasoning. "
                 "Return only a concise answer."
             ),
         },

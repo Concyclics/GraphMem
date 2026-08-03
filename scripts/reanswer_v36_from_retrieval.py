@@ -19,7 +19,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from graphmem_demo.clients import OpenAICompatibleClient
 from graphmem_demo.data import load_longmemeval_cases
 from graphmem_demo.models import RetrievedContext
-from graphmem_demo.v36.retrieval import answer_messages
+from graphmem_demo.v36.retrieval import answer_messages as v36_answer_messages
+from graphmem_demo.v41.retrieval import answer_messages as v41_answer_messages
 
 
 def _args() -> argparse.Namespace:
@@ -29,6 +30,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--max-answer-tokens", type=int, default=512)
+    parser.add_argument("--answer-policy", choices=("v36", "v41"), default="v36")
     parser.add_argument("--model", default=os.environ.get("SGAO_MODEL", "gpt-5.4-mini"))
     parser.add_argument(
         "--base-url",
@@ -52,26 +54,29 @@ def main() -> None:
     missing = [case.question_id for case in cases if case.question_id not in retrievals]
     if missing:
         raise RuntimeError(f"missing frozen retrieval results: {missing}")
+    answer_message_builder = (
+        v41_answer_messages if args.answer_policy == "v41" else v36_answer_messages
+    )
     client = OpenAICompatibleClient(
         model=args.model,
         base_url=args.base_url,
-        api_key_env="SGAO_API_KEY",
-        request_profile="openai",
+        api_key_env=os.environ.get("ANSWER_API_KEY_ENV", "SGAO_API_KEY"),
+        request_profile=os.environ.get("ANSWER_REQUEST_PROFILE", "openai"),
     )
 
     def run(case):
         retrieval = retrievals[case.question_id]
         response = client.chat(
             question_id=case.question_id,
-            variant=retrieval.variant,
+            variant=os.environ.get("ANSWER_VARIANT", retrieval.variant),
             stage="answer_qa",
-            messages=answer_messages(case, retrieval),
+            messages=answer_message_builder(case, retrieval),
             thinking_mode="none",
             max_tokens=args.max_answer_tokens,
         )
         answer = {
             "question_id": case.question_id,
-            "variant": retrieval.variant,
+            "variant": os.environ.get("ANSWER_VARIANT", retrieval.variant),
             "question": case.question,
             "question_type": case.question_type,
             "question_date": case.question_date,

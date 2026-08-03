@@ -4,7 +4,9 @@ from dataclasses import replace
 
 from graphmem_demo.v36.build import build_turn_nodes
 from graphmem_demo.v36.retrieval import _question_relative_target, build_query_ir
-from graphmem_demo.v36.source_spans import build_source_span_closure
+from graphmem_demo.v36.source_spans import (
+    build_source_span_closure, query_binding_terms,
+)
 from test_v36_role_graph import _case
 from test_v36_structural_groups import _index
 
@@ -174,3 +176,23 @@ def test_comparison_closure_obeys_independently_bound_session_hints() -> None:
     )
     assert closure.selected_source_turn_ids[:2] == ["q:festival", "q:spanish"]
     assert "q:distractor" not in closure.selected_source_turn_ids
+
+
+def test_frequency_binding_uses_entity_and_action_not_times_or_phrasal_up() -> None:
+    ir = build_query_ir("How many times have I met up with Alex from Germany?")
+    target, relation = query_binding_terms(ir)
+    assert "time" not in target
+    assert "up" not in relation
+    assert {"meet", "alex", "germany"} <= relation
+
+    template = _turns()[0]
+    relevant = replace(
+        template, node_id="q:alex", session_id="social",
+        text="I met Alex from Germany for coffee again yesterday.",
+    )
+    distractor = replace(
+        template, node_id="q:asana", session_id="social", turn_index=1,
+        text="I use Asana to track my time and keep up with tasks.",
+    )
+    closure = build_source_span_closure(ir, [relevant, distractor], {"social"})
+    assert closure.selected_source_turn_ids == ["q:alex"]

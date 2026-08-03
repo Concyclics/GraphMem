@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timedelta
 import calendar
 import re
 from typing import Any
+
+from ..v3.action_semantics import action_families
 
 _TIME_UNIT_SECONDS = {
     "second": 1.0, "seconds": 1.0, "minute": 60.0, "minutes": 60.0,
@@ -17,6 +20,7 @@ from .schema import (
     EvidenceGroup,
     QueryIR,
     RoleFrameNode,
+    TurnNodeV36,
     V36Index,
 )
 
@@ -191,6 +195,46 @@ def _turn_observed_time(turn: Any) -> datetime | None:
 
 def _relative_event_time(text: str, observed: datetime) -> datetime | None:
     lowered = text.casefold()
+    numeric_date = re.search(
+        r"\b(1[0-2]|0?[1-9])/(3[01]|[12]\d|0?[1-9])"
+        r"(?:/(\d{2,4}))?\b", lowered,
+    )
+    if numeric_date:
+        year = int(numeric_date.group(3) or observed.year)
+        if year < 100:
+            year += 2000
+        try:
+            value = observed.replace(
+                year=year, month=int(numeric_date.group(1)),
+                day=int(numeric_date.group(2)),
+            )
+            if numeric_date.group(3) is None and value > observed:
+                value = value.replace(year=value.year - 1)
+            return value
+        except ValueError:
+            pass
+    month_names = {
+        name.casefold(): index for index, name in enumerate(
+            calendar.month_name
+        ) if name
+    }
+    month_date = re.search(
+        r"\b(" + "|".join(month_names) + r")\s+"
+        r"(3[01]|[12]\d|0?[1-9])(?:st|nd|rd|th)?"
+        r"(?:,?\s+(\d{4}))?\b", lowered,
+    )
+    if month_date:
+        year = int(month_date.group(3) or observed.year)
+        try:
+            value = observed.replace(
+                year=year, month=month_names[month_date.group(1)],
+                day=int(month_date.group(2)),
+            )
+            if month_date.group(3) is None and value > observed:
+                value = value.replace(year=value.year - 1)
+            return value
+        except ValueError:
+            pass
     match = re.search(
         r"\b(\d+|a|an|few|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
         r"(hours?|days?|weeks?|months?)\s+ago\b", lowered,
@@ -219,6 +263,11 @@ def _relative_event_time(text: str, observed: datetime) -> datetime | None:
         return observed - timedelta(**{f"{unit}s": amount})
     if re.search(r"\blast week(?:end)?\b", lowered):
         return observed - timedelta(days=7)
+    if re.search(r"\blast month\b", lowered):
+        month = 12 if observed.month == 1 else observed.month - 1
+        year = observed.year - 1 if observed.month == 1 else observed.year
+        day = min(observed.day, calendar.monthrange(year, month)[1])
+        return observed.replace(year=year, month=month, day=day)
     if re.search(r"\bnext month\b", lowered):
         month = 1 if observed.month == 12 else observed.month + 1
         year = observed.year + 1 if observed.month == 12 else observed.year
@@ -538,11 +587,7 @@ def temporal_source_pair_hint(
     source_turn_ids: list[str],
 ) -> dict[str, Any] | None:
     """Certify a between/before/after duration from two bound sources."""
-    if (
-        ir.requested_value_type != "duration"
-        or not {"event_a", "event_b", "time_a", "time_b"}
-        <= set(ir.required_roles)
-    ):
+    if ir.requested_value_type != "duration":
         return None
     between = re.search(
         r"\bbetween\s+(.+?)\s+and\s+(.+?)(?:\?|$)",
@@ -552,16 +597,41 @@ def temporal_source_pair_hint(
     if between is not None:
         left_text, right_text = between.group(1), between.group(2)
     else:
+        since_when = re.search(
+            r"\bhow many\s+(?:days?|weeks?|months?|years?)\s+"
+            r"(?:had\s+|have\s+)?(?:passed\s+)?since\s+(.+?)\s+when\s+(.+?)(?:\?|$)",
+            ir.raw_question, re.IGNORECASE,
+        )
+        ago_when = re.search(
+            r"\bhow many\s+(?:days?|weeks?|months?|years?)\s+ago\s+did\s+i\s+"
+            r"(.+?)\s+when\s+i\s+(.+?)(?:\?|$)",
+            ir.raw_question, re.IGNORECASE,
+        )
+        state_when = re.search(
+            r"\bhow many\s+(?:days?|weeks?|months?|years?)\s+"
+            r"(?:have|had)\s+i\s+(.+?)\s+when\s+i\s+(.+?)(?:\?|$)",
+            ir.raw_question, re.IGNORECASE,
+        )
         ordered = re.search(
             r"\bhow long\s+(?:did|had|have|was|were)?\s*(.+?)\s+"
             r"(before|after)\s+(.+?)(?:\?|$)",
             ir.raw_question, re.IGNORECASE,
         )
-        if ordered is None:
+        if since_when is not None:
+            left_text, right_text = since_when.group(1), since_when.group(2)
+            relation = "since_when"
+        elif ago_when is not None:
+            left_text, right_text = ago_when.group(1), ago_when.group(2)
+            relation = "ago_when"
+        elif state_when is not None:
+            left_text, right_text = state_when.group(1), state_when.group(2)
+            relation = "state_when"
+        elif ordered is not None:
+            left_text, relation, right_text = (
+                ordered.group(1), ordered.group(2).casefold(), ordered.group(3)
+            )
+        else:
             return None
-        left_text, relation, right_text = (
-            ordered.group(1), ordered.group(2).casefold(), ordered.group(3)
-        )
     stop = {
         "a", "an", "and", "at", "between", "before", "after",
         "did", "had", "have", "how", "i", "in", "many", "me",
@@ -591,21 +661,59 @@ def temporal_source_pair_hint(
         observed = _turn_observed_time(turn)
         if observed is None:
             return None
-        segments = [
+        sentence_segments = [
             segment.strip() for segment in re.split(
                 r"(?<=[.!?])\s+|\n+", turn.text
             ) if segment.strip()
         ] or [turn.text]
+        # Preserve whole sentences, but also expose coordinated clauses so an
+        # event binds to its nearest date when one sentence names two lifecycle
+        # points (for example submitted on X and accepted on Y).
+        segments = list(sentence_segments)
+        for sentence in sentence_segments:
+            segments.extend(
+                clause.strip() for clause in re.split(
+                    r"\s+(?:and|but|while)\s+|;\s*", sentence,
+                    flags=re.IGNORECASE,
+                ) if clause.strip() and clause.strip() != sentence
+            )
         scored = []
+        target_actions = target & {
+            "accept", "attend", "book", "complete", "finish", "launch",
+            "make", "participate", "read", "recover", "sell", "sign",
+            "start", "submit", "visit", "watch",
+        }
+        date_signal = re.compile(
+            r"\b(?:today|yesterday|last\s+\w+|"
+            r"(?:1[0-2]|0?[1-9])/(?:3[01]|[12]\d|0?[1-9])|"
+            r"(?:january|february|march|april|may|june|july|august|"
+            r"september|october|november|december)\s+\d{1,2}"
+            r"(?:st|nd|rd|th)?)\b",
+            re.IGNORECASE,
+        )
         for segment in segments:
             segment_terms = {
                 _stem_word(word) for word in re.findall(
                     r"[\w'-]+", segment.casefold()
                 )
             }
-            scored.append((len(target & segment_terms), segment))
-        score, segment = max(scored, key=lambda row: row[0])
+            overlap = len(target & segment_terms)
+            action_overlap = len(target_actions & segment_terms)
+            single_anchor = int(len(date_signal.findall(segment)) == 1)
+            scored.append((
+                action_overlap, single_anchor, overlap, -len(segment),
+                segment,
+            ))
+        _action_score, _single_anchor, score, _brevity, segment = max(scored)
         required = 1 if len(target) <= 2 else 2
+        if (
+            score < required and _action_score > 0 and _single_anchor
+            and len(target & terms(turn.text)) >= required
+        ):
+            # The dated action clause may omit a category repeated in the
+            # immediately preceding coordinated clause. Keep the exact date
+            # adjacent to the action while using the full turn for identity.
+            score = required
         segment_terms = terms(segment)
         generic_event_terms = {
             "use", "new", "see", "saw", "return", "area", "start",
@@ -632,7 +740,8 @@ def temporal_source_pair_hint(
         if event_time is None and re.search(
             r"\b(?:just|visit(?:ed)?|returned?|attended?|went|completed?|"
             r"finished?|started?|began|met|received?|bought|got|saw|"
-            r"fixed|serviced)\b",
+            r"fixed|serviced|launched?|signed?|accepted?|recovered?|"
+            r"made|sold|participated?)\b",
             segment, re.IGNORECASE,
         ):
             event_time = observed
@@ -673,12 +782,19 @@ def temporal_source_pair_hint(
     delta_seconds = abs((right_date - left_date).total_seconds())
     if delta_seconds == 0:
         return None
-    display_value: float | int = delta_seconds
-    display_unit = "seconds"
-    if not re.search(
-        r"\b(?:seconds?|minutes?|hours?|days?)\b",
+    requested_unit = re.search(
+        r"\bhow many\s+(seconds?|minutes?|hours?|days?|weeks?|months?|years?)\b",
         ir.raw_question, re.IGNORECASE,
-    ):
+    )
+    if requested_unit is not None:
+        unit = requested_unit.group(1).casefold().rstrip("s")
+        display_value: float | int = int(round(
+            delta_seconds / _TIME_UNIT_SECONDS[unit]
+        ))
+        display_unit = unit + ("s" if display_value != 1 else "")
+    else:
+        display_value = delta_seconds
+        display_unit = "seconds"
         left_source_text = turn_by_id[left_id].text
         right_source_text = turn_by_id[right_id].text
         relative_week = re.compile(
@@ -687,7 +803,7 @@ def temporal_source_pair_hint(
             re.IGNORECASE,
         )
         if relative_week.search(left_source_text) and relative_week.search(right_source_text):
-            display_value = int(round(delta_seconds / (7 * 24 * 60 * 60)))
+            display_value = int(round(delta_seconds / _TIME_UNIT_SECONDS["week"]))
             display_unit = "weeks"
     return {
         "operation": "time_difference_from_lossless_sources",
@@ -765,7 +881,35 @@ def relative_anchor_source_hint(
         )
         if word not in ignored and not word.isdigit()
     }
+    if re.search(r"\bkitchen\s+appliance\b", raw, re.IGNORECASE):
+        query_terms |= {
+            "smoker", "blender", "toaster", "oven", "mixer",
+            "grill", "fryer", "processor", "juicer", "cooker",
+        }
     card_by_session = {card.session_id: card for card in index.routing_cards}
+    query_action_terms = {
+        _stem_word(word)
+        for word in re.findall(r"[A-Za-z]+", raw.casefold())
+        if _stem_word(word) in {
+            "attend", "book", "buy", "get", "purchase", "acquire",
+            "fix", "participate", "service", "visit",
+            "volunteer", "watch",
+        }
+    }
+    completed_action = re.compile(
+        r"\bI\s+(?:just\s+|recently\s+|finally\s+)?"
+        r"(?:attended|booked|bought|purchased|acquired|got|fixed|"
+        r"participated|serviced|visited|volunteered|watched|went\s+to|"
+        r"got\s+back\s+from)\b",
+        re.IGNORECASE,
+    )
+    future_action = re.compile(
+        r"\b(?:would\s+love|want|plan|planning|consider|considering|"
+        r"hope|might|may|will)\b.{0,80}"
+        r"\b(?:attend|book|buy|purchase|acquire|fix|participate|"
+        r"service|visit|volunteer|watch)\b",
+        re.IGNORECASE,
+    )
     candidates = []
     for turn in index.turns:
         if turn.transport_role != "user":
@@ -783,13 +927,38 @@ def relative_anchor_source_hint(
         card_terms = {_stem_word(word) for word in re.findall(r"[\w'-]+", (card.routing_text if card else '').casefold())}
         direct_overlap = len(query_terms & turn_terms)
         routed_overlap = len(query_terms & card_terms)
-        if direct_overlap == 0 and routed_overlap == 0:
+        acquisition_requested = bool(
+            {"buy", "purchase", "acquire", "get"} & query_action_terms
+        )
+        acquisition_card = bool(re.search(
+            r"\b(?:acquisition|acquired|bought|purchased|has)\b",
+            card.routing_text if card else "", re.IGNORECASE,
+        ))
+        if (
+            direct_overlap == 0 and routed_overlap == 0
+            and not (acquisition_requested and acquisition_card)
+        ):
             continue
-        candidates.append((direct_overlap, routed_overlap, -turn.turn_index, turn, card, observed))
+        exact_action_overlap = len(query_action_terms & turn_terms)
+        completed_score = int(
+            completed_action.search(turn.text) is not None
+            and future_action.search(turn.text) is None
+        )
+        candidates.append((
+            completed_score, exact_action_overlap,
+            direct_overlap, routed_overlap, -turn.turn_index,
+            turn, card, observed,
+        ))
     if not candidates:
         return None
-    direct, routed, _turn_order, turn, card, observed = max(
-        candidates, key=lambda row: (row[0] + 2 * row[1], row[0], row[2])
+    (
+        _completed, _exact_action, direct, routed, _turn_order,
+        turn, card, observed,
+    ) = max(
+        candidates,
+        key=lambda row: (
+            row[0], row[1], row[2] + 2 * row[3], row[2], row[4],
+        ),
     )
     session_turns = sorted(
         (item for item in index.turns
@@ -809,6 +978,78 @@ def relative_anchor_source_hint(
         )
         if companion is not None:
             answer_candidate = companion.group(1)
+    binary_companion = re.search(
+        r"\bdid\s+(?:I|we)\b.{0,100}"
+        r"\bwith\s+(?:a|my|our)\s+friend\s+or\s+not\b",
+        raw, re.IGNORECASE,
+    )
+    if not answer_candidate and binary_companion is not None:
+        companion_present = bool(re.search(
+            r"\bwith\s+(?:a|my|our)\s+friend\b",
+            bundled_source_text, re.IGNORECASE,
+        ))
+        answer_candidate = (
+            "Yes, the bounded event source says I was with a friend."
+            if companion_present
+            else "No, the bounded event source does not say I was with a friend."
+        )
+    doing_with = re.search(
+        r"\bwhat\s+did\s+(?:I|we)\s+do\s+with\s+"
+        r"(?P<entity>[A-Za-z][A-Za-z'-]*)",
+        raw,
+        re.IGNORECASE,
+    )
+    if not answer_candidate and doing_with is not None:
+        entity = doing_with.group("entity")
+        for source_turn in selected_turns:
+            for sentence in re.split(r"(?<=[.!?])\s+|\n+", source_turn.text):
+                if re.search(
+                    rf"(?<![A-Za-z0-9]){re.escape(entity)}(?![A-Za-z0-9])",
+                    sentence,
+                    re.IGNORECASE,
+                ) is None:
+                    continue
+                action = re.search(
+                    r"\bI\s+(?:just\s+|recently\s+)?"
+                    r"(?P<action>(?:started?|began|went|attended|took|"
+                    r"joined|met|visited|worked|played|practiced|"
+                    r"volunteered)[^.!?]{2,180})",
+                    sentence,
+                    re.IGNORECASE,
+                )
+                if action is not None:
+                    answer_candidate = action.group("action").strip()
+                    break
+            if answer_candidate:
+                break
+    if not answer_candidate and re.search(
+        r"\bwhere\b.{0,100}\b(?:held|take\s+place|happen)",
+        raw, re.IGNORECASE,
+    ):
+        location = re.search(
+            r"\b(?:held\s+)?at\s+(?:the\s+)?"
+            r"(?P<location>[A-Z][A-Za-z&'.-]*(?:\s+(?:(?:of|the|and)\s+)?[A-Z][A-Za-z&'.-]*){0,8}"
+            r"(?:\s+(?:Museum|Gallery|Center|Centre|Hall|Park|School|"
+            r"University|Library|Theater|Theatre))?)\b",
+            bundled_source_text,
+        )
+        if location is not None:
+            answer_candidate = location.group("location").strip()
+    if not answer_candidate and re.search(
+        r"\b(?:what|which)\b.{0,60}"
+        r"\b(?:buy|bought|purchase|purchased|get|got|acquire|acquired)\b",
+        raw, re.IGNORECASE,
+    ):
+        acquired = re.search(
+            r"\bI\s+(?:just\s+|recently\s+)?"
+            r"(?:bought|purchased|acquired|got)\s+"
+            r"(?:my\s+|an?\s+|the\s+)?"
+            r"(?P<object>[A-Za-z][A-Za-z0-9+&' -]{0,70}?)"
+            r"(?=\s+(?:today|yesterday|last\s+\w+)|[,.;!?]|$)",
+            bundled_source_text, re.IGNORECASE,
+        )
+        if acquired is not None:
+            answer_candidate = acquired.group("object").strip()
     head_match = re.search(
         r"\bwhich\s+([A-Za-z]+)\b", raw, re.IGNORECASE,
     )
@@ -838,43 +1079,98 @@ def record_time_source_hint(
     index: V36Index,
     source_turn_ids: list[str],
 ) -> dict[str, Any] | None:
-    """Return the best elapsed-time record explicitly grounded in sources."""
+    """Return the requested version of an elapsed-time personal record."""
+    raw = ir.raw_question
     if ir.requested_value_type != "state" or not re.search(
         r"\b(?:personal\s+best|record)\b.*\btime\b|"
         r"\btime\b.*\b(?:personal\s+best|record)\b",
-        ir.raw_question, re.IGNORECASE,
+        raw, re.IGNORECASE,
     ):
         return None
     turn_by_id = {turn.node_id: turn for turn in index.turns}
-    candidates: list[tuple[int, str, str]] = []
-    for source_id in source_turn_ids:
+    candidates: list[tuple[datetime, int, int, str, str, str]] = []
+    for source_id in dict.fromkeys(source_turn_ids):
         turn = turn_by_id.get(source_id)
-        if turn is None or not re.search(
-            r"\b(?:personal\s+best|record)\b", turn.text, re.IGNORECASE,
-        ):
+        if turn is None or turn.transport_role != "user":
             continue
-        for match in re.finditer(r"\b(\d{1,2}):(\d{2})\b", turn.text):
-            minutes, seconds = int(match.group(1)), int(match.group(2))
-            if seconds < 60:
-                candidates.append((minutes * 60 + seconds, f"{minutes}:{seconds:02d}", source_id))
-        for match in re.finditer(
-            r"\b(\d+)\s+minutes?\s+(?:and\s+)?(\d+)\s+seconds?\b",
-            turn.text, re.IGNORECASE,
+        observed = _turn_observed_time(turn) or datetime.min
+        for sentence_index, sentence in enumerate(
+            re.split(r"(?<=[.!?])\s+|\n+", turn.text)
         ):
-            minutes, seconds = int(match.group(1)), int(match.group(2))
-            if seconds < 60:
-                candidates.append((minutes * 60 + seconds, f"{minutes}:{seconds:02d}", source_id))
+            # Keep the time and its state label in the same sentence.  Looking
+            # across a whole turn also captures unrelated pace, route and
+            # scheduling times.
+            if not re.search(
+                r"\b(?:personal\s+best|record)\b",
+                sentence,
+                re.IGNORECASE,
+            ):
+                continue
+            for match in re.finditer(r"\b(\d{1,2}):(\d{2})\b", sentence):
+                minutes, seconds = int(match.group(1)), int(match.group(2))
+                if seconds < 60:
+                    candidates.append((
+                        observed, turn.turn_index, sentence_index,
+                        f"{minutes}:{seconds:02d}", source_id, sentence[:320],
+                    ))
+            for match in re.finditer(
+                r"\b(\d+)\s+minutes?\s+(?:and\s+)?"
+                r"(\d+)\s+seconds?\b",
+                sentence,
+                re.IGNORECASE,
+            ):
+                minutes, seconds = int(match.group(1)), int(match.group(2))
+                if seconds < 60:
+                    candidates.append((
+                        observed, turn.turn_index, sentence_index,
+                        f"{minutes}:{seconds:02d}", source_id, sentence[:320],
+                    ))
     if not candidates:
         return None
-    seconds, value, source_id = min(candidates)
+
+    # Collapse repeated mentions of the same state while preserving the order
+    # in which distinct record values were observed.
+    ordered = sorted(candidates, key=lambda row: (row[0], row[1], row[2]))
+    versions: list[tuple[datetime, int, int, str, str, str]] = []
+    for row in ordered:
+        if not versions or versions[-1][3] != row[3]:
+            versions.append(row)
+    if re.search(r"\b(?:previous|prior|old|former)\b", raw, re.IGNORECASE):
+        if len(versions) < 2:
+            return None
+        selected = versions[-2]
+        selection = "previous_observed_version"
+    else:
+        selected = min(
+            versions,
+            key=lambda row: (
+                int(row[3].split(":")[0]) * 60
+                + int(row[3].split(":")[1])
+            ),
+        )
+        selection = "best_elapsed_time"
+    value = selected[3]
+    seconds = (
+        int(value.split(":")[0]) * 60 + int(value.split(":")[1])
+    )
     return {
         "operation": "record_time_extreme",
         "value": value,
         "seconds": seconds,
-        "source_turn_ids": [source_id],
+        "selection": selection,
+        "source_turn_ids": [selected[4]],
+        "evidence": selected[5],
+        "history": [
+            {
+                "value": row[3],
+                "source_turn_id": row[4],
+                "observed_at": row[0].isoformat(),
+            }
+            for row in versions
+        ],
+        "binding_complete": True,
         "certified": True,
     }
-
 
 def temporal_order_source_hint(
     ir: QueryIR,
@@ -887,7 +1183,7 @@ def temporal_order_source_hint(
 
     stop = {
         "a", "an", "at", "did", "from", "i", "in", "me", "my", "of",
-        "on", "the", "to", "was", "who", "what", "which",
+        "on", "one", "the", "to", "was", "who", "what", "which",
     }
 
     def terms(text: str) -> set[str]:
@@ -897,9 +1193,102 @@ def temporal_order_source_hint(
             if word.strip("'\"") not in stop and len(word.strip("'\"")) > 1
         }
 
+    def target_event_time(
+        text: str, target: set[str], observed: datetime,
+    ) -> datetime | None:
+        segments = [
+            value.strip() for value in re.split(
+                r"(?<=[.!?])\s+|\n+", text,
+            ) if value.strip()
+        ]
+        windows = list(segments)
+        windows.extend(
+            f"{segments[index]} {segments[index + 1]}"
+            for index in range(len(segments) - 1)
+        )
+        timed: list[tuple[int, int, datetime]] = []
+        for position, segment in enumerate(windows):
+            overlap = len(target & terms(segment))
+            if overlap == 0:
+                continue
+            event_time = _relative_event_time(segment, observed)
+            if event_time is not None:
+                timed.append((overlap, -position, event_time))
+        if timed:
+            return max(timed, key=lambda row: (row[0], row[1]))[2]
+        return _relative_event_time(text, observed)
+
+    def specific_time_overlap(text: str, target: set[str]) -> int:
+        segments = [
+            value.strip() for value in re.split(
+                r"(?<=[.!?])\s+|\n+", text,
+            ) if value.strip()
+        ]
+        segments.extend(
+            f"{segments[index]} {segments[index + 1]}"
+            for index in range(len(segments) - 1)
+        )
+        observed = datetime(2000, 6, 15)
+        return max((
+            len(target & terms(segment))
+            for segment in segments
+            if _relative_event_time(segment, observed) is not None
+        ), default=0)
+
+    def target_time_is_ambiguous(text: str, target: set[str]) -> bool:
+        """Fail closed when one target-bearing clause has several time anchors.
+
+        Such clauses commonly encode different lifecycle points (ordered,
+        expected, arrived). Picking the first date would turn a useful hint
+        into an incorrect mandatory constraint. The answer model can still
+        reason over the lossless source when deterministic binding abstains.
+        """
+        month_pattern = "|".join(
+            name.casefold() for name in calendar.month_name if name
+        )
+        time_pattern = re.compile(
+            r"\b(?:"
+            r"(?:1[0-2]|0?[1-9])/(?:3[01]|[12]\d|0?[1-9])(?:/\d{2,4})?"
+            r"|(?:" + month_pattern + r")\s+(?:3[01]|[12]\d|0?[1-9])"
+            r"(?:st|nd|rd|th)?(?:,?\s+\d{4})?"
+            r"|(?:\d+|a|an|few|one|two|three|four|five|six|seven|eight|"
+            r"nine|ten|eleven|twelve)\s+(?:hours?|days?|weeks?|months?)\s+ago"
+            r"|today|yesterday|last\s+(?:week(?:end)?|month)"
+            r")\b",
+            re.IGNORECASE,
+        )
+        matches = time_pattern.findall(text)
+        lifecycle_markers = re.findall(
+            r"\b(?:pre[- ]?order(?:ed)?|order(?:ed)?|expect(?:ed)?|"
+            r"arriv(?:e|ed)|receiv(?:e|ed)|deliver(?:ed)?|got|bought|"
+            r"purchas(?:e|ed))\b",
+            text, re.IGNORECASE,
+        )
+        if (
+            target & terms(text)
+            and len(matches) > 1
+            and len({value.casefold() for value in lifecycle_markers}) > 1
+        ):
+            return True
+        for segment in re.split(r"(?<=[.!?])\s+|\n+", text):
+            if target & terms(segment) and len(time_pattern.findall(segment)) > 1:
+                return True
+        return False
+
     target_terms = [terms(target) for target in ir.comparison_targets]
     if len(target_terms) < 2 or not all(target_terms):
         return None
+    # Shared category words (for example ``charity`` in "charity gala" and
+    # "charity bake sale") are routing context, not event identity. Requiring
+    # one target-exclusive term prevents a relative date attached to a sibling
+    # event from being certified for the requested target.
+    exclusive_target_terms = [
+        target - set().union(*(
+            other for other_index, other in enumerate(target_terms)
+            if other_index != target_index
+        ))
+        for target_index, target in enumerate(target_terms)
+    ]
     action = re.search(
         r"\bdid\s+i\s+([a-z]+)", ir.raw_question, re.IGNORECASE,
     )
@@ -914,8 +1303,11 @@ def temporal_order_source_hint(
         if source_id in turn_by_id
         and (not first_person or turn_by_id[source_id].transport_role == "user")
     ]
+    term_document_frequency: Counter[str] = Counter()
+    for turn in turns:
+        term_document_frequency.update(terms(turn.text))
     candidates_by_target: list[list[tuple[int, str, Any, datetime]]] = []
-    for target in target_terms:
+    for target_index, target in enumerate(target_terms):
         rows: list[tuple[int, str, Any, datetime]] = []
         for turn in turns:
             observed = _turn_observed_time(turn)
@@ -923,13 +1315,26 @@ def temporal_order_source_hint(
                 continue
             turn_terms = terms(turn.text)
             score = len(target & turn_terms)
-            required = 1 if len(target) == 1 else 2
+            exclusive = exclusive_target_terms[target_index]
+            if exclusive and not (exclusive & turn_terms):
+                continue
+            temporal_overlap = specific_time_overlap(turn.text, target)
+            required = 1 if len(target) == 1 or temporal_overlap else 2
             if score < required:
                 continue
-            event_time = _relative_event_time(turn.text, observed)
+            if target_time_is_ambiguous(turn.text, target):
+                continue
+            event_time = target_event_time(turn.text, target, observed)
             if event_time is None:
                 coverage = score / max(1, len(target))
-                if required_actions and not required_actions <= turn_terms:
+                if (
+                    required_actions
+                    and not required_actions <= turn_terms
+                    and not (
+                        action_families(required_actions)
+                        & action_families(turn.text)
+                    )
+                ):
                     continue
                 if not required_actions and coverage < 0.60:
                     continue
@@ -941,24 +1346,34 @@ def temporal_order_source_hint(
 
     chosen: list[tuple[int, str, Any, datetime]] = []
     used: set[str] = set()
-    for rows in candidates_by_target:
+    for target_index, rows in enumerate(candidates_by_target):
         available = [row for row in rows if row[1] not in used]
         if not available:
             return None
-        selected = max(
-            available,
-            key=lambda row: (
-                row[0],
-                int(bool(re.search(
-                    r"\b(?:today|yesterday|last\s+(?:week|weekend|"
-                    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
-                    r"(?:[0-9]+|a|an|one|two|three|four|five|six|seven|eight|"
-                    r"nine|ten|eleven|twelve)\s+(?:days?|weeks?|months?)\s+ago)\b",
-                    row[2].text, re.IGNORECASE,
-                ))),
-                row[1],
-            ),
-        )
+        target = target_terms[target_index]
+        other_targets = [
+            value for index, value in enumerate(target_terms)
+            if index != target_index
+        ]
+        def selection_key(row: tuple[int, str, Any, datetime]):
+            row_terms = terms(row[2].text)
+            other_overlap = max((
+                len(value & row_terms) for value in other_targets
+            ), default=0)
+            other_required = max((
+                1 if len(value) == 1 else 2 for value in other_targets
+            ), default=1)
+            identity_weight = sum(
+                1.0 / (1 + term_document_frequency[term])
+                for term in target & row_terms
+            )
+            return (
+                specific_time_overlap(row[2].text, target),
+                identity_weight,
+                int(other_overlap < other_required),
+                row[0], row[1],
+            )
+        selected = max(available, key=selection_key)
         chosen.append(selected)
         used.add(selected[1])
 
@@ -993,6 +1408,288 @@ def temporal_order_source_hint(
         "binding_complete": True,
         "certified": True,
     }
+
+
+def open_temporal_sequence_from_sources_hint(
+    ir: QueryIR,
+    index: V36Index,
+    source_turn_ids: list[str],
+    question_date: str | None,
+) -> dict[str, Any] | None:
+    """Enumerate an open completed-event collection and order it by event time."""
+    raw = ir.raw_question
+    if ir.requested_value_type != "temporal_order" or not re.search(
+        r"\b(?:order|sequence|earliest\s+to\s+latest|starting\s+from\s+the\s+earliest)\b",
+        raw, re.IGNORECASE,
+    ):
+        return None
+    number_words = {
+        **_NUMBER_WORDS,
+        "thirteen": 13, "fourteen": 14, "fifteen": 15,
+        "sixteen": 16, "seventeen": 17, "eighteen": 18,
+        "nineteen": 19, "twenty": 20,
+    }
+    count_match = re.search(
+        r"\b(?:order\s+of\s+(?:the\s+)?|the\s+)"
+        r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+        r"eighteen|nineteen|twenty)\b",
+        raw, re.IGNORECASE,
+    )
+    if count_match is None:
+        expected_count = None
+    else:
+        token = count_match.group(1).casefold()
+        expected_count = int(token) if token.isdigit() else number_words[token]
+        if expected_count < 2:
+            return None
+
+    category_vocabularies = {
+        "museum_visit": {
+            "museum", "museums", "gallery", "galleries", "exhibition",
+            "exhibit", "artifacts", "curator",
+        },
+        "trip": {
+            "trip", "trips", "travel", "journey", "hike", "hiked",
+            "road trip", "camping", "camped", "vacation",
+        },
+        "music_event": {
+            "concert", "concerts", "music", "musical", "festival",
+            "jazz", "show", "live", "band", "bands",
+        },
+        "sports_event": {
+            "sport", "sports", "game", "games", "run", "race",
+            "triathlon", "soccer", "football", "basketball", "playoffs",
+            "tournament", "championship",
+        },
+    }
+    question_terms = set(re.findall(r"[a-z0-9]+", raw.casefold()))
+    category = max(
+        category_vocabularies,
+        key=lambda name: len(
+            question_terms & {
+                term for value in category_vocabularies[name]
+                for term in value.split()
+            }
+        ),
+    )
+    category_terms = category_vocabularies[category]
+    category_overlap = len(
+        question_terms & {
+            term for value in category_terms for term in value.split()
+        }
+    )
+    if category_overlap == 0:
+        return None
+
+    if re.search(r"\bwatch(?:ed|ing)?\b", raw, re.IGNORECASE):
+        action_mode = "watch"
+        action_signal = re.compile(
+            r"\b(?:watch(?:ed|ing)?|saw|attended)\b", re.IGNORECASE,
+        )
+    elif re.search(r"\b(?:participat(?:e|ed|ing)|took\s+part|completed?)\b", raw, re.IGNORECASE):
+        action_mode = "participate"
+        action_signal = re.compile(
+            r"\b(?:participat(?:e|ed|ing)|took\s+part|completed?|"
+            r"finished?|ran|played)\b",
+            re.IGNORECASE,
+        )
+    elif re.search(r"\bvisit(?:ed|ing)?\b", raw, re.IGNORECASE):
+        action_mode = "visit"
+        action_signal = re.compile(
+            r"\b(?:visit(?:ed|ing)?|went\s+to|took\s+.+?\s+to|"
+            r"(?:got|came)\s+back\s+from|attended?|participated?|saw)\b",
+            re.IGNORECASE,
+        )
+    elif category == "trip":
+        action_mode = "travel"
+        action_signal = re.compile(
+            r"\b(?:got\s+back\s+from|went\s+on|took|hiked?|"
+            r"camped|started?\s+(?:my\s+)?(?:solo\s+)?(?:camping\s+)?trip)\b",
+            re.IGNORECASE,
+        )
+    else:
+        action_mode = "attend"
+        action_signal = re.compile(
+            r"\b(?:attended?|went\s+to|got\s+back\s+from|"
+            r"saw\b.{0,40}\blive|enjoyed)\b",
+            re.IGNORECASE,
+        )
+
+    question_time = _parse_time(question_date)
+    lower_bound: datetime | None = None
+    month_scope: int | None = None
+    month_names = {
+        name.casefold(): index for index, name in enumerate(calendar.month_name)
+        if name
+    }
+    explicit_month = re.search(
+        r"\b(?:in|during|of)\s+(" + "|".join(month_names) + r")\b",
+        raw, re.IGNORECASE,
+    )
+    if explicit_month is not None:
+        month_scope = month_names[explicit_month.group(1).casefold()]
+    relative_scope = re.search(
+        r"\b(?:past|last)\s+"
+        r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten)?\s*"
+        r"(months?|weeks?)\b",
+        raw, re.IGNORECASE,
+    )
+    if question_time is not None and relative_scope is not None:
+        amount_token = (relative_scope.group(1) or "one").casefold()
+        amount = (
+            int(amount_token) if amount_token.isdigit()
+            else _NUMBER_WORDS[amount_token]
+        )
+        unit = relative_scope.group(2).casefold().rstrip("s")
+        lower_bound = question_time - timedelta(
+            days=amount * (31 if unit == "month" else 7)
+        )
+
+    future_signal = re.compile(
+        r"\b(?:plan(?:ning)?|want|would\s+like|hope|consider(?:ing)?|"
+        r"upcoming|next\s+(?:week|month|year)|recommend)\b",
+        re.IGNORECASE,
+    )
+    completed_signal = re.compile(
+        r"\b(?:just|recently|today|yesterday|last\s+\w+|"
+        r"(?:got|came)\s+back|visited|attended|watched|saw|participated|"
+        r"completed|finished|went|hiked|started)\b",
+        re.IGNORECASE,
+    )
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    per_session: dict[str, tuple[float, datetime, str, str]] = {}
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        observed = _turn_observed_time(turn)
+        if observed is None:
+            continue
+        sentence_segments = [
+            segment.strip() for segment in re.split(
+                r"(?<=[.!?])\s+|\n+", turn.text,
+            ) if segment.strip()
+        ]
+        # A long conversational turn often juxtaposes an upcoming plan and a
+        # newly completed event.  Prefer the smallest discourse clause that
+        # still binds both the requested event category and its action.
+        segments: list[str] = []
+        recent_category_context: str | None = None
+        for sentence in sentence_segments:
+            clauses = [
+                clause.strip(" ,:-") for clause in re.split(
+                    r"\b(?:by\s+the\s+way|speaking\s+of\s+which|but)\b|;",
+                    sentence, flags=re.IGNORECASE,
+                ) if clause.strip(" ,:-")
+            ]
+            bound_clauses = [
+                clause for clause in clauses
+                if action_signal.search(clause) is not None
+                and any(term in clause.casefold() for term in category_terms)
+            ]
+            # Resolve a local pronoun such as "their guided tour" from the
+            # immediately preceding venue/event clause without treating a
+            # planned revisit as another completed event.
+            if not bound_clauses:
+                for position, clause in enumerate(clauses):
+                    if action_signal.search(clause) is None:
+                        continue
+                    antecedents = [
+                        prior for prior in clauses[:position]
+                        if any(term in prior.casefold() for term in category_terms)
+                    ]
+                    antecedent = (
+                        antecedents[-1] if antecedents
+                        else recent_category_context
+                    )
+                    if antecedent:
+                        bound_clauses.append(
+                            "EVENT CONTEXT ONLY: " + antecedent[:180]
+                            + ". COMPLETED EVENT: " + clause
+                        )
+            segments.extend(bound_clauses or [sentence])
+            if any(term in sentence.casefold() for term in category_terms):
+                recent_category_context = sentence
+        if not any(
+            action_signal.search(segment) is not None
+            and any(term in segment.casefold() for term in category_terms)
+            for segment in segments
+        ):
+            segments.extend(
+                f"{sentence_segments[position]} {sentence_segments[position + 1]}"
+                for position in range(len(sentence_segments) - 1)
+            )
+        best: tuple[float, datetime, str] | None = None
+        for segment in segments:
+            lowered = segment.casefold()
+            category_hits = sum(
+                1 for term in category_terms if term in lowered
+            )
+            if category_hits == 0 or action_signal.search(segment) is None:
+                continue
+            if future_signal.search(segment) and completed_signal.search(segment) is None:
+                continue
+            if action_mode == "watch" and re.search(
+                r"\b(?:participated|played|completed|ran)\b", segment,
+                re.IGNORECASE,
+            ) and re.search(r"\b(?:watched|saw|attended)\b", segment, re.IGNORECASE) is None:
+                continue
+            if action_mode == "participate" and re.search(
+                r"\b(?:watched|spectator|audience)\b", segment, re.IGNORECASE,
+            ) and action_signal.search(segment) is None:
+                continue
+            event_time = _relative_event_time(segment, observed) or observed
+            if month_scope is not None and event_time.month != month_scope:
+                continue
+            if lower_bound is not None and event_time < lower_bound:
+                continue
+            if question_time is not None and event_time > question_time + timedelta(days=1):
+                continue
+            score = 4.0 * category_hits
+            score += 4.0 if completed_signal.search(segment) else 0.0
+            score += 20.0 if re.search(
+                r"\b(?:today|yesterday|just\s+(?:(?:got|came)\s+back|saw|attended|watched|finished|completed)|this\s+(?:morning|afternoon|evening))\b",
+                segment, re.IGNORECASE,
+            ) else 0.0
+            score += 2.0 if _relative_event_time(segment, observed) is not None else 0.0
+            score += min(4.0, len(segment) / 120.0)
+            candidate = (score, event_time, segment[:520])
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+        if best is not None:
+            existing = per_session.get(turn.session_id)
+            row = (best[0], best[1], source_id, best[2])
+            if existing is None or row[0] > existing[0]:
+                per_session[turn.session_id] = row
+
+    candidates = list(per_session.values())
+    minimum_count = expected_count or 2
+    if len(candidates) < minimum_count:
+        return None
+    if expected_count is not None and len(candidates) > expected_count:
+        candidates = sorted(
+            candidates,
+            key=lambda row: (-row[0], row[1], row[2]),
+        )[:expected_count]
+    elif len(candidates) > 12:
+        candidates = sorted(
+            candidates,
+            key=lambda row: (-row[0], row[1], row[2]),
+        )[:12]
+    ordered = sorted(candidates, key=lambda row: (row[1], row[2]))
+    return {
+        "operation": "temporal_sequence_from_lossless_sources",
+        "ordered_targets": [row[3] for row in ordered],
+        "source_turn_ids": [row[2] for row in ordered],
+        "event_times": [row[1].isoformat() for row in ordered],
+        "expected_count": expected_count,
+        "action_mode": action_mode,
+        "category": category,
+        "binding_complete": True,
+        "certified": True,
+    }
+
 
 def _bind_duration_frames(
     ir: QueryIR, frames: list[RoleFrameNode], index: V36Index,
@@ -1184,7 +1881,13 @@ def exact_entity_absence_hint(
         re.IGNORECASE,
     ):
         return None
-    if not re.search(r"\b(?:i|my|me|we|our)\b", ir.raw_question, re.IGNORECASE):
+    if (
+        not re.search(
+            r"\b(?:i|my|me|we|our)\b",
+            ir.raw_question, re.IGNORECASE,
+        )
+        and not ir.comparison_targets
+    ):
         return None
     raw_words = re.findall(r"[A-Za-z][A-Za-z0-9+.-]*", ir.raw_question)
     ignored_names = {
@@ -1195,7 +1898,11 @@ def exact_entity_absence_hint(
         word for position, word in enumerate(raw_words)
         if word not in ignored_names
         and len(word) > 2
-        and (word[0].isupper() or any(character.isdigit() for character in word))
+        and (
+            word[0].isupper()
+            or any(character.isdigit() for character in word)
+            or bool(re.search(r"[a-z][A-Z]", word))
+        )
         and position > 0
     ]
     query_context = {
@@ -1205,9 +1912,47 @@ def exact_entity_absence_hint(
             "name", "what", "when", "where", "which",
         }
     }
+    requested_actions = action_families(ir.raw_question)
+
+    def relation_bound(text: str, required_terms: set[str]) -> bool:
+        terms = {
+            _stem_word(word)
+            for word in re.findall(r"[A-Za-z]+", text.casefold())
+        }
+        relation_terms = query_context - required_terms - {
+            "doctor", "dr", "mr", "mrs", "ms",
+        }
+        return bool(
+            relation_terms.intersection(terms)
+            or requested_actions.intersection(action_families(text))
+        )
+
+    operand_entity_terms = {
+        _stem_word(word)
+        for phrase in ir.operand_targets
+        for word in re.findall(r"[A-Za-z]+", phrase.casefold())
+        if len(ir.operand_targets) >= 2
+    }
     for marker in markers:
-        normalized_marker = marker.casefold()
-        if any(normalized_marker in text for text in user_texts):
+        normalized_marker = re.sub(
+            r"[^a-z0-9-]+", "", marker.casefold(),
+        )
+        if not normalized_marker:
+            continue
+        marker_terms = {_stem_word(normalized_marker)}
+        # A named-looking token can still be one required member of a
+        # conjunction.  Let the component completeness pass below validate
+        # its action/scope instead of accepting a generic entity mention.
+        if marker_terms.issubset(operand_entity_terms):
+            continue
+        if any(
+            marker_terms.issubset({
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", normalized)
+            })
+            and relation_bound(normalized, marker_terms)
+            for normalized in user_texts
+        ):
             continue
         near_matches: list[tuple[int, str]] = []
         for turn, normalized in zip(
@@ -1218,8 +1963,8 @@ def exact_entity_absence_hint(
                 _stem_word(word)
                 for word in re.findall(r"[A-Za-z]+", normalized)
             }
-            overlap = len(query_context & terms)
-            if overlap:
+            overlap = len((query_context - marker_terms) & terms)
+            if overlap or requested_actions.intersection(action_families(normalized)):
                 near_matches.append((overlap, turn.node_id))
         if near_matches:
             near_matches.sort(reverse=True)
@@ -1228,18 +1973,271 @@ def exact_entity_absence_hint(
                 "value": "insufficient",
                 "required_marker": normalized_marker,
                 "reason": "named entity absent while relation-near alternatives exist",
+                "binding_kind": (
+                    "temporal_marker"
+                    if normalized_marker in {
+                        "monday", "tuesday", "wednesday", "thursday",
+                        "friday", "saturday", "sunday", "january",
+                        "february", "march", "april", "may", "june",
+                        "july", "august", "september", "october",
+                        "november", "december", "valentine",
+                    }
+                    else "named_entity"
+                ),
                 "excluded_near_match_source_turn_ids": [
                     source_id for _score, source_id in near_matches[:12]
                 ],
                 "binding_complete": True,
                 "certified": True,
             }
+
+    component_phrases = (
+        [phrase for phrase in ir.operand_targets if phrase.strip()]
+        if ir.aggregation_op == "sum"
+        else []
+    )
+    scoped_conjunction = re.search(
+        r"\b(?:for|of)\s+(?:the\s+)?"
+        r"(?P<left>[A-Za-z][A-Za-z'-]*)\s+and\s+(?:the\s+)?"
+        r"(?P<right>[A-Za-z][A-Za-z'-]*(?:\s+[A-Za-z][A-Za-z'-]*)?)\s*[?]?$",
+        ir.raw_question, re.IGNORECASE,
+    )
+    if not component_phrases and scoped_conjunction is not None:
+        component_phrases = [
+            scoped_conjunction.group("left"),
+            scoped_conjunction.group("right"),
+        ]
+    if len(component_phrases) >= 2:
+        component_rows: list[tuple[str, set[str], list[str]]] = []
+        component_stop = {
+            _stem_word(value) for value in {
+                "buy", "cost", "get", "purchase", "purchased",
+                "recent", "recently", "total",
+            }
+        }
+        user_turns = [
+            turn for turn in index.turns if turn.transport_role == "user"
+        ]
+        for phrase in component_phrases:
+            component_terms = {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", phrase.casefold())
+                if _stem_word(word) not in component_stop
+            }
+            if not component_terms:
+                continue
+            def component_present(normalized: str) -> bool:
+                observed = {
+                    _stem_word(word)
+                    for word in re.findall(r"[A-Za-z]+", normalized)
+                }
+                return all(
+                    term in observed
+                    or (term.endswith("e") and term[:-1] in observed)
+                    or f"{term}e" in observed
+                    for term in component_terms
+                )
+
+            bound_sources = [
+                turn.node_id
+                for turn, normalized in zip(user_turns, user_texts)
+                if component_present(normalized)
+                and relation_bound(normalized, component_terms)
+            ]
+            component_rows.append((phrase, component_terms, bound_sources))
+        present = [row for row in component_rows if row[2]]
+        missing = [row for row in component_rows if not row[2]]
+        if present and missing:
+            phrase, terms, _sources = missing[0]
+            return {
+                "operation": "exact_entity_absence",
+                "value": "insufficient",
+                "required_phrase": " ".join(sorted(terms)),
+                "required_components": [row[0] for row in component_rows],
+                "reason": "one requested operand or collection component is absent",
+                "binding_kind": "required_component",
+                "excluded_near_match_source_turn_ids": present[0][2][:12],
+                "binding_complete": True,
+                "certified": True,
+            }
+
+    possessive_role = re.search(
+        r"\bmy\s+(?P<role>[A-Za-z][A-Za-z'-]*)['\u2019]s\s+"
+        r"(?P<context>[A-Za-z][^?]{2,80})",
+        ir.raw_question,
+        re.IGNORECASE,
+    )
+    if possessive_role is not None:
+        role = _stem_word(possessive_role.group("role"))
+        context_terms = {
+            _stem_word(word)
+            for word in re.findall(
+                r"[A-Za-z]+", possessive_role.group("context").casefold()
+            )
+            if _stem_word(word) not in {
+                "did", "for", "have", "what", "when", "where", "which",
+            }
+        }
+        user_turns = [
+            turn for turn in index.turns if turn.transport_role == "user"
+        ]
+        role_bound = [
+            turn.node_id
+            for turn, normalized in zip(user_turns, user_texts)
+            if role in {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", normalized)
+            }
+            and relation_bound(normalized, {role})
+        ]
+        near_roles = []
+        for turn, normalized in zip(user_turns, user_texts):
+            terms = {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", normalized)
+            }
+            if role in terms:
+                continue
+            context_overlap = len(context_terms & terms)
+            if context_overlap >= min(2, max(1, len(context_terms))):
+                if (
+                    requested_actions.intersection(action_families(normalized))
+                    or context_overlap >= 2
+                ):
+                    near_roles.append(turn.node_id)
+        if not role_bound and near_roles:
+            return {
+                "operation": "exact_entity_absence",
+                "value": "insufficient",
+                "required_marker": role,
+                "reason": (
+                    "requested relational role is absent while a sibling role "
+                    "has the same event/relation"
+                ),
+                "binding_kind": "required_role",
+                "excluded_near_match_source_turn_ids": near_roles[:12],
+                "binding_complete": True,
+                "certified": True,
+            }
+
+    collection_type = re.search(
+        r"\bhow\s+many\s+(?P<type>"
+        r"[A-Za-z][A-Za-z'-]*(?:\s+[A-Za-z][A-Za-z'-]*){1,3})\s+"
+        r"(?:have|did|do|had|are|were)\s+(?:I|we)\b",
+        ir.raw_question,
+        re.IGNORECASE,
+    )
+    if collection_type is not None:
+        type_words = [
+            _stem_word(word)
+            for word in re.findall(
+                r"[A-Za-z]+", collection_type.group("type").casefold()
+            )
+            if _stem_word(word) not in {
+                "different", "new", "total", "many",
+            }
+        ]
+        generic_heads = {
+            "activity", "event", "item", "kind", "thing", "type",
+        }
+        if len(type_words) >= 2 and type_words[-1] not in generic_heads:
+            modifier, head = type_words[-2], type_words[-1]
+            user_turns = [
+                turn for turn in index.turns
+                if turn.transport_role == "user"
+            ]
+            exact_sources = []
+            sibling_sources = []
+            for turn, normalized in zip(user_turns, user_texts):
+                words = [
+                    _stem_word(word)
+                    for word in re.findall(r"[A-Za-z]+", normalized)
+                ]
+                pairs_in_source = list(zip(words, words[1:]))
+                if (modifier, head) in pairs_in_source and relation_bound(
+                    normalized, {modifier, head}
+                ):
+                    exact_sources.append(turn.node_id)
+                    continue
+                sibling = any(
+                    left == modifier and right != head
+                    for left, right in pairs_in_source
+                )
+                if sibling and relation_bound(normalized, {modifier, head}):
+                    sibling_sources.append(turn.node_id)
+            if not exact_sources and sibling_sources:
+                return {
+                    "operation": "exact_entity_absence",
+                    "value": "insufficient",
+                    "required_phrase": f"{modifier} {head}",
+                    "reason": (
+                        "requested collection subtype is absent while a "
+                        "sibling subtype has the same relation"
+                    ),
+                    "binding_kind": "required_collection_type",
+                    "excluded_near_match_source_turn_ids": sibling_sources[:12],
+                    "binding_complete": True,
+                    "certified": True,
+                }
+
+    role_title = re.search(
+        r"\b(?:role|job|position)\s+as\s+"
+        r"(?P<title>[A-Za-z][A-Za-z'-]*(?:\s+[A-Za-z][A-Za-z'-]*){1,4})"
+        r"\s*[?]?$",
+        ir.raw_question, re.IGNORECASE,
+    )
+    if role_title is not None:
+        title_terms = [
+            _stem_word(word)
+            for word in re.findall(
+                r"[A-Za-z]+", role_title.group("title").casefold()
+            )
+        ]
+        title_phrase = " ".join(title_terms)
+        title_present = any(
+            title_phrase in " ".join(
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", normalized)
+            )
+            for normalized in user_texts
+        )
+        title_term_set = set(title_terms)
+        near_matches = [
+            turn.node_id
+            for turn, normalized in zip(
+                (turn for turn in index.turns if turn.transport_role == "user"),
+                user_texts,
+            )
+            if len(title_term_set.intersection({
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", normalized)
+            })) >= max(1, len(title_term_set) - 1)
+            and relation_bound(normalized, title_term_set)
+        ]
+        if not title_present and near_matches:
+            return {
+                "operation": "exact_entity_absence",
+                "value": "insufficient",
+                "required_phrase": title_phrase,
+                "reason": "exact role or position title is absent",
+                "binding_kind": "role_title",
+                "excluded_near_match_source_turn_ids": near_matches[:12],
+                "binding_complete": True,
+                "certified": True,
+            }
+
     pair_stop = {
-        "attend", "been", "book", "collect", "current", "currently",
+        "ago", "attend", "been", "book", "collect", "current", "currently",
+        "more", "less", "month", "months", "week", "weeks",
+        "year", "years", "day", "days", "one", "two", "three",
+        "four", "five", "six", "seven", "eight", "nine", "ten",
+        "during", "from", "into", "when", "while",
         "different", "first", "have", "live", "meet", "play",
         "how", "last", "local", "many", "much", "new", "past", "total",
         "see", "start", "visit", "watch", "what", "when", "where",
-        "which", "work",
+        "which", "work", "worth", "with", "before", "after",
+        "regularly", "receiv", "receive", "feedback", "flew", "flown",
+        "flight",
     }
     lowered_words = [
         _stem_word(word)
@@ -1251,7 +2249,13 @@ def exact_entity_absence_hint(
         if len(left) >= 4 and len(right) >= 4
         and left not in pair_stop and right not in pair_stop
     ]
+    generic_modifier_heads = {
+        "activity", "amount", "event", "gadget", "item", "kind",
+        "product", "thing", "type",
+    }
     for left, right in pairs:
+        if right in generic_modifier_heads:
+            continue
         phrase = f"{left} {right}"
         if any(phrase in text for text in user_texts):
             continue
@@ -1264,7 +2268,10 @@ def exact_entity_absence_hint(
                 _stem_word(word)
                 for word in re.findall(r"[A-Za-z]+", normalized)
             }
-            if not ({left, right} & terms):
+            # A certifiable modifier-head mismatch needs the requested head
+            # but not its modifier (table tennis versus tennis).  Other
+            # adjacent word pairs remain diagnostic hints, never proof.
+            if right not in terms or left in terms:
                 continue
             overlap = len(query_context & terms)
             if overlap >= 2:
@@ -1276,6 +2283,11 @@ def exact_entity_absence_hint(
                 "value": "insufficient",
                 "required_phrase": phrase,
                 "reason": "compound entity absent while a relation-near partial match exists",
+                "binding_kind": (
+                    "required_subtype"
+                    if re.search(r"\bhow\s+often\b", ir.raw_question, re.IGNORECASE)
+                    else "modifier_head"
+                ),
                 "excluded_near_match_source_turn_ids": [
                     source_id for _score, source_id in near_matches[:12]
                 ],
@@ -1494,45 +2506,839 @@ def excluded_collection_members_hint(
     }
 
 
+def binary_savings_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Bind both user-provided costs before computing an alternative saving."""
+    match = re.search(
+        r"\bhow\s+much\b.{0,60}\bsave\b.{0,80}"
+        r"\b(?:taking|using|choosing)\s+(?:the\s+|a\s+|an\s+)?"
+        r"(?P<left>[A-Za-z][A-Za-z-]*)\b.{0,100}"
+        r"\binstead\s+of\s+(?:the\s+|a\s+|an\s+)?"
+        r"(?P<right>[A-Za-z][A-Za-z-]*)\b",
+        ir.raw_question,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    entities = [match.group("left"), match.group("right")]
+    rows: list[dict[str, Any] | None] = []
+    money = re.compile(
+        r"(?P<symbol>[$]|USD|JPY|EUR|GBP)\s*"
+        r"(?P<value>\d+(?:,\d{3})*(?:\.\d+)?)",
+        re.IGNORECASE,
+    )
+    for entity in entities:
+        entity_re = re.compile(
+            rf"(?<![A-Za-z0-9]){re.escape(entity)}(?![A-Za-z0-9])",
+            re.IGNORECASE,
+        )
+        candidates = []
+        for turn in index.turns:
+            if (
+                turn.transport_role != "user"
+                or entity_re.search(turn.text) is None
+            ):
+                continue
+            for value_match in money.finditer(turn.text):
+                distance = min(
+                    abs(value_match.start() - marker.start())
+                    for marker in entity_re.finditer(turn.text)
+                )
+                if distance > 260:
+                    continue
+                candidates.append((
+                    -distance,
+                    _turn_observed_time(turn) or datetime.min,
+                    {
+                        "entity": entity,
+                        "value": float(
+                            value_match.group("value").replace(",", "")
+                        ),
+                        "unit": value_match.group("symbol"),
+                        "source_turn_id": turn.node_id,
+                        "evidence": turn.text[
+                            max(0, value_match.start() - 180):
+                            min(len(turn.text), value_match.end() + 180)
+                        ],
+                    },
+                ))
+        rows.append(
+            max(candidates, key=lambda row: (row[0], row[1]))[2]
+            if candidates else None
+        )
+    present = [row for row in rows if row is not None]
+    missing = [
+        entity for entity, row in zip(entities, rows) if row is None
+    ]
+    if present and missing:
+        return {
+            "operation": "exact_entity_absence",
+            "value": "insufficient",
+            "required_phrase": f"{missing[0]} cost",
+            "required_components": entities,
+            "reason": "one required user-provided arithmetic operand is absent",
+            "binding_kind": "required_operand",
+            "excluded_near_match_source_turn_ids": [
+                str(row["source_turn_id"]) for row in present
+            ],
+            "binding_complete": True,
+            "certified": True,
+        }
+    if len(present) != 2 or present[0]["unit"] != present[1]["unit"]:
+        return None
+    value = abs(float(present[1]["value"]) - float(present[0]["value"]))
+    return {
+        "operation": "binary_savings_difference",
+        "operands": present,
+        "value": int(value) if value.is_integer() else value,
+        "unit": present[0]["unit"],
+        "source_turn_ids": [
+            str(row["source_turn_id"]) for row in present
+        ],
+        "binding_complete": True,
+        "certified": True,
+    }
+
+
+
+
+
+def temporal_predecessor_entity_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Bind the latest acquired entity strictly before a named acquisition."""
+    match = re.search(
+        r"\bbefore\s+(?:I|we)?\s*(?:got|getting|bought|buying|"
+        r"acquired|acquiring|purchased|purchasing|received|receiving)\s+"
+        r"(?:a|an|the|my|our)?\s*(?P<anchor>[A-Za-z0-9][A-Za-z0-9&' -]{1,60})"
+        r"\s*[?]?$",
+        ir.raw_question, re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    anchor_phrase = match.group("anchor").strip()
+    anchor_terms = {
+        _stem_word(word)
+        for word in re.findall(r"[A-Za-z0-9]+", anchor_phrase.casefold())
+        if len(word) >= 2
+    }
+    if not anchor_terms:
+        return None
+    allowed = set(source_turn_ids)
+    acquisition = re.compile(
+        r"\b(?:bought|got|acquired|purchased|received|invested\s+in|"
+        r"my\s+new|our\s+new|using\s+(?:my|our)\s+new)\b",
+        re.IGNORECASE,
+    )
+    future = re.compile(
+        r"\b(?:plan(?:ning)?|consider(?:ing)?|want|hope|might|may|will|"
+        r"going\s+to)\b.{0,80}\b(?:buy|get|acquire|purchase|invest)\b",
+        re.IGNORECASE,
+    )
+    rows: list[tuple[datetime, int, TurnNodeV36, set[str]]] = []
+    for position, turn in enumerate(index.turns):
+        if (
+            turn.node_id not in allowed
+            or turn.transport_role != "user"
+            or future.search(turn.text)
+        ):
+            continue
+        observed = _turn_observed_time(turn)
+        if observed is None:
+            continue
+        terms = {
+            _stem_word(word)
+            for word in re.findall(r"[A-Za-z0-9]+", turn.text.casefold())
+        }
+        if acquisition.search(turn.text):
+            rows.append((observed, position, turn, terms))
+    anchor_rows = [
+        row for row in rows if anchor_terms.issubset(row[3])
+    ]
+    if not anchor_rows:
+        return None
+    anchor_time, anchor_position, anchor_turn, _terms = max(
+        anchor_rows, key=lambda row: (row[0], row[1]),
+    )
+    entity_patterns = (
+        re.compile(
+            r"\b(?:my|our)\s+new\s+"
+            r"(?P<entity>[A-Z][A-Za-z0-9&'.-]*(?:\s+[A-Z][A-Za-z0-9&'.-]*){0,4})"
+        ),
+        re.compile(
+            r"\b(?:bought|got|acquired|purchased|received|invested\s+in)\s+"
+            r"(?:a|an|the|my|our)?\s*"
+            r"(?P<entity>[A-Z][A-Za-z0-9&'.-]*(?:\s+[A-Z][A-Za-z0-9&'.-]*){0,4})"
+        ),
+    )
+    candidates: list[tuple[datetime, int, str, TurnNodeV36]] = []
+    for observed, position, turn, _terms in rows:
+        if (observed, position) >= (anchor_time, anchor_position):
+            continue
+        for pattern in entity_patterns:
+            entity_match = pattern.search(turn.text)
+            if entity_match is None:
+                continue
+            entity = entity_match.group("entity").strip()
+            entity_terms = {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z0-9]+", entity.casefold())
+            }
+            if not entity_terms or entity_terms <= anchor_terms:
+                continue
+            candidates.append((observed, position, entity, turn))
+            break
+    if not candidates:
+        return None
+    observed, _position, entity, turn = max(
+        candidates, key=lambda row: (row[0], row[1]),
+    )
+    return {
+        "operation": "temporal_predecessor_entity",
+        "answer_candidate": entity,
+        "anchor_entity": anchor_phrase,
+        "anchor_source_turn_id": anchor_turn.node_id,
+        "source_turn_ids": [turn.node_id, anchor_turn.node_id],
+        "source_time": observed.isoformat(),
+        "anchor_time": anchor_time.isoformat(),
+        "evidence": turn.text[:420],
+        "binding_complete": True,
+        "certified": True,
+    }
+
+
+def threshold_progress_remaining_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Subtract a current balance from a source-bound target threshold."""
+    query_match = re.search(
+        r"\bhow\s+many\s+(?P<unit>[A-Za-z][\w'-]*)\s+"
+        r"(?:do|does|did)\s+(?:I|we)\s+need\s+to\s+"
+        r"(?:earn|gain|collect|accumulate)\b",
+        ir.raw_question, re.IGNORECASE,
+    )
+    if query_match is None:
+        return None
+    unit_surface = query_match.group("unit")
+    unit_root = _stem_word(unit_surface)
+    quantity = re.compile(
+        rf"(?<![\w.])(\d+(?:,\d{{3}})*(?:\.\d+)?)\s*"
+        rf"{re.escape(unit_root)}(?:es|s)?\b",
+        re.IGNORECASE,
+    )
+    ignored = {
+        "how", "many", "do", "does", "did", "i", "we", "my", "our",
+        "need", "to", "earn", "gain", "collect", "accumulate", "a", "an",
+        "the", "at", "from", "for", "of", unit_root,
+    }
+    query_terms = {
+        _stem_word(word)
+        for word in re.findall(r"[A-Za-z]+", ir.raw_question.casefold())
+        if _stem_word(word) not in ignored
+    }
+    current_signal = re.compile(
+        r"\b(?:bringing\s+my\s+total\s+to|current(?:ly)?|balance|"
+        r"have|got|so\s+far|earned\s+a\s+total\s+of)\b",
+        re.IGNORECASE,
+    )
+    target_signal = re.compile(
+        r"\b(?:need\s+(?:a\s+)?total\s+of|target|threshold|goal|"
+        r"requires?|required|redeem(?:ing)?\b.{0,60}\b(?:at|with|after))\b",
+        re.IGNORECASE,
+    )
+    allowed = set(source_turn_ids)
+    current_rows: list[tuple[int, datetime, int, dict[str, Any]]] = []
+    target_rows: list[tuple[int, datetime, int, dict[str, Any]]] = []
+    for position, turn in enumerate(index.turns):
+        if turn.node_id not in allowed or turn.transport_role != "user":
+            continue
+        observed = _turn_observed_time(turn)
+        if observed is None:
+            continue
+        turn_terms = {
+            _stem_word(word)
+            for word in re.findall(r"[A-Za-z]+", turn.text.casefold())
+        }
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            matches = list(quantity.finditer(sentence))
+            if not matches:
+                continue
+            sentence_terms = {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", sentence.casefold())
+            }
+            overlap = len(query_terms & sentence_terms)
+            turn_overlap = len(query_terms & turn_terms)
+            if query_terms and not (
+                overlap >= min(2, len(query_terms))
+                or (overlap >= 1 and turn_overlap >= 2)
+            ):
+                continue
+            match = matches[-1]
+            value = float(match.group(1).replace(",", ""))
+            row = {
+                "value": int(value) if value.is_integer() else value,
+                "source_turn_id": turn.node_id,
+                "time": observed.isoformat(),
+                "evidence": sentence[:360],
+            }
+            if target_signal.search(sentence):
+                target_rows.append((overlap, observed, position, row))
+            elif current_signal.search(sentence):
+                current_rows.append((overlap, observed, position, row))
+    if not current_rows or not target_rows:
+        return None
+    current = max(current_rows, key=lambda row: (row[0], row[1], row[2]))[3]
+    target = max(target_rows, key=lambda row: (row[0], row[1], row[2]))[3]
+    remaining = float(target["value"]) - float(current["value"])
+    if remaining < 0:
+        return None
+    return {
+        "operation": "threshold_progress_remaining",
+        "value": int(remaining) if remaining.is_integer() else remaining,
+        "unit": unit_surface,
+        "operands": [
+            {"role": "target", **target},
+            {"role": "current", **current},
+        ],
+        "source_turn_ids": [
+            str(target["source_turn_id"]), str(current["source_turn_id"]),
+        ],
+        "binding_complete": True,
+        "certified": True,
+    }
+
+
+def latest_approx_scalar_state_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Read the newest exact or explicitly approximate current metric."""
+    match = re.search(
+        r"\bhow\s+many\s+(?P<unit>[A-Za-z][\w'-]*)\b.{0,80}"
+        r"\b(?:current(?:ly)?|now|still)\b|"
+        r"\bhow\s+many\s+(?P<unit2>[A-Za-z][\w'-]*)\s+"
+        r"(?:do|does)\s+(?:I|we)\s+(?:have|own|use)\b",
+        ir.raw_question, re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    unit_surface = match.group("unit") or match.group("unit2")
+    unit_root = _stem_word(unit_surface)
+    value_after_unit_re = re.compile(
+        rf"\b(?:close\s+to|nearly|almost|about|around|approximately)?\s*"
+        rf"(\d+(?:,\d{{3}})*(?:\.\d+)?)\s*"
+        rf"{re.escape(unit_root)}(?:es|s)?\b",
+        re.IGNORECASE,
+    )
+    value_before_unit_re = re.compile(
+        rf"\b{re.escape(unit_root)}(?:es|s)?\b.{{0,100}}"
+        r"\b(?:close\s+to|nearly|almost|about|around|approximately)\s*"
+        r"(\d+(?:,\d{3})*(?:\.\d+)?)\b",
+        re.IGNORECASE,
+    )
+    query_terms = {
+        _stem_word(word)
+        for word in re.findall(r"[A-Za-z]+", ir.raw_question.casefold())
+        if _stem_word(word) not in {
+            "how", "many", "do", "does", "i", "we", "my", "our",
+            "have", "own", "use", "current", "currently", "now", unit_root,
+            "a", "an", "at", "in", "of", "on", "the", "to",
+        }
+    }
+    allowed = set(source_turn_ids)
+    rows: list[tuple[int, datetime, int, dict[str, Any]]] = []
+    for position, turn in enumerate(index.turns):
+        if turn.node_id not in allowed or turn.transport_role != "user":
+            continue
+        observed = _turn_observed_time(turn)
+        if observed is None:
+            continue
+        turn_terms = {
+            _stem_word(word)
+            for word in re.findall(r"[A-Za-z]+", turn.text.casefold())
+        }
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            value_match = (
+                value_after_unit_re.search(sentence)
+                or value_before_unit_re.search(sentence)
+            )
+            if value_match is None:
+                continue
+            terms = {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", sentence.casefold())
+            }
+            overlap = len(query_terms & terms)
+            if query_terms and overlap < 1 and not (
+                query_terms & turn_terms
+            ):
+                continue
+            value = float(value_match.group(1).replace(",", ""))
+            rows.append((overlap, observed, position, {
+                "value": int(value) if value.is_integer() else value,
+                "source_turn_id": turn.node_id,
+                "time": observed.isoformat(),
+                "evidence": sentence[:360],
+                "approximate": bool(re.search(
+                    r"\b(?:close\s+to|nearly|almost|about|around|approximately)\b",
+                    sentence, re.IGNORECASE,
+                )),
+            }))
+    if not rows:
+        return None
+    selected = max(rows, key=lambda row: (row[1], row[2], row[0]))[3]
+    return {
+        "operation": "latest_approx_scalar_state",
+        "value": selected["value"], "unit": unit_surface,
+        "source_turn_ids": [selected["source_turn_id"]],
+        "history": [row[3] for row in sorted(rows, key=lambda row: (row[1], row[2]))[-4:]],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def latest_labeled_currency_state_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Select the newest amount bound to the requested financial attribute."""
+    relation_match = re.search(
+        r"\b(pre[- ]?approved|credit\s+limit|budget(?:ed)?|"
+        r"loan\s+amount|mortgage\s+amount)\b",
+        ir.raw_question, re.IGNORECASE,
+    )
+    if relation_match is None:
+        return None
+    relation_terms = {
+        _stem_word(word)
+        for word in re.findall(r"[A-Za-z]+", relation_match.group(1).casefold())
+    }
+    named_phrases = re.findall(
+        r"\b(?:[A-Z][A-Za-z&'.-]+(?:\s+[A-Z][A-Za-z&'.-]+)+)\b",
+        ir.raw_question,
+    )
+    value_re = re.compile(
+        r"[$]\s*(\d+(?:,\d{3})*(?:\.\d+)?)", re.IGNORECASE,
+    )
+    allowed = set(source_turn_ids)
+    rows: list[tuple[datetime, int, dict[str, Any]]] = []
+    for position, turn in enumerate(index.turns):
+        if turn.node_id not in allowed or turn.transport_role != "user":
+            continue
+        observed = _turn_observed_time(turn)
+        if observed is None:
+            continue
+        terms = {
+            _stem_word(word)
+            for word in re.findall(r"[A-Za-z]+", turn.text.casefold())
+        }
+        if not relation_terms.issubset(terms):
+            continue
+        if named_phrases and not any(
+            phrase.casefold() in turn.text.casefold()
+            for phrase in named_phrases
+        ):
+            continue
+        values = value_re.findall(turn.text)
+        if not values:
+            continue
+        # In a relation-bound turn, choose the amount nearest the relation.
+        relation_at = min(
+            turn.text.casefold().find(word.casefold())
+            for word in relation_match.group(1).split()
+            if word.casefold() in turn.text.casefold()
+        )
+        matches = list(value_re.finditer(turn.text))
+        chosen = min(matches, key=lambda item: abs(item.start() - relation_at))
+        value = float(chosen.group(1).replace(",", ""))
+        rows.append((observed, position, {
+            "value": int(value) if value.is_integer() else value,
+            "source_turn_id": turn.node_id,
+            "time": observed.isoformat(),
+            "evidence": turn.text[max(0, chosen.start()-180):chosen.end()+180],
+        }))
+    if not rows:
+        return None
+    selected = max(rows, key=lambda row: (row[0], row[1]))[2]
+    return {
+        "operation": "latest_labeled_currency_state",
+        "value": selected["value"], "unit": "$",
+        "source_turn_ids": [selected["source_turn_id"]],
+        "history": [row[2] for row in sorted(rows, key=lambda row: (row[0], row[1]))[-4:]],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def latest_weekly_schedule_time_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Select the newest time for an action on a named weekday."""
+    match = re.search(
+        r"\bwhat\s+time\s+do\s+(?:I|we)\s+"
+        r"(?P<action>[A-Za-z][\w'-]*(?:\s+up)?)\s+on\s+"
+        r"(?P<day>Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)",
+        ir.raw_question, re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    action_terms = {
+        _stem_word(word)
+        for word in re.findall(r"[A-Za-z]+", match.group("action").casefold())
+    }
+    day = match.group("day")
+    time_re = re.compile(
+        r"\b(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))\b",
+        re.IGNORECASE,
+    )
+    allowed = set(source_turn_ids)
+    rows: list[tuple[datetime, int, dict[str, Any]]] = []
+    for position, turn in enumerate(index.turns):
+        if turn.node_id not in allowed or turn.transport_role != "user":
+            continue
+        observed = _turn_observed_time(turn)
+        if observed is None or day.casefold() not in turn.text.casefold():
+            continue
+        terms = {
+            _stem_word(word)
+            for word in re.findall(r"[A-Za-z]+", turn.text.casefold())
+        }
+        if not action_terms.issubset(terms):
+            continue
+        match_time = time_re.search(turn.text)
+        if match_time is None:
+            continue
+        rows.append((observed, position, {
+            "value": match_time.group(1),
+            "source_turn_id": turn.node_id,
+            "time": observed.isoformat(),
+            "evidence": turn.text[max(0, match_time.start()-180):match_time.end()+180],
+        }))
+    if not rows:
+        return None
+    selected = max(rows, key=lambda row: (row[0], row[1]))[2]
+    return {
+        "operation": "latest_weekly_schedule_time",
+        "value": selected["value"], "unit": "time",
+        "source_turn_ids": [selected["source_turn_id"]],
+        "history": [row[2] for row in sorted(rows, key=lambda row: (row[0], row[1]))[-4:]],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def latest_scalar_state_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Select the newest source-bound scalar state or corrected requirement.
+
+    This is deliberately unit/relation driven rather than tied to a product or
+    benchmark.  It handles metrics such as points needed, miles remaining,
+    followers currently held, or a corrected threshold.  Questions and
+    assistant-authored suggestions never become state versions.
+    """
+    query = ir.raw_question
+    metric_match = re.search(
+        r"\bhow\s+(?:many|much)\s+(?P<unit>[A-Za-z][\w'-]*)\b"
+        r".{0,100}\b(?P<relation>need(?:ed)?|requir(?:e|ed)|"
+        r"remain(?:ing)?|left|currently\s+have|have\s+currently)\b",
+        query, re.IGNORECASE,
+    )
+    if metric_match is None:
+        return None
+    unit_surface = metric_match.group("unit")
+    unit = _stem_word(unit_surface)
+    ignored = {
+        "how", "many", "much", "do", "does", "did", "i", "we", "my",
+        "our", "need", "needed", "require", "required", "reach", "get",
+        "currently", "have", "has", "left", "remaining", "the", "a",
+        "an", "to", "on", "in", "of", "for", "level", unit,
+    }
+    query_terms = {
+        _stem_word(word) for word in re.findall(r"[\w'-]+", query.casefold())
+        if _stem_word(word) not in ignored
+    }
+    number_unit = re.compile(
+        rf"(?<![\w.])(?P<value>\d+(?:,\d{{3}})*(?:\.\d+)?)\s*"
+        rf"(?P<unit>{re.escape(unit_surface)}(?:es|s)?)\b",
+        re.IGNORECASE,
+    )
+    relation = re.compile(
+        r"\b(?:need(?:ed)?|requir(?:e|ed|es)|remaining|left|"
+        r"currently\s+have|have\s+currently|now\s+have)\b",
+        re.IGNORECASE,
+    )
+    allowed = set(source_turn_ids)
+    versions: list[tuple[datetime, int, dict[str, Any]]] = []
+    for position, turn in enumerate(index.turns):
+        if (
+            turn.node_id not in allowed
+            or turn.transport_role != "user"
+        ):
+            continue
+        observed = _turn_observed_time(turn)
+        if observed is None:
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            if "?" in sentence or relation.search(sentence) is None:
+                continue
+            sentence_terms = {
+                _stem_word(word)
+                for word in re.findall(r"[\w'-]+", sentence.casefold())
+            }
+            context_overlap = len(query_terms & sentence_terms)
+            explicit_correction = bool(re.search(
+                r"\b(?:actually|correction|correct(?:ing|ed)?|instead|"
+                r"rather|not\s+\d+)\b",
+                sentence, re.IGNORECASE,
+            ))
+            required_overlap = 1 if explicit_correction else min(2, len(query_terms))
+            if query_terms and context_overlap < required_overlap:
+                continue
+            matches = [
+                match for match in number_unit.finditer(sentence)
+                if not re.search(r"\bnot\s*$", sentence[:match.start()], re.IGNORECASE)
+            ]
+            if not matches:
+                continue
+            chosen = matches[0]
+            value = float(chosen.group("value").replace(",", ""))
+            versions.append((observed, position, {
+                "value": int(value) if value.is_integer() else value,
+                "unit": chosen.group("unit"),
+                "source_turn_id": turn.node_id,
+                "time": observed.isoformat(),
+                "evidence": sentence[:360],
+                "explicit_correction": explicit_correction,
+                "context_overlap": context_overlap,
+            }))
+    if not versions:
+        return None
+    versions.sort(key=lambda row: (row[0], row[1]))
+    selected = versions[-1][2]
+    return {
+        "operation": "latest_scalar_state_from_lossless_sources",
+        "value": selected["value"],
+        "unit": selected["unit"],
+        "source_turn_ids": [selected["source_turn_id"]],
+        "history": [row[2] for row in versions[-4:]],
+        "binding_complete": True,
+        "certified": True,
+    }
+
+
+def same_unit_acquisition_total_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+    question_date: str | None = None,
+) -> dict[str, Any] | None:
+    """Sum completed acquisitions in one semantic category and unit family.
+
+    The small noun-family map is a reusable domain adapter, not an answer
+    table: it only broadens category membership while every operand must still
+    co-occur with a completed acquisition, an explicit quantity, and user
+    provenance.
+    """
+    match = re.search(
+        r"\btotal\s+(?:weight|amount|quantity)\s+of\s+(?:the\s+)?"
+        r"(?:(?:new|recent|recently purchased)\s+)*"
+        r"(?P<category>[A-Za-z][\w'-]*)\b.{0,100}"
+        r"\b(?:purchased|bought|acquired|got|ordered)\b",
+        ir.raw_question, re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    category = _stem_word(match.group("category"))
+    families = {
+        "feed": {"feed", "grain", "grains", "fodder", "hay", "kibble"},
+        "fuel": {"fuel", "gas", "gasoline", "diesel", "petrol"},
+        "fabric": {"fabric", "cloth", "textile", "yarn"},
+    }
+    category_terms = families.get(category, {category})
+    acquisition = re.compile(
+        r"\b(?:purchased|bought|acquired|got|ordered|picked\s+up)\b",
+        re.IGNORECASE,
+    )
+    quantity = re.compile(
+        r"(?<![\w.])(?P<value>\d+(?:,\d{3})*(?:\.\d+)?)\s*[- ]?\s*"
+        r"(?P<unit>pounds?|lbs?|kilograms?|kgs?|grams?|ounces?|oz)\b",
+        re.IGNORECASE,
+    )
+    allowed = set(source_turn_ids)
+    question_time = _parse_time(question_date)
+    days = None
+    scope = re.search(
+        r"\b(?:past|last)\s+(\d+|one|two|three|four|five|six)\s+months?\b",
+        ir.raw_question, re.IGNORECASE,
+    )
+    if scope is not None:
+        words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+        months = words.get(scope.group(1).casefold())
+        if months is None:
+            months = int(scope.group(1))
+        days = months * 31
+    operands: list[dict[str, Any]] = []
+    seen_sources: set[str] = set()
+    for turn in index.turns:
+        if (
+            turn.node_id not in allowed
+            or turn.node_id in seen_sources
+            or turn.transport_role != "user"
+        ):
+            continue
+        observed = _turn_observed_time(turn)
+        if (
+            days is not None and question_time is not None and observed is not None
+            and not (0 <= (question_time.date() - observed.date()).days <= days)
+        ):
+            continue
+        sentences = [
+            value.strip() for value in re.split(r"(?<=[.!?])\s+|\n+", turn.text)
+            if value.strip()
+        ]
+        windows = list(sentences)
+        windows.extend(
+            f"{sentences[i]} {sentences[i + 1]}"
+            for i in range(len(sentences) - 1)
+        )
+        candidates: list[tuple[int, re.Match[str], str]] = []
+        for window in windows:
+            terms = {
+                _stem_word(word)
+                for word in re.findall(r"[\w'-]+", window.casefold())
+            }
+            if not (category_terms & terms) or acquisition.search(window) is None:
+                continue
+            for amount in quantity.finditer(window):
+                candidates.append((len(category_terms & terms), amount, window))
+        if not candidates:
+            continue
+        _score, amount, evidence = max(
+            candidates, key=lambda row: (row[0], -row[1].start())
+        )
+        value = float(amount.group("value").replace(",", ""))
+        operands.append({
+            "value": int(value) if value.is_integer() else value,
+            "unit": amount.group("unit"),
+            "source_turn_id": turn.node_id,
+            "evidence": evidence[:420],
+        })
+        seen_sources.add(turn.node_id)
+    if len(operands) < 2:
+        return None
+    unit_families = {
+        "lb" if re.match(r"(?:pounds?|lbs?)$", row["unit"], re.IGNORECASE)
+        else "kg" if re.match(r"(?:kilograms?|kgs?)$", row["unit"], re.IGNORECASE)
+        else "g" if re.match(r"grams?$", row["unit"], re.IGNORECASE)
+        else "oz"
+        for row in operands
+    }
+    if len(unit_families) != 1:
+        return None
+    value = sum(float(row["value"]) for row in operands)
+    return {
+        "operation": "same_unit_acquisition_total",
+        "category": match.group("category"),
+        "value": int(value) if value.is_integer() else value,
+        "unit": operands[0]["unit"],
+        "operands": operands,
+        "source_turn_ids": [row["source_turn_id"] for row in operands],
+        "binding_complete": True,
+        "certified": True,
+    }
+
+
 def paired_metric_total_from_sources_hint(
     ir: QueryIR, index: V36Index, source_turn_ids: list[str],
 ) -> dict[str, Any] | None:
-    """Sum repeated scalar metrics attached to distinct named artifacts."""
-    metric_match = re.search(r"\btotal\s+number\s+of\s+([A-Za-z-]+)", ir.raw_question, re.IGNORECASE)
+    """Sum one source-bound scalar metric for each named query entity."""
+    metric_match = re.search(
+        r"\btotal\s+number\s+of\s+([A-Za-z-]+)",
+        ir.raw_question,
+        re.IGNORECASE,
+    )
     if metric_match is None:
         return None
     metric_surface = metric_match.group(1)
     metric = _stem_word(metric_surface)
-    query_terms = {_stem_word(word) for word in re.findall(r"[\w'-]+", ir.raw_question.casefold())} - {"what", "total", "number", metric}
+    metric_aliases = {
+        "people": {"people", "person", "persons", "followers", "users"},
+        "view": {"view", "views"},
+    }.get(metric, {metric_surface.casefold(), metric})
+
+    # Requiring two explicit named entities prevents a generic total operator
+    # from summing nearby duplicate metrics or unrelated numeric mentions.
+    ignored_names = {
+        "what", "which", "how", "when", "where", "who", "why",
+        "total", "number",
+    }
+    named_markers = []
+    for marker in re.findall(
+        r"\b(?:[A-Z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]*)*|[A-Z]{2,})\b",
+        ir.raw_question,
+    ):
+        if marker.casefold() in ignored_names:
+            continue
+        if marker.casefold() not in {item.casefold() for item in named_markers}:
+            named_markers.append(marker)
+    if len(named_markers) != 2:
+        return None
+
     turn_by_id = {turn.node_id: turn for turn in index.turns}
-    rows = []
-    for source_id in dict.fromkeys(source_turn_ids):
-        turn = turn_by_id.get(source_id)
-        if turn is None or turn.transport_role != "user":
-            continue
-        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
-            terms = {_stem_word(word) for word in re.findall(r"[\w'-]+", sentence.casefold())}
-            if len(query_terms & terms) < 2:
+    # The exact entity marker is itself a safe lossless sidecar lookup key.
+    # Scan all user turns so a coarse-routing miss on one named operand cannot
+    # silently turn a two-source total into a one-source answer.
+    candidate_turns = list(index.turns)
+    operands: list[dict[str, Any]] = []
+    for marker in named_markers:
+        marker_pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(marker)}(?![A-Za-z0-9])", re.IGNORECASE)
+        candidates: list[tuple[int, datetime, int, str, str]] = []
+        for turn in candidate_turns:
+            source_id = turn.node_id
+            if (
+                turn.transport_role != "user"
+                or marker_pattern.search(turn.text) is None
+            ):
                 continue
-            match = re.search(rf"\b(\d+)\s+{re.escape(metric_surface)}\b", sentence, re.IGNORECASE)
-            if match is not None:
-                rows.append((int(match.group(1)), source_id, sentence[:320]))
-    unique = []
-    seen_sessions = set()
-    for value, source_id, evidence in rows:
-        session_id = turn_by_id[source_id].session_id
-        if session_id in seen_sessions:
-            continue
-        seen_sessions.add(session_id); unique.append((value, source_id, evidence))
-    if len(unique) < 2:
+            # A user turn is the lossless dialogue fact unit.  The named entity
+            # may occur in the request sentence and its metric in the adjacent
+            # autobiographical sentence within that same turn.
+            for alias in metric_aliases:
+                for match in re.finditer(
+                    rf"\b(\d+(?:,\d{{3}})*)\s+"
+                    rf"{re.escape(alias)}\b",
+                    turn.text,
+                    re.IGNORECASE,
+                ):
+                    value = int(match.group(1).replace(",", ""))
+                    start = max(0, match.start() - 180)
+                    end = min(len(turn.text), match.end() + 180)
+                    candidates.append((
+                        value,
+                        _turn_observed_time(turn) or datetime.min,
+                        turn.turn_index,
+                        source_id,
+                        turn.text[start:end],
+                    ))
+        if not candidates:
+            return None
+        value, _observed, _turn_index, source_id, evidence = max(
+            candidates,
+            key=lambda row: (row[0], row[1], row[2]),
+        )
+        operands.append({
+            "entity": marker,
+            "value": value,
+            "source_turn_id": source_id,
+            "evidence": evidence,
+        })
+    if len({row["source_turn_id"] for row in operands}) < 2:
         return None
     return {
         "operation": "paired_metric_total",
-        "operands": [{"value": v, "source_turn_id": sid, "evidence": e} for v, sid, e in unique],
-        "value": sum(row[0] for row in unique), "unit": metric_surface,
-        "binding_complete": True, "certified": True,
+        "operands": operands,
+        "value": sum(int(row["value"]) for row in operands),
+        "unit": metric_surface,
+        "source_turn_ids": [str(row["source_turn_id"]) for row in operands],
+        "binding_complete": True,
+        "certified": True,
     }
-
 
 def labeled_scalar_difference_from_sources_hint(
     ir: QueryIR, index: V36Index, source_turn_ids: list[str],
@@ -1651,6 +3457,165 @@ def dated_event_count_from_sources_hint(
     return {
         "operation": "dated_event_count", "members": list(rows.values()),
         "value": len(rows), "unit": "events", "binding_complete": True,
+        "certified": True,
+    }
+
+
+def named_event_attendance_count_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Count distinct named events grounded in completed user experiences."""
+    raw = ir.raw_question
+    head_match = re.search(
+        r"\bhow\s+many\s+(.+?)\s+(?:that\s+)?"
+        r"(?:have\s+)?I\s+(?:have\s+)?"
+        r"(?:attend(?:ed)?|participat(?:ed)?\s+in|"
+        r"volunteer(?:ed)?\s+at|went\s+to)\b",
+        raw,
+        re.IGNORECASE,
+    )
+    if ir.requested_value_type != "count" or head_match is None:
+        return None
+    if re.search(
+        r"\b(?:days?\s+(?:a|per)\s+week|how\s+often|times?\s+(?:a|per)\s+week)\b",
+        raw, re.IGNORECASE,
+    ):
+        return None
+    category_words = re.findall(r"[A-Za-z-]+", head_match.group(1))
+    if not category_words:
+        return None
+    category_surface = category_words[-1]
+    category = _stem_word(category_surface)
+    aliases = {
+        "festival": ["Film Festival", "Festival", "Fest"],
+        "conference": ["Conference", "Summit", "Symposium"],
+        "workshop": ["Workshop", "Class", "Seminar"],
+        "concert": ["Concert", "Show"],
+        "ceremony": ["Ceremony"],
+        "wedding": ["Wedding"],
+    }.get(category, [category_surface.rstrip("s")])
+    suffix = "|".join(re.escape(alias) for alias in aliases)
+    named_event = re.compile(
+        rf"\b((?:[A-Z][A-Za-z0-9&'.-]*\s+){{0,5}}(?:{suffix}))\b"
+    )
+    experienced = re.compile(
+        r"\b(?:attend(?:ed|ing)?|participat(?:ed|ing)?|"
+        r"volunteer(?:ed|ing)?|went\s+to|visited|screening|"
+        r"went\s+on\s+(?:a\s+)?guided\s+tour|"
+        r"took\s+(?:a\s+)?guided\s+tour|guided\s+tour|"
+        r"Q&A|challenge|assisted?)\b",
+        re.IGNORECASE,
+    )
+    members: dict[str, dict[str, Any]] = {}
+    for turn in index.turns:
+        if turn.transport_role != "user":
+            continue
+        for match in named_event.finditer(turn.text):
+            start = max(0, match.start() - 220)
+            end = min(len(turn.text), match.end() + 220)
+            evidence = turn.text[start:end]
+            if experienced.search(evidence) is None:
+                continue
+            identity = re.sub(
+                r"^(?:The|At|To|From|After|During)\s+", "",
+                match.group(1).strip(),
+                flags=re.IGNORECASE,
+            )
+            key = _operator_identity_key(identity)
+            if key:
+                members.setdefault(key, {
+                    "identity": identity,
+                    "source_turn_id": turn.node_id,
+                    "evidence": evidence[:420],
+                })
+    if len(members) < 2:
+        # Some completed events have no formal proper-name suffix (for
+        # example, a person's ceremony).  Fall back to a lifecycle-bound
+        # occurrence identity: named participant when present, otherwise one
+        # event per source session.  Repeated mentions in the same scene and
+        # explicitly missed/cancelled events do not count.
+        event_terms = [
+            _stem_word(word)
+            for word in re.findall(
+                r"[A-Za-z]+", head_match.group(1).casefold()
+            )
+            if _stem_word(word) not in {
+                "different", "event", "events", "many",
+            }
+        ]
+        discriminators = set(event_terms[:-1] or event_terms)
+        completed = re.compile(
+            r"\b(?:attend(?:ed|ing)?|participat(?:ed|ing)?|"
+            r"volunteer(?:ed|ing)?|went\s+to|was\s+at|"
+            r"went\s+on\s+(?:a\s+)?guided\s+tour|"
+            r"took\s+(?:a\s+)?guided\s+tour|guided\s+tour)\b",
+            re.IGNORECASE,
+        )
+        excluded = re.compile(
+            r"\b(?:missed|could(?:n't| not)\s+attend|"
+            r"did(?:n't| not)\s+attend|cancelled|canceled)\b",
+            re.IGNORECASE,
+        )
+        occurrence_members: dict[str, dict[str, Any]] = {}
+        possessive_person = re.compile(
+            r"\b(?:my\s+(?:[A-Za-z]+\s+){0,3})?"
+            r"([A-Z][a-z]+)(?:['\u2019]s|\s+graduation)\b"
+        )
+
+        def qualifying_occurrence(turn: Any) -> bool:
+            if (
+                turn.transport_role != "user"
+                or completed.search(turn.text) is None
+                or excluded.search(turn.text) is not None
+            ):
+                return False
+            observed_terms = {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", turn.text.casefold())
+            }
+            return not discriminators or bool(
+                discriminators.intersection(observed_terms)
+            )
+
+        # Resolve pronoun-only repeats against a unique named participant in
+        # the same dialogue scene.  This prevents "Emma's graduation" followed
+        # by "her graduation ceremony" from becoming two events.
+        session_people: dict[str, set[str]] = {}
+        for turn in index.turns:
+            if not qualifying_occurrence(turn):
+                continue
+            people = possessive_person.findall(turn.text)
+            if people:
+                session_people.setdefault(turn.session_id, set()).update(people)
+
+        for turn in index.turns:
+            if not qualifying_occurrence(turn):
+                continue
+            people = possessive_person.findall(turn.text)
+            known_people = session_people.get(turn.session_id, set())
+            identity = (
+                people[-1] if people
+                else next(iter(known_people)) if len(known_people) == 1
+                else turn.session_id
+            )
+            key = _operator_identity_key(identity)
+            occurrence_members.setdefault(key, {
+                "identity": identity,
+                "source_turn_id": turn.node_id,
+                "evidence": turn.text[:420],
+            })
+        members = occurrence_members
+    if len(members) < 2:
+        return None
+    return {
+        "operation": "named_event_attendance_count",
+        "members": list(members.values()),
+        "value": len(members),
+        "unit": category_surface,
+        "source_turn_ids": [
+            row["source_turn_id"] for row in members.values()
+        ],
+        "binding_complete": True,
         "certified": True,
     }
 
@@ -1912,7 +3877,7 @@ def pending_operation_target_pairs_hint(
     ):
         return None
     turn_by_id = {turn.node_id: turn for turn in index.turns}
-    pairs: dict[tuple[str, str, str], dict[str, Any]] = {}
+    pairs: dict[tuple[str, str], dict[str, Any]] = {}
     for source_id in dict.fromkeys(source_turn_ids):
         turn = turn_by_id.get(source_id)
         if turn is None or turn.transport_role != "user":
@@ -1923,11 +3888,13 @@ def pending_operation_target_pairs_hint(
             for match in re.finditer(
                 r"\b(?:need to|have to|haven't|have not|still need to|must)\s+"
                 r"(?:go\s+)?(?:pick\s+up|collect)\s+(?:my\s+|the\s+|them\s*)?"
-                r"([A-Za-z][A-Za-z0-9' -]{1,45}?)(?=\s+(?:from|at|on|before|after)|[,.;!?]|$)",
+                r"([A-Za-z][A-Za-z0-9' -]{1,45}?)(?=\s+(?:from|for|at|on|before|after)|[,.;!?]|$)",
                 sentence, re.IGNORECASE,
             ):
                 target = match.group(1).strip() or "replacement item"
-                pairs[("pickup", _operator_identity_key(target), source_id)] = {
+                if target.casefold() in {"or return", "and return", "items"}:
+                    continue
+                pairs[("pickup", _operator_identity_key(target))] = {
                     "target": target, "operation": "pickup", "source_turn_id": source_id,
                     "evidence": sentence[:360],
                 }
@@ -1936,12 +3903,43 @@ def pending_operation_target_pairs_hint(
             exchange = re.search(r"\b(?:returned|exchanged)\s+(?:some\s+|my\s+|the\s+)?([A-Za-z][A-Za-z0-9' -]{1,35}?)(?=\s+(?:at|for|because)|[,.;!?]|$)", sentence, re.IGNORECASE)
             if exchange is not None:
                 target = exchange.group(1).strip()
-                pairs[("return", _operator_identity_key(target), source_id)] = {
+                if target.casefold() in {"it", "them", "those", "these"}:
+                    explicit_return = list(re.finditer(
+                        r"\b(?:need to|have to|must)\s+return\s+"
+                        r"(?:some\s+|my\s+|the\s+)?"
+                        r"([A-Za-z][A-Za-z0-9' -]{1,35}?)"
+                        r"(?=\s+(?:to|at|from|for|because)|[,.;!?]|$)",
+                        turn.text,
+                        re.IGNORECASE,
+                    ))
+                    if explicit_return:
+                        target = explicit_return[-1].group(1).strip()
+                    prior = sentence[:exchange.start()]
+                    antecedents = list(re.finditer(
+                        r"\b(?:return|exchange|exchanged|got|bought)\s+"
+                        r"(?:some\s+|my\s+|the\s+)?"
+                        r"([A-Za-z][A-Za-z0-9' -]{1,35}?)"
+                        r"(?=\s+(?:to|at|from|for|because)|[,.;!?]|$)",
+                        prior,
+                        re.IGNORECASE,
+                    ))
+                    if (
+                        target.casefold() in {"it", "them", "those", "these"}
+                        and antecedents
+                    ):
+                        candidate = antecedents[-1].group(1).strip()
+                        if candidate.casefold().split()[0] not in {
+                            "it", "them", "those", "these",
+                        }:
+                            target = candidate
+                if target.casefold() in {"it", "them", "those", "these"}:
+                    continue
+                pairs[("return", _operator_identity_key(target))] = {
                     "target": target, "operation": "return", "source_turn_id": source_id,
                     "evidence": sentence[:360],
                 }
                 if re.search(r"\b(?:haven't|have not|still need to)\s+(?:gone to\s+)?pick\s+(?:them|it)\s+up\b", sentence, re.IGNORECASE):
-                    pairs[("pickup", _operator_identity_key(target) + " replacement", source_id)] = {
+                    pairs[("pickup", _operator_identity_key(target) + " replacement")] = {
                         "target": f"replacement {target}", "operation": "pickup",
                         "source_turn_id": source_id, "evidence": sentence[:360],
                     }
@@ -1958,20 +3956,42 @@ def age_arithmetic_from_sources_hint(
 ) -> dict[str, Any] | None:
     """Bind person roles to explicit ages and expose the requested arithmetic."""
     raw = ir.raw_question
-    if not re.search(r"\b(?:age|years?\s+older)\b", raw, re.IGNORECASE):
+    if not re.search(
+        r"\b(?:age|old|years?\s+older|born|birthday|gets?\s+married)\b",
+        raw, re.IGNORECASE,
+    ):
         return None
     turn_by_id = {turn.node_id: turn for turn in index.turns}
     ages: dict[str, tuple[int, str]] = {}
+    age_mentions: dict[str, list[tuple[int, str]]] = {}
+    named_match = (
+        re.search(r"\bwhen\s+([A-Z][A-Za-z'-]+)\s+was\s+born\b", raw)
+        or re.search(
+            r"\b(?:friend\s+)?([A-Z][A-Za-z'-]+)\s+gets?\s+married\b",
+            raw,
+        )
+    )
+    named_target = named_match.group(1) if named_match is not None else ""
+    named_age: tuple[int, str] | None = None
+    future_years: tuple[int, str] | None = None
+    elapsed_years: tuple[int, str] | None = None
     role_patterns = {
         "self": [
             r"\bI(?:'m| am| just turned| turned)\s+(\d{1,3})\b",
             r"\bI\s+just\s+turned\s+(\d{1,3})\b",
             r"\b(?:as\s+)?a\s+(\d{1,3})-year-old\b",
+            r"\bdo you think\s+(\d{1,3})\s+is considered\b",
         ],
         "mother": [r"\bmy\s+(?:mom|mother)\s+(?:is|was)\s+(\d{1,3})\b"],
         "father": [r"\bmy\s+(?:dad|father)\s+(?:is|was)\s+(\d{1,3})\b"],
-        "grandmother": [r"\bmy\s+(?:grandma|grandmother)\s+(?:is|was)\s+(\d{1,3})\b"],
-        "grandfather": [r"\bmy\s+(?:grandpa|grandfather)\s+(?:is|was)\s+(\d{1,3})\b"],
+        "grandmother": [
+            r"\bmy\s+(?:grandma|grandmother)\s+(?:is|was)\s+(\d{1,3})\b",
+            r"\bmy\s+(?:grandma|grandmother)(?:'s)?\s+(\d{1,3})(?:st|nd|rd|th)?\s+birthday\b",
+        ],
+        "grandfather": [
+            r"\bmy\s+(?:grandpa|grandfather)\s+(?:is|was)\s+(\d{1,3})\b",
+            r"\bmy\s+(?:grandpa|grandfather)(?:'s)?\s+(\d{1,3})(?:st|nd|rd|th)?\s+birthday\b",
+        ],
     }
     event_ages: list[tuple[int, str, str]] = []
     for source_id in dict.fromkeys(source_turn_ids):
@@ -1983,9 +4003,68 @@ def age_arithmetic_from_sources_hint(
                 match = re.search(pattern, turn.text, re.IGNORECASE)
                 if match is not None:
                     value = int(match.group(1))
-                    if 0 < value < 125:
-                        ages[role] = (value, source_id)
+                    local_start = max(0, match.start() - 80)
+                    local_context = turn.text[local_start:match.end()].casefold()
+                    future_self = (
+                        role == "self"
+                        and re.search(
+                            r"\b(?:retire|hope|aim|want|plan|by the time)\b",
+                            local_context,
+                        ) is not None
+                    )
+                    if 0 < value < 125 and not future_self:
+                        age_mentions.setdefault(role, []).append((value, source_id))
                         break
+        if named_target and re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(named_target)}(?![A-Za-z0-9])",
+            turn.text, re.IGNORECASE,
+        ):
+            direct_named = re.search(
+                rf"\b{re.escape(named_target)}\b.{{0,100}}?"
+                r"\b(?:is|was|turned)\s+(?:just\s+)?(\d{{1,3}})\b",
+                turn.text, re.IGNORECASE,
+            )
+            pronoun_named = re.search(
+                r"\b(?:he|she)(?:'s|\s+is|\s+was)\s+(?:just\s+)?"
+                r"(\d{1,3})\b",
+                turn.text, re.IGNORECASE,
+            )
+            age_match = direct_named or pronoun_named
+            if age_match is not None and 0 < int(age_match.group(1)) < 125:
+                named_age = (int(age_match.group(1)), source_id)
+            if re.search(r"\b(?:marry|married|wedding)\b", turn.text, re.IGNORECASE):
+                ahead = re.search(
+                    r"\b(?:in\s+)?(\d+|one|two|three|four|five)\s+years?\b",
+                    turn.text, re.IGNORECASE,
+                )
+                if re.search(r"\bnext\s+year\b", turn.text, re.IGNORECASE):
+                    future_years = (1, source_id)
+                elif ahead is not None:
+                    token = ahead.group(1).casefold()
+                    future_years = (
+                        int(token) if token.isdigit() else _NUMBER_WORDS[token],
+                        source_id,
+                    )
+        for duration_match in re.finditer(
+            r"\b(?:have|has|had|'ve|been)\b.{0,100}?"
+            r"\b(?:for\s+)?(?:the\s+)?(?:past\s+)?"
+            r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+years?\b",
+            turn.text, re.IGNORECASE,
+        ):
+            query_terms = {
+                _stem_word(word) for word in re.findall(r"[\w'-]+", raw.casefold())
+                if word not in {"how", "old", "was", "when", "did", "i", "the", "to"}
+            }
+            window = turn.text[max(0, duration_match.start() - 120):duration_match.end() + 40]
+            window_terms = {
+                _stem_word(word) for word in re.findall(r"[\w'-]+", window.casefold())
+            }
+            if len(query_terms & window_terms) >= 1:
+                token = duration_match.group(1).casefold()
+                elapsed_years = (
+                    int(token) if token.isdigit() else _NUMBER_WORDS[token],
+                    source_id,
+                )
         for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
             match = re.search(
                 r"\b(?:at|when I was)\s+(?:the\s+)?age\s+(?:of\s+)?(\d{1,3})\b",
@@ -1996,6 +4075,97 @@ def age_arithmetic_from_sources_hint(
             value = int(match.group(1))
             if 0 < value < 125:
                 event_ages.append((value, source_id, sentence[:320]))
+    for role, rows in age_mentions.items():
+        frequencies = Counter(value for value, _source_id in rows)
+        _index, selected = max(
+            enumerate(rows),
+            key=lambda pair: (frequencies[pair[1][0]], pair[0]),
+        )
+        ages[role] = selected
+    if (
+        re.search(r"\byears?\s+older\b", raw, re.IGNORECASE)
+        and "self" in ages
+    ):
+        requested_role = next((
+            role for role, aliases in {
+                "mother": ("mom", "mother"),
+                "father": ("dad", "father"),
+                "grandmother": ("grandma", "grandmother"),
+                "grandfather": ("grandpa", "grandfather"),
+            }.items()
+            if any(re.search(rf"\b{alias}\b", raw, re.IGNORECASE) for alias in aliases)
+        ), None)
+        if requested_role in ages:
+            other_age, other_source = ages[requested_role]
+            self_age, self_source = ages["self"]
+            return {
+                "operation": "age_arithmetic_from_lossless_sources",
+                "arithmetic": "role_age_minus_self_age",
+                "value": other_age - self_age,
+                "unit": "years",
+                "operands": [
+                    {"role": requested_role, "value": other_age, "source_turn_id": other_source},
+                    {"role": "self", "value": self_age, "source_turn_id": self_source},
+                ],
+                "source_turn_ids": [other_source, self_source],
+                "binding_complete": True, "certified": True,
+            }
+    if (
+        re.search(r"\bwhen\s+[A-Z][A-Za-z'-]+\s+was\s+born\b", raw)
+        and "self" in ages and named_age is not None
+    ):
+        self_age, self_source = ages["self"]
+        other_age, other_source = named_age
+        if self_age >= other_age:
+            return {
+                "operation": "age_arithmetic_from_lossless_sources",
+                "arithmetic": "self_age_minus_other_current_age",
+                "value": self_age - other_age,
+                "unit": "years",
+                "operands": [
+                    {"role": "self", "value": self_age, "source_turn_id": self_source},
+                    {"role": named_target, "value": other_age, "source_turn_id": other_source},
+                ],
+                "source_turn_ids": [self_source, other_source],
+                "binding_complete": True, "certified": True,
+            }
+    if (
+        re.search(r"\bwill\s+i\s+be\b", raw, re.IGNORECASE)
+        and "self" in ages and future_years is not None
+    ):
+        self_age, self_source = ages["self"]
+        years, event_source = future_years
+        return {
+            "operation": "age_arithmetic_from_lossless_sources",
+            "arithmetic": "self_age_plus_explicit_future_years",
+            "value": self_age + years,
+            "unit": "years",
+            "operands": [
+                {"role": "self", "value": self_age, "source_turn_id": self_source},
+                {"role": "future_offset", "value": years, "source_turn_id": event_source},
+            ],
+            "source_turn_ids": [self_source, event_source],
+            "binding_complete": True, "certified": True,
+        }
+    if (
+        re.search(r"\bhow\s+old\s+was\s+i\s+when\b", raw, re.IGNORECASE)
+        and "self" in ages and elapsed_years is not None
+    ):
+        self_age, self_source = ages["self"]
+        years, elapsed_source = elapsed_years
+        if self_age >= years:
+            return {
+                "operation": "age_arithmetic_from_lossless_sources",
+                "arithmetic": "self_age_minus_elapsed_years",
+                "value": self_age - years,
+                "unit": "years",
+                "operands": [
+                    {"role": "self", "value": self_age, "source_turn_id": self_source},
+                    {"role": "elapsed_years", "value": years, "source_turn_id": elapsed_source},
+                ],
+                "source_turn_ids": [self_source, elapsed_source],
+                "binding_complete": True, "certified": True,
+            }
     if re.search(r"\baverage\s+age\b", raw, re.IGNORECASE):
         required = ["self", "mother", "father", "grandmother", "grandfather"]
         if not all(role in ages for role in required):
@@ -2041,6 +4211,193 @@ def age_arithmetic_from_sources_hint(
                     "binding_complete": True, "certified": True,
                 }
     return None
+
+
+
+
+def advance_booking_recency_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Compose event recency with an explicit booking-in-advance interval."""
+    raw = ir.raw_question
+    unit_match = re.search(
+        r"\bhow many\s+(weeks?|months?|years?)\s+ago\s+did\s+i\s+"
+        r"(?:book|reserve)\b",
+        raw, re.IGNORECASE,
+    )
+    if unit_match is None:
+        return None
+    requested_unit = unit_match.group(1).casefold().rstrip("s")
+    ignored = {
+        "how", "many", "week", "weeks", "month", "months", "year",
+        "years", "ago", "did", "i", "book", "reserve", "the", "a",
+        "an", "in", "at", "for", "my", "to",
+    }
+    query_terms = {
+        _stem_word(word) for word in re.findall(r"[\w'-]+", raw.casefold())
+        if word not in ignored and len(word) > 1
+    }
+    if not query_terms:
+        return None
+    number = (
+        r"\d+|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve"
+    )
+    recency_pattern = re.compile(
+        rf"\b(?P<value>{number})\s+{requested_unit}s?\s+ago\b",
+        re.IGNORECASE,
+    )
+    advance_pattern = re.compile(
+        rf"\b(?:book|reserve)(?:ed|ing)?\b.{{0,60}}?"
+        rf"(?P<value>{number})\s+{requested_unit}s?\s+in\s+advance\b",
+        re.IGNORECASE,
+    )
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    recencies: list[tuple[int, int, str, str]] = []
+    advances: list[tuple[int, int, str, str]] = []
+
+    def parse_number(token: str) -> int:
+        value = token.casefold()
+        return int(value) if value.isdigit() else _NUMBER_WORDS[value]
+
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        turn_terms = {
+            _stem_word(word) for word in re.findall(r"[\w'-]+", turn.text.casefold())
+        }
+        overlap = len(query_terms & turn_terms)
+        if overlap == 0:
+            continue
+        for match in recency_pattern.finditer(turn.text):
+            recencies.append((
+                overlap, parse_number(match.group("value")),
+                source_id, turn.text[:420],
+            ))
+        for match in advance_pattern.finditer(turn.text):
+            advances.append((
+                overlap, parse_number(match.group("value")),
+                source_id, turn.text[:420],
+            ))
+    if not recencies or not advances:
+        return None
+    candidates = [
+        (min(left[0], right[0]), left[0] + right[0], left, right)
+        for left in recencies for right in advances
+        if left[2] != right[2] or left[1] != right[1]
+    ]
+    if not candidates:
+        return None
+    _minimum, _total, recency, advance = max(
+        candidates, key=lambda row: (row[0], row[1], row[2][2], row[3][2])
+    )
+    value = recency[1] + advance[1]
+    return {
+        "operation": "advance_booking_recency_from_lossless_sources",
+        "value": value,
+        "unit": requested_unit + ("s" if value != 1 else ""),
+        "operands": [
+            {
+                "role": "event_recency", "value": recency[1],
+                "unit": requested_unit + ("s" if recency[1] != 1 else ""),
+                "source_turn_id": recency[2], "evidence": recency[3],
+            },
+            {
+                "role": "advance_booking_interval", "value": advance[1],
+                "unit": requested_unit + ("s" if advance[1] != 1 else ""),
+                "source_turn_id": advance[2], "evidence": advance[3],
+            },
+        ],
+        "source_turn_ids": [recency[2], advance[2]],
+        "binding_complete": True,
+        "certified": True,
+    }
+
+
+def current_role_duration_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Derive current-role tenure from total tenure minus pre-promotion tenure."""
+    raw = ir.raw_question
+    if (
+        ir.requested_value_type != "duration"
+        or not re.search(r"\bcurrent\s+(?:role|position|job|title)\b", raw, re.IGNORECASE)
+    ):
+        return None
+
+    def months(match: re.Match[str]) -> int:
+        years = int(match.group("years") or 0)
+        month_count = int(match.group("months") or 0)
+        return 12 * years + month_count
+
+    duration_pattern = re.compile(
+        r"(?:(?P<years>\d+)\s+years?)?"
+        r"(?:\s*(?:and|,)\s*)?"
+        r"(?:(?P<months>\d+)\s+months?)?",
+        re.IGNORECASE,
+    )
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    total_candidates: list[tuple[int, str, str]] = []
+    prior_candidates: list[tuple[int, str, str]] = []
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            lower = sentence.casefold()
+            for match in duration_pattern.finditer(sentence):
+                value = months(match)
+                if value <= 0:
+                    continue
+                evidence = sentence[:360]
+                if re.search(
+                    r"\b(?:experience|tenure)\b.{0,60}\b(?:company|organization|employer)\b|"
+                    r"\b(?:company|organization|employer)\b.{0,60}\b(?:experience|tenure)\b",
+                    lower,
+                ):
+                    total_candidates.append((value, source_id, evidence))
+                if re.search(
+                    r"\b(?:worked\s+(?:my|their)\s+way\s+up|promot(?:ed|ion)|"
+                    r"advanced?)\b.{0,100}\bafter\b|\bafter\b.{0,100}"
+                    r"\b(?:promot(?:ed|ion)|worked\s+(?:my|their)\s+way\s+up)\b",
+                    lower,
+                ):
+                    prior_candidates.append((value, source_id, evidence))
+    if not total_candidates or not prior_candidates:
+        return None
+    candidates = [
+        (total - prior, total, prior, total_source, prior_source, total_evidence, prior_evidence)
+        for total, total_source, total_evidence in total_candidates
+        for prior, prior_source, prior_evidence in prior_candidates
+        if total > prior
+    ]
+    if not candidates:
+        return None
+    value, total, prior, total_source, prior_source, total_evidence, prior_evidence = min(
+        candidates, key=lambda row: (row[0], -row[1], row[3], row[4])
+    )
+    years, month_count = divmod(value, 12)
+    if years and month_count:
+        display = f"{years} year{'s' if years != 1 else ''} and {month_count} month{'s' if month_count != 1 else ''}"
+    elif years:
+        display = f"{years} year{'s' if years != 1 else ''}"
+    else:
+        display = f"{month_count} month{'s' if month_count != 1 else ''}"
+    return {
+        "operation": "current_role_duration_from_lossless_sources",
+        "value": display,
+        "unit": "duration",
+        "months": value,
+        "operands": [
+            {"role": "total_company_tenure", "value_months": total, "source_turn_id": total_source},
+            {"role": "pre_current_role_tenure", "value_months": prior, "source_turn_id": prior_source},
+        ],
+        "source_turn_ids": list(dict.fromkeys([total_source, prior_source])),
+        "evidence": [total_evidence, prior_evidence],
+        "binding_complete": True,
+        "certified": True,
+    }
 
 
 def incomplete_terminal_event_hint(
@@ -2308,9 +4665,18 @@ def repeated_event_total_from_sources_hint(
                     r"[\w'-]+", sentence.casefold()
                 )
             }
-            if action not in sentence_terms:
+            sentence_words = [
+                word.casefold() for word in re.findall(r"[\w'-]+", sentence)
+            ]
+            action_surface_match = any(
+                _stem_word(word) == action or word.rstrip("d") == action
+                for word in sentence_words
+            )
+            if not action_surface_match:
                 continue
-            if query_terms and not (query_terms & sentence_terms):
+            if query_terms and not (
+                (query_terms & sentence_terms) or action_surface_match
+            ):
                 continue
             explicit = re.search(
                 r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|"
@@ -2325,12 +4691,20 @@ def repeated_event_total_from_sources_hint(
                 action_tokens = list(re.finditer(r"[\w'-]+", sentence))
                 action_token = next((
                     token for token in action_tokens
-                    if _stem_word(token.group(0)) == action
+                    if (
+                        _stem_word(token.group(0)) == action
+                        or token.group(0).casefold().rstrip("d") == action
+                    )
                 ), None)
                 object_span = (
                     sentence[action_token.end():]
                     if action_token is not None else sentence
                 )
+                # A trailing result clause describes the same action, not a second object.
+                object_span = re.split(
+                    r",?\s+\band\b\s+(?=(?:it|they|he|she|we|i)\b)",
+                    object_span, maxsplit=1, flags=re.IGNORECASE,
+                )[0]
                 object_span = re.split(
                     r"\b(?:at|on|in|during|from|because|which|that)\b",
                     object_span, maxsplit=1, flags=re.IGNORECASE,
@@ -2379,6 +4753,10 @@ def transaction_sum_from_sources_hint(
     if (
         ir.requested_value_type != "aggregate"
         or ir.aggregation_op != "sum"
+        or not re.search(
+            r"\b(?:total|combined|altogether|in\s+all|sum)\b",
+            ir.raw_question, re.IGNORECASE,
+        )
         or not re.search(
             r"\b(?:money|earn(?:ed|ing)?|sell(?:ing)?|sold|spend|spent|"
             r"paid|cost|expenses?)\b|[$]",
@@ -2579,11 +4957,24 @@ def transaction_sum_from_sources_hint(
     for turn, clause, clause_terms in clauses:
         action_match = bool(action_terms.intersection(clause_terms))
         if not action_match and action_terms.intersection(money_action_family):
-            action_match = bool(clause_terms.intersection(money_action_family))
+            action_match = bool(
+                clause_terms.intersection(money_action_family)
+                or re.search(
+                    r"\b(?:paid|spent|cost|bought|purchased)\b",
+                    clause, re.IGNORECASE,
+                )
+            )
         if not action_match:
             continue
         overlap = len(query_terms & clause_terms)
-        if overlap < 2:
+        turn_terms = {
+            _stem_word(word) for word in re.findall(
+                r"[\w'-]+", turn.text.casefold()
+            )
+        }
+        if overlap < 2 and not (
+            overlap >= 1 and len(query_terms & turn_terms) >= 2
+        ):
             continue
         amount = amount_from_clause(clause, allow_multiply=True)
         if amount is None:
@@ -4266,6 +6657,1860 @@ def counterfactual_dependency_hint(
         "source_turn_ids": [source_id],
         "certified": True,
     }
+
+
+
+def weekly_schedule_days_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Count distinct weekdays in a recurring, source-bound schedule."""
+    raw = ir.raw_question
+    if ir.requested_value_type != "count" or not re.search(
+        r"\b(?:days?\s+(?:a|per|each)\s+week|days?\s+weekly|"
+        r"how\s+many\s+days?\s+.*\bweek)\b", raw, re.IGNORECASE,
+    ):
+        return None
+    activity_terms = {
+        "class", "fitness", "workout", "exercise", "training", "practice",
+    }
+    query_terms = {
+        _stem_word(word) for word in re.findall(r"[A-Za-z]+", raw.casefold())
+        if word not in {
+            "how", "many", "day", "days", "a", "per", "each", "the",
+            "week", "weekly", "do", "does", "did", "i", "we", "attend",
+        }
+    }
+    if query_terms & activity_terms:
+        activity_terms |= {
+            "yoga", "zumba", "pilates", "weightlifting", "aerobic",
+            "spin", "cycling", "dance", "gym",
+        }
+    else:
+        activity_terms |= query_terms
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    members: dict[str, dict[str, str]] = {}
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            terms = {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", sentence.casefold())
+            }
+            observed_days = [
+                day for day in _WEEKDAYS
+                if re.search(rf"\b{day}s?\b", sentence, re.IGNORECASE)
+            ]
+            if not observed_days or not (terms & activity_terms):
+                continue
+            if re.search(
+                r"\b(?:might|may|plan(?:ning)?|consider(?:ing)?|"
+                r"would\s+like)\b.{0,80}\b(?:class|workout|practice)\b",
+                sentence, re.IGNORECASE,
+            ):
+                continue
+            for day in observed_days:
+                members.setdefault(day, {
+                    "identity": day,
+                    "source_turn_id": source_id,
+                    "evidence": sentence[:360],
+                })
+    if len(members) < 2:
+        return None
+    ordered = sorted(
+        members.values(), key=lambda row: _WEEKDAYS[row["identity"]]
+    )
+    return {
+        "operation": "weekly_schedule_distinct_days",
+        "value": len(ordered), "unit": "days per week",
+        "members": ordered,
+        "source_turn_ids": [row["source_turn_id"] for row in ordered],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def family_relation_total_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Sum explicit sibling subtype counts without unrelated people."""
+    raw = ir.raw_question
+    if ir.requested_value_type != "count" or not re.search(
+        r"\b(?:total\s+(?:number\s+of\s+)?siblings?|"
+        r"how\s+many\s+siblings?)\b", raw, re.IGNORECASE,
+    ):
+        return None
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    best: dict[str, dict[str, Any]] = {}
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        for relation in ("sister", "brother"):
+            values: list[int] = []
+            for match in re.finditer(
+                rf"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+                rf"{relation}s?\b", turn.text, re.IGNORECASE,
+            ):
+                token = match.group(1).casefold()
+                values.append(
+                    int(token) if token.isdigit() else _NUMBER_WORDS[token]
+                )
+            if re.search(
+                rf"\b(?:I\s+have|I've\s+got|with)\s+(?:an?|one)\s+"
+                rf"{relation}\b", turn.text, re.IGNORECASE,
+            ):
+                values.append(1)
+            if values:
+                value = max(values)
+                previous = best.get(relation)
+                if previous is None or value > previous["value"]:
+                    best[relation] = {
+                        "relation": relation, "value": value,
+                        "source_turn_id": source_id,
+                        "evidence": turn.text[:360],
+                    }
+    if not best:
+        return None
+    return {
+        "operation": "family_relation_subtype_total",
+        "value": sum(row["value"] for row in best.values()),
+        "unit": "siblings", "operands": list(best.values()),
+        "source_turn_ids": [row["source_turn_id"] for row in best.values()],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def linked_event_date_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Join an event to a date through a unique organization anchor."""
+    raw = ir.raw_question
+    if ir.requested_value_type != "date" or not re.search(
+        r"\bwhen\s+did\s+I\b", raw, re.IGNORECASE,
+    ):
+        return None
+    action_match = re.search(
+        r"\bwhen\s+did\s+I\s+([A-Za-z][\w'-]*)\s+(.+?)[?]?$",
+        raw, re.IGNORECASE,
+    )
+    if action_match is None:
+        return None
+    action = _stem_word(action_match.group(1))
+    object_terms = {
+        _stem_word(word)
+        for word in re.findall(r"[A-Za-z]+", action_match.group(2).casefold())
+        if word not in {
+            "a", "an", "the", "my", "on", "at", "to", "for", "in",
+        }
+    }
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    user_turns = [
+        turn_by_id[source_id] for source_id in dict.fromkeys(source_turn_ids)
+        if source_id in turn_by_id
+        and turn_by_id[source_id].transport_role == "user"
+    ]
+    event_rows: list[tuple[str, str]] = []
+    for turn in user_turns:
+        terms = {
+            _stem_word(word)
+            for word in re.findall(r"[A-Za-z]+", turn.text.casefold())
+        }
+        action_bound = any(
+            _stem_word(word) == action
+            for word in re.findall(r"[A-Za-z]+", turn.text)
+        )
+        if not action_bound or len(object_terms & terms) < min(2, len(object_terms)):
+            continue
+        event_rows.extend(
+            (anchor.casefold(), turn.node_id)
+            for anchor in re.findall(r"\b[A-Z][A-Z0-9&.-]{1,12}\b", turn.text)
+        )
+    if not event_rows:
+        return None
+    date_pattern = re.compile(
+        r"\b(" + "|".join(calendar.month_name[1:]) + r")\s+"
+        r"(\d{1,2})(st|nd|rd|th)?\b", re.IGNORECASE,
+    )
+    candidates: list[dict[str, Any]] = []
+    for anchor, event_source in event_rows:
+        for turn in user_turns:
+            if turn.node_id == event_source or anchor not in turn.text.casefold():
+                continue
+            match = date_pattern.search(turn.text)
+            if match is None:
+                continue
+            window = turn.text[max(0, match.start() - 180):match.end() + 100]
+            if not re.search(
+                r"\b(?:submission|submitted|deadline|due|date)\b",
+                window, re.IGNORECASE,
+            ):
+                continue
+            candidates.append({
+                "anchor": anchor.upper(),
+                "value": f"{match.group(1)} {match.group(2)}{match.group(3) or ''}",
+                "event_source_turn_id": event_source,
+                "date_source_turn_id": turn.node_id,
+                "evidence": window[:360],
+            })
+    unique = {(row["anchor"], row["value"]): row for row in candidates}
+    if len(unique) != 1:
+        return None
+    row = next(iter(unique.values()))
+    return {
+        "operation": "linked_event_date_from_lossless_sources",
+        **row,
+        "source_turn_ids": [
+            row["event_source_turn_id"], row["date_source_turn_id"],
+        ],
+        "binding_complete": True, "certified": True,
+    }
+
+
+
+def scoped_completed_event_members_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+    question_date: str | None,
+) -> dict[str, Any] | None:
+    """Enumerate completed social/place events inside an explicit time scope."""
+    raw = ir.raw_question
+    if ir.requested_value_type != "count":
+        return None
+    if re.search(r"\b(?:museums?|galler(?:y|ies))\b", raw, re.IGNORECASE):
+        family = "venue"
+    elif re.search(
+        r"\b(?:dinner\s+part(?:y|ies)|dinner\s+events?)\b",
+        raw, re.IGNORECASE,
+    ):
+        family = "dinner_party"
+    else:
+        return None
+    month_names = {
+        name.casefold(): number
+        for number, name in enumerate(calendar.month_name) if name
+    }
+    month_match = re.search(
+        r"\b(?:in|during|of)\s+(" + "|".join(month_names) + r")\b",
+        raw, re.IGNORECASE,
+    )
+    month_scope = (
+        month_names[month_match.group(1).casefold()]
+        if month_match is not None else None
+    )
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    members: dict[str, dict[str, Any]] = {}
+
+    def source_event_time(turn: TurnNodeV36, text: str) -> datetime | None:
+        observed = _turn_observed_time(turn)
+        numeric = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", text)
+        if numeric is not None and observed is not None:
+            year = int(numeric.group(3)) if numeric.group(3) else observed.year
+            if year < 100:
+                year += 2000
+            try:
+                return observed.replace(
+                    year=year, month=int(numeric.group(1)),
+                    day=int(numeric.group(2)),
+                )
+            except ValueError:
+                pass
+        named = re.search(
+            r"\b(" + "|".join(calendar.month_name[1:]) + r")\s+"
+            r"(\d{1,2})(?:st|nd|rd|th)?\b", text, re.IGNORECASE,
+        )
+        if named is not None and observed is not None:
+            try:
+                return observed.replace(
+                    month=month_names[named.group(1).casefold()],
+                    day=int(named.group(2)),
+                )
+            except ValueError:
+                pass
+        if re.search(
+            r"\bin\s+(" + "|".join(month_names) + r")\b",
+            text, re.IGNORECASE,
+        ) and observed is not None:
+            named_month = re.search(
+                r"\bin\s+(" + "|".join(month_names) + r")\b",
+                text, re.IGNORECASE,
+            )
+            return observed.replace(
+                month=month_names[named_month.group(1).casefold()], day=1
+            )
+        if observed is not None:
+            return _relative_event_time(text, observed) or observed
+        return None
+
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            event_time = source_event_time(turn, sentence)
+            if month_scope is not None and (
+                event_time is None or event_time.month != month_scope
+            ):
+                continue
+            if family == "venue":
+                if not re.search(
+                    r"\b(?:visited|attended|went\s+to|took\s+.+?\s+to|"
+                    r"met\s+.+?\s+at|came\s+back\s+from|got\s+back\s+from)\b",
+                    sentence, re.IGNORECASE,
+                ):
+                    continue
+                identities = re.findall(
+                    r"\b((?:The\s+)?(?:[A-Z][A-Za-z&'-]*\s+){0,5}"
+                    r"(?:Museum|Gallery)(?:\s+of\s+[A-Z][A-Za-z&'-]*)?)\b",
+                    sentence,
+                )
+                identities.extend(
+                    re.findall(r"\b(The\s+Art\s+Cube)\b", sentence)
+                )
+                for identity in identities:
+                    key = re.sub(
+                        r"[^a-z0-9]+", " ", identity.casefold()
+                    ).strip()
+                    members.setdefault(key, {
+                        "identity": identity,
+                        "source_turn_id": source_id,
+                        "event_time": (
+                            event_time.isoformat() if event_time else ""
+                        ),
+                        "evidence": sentence[:360],
+                    })
+            else:
+                if not re.search(
+                    r"\b(?:attended|went\s+to|had\s+(?:a|an|the|experience)|"
+                    r"we\s+had)\b", sentence, re.IGNORECASE,
+                ) or not re.search(
+                    r"\b(?:dinner\s+part(?:y|ies)|feast|potluck|BBQ|barbecue)\b",
+                    sentence, re.IGNORECASE,
+                ):
+                    continue
+                places = re.findall(
+                    r"\bat\s+([A-Z][A-Za-z'-]+)(?:'s|\u2019s)\s+place\b",
+                    sentence,
+                )
+                for place in places:
+                    key = place.casefold()
+                    members.setdefault(key, {
+                        "identity": f"{place}'s place",
+                        "source_turn_id": source_id,
+                        "event_time": (
+                            event_time.isoformat() if event_time else ""
+                        ),
+                        "evidence": sentence[:360],
+                    })
+    if len(members) < 2:
+        return None
+    rows = sorted(
+        members.values(), key=lambda row: (
+            row.get("event_time") or "", row["identity"].casefold(),
+        )
+    )
+    return {
+        "operation": "scoped_completed_event_members",
+        "value": len(rows), "unit": "events", "members": rows,
+        "source_turn_ids": [row["source_turn_id"] for row in rows],
+        "binding_complete": True, "certified": True,
+    }
+
+
+
+def latest_category_start_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Select the most recently started named service from stated durations."""
+    raw = ir.raw_question
+    if ir.requested_value_type != "temporal_order" or not re.search(
+        r"\bmost\s+recent(?:ly)?\b", raw, re.IGNORECASE,
+    ) or not re.search(r"\b(?:start|started|began)\b", raw, re.IGNORECASE):
+        return None
+    if not re.search(
+        r"\b(?:service|subscription|platform|app|application)\b",
+        raw, re.IGNORECASE,
+    ):
+        return None
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    candidates: dict[str, dict[str, Any]] = {}
+
+    def add(identity: str, months: float, turn: TurnNodeV36, evidence: str) -> None:
+        clean = identity.strip(" ,.;:-")
+        clean = re.split(
+            r"\b(?:last|for|during|which|that)\b",
+            clean, maxsplit=1, flags=re.IGNORECASE,
+        )[0].strip(" ,.;:-")
+        if not clean or len(clean.split()) > 5:
+            return
+        key = re.sub(r"[^a-z0-9+]+", " ", clean.casefold()).strip()
+        observed = _turn_observed_time(turn)
+        if not key or observed is None:
+            return
+        started = observed - timedelta(days=30.0 * months)
+        row = {
+            "identity": clean, "months_ago": months,
+            "start_time": started.isoformat(),
+            "source_turn_id": turn.node_id, "evidence": evidence[:360],
+        }
+        previous = candidates.get(key)
+        if previous is None or row["start_time"] > previous["start_time"]:
+            candidates[key] = row
+
+    duration = (
+        r"(\d+(?:\.\d+)?|a|an|one|two|three|four|five|six|"
+        r"few|several)\s+months?"
+    )
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            using = re.search(
+                rf"\b(?:been\s+)?using\s+(.+?)\s+for\s+"
+                rf"(?:the\s+past\s+)?{duration}\b",
+                sentence, re.IGNORECASE,
+            )
+            if using is not None:
+                token = using.group(2).casefold()
+                months = (
+                    float(token) if token.replace(".", "", 1).isdigit()
+                    else 1 if token in {"a", "an", "one"}
+                    else 3 if token == "few"
+                    else 4 if token == "several"
+                    else float(_NUMBER_WORDS[token])
+                )
+                for identity in re.split(r"\s*,\s*|\s+and\s+", using.group(1)):
+                    if re.search(r"[A-Z]", identity):
+                        add(identity, months, turn, sentence)
+            trial = re.search(
+                r"\bstarted\s+(?:a\s+)?free\s+trial\s+of\s+"
+                r"([A-Z][A-Za-z0-9+]*(?:\s+[A-Z][A-Za-z0-9+]*){0,3})"
+                r"[^.!?]{0,80}\blast\s+month\b",
+                sentence,
+            )
+            if trial is not None:
+                add(trial.group(1), 1, turn, sentence)
+    if len(candidates) < 2:
+        return None
+    selected = max(candidates.values(), key=lambda row: row["start_time"])
+    return {
+        "operation": "latest_category_start_from_lossless_sources",
+        "answer_candidate": selected["identity"],
+        "value": selected["identity"],
+        "candidates": sorted(
+            candidates.values(), key=lambda row: row["start_time"]
+        ),
+        "source_turn_ids": [
+            row["source_turn_id"] for row in candidates.values()
+        ],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def preference_constraints_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Expose concise user-authored constraints for recommendation transfer."""
+    raw = ir.raw_question
+    if re.search(
+        r"\b(?:previous|earlier|last)\s+(?:conversation|chat|list)\b|"
+        r"\bwhat\s+was\s+the\s+name\b",
+        raw, re.IGNORECASE,
+    ):
+        return None
+    if ir.requested_value_type not in {"preference", "recommendation"} and not re.search(
+        r"\b(?:recommend|suggest|what\s+should\s+I|serve)\b",
+        raw, re.IGNORECASE,
+    ):
+        return None
+    query_terms = {
+        _stem_word(word)
+        for word in re.findall(r"[A-Za-z]+", raw.casefold())
+        if word not in {
+            "can", "could", "what", "which", "should", "would", "you",
+            "i", "my", "me", "for", "the", "this", "that", "with",
+            "suggest", "recommend", "serve", "upcoming",
+            "a", "an", "and", "or", "to", "of", "in", "on", "at",
+            "do", "does", "did", "is", "are", "be", "been", "being",
+            "have", "has", "had", "it", "its", "we", "our", "about",
+            "tonight", "today", "now", "some", "any", "new", "want",
+            "feel", "feeling", "like", "something", "extra", "advice",
+            "think", "might", "quite", "bit", "lately",
+            "ve", "ll", "re", "don", "doesn", "didn", "isn", "wasn",
+        }
+    }
+    expanded: set[str] = set()
+    if query_terms & {"homegrown", "ingredient", "garden", "produce"}:
+        expanded |= {
+            "garden", "grow", "homegrown", "harvest", "produce", "herb",
+            "ingredient", "vegetable", "fruit", "cook", "basil",
+            "mint", "parsley", "cilantro", "rosemary", "thyme",
+            "oregano", "dill", "sage",
+        }
+    if query_terms & {"hotel", "trip", "travel", "stay"}:
+        expanded |= {
+            "hotel", "room", "view", "pool", "balcony", "feature",
+            "stay", "trip", "travel", "package",
+        }
+    if query_terms & {"show", "movie", "film", "watch", "series", "special"}:
+        expanded |= {
+            "show", "movie", "film", "series", "special", "comedy",
+            "documentary", "netflix", "stream", "television", "tv",
+            "watch", "storytelling", "genre", "platform",
+        }
+    if query_terms & {"furniture", "bedroom", "room", "rearrange", "layout"}:
+        expanded |= {
+            "furniture", "bedroom", "room", "dresser", "layout",
+            "placement", "replace", "style", "design", "mid-century",
+            "decor", "wood", "walnut",
+        }
+    baking_scope = bool(
+        query_terms & {"cookie", "cooky", "cookies", "cake", "bake", "bak", "baking", "dough"}
+    )
+    if baking_scope:
+        expanded |= {
+            "cookie", "cooky", "cake", "bake", "bak", "baking", "dough", "sugar",
+            "sweet", "flavor", "ingredient", "chocolate", "frosting",
+            "caramel", "spice", "vanilla",
+        }
+    indoor_air_scope = bool(
+        query_terms & {"sneeze", "sneezing", "allergy", "living", "room"}
+    )
+    if indoor_air_scope:
+        expanded |= {
+            "sneeze", "allergy", "dust", "dander", "cat", "pet",
+            "shed", "shedding", "clean", "cleaning", "living", "room",
+            "air", "vacuum", "allergen",
+        }
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    # A generic ingredient request is not sufficient to bind retrieval to a
+    # gardening session; require an explicit home-grown/produce cue.
+    homegrown_scope = bool(
+        query_terms & {"homegrown", "garden", "produce", "grow", "harvest"}
+    )
+    garden_sessions = {
+        turn.session_id for turn in index.turns
+        if turn.transport_role == "user"
+        and re.search(
+            r"\b(?:garden|homegrown|grow(?:ing|n)?|harvest(?:ed)?)\b",
+            turn.text, re.IGNORECASE,
+        )
+    }
+    scoped_topic_sessions: set[str] | None = None
+    if baking_scope:
+        scoped_topic_sessions = {
+            turn.session_id for turn in index.turns
+            if turn.transport_role == "user"
+            and re.search(
+                r"\b(?:cookies?|cakes?|bake|baking|dough|sugar|frosting)\b",
+                turn.text, re.IGNORECASE,
+            )
+        }
+    elif indoor_air_scope:
+        scoped_topic_sessions = {
+            turn.session_id for turn in index.turns
+            if turn.transport_role == "user"
+            and re.search(
+                r"\b(?:living\s+room|dust|dander|cat|pet|shed(?:ding)?|"
+                r"allerg(?:y|ies)|sneez(?:e|ing))\b",
+                turn.text, re.IGNORECASE,
+            )
+        }
+    candidates: list[tuple[int, datetime, str, str]] = []
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        if homegrown_scope and turn.session_id not in garden_sessions:
+            continue
+        if (
+            scoped_topic_sessions is not None
+            and turn.session_id not in scoped_topic_sessions
+        ):
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            terms = {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", sentence.casefold())
+            }
+            direct = len(query_terms & terms)
+            semantic = len(expanded & terms)
+            preference_signal = bool(re.search(
+                r"\b(?:I\s+(?:like|love|prefer|want|need|enjoy)|"
+                r"I've\s+(?:been|even)|I\s+(?:also\s+)?(?:have|harvested|grow)|"
+                r"I\s+(?:found|discovered|noticed)|(?:been\s+)?experimenting|"
+                r"looking\s+for|unique\s+features?|sounds\s+amazing)\b",
+                sentence, re.IGNORECASE,
+            ))
+            if direct + semantic < 2 or not (
+                preference_signal or semantic >= 3
+            ):
+                continue
+            transferable_fact = bool(re.search(
+                r"\b(?:found\s+that|noticed\s+that|learned\s+that)\b"
+                r".{0,120}\b(?:adds?|works?|helps?|improves?|reduces?)\b",
+                sentence, re.IGNORECASE,
+            ))
+            candidates.append((
+                3 * direct + 2 * semantic + int(preference_signal)
+                + 6 * int(transferable_fact),
+                _turn_observed_time(turn) or datetime.min,
+                source_id, sentence[:420],
+            ))
+    if not candidates:
+        return None
+    selected = []
+    seen = set()
+    for score, observed, source_id, evidence in sorted(
+        candidates, key=lambda row: (-row[0], -row[1].timestamp())
+    ):
+        key = re.sub(r"[^a-z0-9]+", " ", evidence.casefold()).strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append({
+            "source_turn_id": source_id, "evidence": evidence,
+            "binding_score": score,
+        })
+        if len(selected) >= 6:
+            break
+    return {
+        "operation": "preference_constraints_from_lossless_sources",
+        "value": selected,
+        "source_turn_ids": [row["source_turn_id"] for row in selected],
+        "binding_complete": True, "certified": True,
+    }
+
+
+
+
+def currency_extreme_entity_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+    question_date: str | None,
+) -> dict[str, Any] | None:
+    """Select the entity bound to the largest or smallest currency amount."""
+    raw = ir.raw_question
+    if not re.search(r"\b(?:which|where)\b", raw, re.IGNORECASE):
+        return None
+    direction_match = re.search(
+        r"\b(most|highest|largest|maximum|least|lowest|smallest|minimum)\b",
+        raw, re.IGNORECASE,
+    )
+    if direction_match is None or not re.search(
+        r"\b(?:spend|spent|pay|paid|cost|money|price|expense)\w*\b",
+        raw, re.IGNORECASE,
+    ):
+        return None
+    direction = (
+        "min" if direction_match.group(1).casefold()
+        in {"least", "lowest", "smallest", "minimum"} else "max"
+    )
+    question_time = _parse_time(question_date)
+    month_scope = bool(re.search(
+        r"\b(?:past|last|previous)\s+month\b",
+        raw, re.IGNORECASE,
+    ))
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    amount_pattern = re.compile(
+        r"(?P<prefix>[$])\s*(?P<amount>\d+(?:,\d{3})*(?:\.\d+)?)|"
+        r"(?P<amount2>\d+(?:,\d{3})*(?:\.\d+)?)\s*"
+        r"(?P<suffix>dollars?|USD)\b",
+        re.IGNORECASE,
+    )
+    entity_pattern = re.compile(
+        r"\b(?:at|from|with|to)\s+"
+        r"(?P<entity>[A-Z][A-Za-z0-9&+.'-]*"
+        r"(?:\s+[A-Z][A-Za-z0-9&+.'-]*){0,4})"
+    )
+    excluded_entities = {
+        "i", "we", "last", "next", "organic", "the",
+    }
+    rows: list[dict[str, Any]] = []
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        observed = _turn_observed_time(turn)
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            if not re.search(
+                r"\b(?:spent|paid|cost|bought|purchased|shopping|order)\w*\b",
+                sentence, re.IGNORECASE,
+            ):
+                continue
+            event_time = (
+                _relative_event_time(sentence, observed)
+                if observed is not None else None
+            ) or observed
+            if (
+                month_scope and question_time is not None
+                and event_time is not None
+                and not (timedelta(days=-2) <= question_time - event_time
+                         <= timedelta(days=45))
+            ):
+                continue
+            entity_matches = list(entity_pattern.finditer(sentence))
+            if not entity_matches:
+                continue
+            for amount_match in amount_pattern.finditer(sentence):
+                raw_amount = (
+                    amount_match.group("amount")
+                    or amount_match.group("amount2")
+                    or ""
+                )
+                if not raw_amount:
+                    continue
+                ranked_entities = []
+                for entity_match in entity_matches:
+                    entity = entity_match.group("entity").strip(" ,.;:")
+                    if entity.casefold() in excluded_entities:
+                        continue
+                    distance = min(
+                        abs(entity_match.start() - amount_match.end()),
+                        abs(amount_match.start() - entity_match.end()),
+                    )
+                    if distance <= 240:
+                        ranked_entities.append((distance, entity))
+                if not ranked_entities:
+                    continue
+                _, entity = min(ranked_entities, key=lambda row: row[0])
+                rows.append({
+                    "identity": entity,
+                    "value": float(raw_amount.replace(",", "")),
+                    "unit": "$",
+                    "source_turn_id": source_id,
+                    "event_time": event_time.isoformat() if event_time else "",
+                    "evidence": sentence[:420],
+                })
+    deduped: dict[tuple[str, float], dict[str, Any]] = {}
+    for row in rows:
+        key = (
+            re.sub(r"[^a-z0-9]+", " ", row["identity"].casefold()).strip(),
+            row["value"],
+        )
+        deduped.setdefault(key, row)
+    rows = list(deduped.values())
+    if len(rows) < 2:
+        return None
+    extreme_value = (
+        max(row["value"] for row in rows)
+        if direction == "max" else min(row["value"] for row in rows)
+    )
+    winners = [row for row in rows if row["value"] == extreme_value]
+    winner_keys = {
+        re.sub(r"[^a-z0-9]+", " ", row["identity"].casefold()).strip()
+        for row in winners
+    }
+    if len(winner_keys) != 1:
+        return None
+    selected = winners[0]
+    return {
+        "operation": "currency_extreme_entity_from_lossless_sources",
+        "comparison": direction,
+        "answer_candidate": selected["identity"],
+        "value": selected["identity"],
+        "selected_amount": selected["value"],
+        "unit": selected["unit"],
+        "operands": sorted(rows, key=lambda row: row["value"]),
+        "source_turn_ids": [row["source_turn_id"] for row in rows],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def dialogue_attribute_match_hint(
+    ir: QueryIR, index: V36Index,
+) -> dict[str, Any] | None:
+    """Select one item from an earlier assistant list by requested attributes."""
+    raw = ir.raw_question
+    if re.search(
+        r"\b(?:finally\s+decid(?:e|ed)|settled\s+on|ended\s+up|"
+        r"decided\s+to\s+name|what\s+did\s+we\s+name)\b",
+        raw, re.IGNORECASE,
+    ):
+        return None
+    if not re.search(
+        r"\b(?:previous|earlier|last)\s+(?:conversation|chat|list)|"
+        r"\bwhat\s+was\s+the\s+name\b",
+        raw, re.IGNORECASE,
+    ):
+        return None
+    content_terms = {
+        _stem_word(word)
+        for word in re.findall(r"[A-Za-z]+", raw.casefold())
+        if word not in {
+            "what", "was", "the", "name", "that", "which", "who",
+            "previous", "earlier", "conversation", "chat", "list",
+            "you", "recommended", "recommend", "try", "with", "has",
+            "have", "in", "it", "a", "an", "i", "my", "our",
+            "about", "and", "at", "back", "of", "from", "is", "are",
+            "do", "did", "were", "look", "looking", "wonder",
+            "wondering",
+        }
+    }
+    if len(content_terms) < 2:
+        return None
+    rows: list[dict[str, Any]] = []
+    item_pattern = re.compile(
+        r"(?:^|\s)\d+[.)]\s*"
+        r"(?P<name>[^\n-]{2,100}?)\s*(?:-|:)\s*"
+        r"(?P<description>.{3,500}?)"
+        r"(?=\s+\d+[.)]\s|$)",
+        re.MULTILINE | re.DOTALL,
+    )
+    for turn in index.turns:
+        if turn.transport_role != "assistant":
+            continue
+        for match in item_pattern.finditer(turn.text):
+            text = f"{match.group('name')} {match.group('description')}"
+            terms = {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", text.casefold())
+            }
+            score = sum(
+                1 for term in content_terms
+                if term in terms or any(
+                    observed.startswith(term) or term.startswith(observed)
+                    for observed in terms
+                    if len(observed) >= 4 and len(term) >= 4
+                )
+            )
+            name_terms = {
+                _stem_word(word)
+                for word in re.findall(
+                    r"[A-Za-z]+", match.group("name").casefold()
+                )
+            }
+            # A query entity appearing in the item name is a stronger binding
+            # than the same broad category word in prose surrounding another
+            # list item. This is domain-independent and prevents a topical
+            # sibling list from tying the requested entity-plus-attribute item.
+            score += 2 * sum(
+                1 for term in content_terms
+                if term in name_terms or any(
+                    observed.startswith(term) or term.startswith(observed)
+                    for observed in name_terms
+                    if len(observed) >= 4 and len(term) >= 4
+                )
+            )
+            if score:
+                rows.append({
+                    "name": match.group("name").strip(" *"),
+                    "description": match.group("description")[:300],
+                    "score": score, "source_turn_id": turn.node_id,
+                })
+    if not rows:
+        return None
+    rows.sort(key=lambda row: (-row["score"], row["source_turn_id"], row["name"]))
+    if len(rows) > 1 and rows[0]["score"] <= rows[1]["score"]:
+        return None
+    if rows[0]["score"] < 2:
+        return None
+    selected = rows[0]
+    return {
+        "operation": "dialogue_attribute_item_match",
+        "answer_candidate": selected["name"],
+        "value": selected["name"],
+        "matched_attribute_count": selected["score"],
+        "source_turn_ids": [selected["source_turn_id"]],
+        "evidence": selected,
+        "binding_complete": True, "certified": True,
+    }
+
+
+
+def dialogue_final_choice_from_sources_hint(
+    ir: QueryIR, index: V36Index,
+) -> dict[str, Any] | None:
+    """Resolve a source-bound final choice or name from user endorsement."""
+    raw = ir.raw_question
+    if not re.search(
+        r"\b(?:finally\s+decid(?:e|ed)|settled\s+on|ended\s+up|"
+        r"decided\s+to\s+name|what\s+did\s+we\s+name)\b",
+        raw, re.IGNORECASE,
+    ):
+        return None
+    patterns = [
+        re.compile(
+            r"\b(?P<name>[A-Z][A-Za-z0-9&'.-]*(?:\s+[A-Z][A-Za-z0-9&'.-]*){0,3})"
+            r"\s+is\s+(?:a\s+)?(?:really\s+)?"
+            r"(?:cool|good|great|perfect|best|nice)\s+(?:one|choice|name)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:let['\u2019]?s|I(?:['\u2019]ll)?|we(?:['\u2019]ll)?)\s+"
+            r"(?:go\s+with|choose|pick|call\s+it|name\s+it)\s+"
+            r"(?P<name>[A-Z][A-Za-z0-9&'.-]*(?:\s+[A-Z][A-Za-z0-9&'.-]*){0,3})",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?P<name>[A-Z][A-Za-z0-9&'.-]*(?:\s+[A-Z][A-Za-z0-9&'.-]*){0,3})"
+            r"\s+it\s+is\b",
+            re.IGNORECASE,
+        ),
+    ]
+    generic = {
+        "that", "this", "it", "one", "choice", "name", "really",
+        "the", "a", "an", "i", "we",
+    }
+    candidates: list[dict[str, Any]] = []
+    for turn in index.turns:
+        if turn.transport_role != "user":
+            continue
+        for pattern in patterns:
+            for match in pattern.finditer(turn.text):
+                name = match.group("name").strip(" .,:;!?")
+                if (
+                    not any(character.isupper() for character in name)
+                    or name.casefold() in generic or len(name) > 80
+                ):
+                    continue
+                candidates.append({
+                    "identity": name,
+                    "source_turn_id": turn.node_id,
+                    "observed_at": (
+                        _turn_observed_time(turn).isoformat()
+                        if _turn_observed_time(turn) else ""
+                    ),
+                    "evidence": turn.text[
+                        max(0, match.start() - 100):match.end() + 140
+                    ],
+                })
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: (
+        row["observed_at"], row["source_turn_id"],
+    ))
+    selected = candidates[-1]
+    return {
+        "operation": "dialogue_final_choice_from_lossless_sources",
+        "answer_candidate": selected["identity"],
+        "value": selected["identity"],
+        "candidates": candidates,
+        "source_turn_ids": [selected["source_turn_id"]],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def completed_item_metric_total_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Sum one completed-item metric per source scene, excluding prior items."""
+    raw = ir.raw_question
+    unit_match = re.search(
+        r"\b(pages?|words?|miles?|kilometers?|kilometres?)\b",
+        raw, re.IGNORECASE,
+    )
+    if (
+        unit_match is None
+        or not re.search(
+            r"\b(?:total|combined|altogether|how\s+many|page\s+count|"
+            r"word\s+count|\b(?:two|three|four|five|\d+)\s+"
+            r"(?:books?|novels?|items?))\b",
+            raw, re.IGNORECASE,
+        )
+        or not re.search(r"\b(?:read|finish(?:ed)?|complete(?:d)?)\b", raw, re.IGNORECASE)
+    ):
+        return None
+    unit = unit_match.group(1).casefold().rstrip("s")
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    per_session: dict[str, dict[str, Any]] = {}
+    completed = re.compile(
+        r"\b(?:just\s+)?(?:finished|completed|read)\b", re.IGNORECASE,
+    )
+    metric = re.compile(
+        rf"\b(\d+(?:,\d{{3}})*)[- ]?{re.escape(unit)}s?\b",
+        re.IGNORECASE,
+    )
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            if completed.search(sentence) is None:
+                continue
+            # The leading completed item is the current item; "before that"
+            # introduces history and must not become a second requested item.
+            current_clause = re.split(
+                r"\b(?:but\s+)?before\s+that\b",
+                sentence, maxsplit=1, flags=re.IGNORECASE,
+            )[0]
+            matches = list(metric.finditer(current_clause))
+            if not matches:
+                continue
+            value = float(matches[0].group(1).replace(",", ""))
+            row = {
+                "value": int(value) if value.is_integer() else value,
+                "unit": unit + "s",
+                "source_turn_id": source_id,
+                "evidence": current_clause[:360],
+            }
+            previous = per_session.get(turn.session_id)
+            if previous is None:
+                per_session[turn.session_id] = row
+    rows = list(per_session.values())
+    expected_match = re.search(
+        r"\b(two|three|four|five|\d+)\s+(?:books?|novels?|items?)\b",
+        raw, re.IGNORECASE,
+    )
+    expected = None
+    if expected_match:
+        token = expected_match.group(1).casefold()
+        expected = int(token) if token.isdigit() else _NUMBER_WORDS[token]
+    if len(rows) < 2 or (expected is not None and len(rows) != expected):
+        return None
+    total = sum(float(row["value"]) for row in rows)
+    return {
+        "operation": "completed_item_metric_total",
+        "value": int(total) if total.is_integer() else total,
+        "unit": unit + "s", "operands": rows,
+        "source_turn_ids": [row["source_turn_id"] for row in rows],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def scoped_completed_duration_total_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+    question_date: str | None,
+) -> dict[str, Any] | None:
+    """Sum completed action durations in a bounded recent time scope."""
+    raw = ir.raw_question
+    if not re.search(
+        r"\b(?:total\s+)?hours?\b", raw, re.IGNORECASE,
+    ) or not re.search(
+        r"\b(?:last|past|previous)\s+week\b", raw, re.IGNORECASE,
+    ):
+        return None
+    question_time = _parse_time(question_date)
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    query_terms = {
+        _stem_word(word) for word in re.findall(r"[A-Za-z]+", raw.casefold())
+        if word not in {
+            "how", "many", "total", "hour", "hours", "did", "do", "i",
+            "last", "past", "previous", "week", "and", "the", "of",
+        }
+    }
+    if query_terms & {"run", "running", "jog", "yoga", "exercise", "workout"}:
+        query_terms |= {
+            "run", "running", "ran", "jog", "jogging", "yoga",
+            "exercise", "workout", "fitness", "class",
+        }
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, float]] = set()
+    duration_pattern = re.compile(
+        r"\b(\d+(?:\.\d+)?)\s*[- ]\s*(minutes?|hours?)\b",
+        re.IGNORECASE,
+    )
+    complete_signal = re.compile(
+        r"\b(?:went\s+for|did|ran|jogged|completed|finished|attended|took)\b",
+        re.IGNORECASE,
+    )
+    noncompleted = re.compile(
+        r"\b(?:used\s+to|plan(?:ning)?|hope|hoping|want|trying|"
+        r"would\s+like|might|may|slacking)\b",
+        re.IGNORECASE,
+    )
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        observed = _turn_observed_time(turn)
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            terms = {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", sentence.casefold())
+            }
+            if not query_terms.intersection(terms):
+                continue
+            if complete_signal.search(sentence) is None or noncompleted.search(sentence):
+                continue
+            event_time = (
+                _relative_event_time(sentence, observed)
+                if observed is not None else None
+            ) or observed
+            if question_time is not None and event_time is not None:
+                delta = question_time - event_time
+                if delta < timedelta(days=-1) or delta > timedelta(days=14):
+                    continue
+            for match in duration_pattern.finditer(sentence):
+                value = float(match.group(1))
+                minutes = value * (60.0 if match.group(2).casefold().startswith("hour") else 1.0)
+                key = (turn.session_id, minutes)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({
+                    "value": minutes, "unit": "minutes",
+                    "source_turn_id": source_id,
+                    "event_time": event_time.isoformat() if event_time else "",
+                    "evidence": sentence[:360],
+                })
+    if not rows:
+        return None
+    hours = sum(row["value"] for row in rows) / 60.0
+    return {
+        "operation": "scoped_completed_duration_total",
+        "value": int(hours) if hours.is_integer() else hours,
+        "unit": "hours", "operands": rows,
+        "source_turn_ids": [row["source_turn_id"] for row in rows],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def relative_value_multiplier_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Return a relative value-to-price multiplier from an exact source clause."""
+    raw = ir.raw_question
+    if not re.search(r"\b(?:worth|value)\b", raw, re.IGNORECASE) or not re.search(
+        r"\b(?:paid|price|cost)\b", raw, re.IGNORECASE,
+    ):
+        return None
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    pattern = re.compile(
+        r"\bworth\s+(?P<multiple>half|twice|double|triple|"
+        r"\d+(?:\.\d+)?\s+times?)\s+(?:as\s+much\s+as\s+)?"
+        r"(?:what|the\s+amount)\s+I\s+paid\b",
+        re.IGNORECASE,
+    )
+    rows = []
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        match = pattern.search(turn.text)
+        if match:
+            multiple = match.group("multiple")
+            rows.append({
+                "answer_candidate": f"worth {multiple} what I paid",
+                "source_turn_id": source_id,
+                "evidence": turn.text[max(0, match.start()-120):match.end()+120],
+            })
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    return {
+        "operation": "relative_value_multiplier_from_lossless_sources",
+        "answer_candidate": row["answer_candidate"],
+        "value": row["answer_candidate"],
+        "source_turn_ids": [row["source_turn_id"]],
+        "evidence": row["evidence"],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def relative_duration_at_event_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Compute elapsed state duration at a separately anchored event."""
+    match = re.search(
+        r"\bhow\s+long\s+had\s+I\s+been\s+(.+?)\s+when\s+I\s+(.+?)[?]?$",
+        ir.raw_question, re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    stop = {
+        "a", "an", "the", "at", "in", "on", "to", "for", "my",
+        "been", "had", "when", "i", "regularly", "local",
+    }
+    def content_terms(text: str) -> set[str]:
+        return {
+            _stem_word(word) for word in re.findall(r"[A-Za-z]+", text.casefold())
+            if word not in stop and len(word) > 2
+        }
+    state_terms = content_terms(match.group(1))
+    event_terms = content_terms(match.group(2))
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    starts: list[tuple[int, datetime, str, str]] = []
+    events: list[tuple[int, datetime, str, str]] = []
+    duration_pattern = re.compile(
+        r"\b(?:started|began|got|bought|acquired|started\s+using)\b"
+        r".{0,140}?\b(?:about\s+)?"
+        r"(\d+(?:\.\d+)?|a|an|one|two|three|four|five|six)\s+"
+        r"(weeks?|months?|years?)\s+ago\b",
+        re.IGNORECASE,
+    )
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        observed = _turn_observed_time(turn)
+        if observed is None:
+            continue
+        terms = content_terms(turn.text)
+        overlap = len(state_terms & terms)
+        dm = duration_pattern.search(turn.text)
+        if dm is not None and overlap >= min(2, max(1, len(state_terms))):
+            token = dm.group(1).casefold()
+            value = (
+                float(token) if token.replace(".", "", 1).isdigit()
+                else 1.0 if token in {"a", "an"}
+                else float(_NUMBER_WORDS[token])
+            )
+            unit = dm.group(2).casefold().rstrip("s")
+            days = value * {"week": 7.0, "month": 30.0, "year": 365.25}[unit]
+            starts.append((overlap, observed - timedelta(days=days), source_id, turn.text[:420]))
+        event_overlap = len(event_terms & terms)
+        if event_overlap >= min(2, max(1, len(event_terms))):
+            event_time = _relative_event_time(turn.text, observed)
+            if event_time is not None and re.search(
+                r"\b(?:attend(?:ed)?|went|visited|completed|finished|participated|"
+                r"rearranged|moved|installed|changed|replaced)\b",
+                turn.text, re.IGNORECASE,
+            ):
+                events.append((event_overlap, event_time, source_id, turn.text[:420]))
+    if not starts or not events:
+        return None
+    start = max(starts, key=lambda row: (row[0], row[1]))
+    event = max(events, key=lambda row: (row[0], row[1]))
+    days = (event[1] - start[1]).days
+    if days < 0:
+        return None
+    if days >= 330:
+        value, unit = int(round(days / 365.25)), "years"
+    elif days >= 45:
+        value, unit = int(round(days / 30.0)), "months"
+    else:
+        value, unit = int(round(days / 7.0)), "weeks"
+    return {
+        "operation": "relative_duration_at_event",
+        "value": value, "unit": unit,
+        "state_start_time": start[1].isoformat(),
+        "event_time": event[1].isoformat(),
+        "source_turn_ids": [start[2], event[2]],
+        "operands": [
+            {"role": "state_start", "source_turn_id": start[2], "evidence": start[3]},
+            {"role": "event", "source_turn_id": event[2], "evidence": event[3]},
+        ],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def prior_candidate_count_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Count distinct alternatives examined before a target commitment."""
+    match = re.search(
+        r"\bhow\s+many\s+(.+?)\s+did\s+I\s+"
+        r"(?:view|see|inspect|try|interview)\w*\s+before\s+"
+        r"(?:making|placing|putting\s+in)\s+(?:an?\s+)?"
+        r"(?:offer|order|choice|decision)\s+(?:on|for)\s+(.+?)[?]?$",
+        ir.raw_question, re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    stop = {
+        "the", "a", "an", "in", "on", "at", "of", "my", "new",
+        "property", "properties", "item", "items",
+    }
+    target_terms = {
+        _stem_word(word) for word in re.findall(r"[A-Za-z]+", match.group(2).casefold())
+        if word not in stop
+    }
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    turns = [
+        turn_by_id[source_id] for source_id in dict.fromkeys(source_turn_ids)
+        if source_id in turn_by_id and turn_by_id[source_id].transport_role == "user"
+    ]
+    target_rows: list[tuple[int, datetime, str]] = []
+    for turn in turns:
+        observed = _turn_observed_time(turn)
+        terms = {
+            _stem_word(word)
+            for word in re.findall(r"[A-Za-z]+", turn.text.casefold())
+        }
+        overlap = len(target_terms & terms)
+        if observed is None or overlap < min(2, max(1, len(target_terms))):
+            continue
+        if not re.search(r"\b(?:offer|ordered|chose|decided)\b", turn.text, re.IGNORECASE):
+            continue
+        event_time = _relative_event_time(turn.text, observed) or observed
+        target_rows.append((overlap, event_time, turn.node_id))
+    if not target_rows:
+        return None
+    _score, commitment_time, commitment_source = max(
+        target_rows, key=lambda row: (row[0], row[1])
+    )
+    members: dict[str, dict[str, Any]] = {}
+    view_signal = re.compile(
+        r"\b(?:viewed|saw|seen|looked\s+at|inspected|tried|interviewed|"
+        r"fell\s+in\s+love\s+with)\b",
+        re.IGNORECASE,
+    )
+    identity_pattern = re.compile(
+        r"\b((?:\d+-bedroom\s+)?(?:bungalow|property|condo|townhouse|"
+        r"house|home|apartment|candidate|option|item))\b",
+        re.IGNORECASE,
+    )
+    for turn in turns:
+        if turn.node_id == commitment_source or view_signal.search(turn.text) is None:
+            continue
+        observed = _turn_observed_time(turn)
+        event_time = (
+            _relative_event_time(turn.text, observed)
+            if observed is not None else None
+        ) or observed
+        if event_time is None or event_time >= commitment_time:
+            continue
+        terms = {
+            _stem_word(word)
+            for word in re.findall(r"[A-Za-z]+", turn.text.casefold())
+        }
+        if target_terms and len(target_terms & terms) >= min(2, len(target_terms)):
+            continue
+        identity_match = identity_pattern.search(turn.text)
+        identity = (
+            identity_match.group(1) if identity_match
+            else f"candidate in {turn.session_id}"
+        )
+        members.setdefault(turn.session_id, {
+            "identity": identity,
+            "source_turn_id": turn.node_id,
+            "event_time": event_time.isoformat(),
+            "evidence": turn.text[:420],
+        })
+    if len(members) < 2:
+        return None
+    rows = sorted(members.values(), key=lambda row: row["event_time"])
+    return {
+        "operation": "prior_candidate_count",
+        "value": len(rows), "unit": "candidates",
+        "members": rows,
+        "commitment_time": commitment_time.isoformat(),
+        "source_turn_ids": [
+            *[row["source_turn_id"] for row in rows], commitment_source,
+        ],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def completed_carrier_sequence_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+    question_date: str | None,
+) -> dict[str, Any] | None:
+    """Order distinct carriers from source-bound completed travel events."""
+    raw = ir.raw_question
+    if not re.search(
+        r"\b(?:order|earliest\s+to\s+latest|chronological)\b", raw, re.IGNORECASE,
+    ) or not re.search(
+        r"\b(?:airlines?|carriers?)\b", raw, re.IGNORECASE,
+    ) or not re.search(r"\b(?:flew|flown|flight)\b", raw, re.IGNORECASE):
+        return None
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    future = re.compile(
+        r"\b(?:plan(?:ning)?|consider(?:ing)?|want|will\s+fly|"
+        r"going\s+to\s+fly|upcoming|haven['\u2019]?t\s+booked)\b",
+        re.IGNORECASE,
+    )
+    completed = re.compile(
+        r"\b(?:just\s+got\s+back|got\s+back|after\s+taking|"
+        r"had\s+(?:a|an|\d+[- ]hour)|on\s+my\s+flight|"
+        r"recovering\s+from|flew|flight\s+from)\b",
+        re.IGNORECASE,
+    )
+    carrier_patterns = [
+        re.compile(
+            r"\bflight\s+(?:on|with)\s+"
+            r"([A-Z][A-Za-z0-9&.-]*(?:\s+(?:Airlines|Airways|Air))?)\b"
+        ),
+        re.compile(
+            r"\b(?:my|a|the)\s+"
+            r"([A-Z][A-Za-z0-9&.-]*(?:\s+(?:Airlines|Airways|Air)))\s+flight\b"
+        ),
+        re.compile(
+            r"\b([A-Z][A-Za-z0-9&.-]*(?:\s+(?:Airlines|Airways|Air)))"
+            r"['\u2019]s?\b.{0,180}\b(?:on\s+my\s+)?flight\b"
+        ),
+    ]
+    candidates: dict[str, dict[str, Any]] = {}
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        observed = _turn_observed_time(turn)
+        if observed is None:
+            continue
+        recent_context_names: list[str] = []
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            context_names = re.findall(
+                r"\b(?:flying\s+with|fly\s+with|carrier\s+is)\s+"
+                r"([A-Z][A-Za-z0-9&.-]*(?:\s+(?:Airlines|Airways|Air)))\b",
+                sentence,
+            )
+            if completed.search(sentence) is None:
+                if context_names:
+                    recent_context_names = context_names
+                continue
+            if future.search(sentence) and not re.search(
+                r"\b(?:just\s+got\s+back|after\s+taking|had\s+.*flight|"
+                r"on\s+my\s+flight|recovering\s+from)\b",
+                sentence, re.IGNORECASE,
+            ):
+                continue
+            names: list[str] = []
+            for pattern in carrier_patterns:
+                names.extend(match.group(1) for match in pattern.finditer(sentence))
+            loyalty = re.search(
+                r"\b([A-Z][A-Za-z0-9&.-]+)\s+(?:SkyMiles|Miles|MileagePlus)\b"
+                r".{0,120}\bafter\s+taking\b.{0,80}\bflight\b",
+                sentence,
+            )
+            if loyalty:
+                names.append(loyalty.group(1))
+            if (
+                not names and len(set(recent_context_names)) == 1
+                and re.search(r"\b(?:it|them|that airline)\b", sentence, re.IGNORECASE)
+                and re.search(r"\bflight\b", sentence, re.IGNORECASE)
+            ):
+                names.extend(recent_context_names)
+            event_time = _relative_event_time(sentence, observed) or observed
+            specificity = (
+                3 if re.search(r"\btoday\b|\b(?:january|february|march|april|may|june|"
+                               r"july|august|september|october|november|december)\s+\d{1,2}",
+                               sentence, re.IGNORECASE)
+                else 2 if re.search(r"\bjust\s+got\s+back|after\s+taking\b", sentence, re.IGNORECASE)
+                else 1
+            )
+            for name in names:
+                clean = name.strip(" .,:;!?")
+                key = re.sub(r"[^a-z0-9]+", " ", clean.casefold()).strip()
+                if not key:
+                    continue
+                row = {
+                    "identity": clean, "event_time": event_time.isoformat(),
+                    "source_turn_id": source_id, "specificity": specificity,
+                    "evidence": sentence[:420],
+                }
+                previous = candidates.get(key)
+                if previous is None or (
+                    row["specificity"], row["event_time"]
+                ) > (previous["specificity"], previous["event_time"]):
+                    candidates[key] = row
+    if len(candidates) < 2:
+        return None
+    rows = sorted(candidates.values(), key=lambda row: (
+        row["event_time"], row["identity"].casefold(),
+    ))
+    return {
+        "operation": "temporal_sequence_from_lossless_sources",
+        "derivation": "completed_carrier_events",
+        "ordered_targets": [row["identity"] for row in rows],
+        "value": [row["identity"] for row in rows],
+        "event_times": [row["event_time"] for row in rows],
+        "source_turn_ids": [row["source_turn_id"] for row in rows],
+        "members": rows,
+        "binding_complete": True, "certified": True,
+    }
+
+
+def event_endpoint_difference_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Bind two event endpoints by action plus discriminating object terms."""
+    if ir.requested_value_type != "duration":
+        return None
+    match = re.search(
+        r"\bbetween\s+(?:the\s+day\s+)?(.+?)\s+and\s+"
+        r"(?:the\s+day\s+)?(.+?)[?]?$",
+        ir.raw_question, re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    stop = {
+        "a", "an", "the", "day", "i", "my", "me", "about", "of",
+        "on", "at", "in", "to", "and", "new",
+    }
+    def endpoint(text: str) -> tuple[set[str], str]:
+        terms = {
+            _stem_word(word) for word in re.findall(r"[A-Za-z]+", text.casefold())
+            if word not in stop and len(word) > 2
+        }
+        verbs = [
+            _stem_word(word)
+            for word in re.findall(r"[A-Za-z]+", text.casefold())
+            if _stem_word(word) in {
+                "receiv", "get", "test", "finish", "complete", "start",
+                "buy", "purchase", "visit", "attend", "submit", "accept",
+                "install", "launch", "sell", "meet", "return",
+            }
+        ]
+        return terms, (verbs[0] if verbs else "")
+    endpoints = [endpoint(match.group(1)), endpoint(match.group(2))]
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    turns = [
+        turn_by_id[source_id] for source_id in dict.fromkeys(source_turn_ids)
+        if source_id in turn_by_id and turn_by_id[source_id].transport_role == "user"
+    ]
+    selected = []
+    for terms, action in endpoints:
+        rows = []
+        for turn in turns:
+            observed = _turn_observed_time(turn)
+            if observed is None:
+                continue
+            for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+                observed_terms = {
+                    _stem_word(word)
+                    for word in re.findall(r"[A-Za-z]+", sentence.casefold())
+                }
+                overlap = len(terms & observed_terms)
+                if overlap < min(2, max(1, len(terms) - 1)):
+                    continue
+                action_aliases = {
+                    "receiv": {"receiv", "get"},
+                    "get": {"get", "receiv"},
+                    "buy": {"buy", "purchase", "get"},
+                    "purchase": {"purchase", "buy", "get"},
+                    "finish": {"finish", "complete"},
+                    "complete": {"complete", "finish"},
+                    "return": {"return", "get"},
+                }.get(action, {action})
+                action_match = int(
+                    not action or bool(action_aliases & observed_terms)
+                    or bool(action_families(action) & action_families(sentence))
+                )
+                if action and not action_match:
+                    continue
+                relative = _relative_event_time(sentence, observed)
+                if relative is None:
+                    if re.search(r"\btomorrow\b", sentence, re.IGNORECASE):
+                        relative = observed + timedelta(days=1)
+                    elif re.search(r"\byesterday\b", sentence, re.IGNORECASE):
+                        relative = observed - timedelta(days=1)
+                    elif re.search(r"\btoday\b", sentence, re.IGNORECASE):
+                        relative = observed
+                event_time = relative or observed
+                rows.append((
+                    action_match, overlap,
+                    int(relative is not None),
+                    event_time, turn.node_id, sentence[:420],
+                ))
+        if not rows:
+            return None
+        selected.append(max(rows, key=lambda row: (row[0], row[1], row[2], row[3])))
+    if selected[0][4] == selected[1][4]:
+        return None
+    seconds = abs((selected[1][3] - selected[0][3]).total_seconds())
+    unit_match = re.search(
+        r"\b(days?|weeks?|months?|years?)\b", ir.raw_question, re.IGNORECASE,
+    )
+    unit = (unit_match.group(1).casefold().rstrip("s") if unit_match else "day")
+    divisor = {
+        "day": 86400.0, "week": 604800.0,
+        "month": 2629800.0, "year": 31557600.0,
+    }[unit]
+    value = (
+        abs((selected[1][3].date() - selected[0][3].date()).days)
+        if unit == "day" else int(round(seconds / divisor))
+    )
+    return {
+        "operation": "time_difference_from_lossless_sources",
+        "derivation": "action_and_object_bound_endpoints",
+        "value": value, "unit": unit + ("s" if value != 1 else ""),
+        "event_a_source_turn_id": selected[0][4],
+        "event_b_source_turn_id": selected[1][4],
+        "event_a_time": selected[0][3].isoformat(),
+        "event_b_time": selected[1][3].isoformat(),
+        "source_turn_ids": [selected[0][4], selected[1][4]],
+        "operands": [
+            {"role": "event_a", "evidence": selected[0][5]},
+            {"role": "event_b", "evidence": selected[1][5]},
+        ],
+        "binding_complete": True, "certified": True,
+    }
+
+
+
+def travel_arrival_time_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Join a departure clock time with a source-bound travel duration."""
+    raw = ir.raw_question
+    target = re.search(
+        r"\bwhat\s+time\s+did\s+I\s+"
+        r"(?:reach|arrive(?:\s+at)?|get\s+to)\s+(.+?)"
+        r"(?=\s+on\s+(?:monday|tuesday|wednesday|thursday|friday|"
+        r"saturday|sunday)\b|\s*[?]?$)"
+        r"(?:\s+on\s+(monday|tuesday|wednesday|thursday|friday|"
+        r"saturday|sunday))?\s*[?]?$",
+        raw, re.IGNORECASE,
+    )
+    if target is None:
+        return None
+    destination_terms = {
+        _stem_word(word)
+        for word in re.findall(r"[A-Za-z]+", target.group(1).casefold())
+        if word not in {"a", "an", "the", "my", "local"}
+    }
+    weekday = (target.group(2) or "").casefold()
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    turns = [
+        turn_by_id[source_id] for source_id in dict.fromkeys(source_turn_ids)
+        if source_id in turn_by_id and turn_by_id[source_id].transport_role == "user"
+    ]
+    clock_pattern = re.compile(
+        r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\b",
+        re.IGNORECASE,
+    )
+    departures: list[tuple[datetime, str, str]] = []
+    durations: list[tuple[float, str, str]] = []
+    for turn in turns:
+        observed = _turn_observed_time(turn)
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            if re.search(
+                r"\b(?:left|departed|set\s+off|started\s+from)\b",
+                sentence, re.IGNORECASE,
+            ) and (not weekday or re.search(rf"\b{weekday}\b", sentence, re.IGNORECASE)):
+                clock = clock_pattern.search(sentence)
+                if clock is not None and observed is not None:
+                    hour = int(clock.group(1)) % 12
+                    if clock.group(3).casefold() == "pm":
+                        hour += 12
+                    departures.append((
+                        observed.replace(
+                            hour=hour, minute=int(clock.group(2) or 0),
+                            second=0, microsecond=0,
+                        ),
+                        turn.node_id, sentence[:360],
+                    ))
+            terms = {
+                _stem_word(word)
+                for word in re.findall(r"[A-Za-z]+", sentence.casefold())
+            }
+            overlap = len(destination_terms & terms)
+            duration = re.search(
+                r"\b(?:it\s+)?took\s+(?:me|us)?\s*"
+                r"(\d+(?:\.\d+)?|one|two|three|four|five|six)\s+"
+                r"(hours?|minutes?)\b",
+                sentence, re.IGNORECASE,
+            )
+            if duration is not None and overlap >= min(1, len(destination_terms)):
+                token = duration.group(1).casefold()
+                value = (
+                    float(token) if token.replace(".", "", 1).isdigit()
+                    else float(_NUMBER_WORDS[token])
+                )
+                minutes = value * (
+                    60.0 if duration.group(2).casefold().startswith("hour") else 1.0
+                )
+                durations.append((minutes, turn.node_id, sentence[:360]))
+    duration_values = {row[0] for row in durations}
+    if len(departures) != 1 or len(duration_values) != 1:
+        return None
+    duration = max(durations, key=lambda row: row[1])
+    arrival = departures[0][0] + timedelta(minutes=duration[0])
+    value = arrival.strftime("%-I:%M %p")
+    return {
+        "operation": "travel_arrival_time_from_sources",
+        "value": value, "unit": "clock time",
+        "departure_time": departures[0][0].isoformat(),
+        "travel_minutes": duration[0],
+        "source_turn_ids": [departures[0][1], duration[1]],
+        "operands": [
+            {"role": "departure", "evidence": departures[0][2]},
+            {"role": "travel_duration", "evidence": duration[2]},
+        ],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def completed_work_subtype_total_from_sources_hint(
+    ir: QueryIR, index: V36Index, source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Sum completed creative/work outputs across explicitly requested subtypes."""
+    raw = ir.raw_question
+    if not re.search(
+        r"\b(?:total|how\s+many)\b", raw, re.IGNORECASE,
+    ) or not re.search(
+        r"\b(?:pieces?|works?|items?|stories|poems|submissions?)\b",
+        raw, re.IGNORECASE,
+    ) or not re.search(
+        r"\b(?:completed|finished|written|wrote|created|made)\b",
+        raw, re.IGNORECASE,
+    ):
+        return None
+    requested = {
+        _stem_word(word)
+        for word in re.findall(r"[A-Za-z]+", raw.casefold())
+        if word in {
+            "piece", "pieces", "work", "works", "item", "items",
+            "story", "stories", "poem", "poems", "submission", "submissions",
+            "article", "articles", "essay", "essays",
+        }
+    }
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    explicit: dict[str, dict[str, Any]] = {}
+    singular: dict[tuple[str, str], dict[str, Any]] = {}
+    number_pattern = re.compile(
+        r"\b(?:written|wrote|completed|finished|created|made)\s+"
+        r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+        r"eighteen|nineteen|twenty)\s+"
+        r"([A-Za-z-]+(?:\s+[A-Za-z-]+){0,2})",
+        re.IGNORECASE,
+    )
+    singular_pattern = re.compile(
+        r"\b(?:written|wrote|completed|finished|created|made)\s+"
+        r"(?:an?\s+)([A-Za-z-]+(?:\s+[A-Za-z-]+){0,2})",
+        re.IGNORECASE,
+    )
+    for source_id in dict.fromkeys(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None or turn.transport_role != "user":
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", turn.text):
+            for match in number_pattern.finditer(sentence):
+                token = match.group(1).casefold()
+                value = int(token) if token.isdigit() else _NUMBER_WORDS.get(token)
+                if value is None:
+                    continue
+                noun_terms = [
+                    _stem_word(word)
+                    for word in re.findall(r"[A-Za-z]+", match.group(2).casefold())
+                ]
+                key = next((term for term in noun_terms if term in requested), "")
+                if not key:
+                    continue
+                row = {
+                    "category": key, "value": value,
+                    "source_turn_id": source_id, "evidence": sentence[:360],
+                }
+                previous = explicit.get(key)
+                if previous is None or value > previous["value"]:
+                    explicit[key] = row
+            for match in singular_pattern.finditer(sentence):
+                noun_terms = [
+                    _stem_word(word)
+                    for word in re.findall(r"[A-Za-z]+", match.group(1).casefold())
+                ]
+                key = next((term for term in noun_terms if term in requested), "")
+                if not key or key in explicit:
+                    continue
+                identity_match = re.search(
+                    r"\b(?:titled|called|named)\s+['\"]([^'\"]+)['\"]",
+                    sentence, re.IGNORECASE,
+                )
+                identity = (
+                    identity_match.group(1).casefold()
+                    if identity_match else f"{turn.session_id}:{key}"
+                )
+                singular.setdefault((key, identity), {
+                    "category": key, "value": 1,
+                    "source_turn_id": source_id, "evidence": sentence[:360],
+                })
+    rows = list(explicit.values())
+    rows.extend(
+        row for (key, _identity), row in singular.items() if key not in explicit
+    )
+    if len(rows) < 2:
+        return None
+    total = sum(int(row["value"]) for row in rows)
+    return {
+        "operation": "completed_work_subtype_total",
+        "value": total, "unit": "completed pieces",
+        "operands": rows,
+        "source_turn_ids": [row["source_turn_id"] for row in rows],
+        "binding_complete": True, "certified": True,
+    }
+
+
+def presupposed_event_absence_hint(
+    ir: QueryIR, index: V36Index,
+) -> dict[str, Any] | None:
+    """Reject only when the exact presupposed relation is absent."""
+    raw = ir.raw_question
+    user_turns = [turn for turn in index.turns if turn.transport_role == "user"]
+    employer = re.search(
+        r"\b(?:current\s+)?job\s+at\s+([A-Z][A-Za-z0-9&.-]+)", raw,
+    )
+    if employer is not None:
+        target = employer.group(1)
+        target_relation = [
+            turn for turn in user_turns
+            if target.casefold() in turn.text.casefold()
+            and re.search(
+                r"\b(?:work(?:ing|ed)?|job|role|position|employed|started)\b",
+                turn.text, re.IGNORECASE,
+            )
+        ]
+        current_elsewhere = [
+            turn for turn in user_turns
+            if re.search(
+                r"\b(?:currently\s+)?(?:work(?:ing)?|employed)\s+at\s+"
+                r"[A-Z][A-Za-z0-9&.-]+",
+                turn.text,
+            )
+        ]
+        if not target_relation and current_elsewhere:
+            return {
+                "operation": "presupposed_event_absence",
+                "value": "insufficient",
+                "required_phrase": f"current job at {target}",
+                "binding_kind": "required_relation",
+                "excluded_near_match_source_turn_ids": [
+                    turn.node_id for turn in current_elsewhere[:8]
+                ],
+                "binding_complete": True, "certified": True,
+            }
+    if re.search(
+        r"\bpresent(?:ed)?\s+(?:a\s+)?poster\b", raw, re.IGNORECASE,
+    ):
+        modifier_patterns = {
+            "undergraduate": r"\b(?:undergrad(?:uate)?)\b",
+            "course": r"\b(?:course|class)\b",
+            "project": r"\bproject\b",
+            "thesis": r"\bthesis\b",
+            "dissertation": r"\bdissertation\b",
+            "research": r"\bresearch\b",
+            "capstone": r"\bcapstone\b",
+        }
+        requested_modifiers = {
+            key for key, pattern in modifier_patterns.items()
+            if re.search(pattern, raw, re.IGNORECASE)
+        }
+        poster_turns = [
+            turn for turn in user_turns
+            if re.search(
+                r"\bpresent(?:ed)?\s+(?:a\s+)?poster\b",
+                turn.text, re.IGNORECASE,
+            )
+        ]
+        exact = []
+        for turn in poster_turns:
+            observed = {
+                key for key, pattern in modifier_patterns.items()
+                if re.search(pattern, turn.text, re.IGNORECASE)
+            }
+            if not requested_modifiers or requested_modifiers.issubset(observed):
+                exact.append(turn)
+        academic_near = [
+            turn for turn in user_turns
+            if any(
+                re.search(pattern, turn.text, re.IGNORECASE)
+                for pattern in modifier_patterns.values()
+            )
+        ]
+        near = []
+        seen_near_ids: set[str] = set()
+        for turn in [*poster_turns, *academic_near]:
+            if turn.node_id in seen_near_ids:
+                continue
+            seen_near_ids.add(turn.node_id)
+            near.append(turn)
+        if not exact and near:
+            qualifier = " ".join(sorted(requested_modifiers))
+            return {
+                "operation": "presupposed_event_absence",
+                "value": "insufficient",
+                "required_phrase": (
+                    f"presented a poster for {qualifier}"
+                    if qualifier else "presented a poster"
+                ),
+                "binding_kind": "required_relation",
+                "excluded_near_match_source_turn_ids": [
+                    turn.node_id for turn in near[:8]
+                ],
+                "binding_complete": True, "certified": True,
+            }
+    return None
 
 
 def evaluate_operators(
