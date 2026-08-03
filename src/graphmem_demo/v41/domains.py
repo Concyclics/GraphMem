@@ -265,7 +265,10 @@ def augment_query(ir: QueryIR) -> QueryAugmentationV41:
     elif value in {"date", "duration", "temporal_order"}:
         explicit_temporal_comparison = bool(
             value == "temporal_order"
-            or len(ir.comparison_targets) > 1
+            or (
+                value != "date"
+                and len(ir.comparison_targets) > 1
+            )
             or re.search(
                 r"\b(?:time|duration|days?|weeks?|months?|years?)\s+between\b"
                 r"|\bhow\s+(?:long|many\s+\w+)\s+(?:after|before)\b"

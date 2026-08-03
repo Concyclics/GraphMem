@@ -344,6 +344,9 @@ def build_query_ir(question: str) -> QueryIR:
     elif _TEMPORAL_LATEST_RE.search(question):
         value_type = "temporal_order"
         roles = ["events", "times", "source"]
+    elif re.match(r"\s*(?:when|what date)\b", lowered):
+        value_type = "date"
+        roles = ["event", "time", "identity", "source"]
     elif _TEMPORAL_AFTER_FIRST_RE.search(question) or relative_event_targets:
         value_type = "temporal_order"
         roles = ["event_a", "event_b", "time_a", "time_b", "identity", "source"]

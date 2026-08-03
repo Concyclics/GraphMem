@@ -4,7 +4,7 @@ import json
 import re
 from collections import Counter, defaultdict, deque
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from ..clients import rough_token_count
@@ -106,6 +106,8 @@ _RELATION_TERM_FAMILIES: dict[str, set[str]] = {
     "attended": {"attend", "join", "joined", "participate", "participated", "visit", "visited", "went"},
     "bake": {"baked", "cook", "cooked", "make", "made"},
     "baked": {"bake", "cook", "cooked", "make", "made"},
+    "hike": {"hiking", "walk", "walking", "trail", "trek", "trekking"},
+    "hiking": {"hike", "walk", "walking", "trail", "trek", "trekking"},
     "album": {"albums", "ep", "eps", "record", "records", "vinyl"},
     "albums": {"album", "ep", "eps", "record", "records", "vinyl"},
     "arrive": {"arrived", "reach", "reached", "got"},
@@ -1490,6 +1492,7 @@ def _scene_window_nodes(
     anchors.sort(key=lambda row: (-row[0], row[1]))
     candidates: dict[str, float] = {}
     protected_forward: list[str] = []
+    protected_backward: list[str] = []
     relative_time = re.compile(
         r"\b(?:next|last|this)\s+(?:day|week|month|year|weekend)\b|"
         r"\b(?:yesterday|tomorrow|today)\b", re.IGNORECASE,
@@ -1523,6 +1526,35 @@ def _scene_window_nodes(
             _semantic_overlap(ir, _tokens(anchor_document.text))
             if anchor_document is not None else set()
         )
+        # A relative-date reply is often elliptical: "we did it yesterday"
+        # gets its event identity from the preceding question, media caption,
+        # or statement. Keep that tiny backward dialogue unit intact instead
+        # of asking lexical overlap to rediscover nouns that the reply omits.
+        # This is deliberately limited to temporal questions and two turns.
+        deictic_temporal_reply = bool(
+            anchor_document is not None
+            and ir.requested_value_type in {
+                "date", "temporal_order", "duration",
+            }
+            and relative_time.search(anchor_document.text)
+            and re.search(
+                r"\b(?:it|that|this|them|those|did\s+(?:it|that|this)|"
+                r"went|was|were)\b",
+                anchor_document.text, re.IGNORECASE,
+            )
+        )
+        if deictic_temporal_reply:
+            for delta in (-2, -1):
+                neighbor_id = f"{prefix}{ordinal + delta}"
+                neighbor = sidecar.documents.get(neighbor_id)
+                if neighbor is None or neighbor.node_type != "turn":
+                    continue
+                candidates[neighbor_id] = max(
+                    candidates.get(neighbor_id, 0.0),
+                    anchor_score + 18.0 - 0.5 * abs(delta),
+                )
+                if neighbor_id not in protected_backward:
+                    protected_backward.append(neighbor_id)
         deltas = (-2, -1, 1, 2, 3) if slot_completion_query else (-2, -1, 1, 2)
         for delta in deltas:
             neighbor_id = f"{prefix}{ordinal + delta}"
@@ -1583,7 +1615,7 @@ def _scene_window_nodes(
     # the topical anchor. Reserve a tiny ordered closure before global scoring;
     # otherwise many stronger topical anchors can evict the actual reply.
     return list(dict.fromkeys([
-        *protected_forward[:6], *ranked,
+        *protected_backward[:4], *protected_forward[:6], *ranked,
     ]))[:limit]
 
 def _followup_endorsements(text: str) -> list[str]:
@@ -2484,13 +2516,139 @@ def _numeric_value(value: str) -> int | None:
 def _source_date(value: str | None) -> datetime | None:
     if not value:
         return None
-    match = re.match(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", value)
-    if match is None:
+    match = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", value)
+    if match is not None:
+        try:
+            return datetime(*(int(part) for part in match.groups()))
+        except ValueError:
+            return None
+    # Chat exports often attach a clock prefix to a natural-language session
+    # date. ISO-only parsing silently loses the source anchor needed by
+    # relative-time evidence.
+    natural = re.search(
+        r"\b(\d{1,2})\s+"
+        r"(January|February|March|April|May|June|July|August|September|"
+        r"October|November|December),?\s+(\d{4})\b",
+        value, re.IGNORECASE,
+    )
+    if natural is None:
         return None
     try:
-        return datetime(*(int(part) for part in match.groups()))
+        return datetime.strptime(
+            f"{natural.group(1)} {natural.group(2).title()} {natural.group(3)}",
+            "%d %B %Y",
+        )
     except ValueError:
         return None
+
+
+def _relative_date_from_text(text: str, anchor: datetime) -> datetime | None:
+    """Resolve bounded source-local deictic dates without topic knowledge."""
+    folded = text.casefold()
+    if re.search(r"\byesterday\b", folded):
+        return anchor - timedelta(days=1)
+    if re.search(r"\btoday\b", folded):
+        return anchor
+    if re.search(r"\btomorrow\b", folded):
+        return anchor + timedelta(days=1)
+    match = re.search(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|a)\s+"
+        r"(day|week)s?\s+ago\b", folded,
+    )
+    if match is None:
+        return None
+    amount = 1 if match.group(1) == "a" else (
+        _numeric_value(match.group(1)) or 0
+    )
+    if amount <= 0:
+        return None
+    return anchor - timedelta(
+        days=amount * (7 if match.group(2) == "week" else 1),
+    )
+
+
+def _scoped_relative_date_hint(
+    index: V36Index, source_ids: list[str], ir: QueryIR,
+) -> dict[str, Any] | None:
+    """Bind an elliptical relative-date reply to its local event scene.
+
+    This applies only to explicit before/after date questions, requires every
+    comparison target in the same bounded scene, checks speaker ownership and
+    provenance, and accepts only one resulting date. It is topic independent.
+    """
+    if (
+        ir.requested_value_type != "date"
+        or not set(ir.temporal_constraints).intersection({"after", "before"})
+        or len(ir.comparison_targets) < 2
+    ):
+        return None
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    candidate_ids = set(source_ids)
+    owner_terms = _tokens(ir.target_owner)
+    rows: list[tuple[int, datetime, TurnNodeV36, list[TurnNodeV36]]] = []
+    for source_id in dict.fromkeys(source_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None:
+            continue
+        if owner_terms and not _fuzzy_overlap(owner_terms, _tokens(turn.speaker_key)):
+            continue
+        anchor = _source_date(turn.session_date)
+        if anchor is None:
+            continue
+        resolved = _relative_date_from_text(turn.text, anchor)
+        if resolved is None or not re.search(
+            r"\b(?:it|that|this|them|those|we|i|they|he|she)\b",
+            turn.text, re.IGNORECASE,
+        ):
+            continue
+        scene = [candidate for candidate in index.turns if (
+            candidate.session_id == turn.session_id
+            and abs(candidate.turn_index - turn.turn_index) <= 2
+        )]
+        scene_terms = _tokens(" ".join(candidate.text for candidate in scene))
+        target_hits = 0
+        for target in ir.comparison_targets:
+            base_terms = _tokens(target) - _QUERY_STOP_TERMS - owner_terms
+            matched = any(
+                _fuzzy_overlap(
+                    {term, *_RELATION_TERM_FAMILIES.get(term, set())},
+                    scene_terms,
+                )
+                for term in base_terms
+            )
+            target_hits += int(matched)
+        if target_hits < len(ir.comparison_targets):
+            continue
+        # Require the navigator to have selected at least two members of this
+        # scene. The operator completes a route; it never creates a global one.
+        selected_scene = sum(
+            candidate.node_id in candidate_ids for candidate in scene
+        )
+        if selected_scene < 2:
+            continue
+        rows.append((target_hits * 10 + selected_scene, resolved, turn, scene))
+    if not rows or len({row[1].date() for row in rows}) != 1:
+        return None
+    _score, resolved, turn, scene = max(rows, key=lambda row: row[0])
+    anchor = _source_date(turn.session_date)
+    assert anchor is not None
+    return {
+        "operation": "source_bound_scoped_relative_date",
+        "value": resolved.strftime("%Y-%m-%d"),
+        "date_precision": "day",
+        "derivation_kind": "source_local_relative_scene",
+        "source_turn_ids": [candidate.node_id for candidate in scene],
+        "relative_source_turn_id": turn.node_id,
+        "anchor_date": anchor.strftime("%Y-%m-%d"),
+        "evidence": " ".join(candidate.text for candidate in scene)[:900],
+        "binding_complete": True,
+        "certified": True,
+        "operator_certificate": {
+            "entity_match": True, "relation_match": True,
+            "scope_match": True, "provenance_complete": True,
+        },
+    }
+
 
 
 def _relative_scope_matches(
@@ -3243,6 +3401,25 @@ def retrieve(
     candidates, candidate_trace = _candidate_nodes(
         query_ir, augmentation, sidecar, planner, policy.anchor_limit,
     )
+    # Spend the incremental budget on role-directed graph navigation before
+    # broad multichannel and scene overlays. The baseline V4 evidence remains
+    # untouched; only the ordering of optional additions changes. Previously
+    # these edges were computed late and almost always rejected after the pack
+    # was full, reducing typed expansion to trace-only instrumentation.
+    relations = _relations_for_gap(
+        certificate.missing_roles, augmentation.answer_algebra,
+    )
+    seeds = list(dict.fromkeys([
+        *original_sources, *original_frames, *original_groups,
+        *candidates[:12],
+    ]))
+    expanded, expansion_trace = _expand_nodes(
+        seeds, sidecar, relations, policy,
+    )
+    expanded_added, expansion_decisions = _append_sources(
+        result, index, sidecar, expanded,
+        pack_limit, "v41_typed_expansion", 8,
+    )
     location_source_nodes = [
         node_id for node_id in candidates
         if (candidate_trace.get("channels", {}).get(node_id) or {}).get(
@@ -3472,21 +3649,6 @@ def retrieve(
         result, index, sidecar, pair_completion_nodes, pack_limit,
         "v41_dialogue_pair_completion", 10,
     )
-    relations = _relations_for_gap(
-        certificate.missing_roles, augmentation.answer_algebra,
-    )
-    seeds = list(dict.fromkeys([
-        *original_sources, *original_frames, *original_groups,
-        *candidates[:12],
-    ]))
-    expanded, expansion_trace = _expand_nodes(
-        seeds, sidecar, relations, policy,
-    )
-    expanded_added, expansion_decisions = _append_sources(
-        result, index, sidecar, expanded,
-        pack_limit,
-        "v41_typed_expansion", 8,
-    )
     closure_nodes = _dialogue_closure_nodes(
         list(dict.fromkeys(result.leaf_node_ids)), query_ir, sidecar,
         policy.dialogue_closure_limit,
@@ -3551,6 +3713,11 @@ def retrieve(
     ]
     derived_hints = [
         hint for hint in (
+            _scoped_relative_date_hint(
+                index, list(dict.fromkeys([
+                    *packed_sources, *scene_window_nodes, *late_scene_nodes,
+                ])), query_ir,
+            ),
             _explicit_date_hint(index, packed_sources, query_ir),
             _scoped_container_count_hint(index, packed_sources, query_ir),
             _labeled_collection_subtotals_hint(index, query_ir),
@@ -3577,6 +3744,7 @@ def retrieve(
         if hint.get("operation") in {
             "temporal_order_from_lossless_sources",
             "temporal_sequence_from_lossless_sources",
+            "source_bound_scoped_relative_date",
         }
         for key in (
             "source_turn_ids", "selected_source_turn_id",
@@ -3652,6 +3820,7 @@ def retrieve(
         if hint.get("operation") in {
             "temporal_order_from_lossless_sources",
             "temporal_sequence_from_lossless_sources",
+            "source_bound_scoped_relative_date",
         } and hint.get("certified") is True
     ), None)
     if temporal_bound is not None:
@@ -3698,26 +3867,11 @@ def retrieve(
             "generic_operator_hints", []
         )
     )
-    hard_relation_plan = augmentation.answer_algebra in {
-        "temporal_lookup", "temporal_comparison", "multi_hop",
-        "state_update", "reference_identity",
-    } and not (
-        augmentation.answer_algebra == "temporal_lookup"
-        and certified_source_bound_date
-    )
-    ambiguous_scene_plan = bool(
-        augmentation.answer_algebra in {
-            "dialogue_lookup", "preference_recommendation",
-        }
-        and len(answer_bearing_evidence) >= 4
-    )
-    augmentation.planner_required = bool(
-        inferential_identity
-        or augmentation.answer_algebra == "collection"
-        or hard_relation_plan
-        or ambiguous_scene_plan
-        or (augmentation.planner_required and not certificate.complete)
-    )
+    # Planner is a bounded gap repair, not a default reasoning stage. It is
+    # called only after deterministic multichannel and typed expansion still
+    # leave the four provenance certificates or a required role incomplete.
+    # Difficulty affects its prompt, not whether complete evidence is re-searched.
+    augmentation.planner_required = not certificate.complete
     if certified_source_bound_date:
         result.retrieval_trace["v41_planner_gate"] = "certified_source_bound_date"
     if augmentation.answer_algebra == "collection":
@@ -3868,7 +4022,10 @@ def retrieve(
         *[
             document.session_ids[0]
             for source_id in [
-                *answer_bearing_added, *collection_source_added, *scene_added, *pair_completion_added, *candidate_added, *projected_added, *expanded_added, *closure_added, *late_scene_added, *temporal_operator_added,
+                *expanded_added, *answer_bearing_added, *collection_source_added,
+            *candidate_added, *scene_added, *overlay_added, *projected_added,
+            *pair_completion_added, *closure_added, *late_scene_added,
+            *temporal_operator_added,
             ]
             if (document := sidecar.documents.get(source_id))
             and document.session_ids
@@ -3883,6 +4040,12 @@ def retrieve(
             "diagnostics": sidecar.diagnostics,
         },
         "v41_candidate_trace": candidate_trace,
+        "v41_optional_stage_order": [
+            "typed_expansion", "answer_bearing", "collection_source",
+            "multichannel", "scene_window", "lossless_overlay",
+            "source_projection", "dialogue_pair", "dialogue_closure",
+            "late_scene", "temporal_operator",
+        ],
         "v41_scene_window_decisions": scene_decisions,
         "v41_scene_window_evidence": scene_window_evidence,
         "v41_late_scene_window_node_ids": late_scene_nodes,
@@ -3924,7 +4087,10 @@ def retrieve(
         "v41_original_source_ids": original_sources,
         "v41_original_frame_ids": original_frames,
         "v41_source_additions": [
-            *answer_bearing_added, *collection_source_added, *scene_added, *pair_completion_added, *candidate_added, *projected_added, *expanded_added, *closure_added, *late_scene_added, *temporal_operator_added,
+            *expanded_added, *answer_bearing_added, *collection_source_added,
+            *candidate_added, *scene_added, *overlay_added, *projected_added,
+            *pair_completion_added, *closure_added, *late_scene_added,
+            *temporal_operator_added,
         ],
         "v41_source_deletions": sorted(set(original_sources) - set(packed_sources)),
         "v41_frame_deletions": sorted(
@@ -4389,14 +4555,16 @@ def answer_messages(
             binding_ok = hint.get("binding_complete") is not False
             operation = str(hint.get("operation") or "")
             mandatory_operations = {
-                "distinct_collection", "scoped_container_count",
+                "distinct_collection", "scoped_container_count", "duration_total",
                 "labeled_collection_subtotal_sum",
                 "event_identity_collection_members",
                 "temporal_order_from_lossless_sources",
                 "temporal_sequence_from_lossless_sources",
                 "explicit_operand_currency_sum", "labeled_scalar_difference",
                 "same_unit_state_difference", "record_time_extreme",
-                "source_bound_explicit_date", "pending_operation_target_pairs",
+                "source_bound_explicit_date",
+                "source_bound_scoped_relative_date",
+                "pending_operation_target_pairs",
                 "named_event_attendance_count", "binary_savings_difference",
                 "latest_scalar_state_from_lossless_sources",
                 "threshold_progress_remaining", "latest_approx_scalar_state",
@@ -4433,8 +4601,35 @@ def answer_messages(
                     "required_operand",
                 }
             )
+            duration_unit = str(hint.get("unit") or "").casefold().rstrip("s")
+            duration_unit_bound = bool(
+                operation != "duration_total"
+                or (
+                    duration_unit
+                    and re.search(
+                        rf"\b{re.escape(duration_unit)}s?\b",
+                        case.question, re.IGNORECASE,
+                    )
+                )
+            )
+            query_ir_trace = trace.get("query_ir") or {}
+            scoped_single_date_safe = not (
+                operation == "source_bound_explicit_date"
+                and set(query_ir_trace.get("temporal_constraints") or [])
+                .intersection({"after", "before"})
+                and len(query_ir_trace.get("comparison_targets") or []) > 1
+            )
             operation_safe = (
                 operation in mandatory_operations
+                and duration_unit_bound
+                and scoped_single_date_safe
+                and not (
+                    algebra == "temporal_lookup"
+                    and operation in {
+                        "temporal_order_from_lossless_sources",
+                        "temporal_sequence_from_lossless_sources",
+                    }
+                )
                 and (
                     operation != "exact_entity_absence"
                     or robust_absence
@@ -4466,6 +4661,7 @@ def answer_messages(
     # retrieval certificate is missing a generic role label.
     local_self_certifying = {
         "record_time_extreme", "source_bound_explicit_date",
+        "source_bound_scoped_relative_date",
         "pending_operation_target_pairs", "paired_metric_total",
         "named_event_attendance_count", "binary_savings_difference",
         "latest_scalar_state_from_lossless_sources",
@@ -4498,6 +4694,14 @@ def answer_messages(
         if not isinstance(hint, dict) or hint.get("certified") is not True:
             continue
         operation = str(hint.get("operation") or "")
+        query_ir_trace = trace.get("query_ir") or {}
+        if (
+            operation == "source_bound_explicit_date"
+            and set(query_ir_trace.get("temporal_constraints") or [])
+            .intersection({"after", "before"})
+            and len(query_ir_trace.get("comparison_targets") or []) > 1
+        ):
+            continue
         direction_state = bool(
             operation == "latest_valid_state"
             and hint.get("change_direction")
@@ -4915,7 +5119,9 @@ def answer_messages(
         certified_operator_results = [
             row for row in constraints
             if row.get("operation") in {
-                "record_time_extreme", "paired_metric_total",
+                "record_time_extreme", "source_bound_explicit_date",
+                "source_bound_scoped_relative_date",
+                "duration_total", "paired_metric_total",
                 "pending_operation_target_pairs",
                 "named_event_attendance_count",
                 "binary_savings_difference",
@@ -4977,6 +5183,8 @@ def answer_messages(
             exact_scalar_results = [
                 row for row in certified_operator_results
                 if row.get("operation") in {
+                    "source_bound_explicit_date",
+                    "source_bound_scoped_relative_date", "duration_total",
                     "threshold_progress_remaining",
                     "latest_approx_scalar_state",
                     "latest_labeled_currency_state",
@@ -5029,6 +5237,8 @@ def answer_messages(
     certified_scalar_slots = [
         row for row in constraints
         if row.get("operation") in {
+            "source_bound_explicit_date",
+            "source_bound_scoped_relative_date", "duration_total",
             "threshold_progress_remaining",
             "latest_approx_scalar_state",
             "latest_labeled_currency_state",

@@ -1059,10 +1059,57 @@ def build_evidence_ledger(
     return rows
 
 
+
+def _question_derived_answer_policy(question: str) -> str:
+    """Compile broad answer algebra from wording without benchmark metadata."""
+    policies: list[str] = []
+    policies.append(
+        "Preserve exact identity and attribution. A value for a different named "
+        "person, relationship, place, product, title, event, or object cannot be "
+        "transferred to the requested one. If only a sibling entity is supported, "
+        "answer that the requested information is unavailable and do not include "
+        "the sibling entitys number or value as though it answered the question."
+    )
+    if re.search(r"\b(?:how many|how much|total|combined|average|in all)\b", question, re.I):
+        policies.append(
+            "For an aggregate, scan all matching facts and source excerpts; bind "
+            "each quantity to its named item, event, unit, owner, lifecycle, and "
+            "time scope. Combine non-overlapping operands, deduplicate repeated "
+            "mentions, count repeated scheduled occurrences separately, and do "
+            "not stop after the first subtotal."
+        )
+    if re.search(r"\b(?:when|how long|days?|weeks?|months?|years?)\b", question, re.I):
+        policies.append(
+            "For time reasoning, first identify the exact requested event or both "
+            "named endpoints. Resolve each relative expression against its own "
+            "source date, then calculate. Never borrow a date or duration from a "
+            "nearby event that merely shares a topic."
+        )
+    if re.search(r"\b(?:current|currently|now|latest|still)\b", question, re.I):
+        policies.append(
+            "For a current value, apply later additions, removals, replacements, "
+            "corrections, and cancellations to the earlier state; do not answer "
+            "with an older subtotal."
+        )
+    if re.search(r"\b(?:first|earliest|latest|order|before|after)\b", question, re.I):
+        policies.append(
+            "For ordering, compare only completed instances of the exact named "
+            "events and return every requested member in the requested direction."
+        )
+    if re.search(r"\b(?:which|what)\b.*\b(?:list|item|job|name|title|shop|place)\b|\b\d+(?:st|nd|rd|th)\b", question, re.I):
+        policies.append(
+            "For an ordinal or named-field lookup, use the complete cited source "
+            "list and preserve its one-based order; return the exact requested "
+            "name or field rather than a nearby list item."
+        )
+    return " ".join(policies)
+
+
 def answer_messages(case: QuestionCase, retrieval: RetrievedContext) -> list[dict[str, str]]:
     preference_instruction = ("When the user asks for advice or a recommendation, you MUST answer with practical, tailored suggestions. Use the evidence as preference and compatibility constraints and build on the user's existing tools, successes, setup, and concerns. You may use general knowledge for the advice. Do not abstain merely because the exact tip, resource, or accessory is not already in memory. " if retrieval.query_kind=="preference" else "")
+    question_policy = _question_derived_answer_policy(case.question)
     system = """Answer the question using the provided GraphMem V2 evidence ledger, routing cards, atomic facts, and short source excerpts.
-Do not reveal chain-of-thought. Treat an operator as authoritative only when candidate_pool_complete=true; otherwise it is a fallible aid that must be checked against the cited facts, raw excerpts, date window, completed/planned status, and the exact entity or action in the question. Resolve relative time expressions against each source's session date. observed_at is an evidence date, but explicit relative wording in the source can still be used to derive an event date or duration. """ + preference_instruction + """For factual claims about the user, stay grounded in evidence. Prefer a directly matching recent source over a generic state label. If the evidence does not support an answer, say that there is not enough information. Give only a concise final answer."""
+Do not reveal chain-of-thought. Treat an operator as authoritative only when candidate_pool_complete=true; otherwise it is a fallible aid that must be checked against the cited facts, raw excerpts, date window, completed/planned status, and the exact entity or action in the question. Resolve relative time expressions against each source's session date. observed_at is an evidence date, but explicit relative wording in the source can still be used to derive an event date or duration. """ + preference_instruction + """For factual claims about the user, stay grounded in evidence. Prefer a directly matching recent source over a generic state label. If the evidence does not support an answer, say that there is not enough information. Give only a concise final answer.""" + (" " + question_policy if question_policy else "")
     mandatory=_mandatory_answer_hint(retrieval.context_text)
     mandatory_block=(f"\nMANDATORY DETERMINISTIC ANSWER CONSTRAINT: {mandatory}\n" if mandatory else "")
     user = f"Question date: {case.question_date or 'unknown'}\nQuestion: {case.question}{mandatory_block}\n\n{retrieval.context_text}"

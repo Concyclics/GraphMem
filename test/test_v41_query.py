@@ -53,6 +53,42 @@ def test_v41_domain_query_plan_is_generic_and_role_based() -> None:
     assert query_views(ir, plan)
 
 
+def test_v41_temporal_deictic_reply_keeps_preceding_event_identity() -> None:
+    from graphmem_demo.v41.retrieval import _scene_window_nodes
+    from graphmem_demo.v41.schema import (
+        QuerySidecarV41, SidecarDocumentV41,
+    )
+
+    ir = build_query_ir("When did Dana take a walk after the trip?")
+    assert ir.requested_value_type == "date"
+    assert build_query_plan(ir).answer_algebra == "temporal_lookup"
+    documents = {
+        "q:s:turn:2": SidecarDocumentV41(
+            node_id="q:s:turn:2", node_type="turn",
+            session_ids=["s"], source_turn_ids=["q:s:turn:2"],
+            text="speaker Dana | [Media shared; caption: walking on a trail]",
+        ),
+        "q:s:turn:3": SidecarDocumentV41(
+            node_id="q:s:turn:3", node_type="turn",
+            session_ids=["s"], source_turn_ids=["q:s:turn:3"],
+            text="speaker Lee | Is that recent?",
+        ),
+        "q:s:turn:4": SidecarDocumentV41(
+            node_id="q:s:turn:4", node_type="turn",
+            session_ids=["s"], source_turn_ids=["q:s:turn:4"],
+            text="speaker Dana | We did it yesterday after the trip.",
+        ),
+    }
+    sidecar = QuerySidecarV41(
+        index_hash="test", policy_version="test", documents=documents,
+        inverted={}, adjacency={},
+    )
+    selected = _scene_window_nodes(
+        ["q:s:turn:4"], ir, sidecar, limit=4,
+    )
+    assert selected[:2] == ["q:s:turn:2", "q:s:turn:3"]
+
+
 def test_v41_reference_identity_is_generic_and_planner_bound() -> None:
     from graphmem_demo.v41 import planner_messages
 
@@ -137,6 +173,12 @@ def test_v41_retrieval_only_appends_sources_and_respects_budget() -> None:
     assert trace["v41_evidence_certificate"]["source_turn_ids"]
     assert "v41_candidate_trace" in trace
     assert "v41_typed_expansion" in trace
+    assert trace["v41_optional_stage_order"][:2] == [
+        "typed_expansion", "answer_bearing",
+    ]
+    assert trace["planner_required"] is (
+        not trace["v41_evidence_certificate"]["complete"]
+    )
 
 
 
@@ -922,6 +964,15 @@ def test_v41_certified_temporal_result_is_last_and_keeps_lossless_sources() -> N
     assert "I got the phone last month." in content[content.rfind(marker):]
     assert content.rstrip().endswith("larger memory block.")
 
+    lookup_case = replace(
+        case, question="When did I get the phone after the trip?",
+    )
+    result.retrieval_trace["v41_query_augmentation"][
+        "answer_algebra"
+    ] = "temporal_lookup"
+    lookup_content = answer_messages(lookup_case, result)[-1]["content"]
+    assert marker not in lookup_content
+
 
 
 
@@ -1545,6 +1596,54 @@ def test_v41_relative_anchor_answer_candidate_is_final_constraint() -> None:
 
 
 
+def test_v41_source_date_and_explicit_unit_duration_are_final_slots() -> None:
+    case, index, embedder = _parsed("When did I launch the site?")
+    ir = build_query_ir(case.question)
+    plan = build_query_plan(ir)
+    result = retrieve(
+        case=case, variant="hierarchical_hybrid_graph_v4_1_query",
+        index=index, capability_view=build_capability_view(index),
+        sidecar=build_sidecar(index), query_ir=ir,
+        query_vectors=embedder.embed(
+            query_views(ir, plan), question_id=case.question_id,
+            variant="hierarchical_hybrid_graph_v4_1_query",
+        ), token_budget=9200,
+    )
+    result.retrieval_trace["v41_evidence_certificate"] = {
+        "entity_match": True, "relation_match": True,
+        "scope_match": True, "provenance_complete": True,
+    }
+    result.retrieval_trace["generic_operator_hints"] = [{
+        "operation": "source_bound_explicit_date",
+        "value": "2023-07-02", "source_turn_ids": ["q:s1:turn:0"],
+        "binding_complete": True, "certified": True,
+    }]
+    date_content = answer_messages(case, result)[-1]["content"]
+    assert "CERTIFIED_FINAL_ANSWER_SLOT" in date_content
+    assert "2023-07-02" in date_content
+    result.retrieval_trace["query_ir"] = {
+        "temporal_constraints": ["after"],
+        "comparison_targets": ["walk", "trip"],
+    }
+    scoped_content = answer_messages(case, result)[-1]["content"]
+    assert "CERTIFIED_FINAL_ANSWER_SLOT" not in scoped_content
+    result.retrieval_trace["query_ir"] = {}
+
+    result.retrieval_trace["generic_operator_hints"] = [{
+        "operation": "duration_total", "value": 19, "unit": "days",
+        "frame_ids": ["q:s1:frame:0"],
+        "binding_complete": True, "certified": True,
+    }]
+    explicit_case = replace(case, question="How many days did the trip take?")
+    explicit_content = answer_messages(explicit_case, result)[-1]["content"]
+    assert "CERTIFIED_FINAL_ANSWER_SLOT" in explicit_content
+    assert "19" in explicit_content
+
+    ambiguous_case = replace(case, question="How long did the trip take?")
+    ambiguous_content = answer_messages(ambiguous_case, result)[-1]["content"]
+    assert "CERTIFIED_FINAL_ANSWER_SLOT" not in ambiguous_content
+
+
 def test_v41_local_temporal_pair_survives_unrelated_global_role_gap() -> None:
     case, index, embedder = _parsed(
         "How many days passed since I launched the site when I signed the contract?"
@@ -1668,11 +1767,11 @@ def test_v41_before_after_date_binds_both_events() -> None:
     ir = build_query_ir(
         "When did Melanie go on a hike after the roadtrip?"
     )
-    assert ir.requested_value_type == "temporal_order"
+    assert ir.requested_value_type == "date"
     assert ir.comparison_targets == [
         "melanie go hike", "roadtrip",
     ]
-    assert {"event_a", "event_b", "time_a", "time_b"}.issubset(
+    assert {"event", "time", "identity", "source"}.issubset(
         ir.required_roles
     )
 
@@ -1861,6 +1960,51 @@ def test_v41_comparison_query_uses_analogy_scene_terms() -> None:
     assert {"like", "analogy", "metaphor"}.issubset(
         set(plan.expanded_terms)
     )
+
+
+def test_v41_scoped_relative_date_binds_local_event_scene() -> None:
+    from graphmem_demo.v36.schema import TurnNodeV36, V36Index
+    from graphmem_demo.v41.retrieval import (
+        _scoped_relative_date_hint, _source_date,
+    )
+
+    assert _source_date("6:55 pm on 20 October, 2023").strftime("%Y-%m-%d") == "2023-10-20"
+    prefix = "memory:session_1:turn:"
+    turns = [
+        TurnNodeV36(
+            node_id=prefix + "0", question_id="q", session_id="s1",
+            session_date="9:00 am on 5 March, 2025", turn_index=0,
+            speaker="Alex", speaker_key="alex", listener="Blair",
+            transport_role="user", text="The audit is finally complete.",
+            retrieval_text="The audit is finally complete.",
+        ),
+        TurnNodeV36(
+            node_id=prefix + "1", question_id="q", session_id="s1",
+            session_date="9:00 am on 5 March, 2025", turn_index=1,
+            speaker="Blair", speaker_key="blair", listener="Alex",
+            transport_role="assistant", text="Did you deploy after the audit?",
+            retrieval_text="Did you deploy after the audit?",
+        ),
+        TurnNodeV36(
+            node_id=prefix + "2", question_id="q", session_id="s1",
+            session_date="9:00 am on 5 March, 2025", turn_index=2,
+            speaker="Alex", speaker_key="alex", listener="Blair",
+            transport_role="user", text="Yes, I did it yesterday.",
+            retrieval_text="Yes, I did it yesterday.",
+        ),
+    ]
+    ir = build_query_ir("When did Alex deploy after the audit?")
+    hint = _scoped_relative_date_hint(
+        V36Index(turns=turns), [turn.node_id for turn in turns], ir,
+    )
+    assert hint is not None
+    assert hint["value"] == "2025-03-04"
+    assert hint["source_turn_ids"] == [turn.node_id for turn in turns]
+    assert hint["operator_certificate"] == {
+        "entity_match": True, "relation_match": True,
+        "scope_match": True, "provenance_complete": True,
+    }
+
 
 
 def test_v41_media_reaction_scene_adds_immediate_reply() -> None:
