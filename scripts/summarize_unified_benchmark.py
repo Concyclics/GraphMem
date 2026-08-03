@@ -44,6 +44,25 @@ def unique_by_question(items: Iterable[dict[str, Any]]) -> dict[str, dict[str, A
     }
 
 
+def unique_provider_calls(
+    items: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Remove persisted cache replays while retaining calls without provider IDs."""
+    output: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    replayed = 0
+    for item in items:
+        call_id = str(item.get("call_id") or "").strip()
+        if call_id:
+            key = (str(item.get("model") or ""), call_id)
+            if key in seen:
+                replayed += 1
+                continue
+            seen.add(key)
+        output.append(item)
+    return output, replayed
+
+
 def percentile(values: list[int | float], quantile: float) -> int | float:
     if not values:
         return 0
@@ -119,6 +138,8 @@ def main() -> None:
         answer_rows.extend(rows(directory / "answers.jsonl"))
         stat_rows.extend(rows(directory / "question_stats.jsonl"))
         calls.extend(rows(directory / "llm_calls.jsonl"))
+    raw_call_records = len(calls)
+    calls, replayed_call_records = unique_provider_calls(calls)
     answers = unique_by_question(answer_rows)
     stats = unique_by_question(stat_rows)
     judge_path = args.judge
@@ -181,6 +202,11 @@ def main() -> None:
         "benchmark": args.benchmark,
         "variant": args.variant,
         "models": dict(models),
+        "call_accounting": {
+            "raw_records": raw_call_records,
+            "unique_provider_calls": len(calls),
+            "cached_replay_records_excluded": replayed_call_records,
+        },
         "expected_questions": args.expected,
         "answered_questions": len(answers),
         "judged_questions": len(judged_ids),

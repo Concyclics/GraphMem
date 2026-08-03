@@ -38,3 +38,16 @@ def test_unified_report_accepts_both_judge_contracts() -> None:
     assert module.judged_correct({"verdict": "yes"}) is True
     assert module.judged_correct({"label": "CORRECT"}) is True
     assert module.judged_correct({"verdict": "no"}) is False
+
+
+def test_unified_report_excludes_cached_call_replays_by_provider_id() -> None:
+    module = _module()
+    first = {"model": "qwen", "call_id": "call-1", "total_tokens": 100}
+    replay = {**first, "question_id": "replayed-owner"}
+    no_id_a = {"model": "qwen", "total_tokens": 20}
+    no_id_b = {"model": "qwen", "total_tokens": 20}
+    unique, replayed = module.unique_provider_calls(
+        [first, replay, no_id_a, no_id_b]
+    )
+    assert unique == [first, no_id_a, no_id_b]
+    assert replayed == 1
