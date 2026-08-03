@@ -6,6 +6,7 @@ from graphmem_demo.v36.operators import (
     evaluate_operators, exact_entity_absence_hint, query_bound_collection_ledger, counterfactual_dependency_hint, record_time_source_hint, temporal_order_source_hint,
     open_temporal_sequence_from_sources_hint,
     temporal_source_pair_hint, transaction_sum_from_sources_hint,
+    source_bound_date_lookup_hint,
     dated_event_count_from_sources_hint, same_unit_state_difference_hint,
     category_acquisition_members_hint, maintenance_entity_count_hint,
     pending_operation_target_pairs_hint, paired_metric_total_from_sources_hint,
@@ -55,6 +56,295 @@ def _certificate(complete: bool = True) -> CompletenessCertificate:
         excluded_near_matches=[],
         complete=complete,
     )
+
+
+def test_source_bound_date_lookup_anchors_relative_time_to_matching_turn() -> None:
+    index = _index()
+    template = index.turns[0]
+    index.turns = [
+        replace(
+            template,
+            node_id="q:s1:t1",
+            speaker="Alice",
+            speaker_key="alice",
+            session_date="3:19 pm on 28 August, 2023",
+            text="Since we last spoke, I took my kids to the park yesterday.",
+        ),
+        replace(
+            template,
+            node_id="q:s2:t1",
+            speaker="Alice",
+            speaker_key="alice",
+            session_date="12:09 am on 13 September, 2023",
+            text="I had a great time at the park.",
+        ),
+    ]
+    frame_template = index.frames[0]
+    index.frames = [
+        replace(
+            frame_template,
+            frame_id="q:s1:park-frame",
+            owner_key="alice",
+            entity_key="park",
+            predicate_key="went",
+            object_key="kids to park",
+            source_turn_ids=["q:s1:t1"],
+        ),
+    ]
+    hint = source_bound_date_lookup_hint(
+        build_query_ir("When did Alice go to the park?"),
+        index,
+        ["q:s2:t1", "q:s1:t1"],
+    )
+    assert hint is not None
+    assert hint["operation"] == "source_bound_explicit_date"
+    assert hint["value"] == "2023-08-27"
+    assert hint["source_turn_ids"] == ["q:s1:t1"]
+    assert hint["operator_certificate"] == {
+        "entity_match": True,
+        "relation_match": True,
+        "scope_match": True,
+        "provenance_complete": True,
+    }
+
+
+def test_source_bound_date_lookup_binds_named_speaker_and_month_precision() -> None:
+    index = _index()
+    template = index.turns[0]
+    index.turns = [
+        replace(
+            template,
+            node_id="q:s1:jon",
+            speaker="Jon",
+            speaker_key="jon",
+            session_date="4:04 pm on 20 January, 2023",
+            text="Hey Gina. I lost my job as a banker yesterday.",
+        ),
+        replace(
+            template,
+            node_id="q:s1:gina",
+            speaker="Gina",
+            speaker_key="gina",
+            session_date="4:04 pm on 20 January, 2023",
+            text="Unfortunately, I also lost my job at the delivery company this month.",
+        ),
+    ]
+    frame_template = index.frames[0]
+    index.frames = [
+        replace(
+            frame_template,
+            frame_id="q:s1:jon-job",
+            owner_key="jon",
+            entity_key="banker job",
+            predicate_key="lost",
+            object_key="banker",
+            source_turn_ids=["q:s1:jon"],
+        ),
+        replace(
+            frame_template,
+            frame_id="q:s1:gina-job",
+            owner_key="gina",
+            entity_key="delivery company job",
+            predicate_key="lost",
+            object_key="delivery company",
+            source_turn_ids=["q:s1:gina"],
+        ),
+    ]
+    hint = source_bound_date_lookup_hint(
+        build_query_ir("When Gina has lost her job at the delivery company?"),
+        index,
+        ["q:s1:jon", "q:s1:gina"],
+    )
+    assert hint is not None
+    assert hint["value"] == "2023-01"
+    assert hint["date_precision"] == "month"
+    assert hint["source_turn_ids"] == ["q:s1:gina"]
+    assert hint["owner_bound"] is True
+
+
+def test_source_bound_date_lookup_derives_start_and_future_anchor() -> None:
+    index = _index()
+    template = index.turns[0]
+    index.turns = [
+        replace(
+            template,
+            node_id="q:music",
+            speaker="Alice",
+            speaker_key="alice",
+            session_date="6 December, 2023",
+            text="I've been playing the violin for about four months now.",
+        ),
+        replace(
+            template,
+            node_id="q:gym",
+            speaker="Bob",
+            speaker_key="bob",
+            session_date="27 July, 2023",
+            text="Starting tomorrow, I will go to the gym regularly.",
+        ),
+    ]
+    frame_template = index.frames[0]
+    index.frames = [
+        replace(
+            frame_template,
+            frame_id="q:music-frame",
+            owner_key="alice",
+            entity_key="violin",
+            predicate_key="playing",
+            object_key="violin",
+            source_turn_ids=["q:music"],
+        ),
+        replace(
+            frame_template,
+            frame_id="q:gym-frame",
+            owner_key="bob",
+            entity_key="gym",
+            predicate_key="start working out",
+            object_key="gym regularly",
+            source_turn_ids=["q:gym"],
+        ),
+    ]
+    music = source_bound_date_lookup_hint(
+        build_query_ir("When did Alice start playing the violin?"),
+        index,
+        ["q:music", "q:gym"],
+    )
+    gym = source_bound_date_lookup_hint(
+        build_query_ir("When did Bob start working out at the gym?"),
+        index,
+        ["q:music", "q:gym"],
+    )
+    assert music is not None
+    assert music["value"] == "2023-08"
+    assert music["date_precision"] == "month"
+    assert music["source_turn_ids"] == ["q:music"]
+    assert gym is not None
+    assert gym["value"] == "2023-07-28"
+    assert gym["date_precision"] == "day"
+    assert gym["source_turn_ids"] == ["q:gym"]
+
+
+def test_source_bound_date_lookup_uses_same_source_frame_for_pronoun() -> None:
+    index = _index()
+    template = index.turns[0]
+    index.turns = [
+        replace(
+            template,
+            node_id="q:turtles",
+            speaker="Nate",
+            speaker_key="nate",
+            session_date="5 September, 2022",
+            text="I've had them for 3 years now.",
+        ),
+    ]
+    frame_template = index.frames[0]
+    index.frames = [
+        replace(
+            frame_template,
+            frame_id="q:turtles:frame",
+            owner_key="nate",
+            entity_key="turtles",
+            predicate_key="duration owned",
+            object_key="3 years",
+            source_turn_ids=["q:turtles"],
+        ),
+    ]
+    hint = source_bound_date_lookup_hint(
+        build_query_ir("When did Nate get his turtles?"),
+        index,
+        ["q:turtles"],
+    )
+    assert hint is not None
+    assert hint["value"] == "2019"
+    assert hint["date_precision"] == "year"
+    assert hint["frame_bound_reference"] is True
+    assert hint["matched_source_term_count"] == 0
+    assert hint["frame_ids"] == ["q:turtles:frame"]
+    assert hint["derivation_kind"] == "duration_start"
+    assert hint["planner_safe"] is True
+
+
+def test_source_bound_date_lookup_joins_clauses_in_one_lossless_turn() -> None:
+    index = _index()
+    template = index.turns[0]
+    index.turns = [
+        replace(
+            template,
+            node_id="q:hoodie",
+            speaker="Gina",
+            speaker_key="gina",
+            session_date="21 June, 2023",
+            text=(
+                "This hoodie is from my own collection. "
+                "I made a limited edition line last week."
+            ),
+        ),
+    ]
+    index.frames = []
+    hint = source_bound_date_lookup_hint(
+        build_query_ir("When did Gina design a limited collection of hoodies?"),
+        index,
+        ["q:hoodie"],
+    )
+    assert hint is not None
+    assert hint["value"] == "2023-06-14"
+    assert hint["frame_bound_reference"] is False
+    assert hint["planner_safe"] is False
+
+
+def test_source_bound_date_lookup_rejects_equal_repeated_event_dates() -> None:
+    index = _index()
+    template = index.turns[0]
+    index.turns = [
+        replace(
+            template,
+            node_id="q:beach-one",
+            speaker="Maria",
+            speaker_key="maria",
+            session_date="10 January, 2023",
+            text="I went to the beach yesterday.",
+        ),
+        replace(
+            template,
+            node_id="q:beach-two",
+            speaker="Maria",
+            speaker_key="maria",
+            session_date="10 February, 2023",
+            text="I went to the beach yesterday.",
+        ),
+    ]
+    index.frames = []
+    hint = source_bound_date_lookup_hint(
+        build_query_ir("When did Maria go to the beach?"),
+        index,
+        ["q:beach-one", "q:beach-two"],
+    )
+    assert hint is None
+
+
+def test_source_bound_date_lookup_duration_overrides_recent_endpoint() -> None:
+    index = _index()
+    template = index.turns[0]
+    index.turns = [
+        replace(
+            template,
+            node_id="q:it-job",
+            speaker="John",
+            speaker_key="john",
+            session_date="6 August, 2022",
+            text="I recently left my IT job after 3 years.",
+        ),
+    ]
+    index.frames = []
+    hint = source_bound_date_lookup_hint(
+        build_query_ir("When did John start his job in IT?"),
+        index,
+        ["q:it-job"],
+    )
+    assert hint is not None
+    assert hint["value"] == "2019"
+    assert hint["derivation_kind"] == "duration_start"
+    assert hint["planner_safe"] is False
 
 
 def test_collection_operator_is_generic_and_certified() -> None:

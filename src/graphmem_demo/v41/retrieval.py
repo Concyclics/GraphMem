@@ -3664,10 +3664,30 @@ def retrieve(
             certificate.dialogue_complete, not certificate.missing_roles,
         ))
     inferential_identity = is_inferential_question(query_ir.raw_question)
+    certified_source_bound_date = any(
+        isinstance(hint, dict)
+        and hint.get("operation") == "source_bound_explicit_date"
+        and hint.get("planner_safe") is True
+        and hint.get("certified") is True
+        and hint.get("binding_complete") is True
+        and all(
+            (hint.get("operator_certificate") or {}).get(field) is True
+            for field in (
+                "entity_match", "relation_match", "scope_match",
+                "provenance_complete",
+            )
+        )
+        for hint in result.retrieval_trace.get(
+            "generic_operator_hints", []
+        )
+    )
     hard_relation_plan = augmentation.answer_algebra in {
         "temporal_lookup", "temporal_comparison", "multi_hop",
         "state_update",
-    }
+    } and not (
+        augmentation.answer_algebra == "temporal_lookup"
+        and certified_source_bound_date
+    )
     ambiguous_scene_plan = bool(
         augmentation.answer_algebra in {
             "dialogue_lookup", "preference_recommendation",
@@ -3681,6 +3701,8 @@ def retrieve(
         or ambiguous_scene_plan
         or (augmentation.planner_required and not certificate.complete)
     )
+    if certified_source_bound_date:
+        result.retrieval_trace["v41_planner_gate"] = "certified_source_bound_date"
     if augmentation.answer_algebra == "collection":
         planner_evidence = []
         for row in collection_source_evidence[:8]:

@@ -22,7 +22,8 @@ from .operators import (
     evaluate_operators, query_bound_collection_ledger, counterfactual_dependency_hint, record_time_source_hint, temporal_order_source_hint,
     open_temporal_sequence_from_sources_hint,
     temporal_source_pair_hint, relative_time_from_sources_hint,
-    transaction_sum_from_sources_hint, exact_entity_absence_hint,
+    source_bound_date_lookup_hint, transaction_sum_from_sources_hint,
+    exact_entity_absence_hint,
     named_individual_event_members_hint, repeated_event_total_from_sources_hint,
     age_arithmetic_from_sources_hint, advance_booking_recency_from_sources_hint,
     current_role_duration_from_sources_hint, weekly_schedule_days_from_sources_hint,
@@ -3374,6 +3375,9 @@ def retrieve(
     relative_time_hint = relative_time_from_sources_hint(
         ir, index, temporal_operator_source_ids, case.question_date,
     )
+    date_lookup_hint = source_bound_date_lookup_hint(
+        ir, index, operator_source_ids,
+    )
     transaction_sum_hint = transaction_sum_from_sources_hint(
         ir, index, operator_source_ids,
     )
@@ -3659,6 +3663,12 @@ def retrieve(
             if hint.get("operation") not in {"duration_total", "event_time"}
         ]
         operator_hints.insert(0, relative_time_hint)
+    if date_lookup_hint is not None:
+        operator_hints = [
+            hint for hint in operator_hints
+            if hint.get("operation") not in {"event_time", "source_bound_explicit_date"}
+        ]
+        operator_hints.insert(0, date_lookup_hint)
     if transaction_sum_hint is not None:
         operator_hints = [
             hint for hint in operator_hints

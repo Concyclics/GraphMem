@@ -408,6 +408,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v41-planner-output-max", type=int, default=256)
     parser.add_argument("--v41-query-target-tokens", type=int, default=10000)
     parser.add_argument("--v41-query-hard-limit-tokens", type=int, default=13000)
+    parser.add_argument(
+        "--record-query-budget-overflow",
+        action="store_true",
+        help=(
+            "Persist V4.1 answers that exceed the query hard limit and mark "
+            "their budget failure instead of aborting/retrying the shard."
+        ),
+    )
     parser.add_argument("--disable-v41-planner", action="store_true")
     parser.add_argument(
         "--retrieval-only",
@@ -590,6 +598,7 @@ def main() -> None:
         v41_query_target_tokens=args.v41_query_target_tokens,
         v41_query_hard_limit_tokens=args.v41_query_hard_limit_tokens,
         v41_enable_planner=not args.disable_v41_planner,
+        v41_record_query_budget_overflow=args.record_query_budget_overflow,
         retrieval_only=args.retrieval_only,
     )
     aggregates = run_demo(config)

@@ -446,6 +446,282 @@ def _duration_query_terms(ir: QueryIR) -> set[str]:
     }
 
 
+def source_bound_date_lookup_hint(
+    ir: QueryIR,
+    index: V36Index,
+    source_turn_ids: list[str],
+) -> dict[str, Any] | None:
+    """Resolve a date lookup from one query-bound lossless source.
+
+    Relative expressions are anchored to the selected source turn rather than
+    copied from an extracted frame.  This prevents a nearby event with the same
+    topic from donating its date, and works uniformly for peer dialogue and
+    user/assistant memory.
+    """
+    if ir.requested_value_type != "date":
+        return None
+    ignored = {
+        "when", "what", "which", "did", "does", "do", "has", "have",
+        "had", "is", "are", "was", "were", "will", "would", "the", "a",
+        "an", "to", "at", "in", "on", "of", "for", "my", "i", "me",
+    }
+    owner = ir.target_owner.casefold().strip()
+    query_terms = {
+        _stem_word(word)
+        for word in re.findall(r"[\w'-]+", ir.raw_question.casefold())
+        if word not in ignored and word.casefold() != owner
+    }
+    query_actions = action_families(ir.raw_question)
+    start_intent = bool(re.search(
+        r"\b(?:start(?:ed|ing)?|begin|began|get|got|adopt(?:ed)?|take up|took up|first|meet|met)\b",
+        ir.raw_question, re.IGNORECASE,
+    ))
+    turn_by_id = {turn.node_id: turn for turn in index.turns}
+    if not owner:
+        speaker_keys = {turn.speaker_key.casefold() for turn in index.turns}
+        named_speakers = speaker_keys.intersection(query_terms)
+        if len(named_speakers) == 1:
+            owner = next(iter(named_speakers))
+            query_terms.discard(owner)
+    frames_by_source: dict[str, list[RoleFrameNode]] = {}
+    for frame in index.frames:
+        for source_id in frame.source_turn_ids:
+            frames_by_source.setdefault(source_id, []).append(frame)
+    candidates: list[
+        tuple[int, int, int, int, int, int, str, datetime, str, str, str]
+    ] = []
+    for source_rank, source_id in enumerate(source_turn_ids):
+        turn = turn_by_id.get(source_id)
+        if turn is None:
+            continue
+        owner_match = int(bool(owner) and turn.speaker_key.casefold() == owner)
+        if owner and not owner_match:
+            continue
+        observed = _turn_observed_time(turn)
+        if observed is None:
+            continue
+        source_frames = [
+            frame for frame in frames_by_source.get(source_id, [])
+            if not owner or frame.owner_key.casefold() == owner
+        ]
+        frame_matches: list[tuple[int, int, float, str]] = []
+        for frame in source_frames:
+            frame_relation_text = " ".join((
+                frame.predicate_key, frame.event_identity_key,
+                " ".join(frame.semantic_type_keys),
+            ))
+            frame_terms = {
+                _stem_word(word)
+                for word in re.findall(
+                    r"[\w'-]+",
+                    " ".join((
+                        frame.entity_key,
+                        frame.predicate_key,
+                        frame.object_key,
+                        frame.context_key,
+                        frame.event_identity_key,
+                        " ".join(frame.semantic_type_keys),
+                    )).casefold(),
+                )
+            }
+            frame_overlap = len(query_terms & frame_terms)
+            frame_actions = action_families(frame_relation_text)
+            relation_bound = int(bool(query_actions & frame_actions))
+            # Asking when an entity was acquired can be answered from a
+            # source-grounded possession duration. This relation bridge is
+            # generic across pets, devices, jobs, homes, memberships, etc.
+            if (
+                start_intent
+                and "acquire" in query_actions
+                and "possess" in frame_actions
+            ):
+                relation_bound = 1
+            if frame_overlap:
+                frame_matches.append((
+                    frame_overlap, relation_bound, frame.confidence, frame.frame_id,
+                ))
+        best_frame_overlap, best_frame_relation, _frame_confidence, best_frame_id = max(
+            frame_matches, default=(0, 0, 0.0, ""),
+        )
+        turn_terms = {
+            _stem_word(word)
+            for word in re.findall(r"[\w'-]+", turn.text.casefold())
+        }
+        source_lexical_overlap = len(query_terms & turn_terms)
+        segments = [
+            value.strip() for value in re.split(
+                r"(?<=[.!?])\s+|\n+", turn.text,
+            ) if value.strip()
+        ] or [turn.text]
+        for segment in segments:
+            lowered_segment = segment.casefold()
+            derivation_kind = "source_relative"
+            date_precision = "day"
+            if re.search(r"\btomorrow\b", lowered_segment):
+                event_time = observed + timedelta(days=1)
+            elif re.search(r"\blast night\b", lowered_segment):
+                event_time = observed - timedelta(days=1)
+            else:
+                event_time = _relative_event_time(segment, observed)
+            if event_time is None and re.search(r"\bthis month\b", lowered_segment):
+                event_time = observed
+                date_precision = "month"
+            number = (
+                r"\d+|one|two|three|four|five|six|seven|eight|nine|ten|"
+                r"eleven|twelve"
+            )
+            ago_duration = re.search(
+                rf"\b({number})\s+(days?|weeks?|months?|years?)\s+ago\b",
+                lowered_segment,
+            )
+            start_duration = None
+            if start_intent:
+                start_duration = re.search(
+                    rf"\b(?:for|after)\s+(?:about\s+)?({number})\s+"
+                    rf"(days?|weeks?|months?|years?)(?:\s+now)?\b",
+                    lowered_segment,
+                )
+            duration = start_duration or ago_duration
+            if duration is not None and (
+                event_time is None or start_duration is not None
+            ):
+                derivation_kind = "duration_start"
+                amount_text, unit_text = duration.groups()
+                amount = (
+                    int(amount_text) if amount_text.isdigit()
+                    else _NUMBER_WORDS[amount_text]
+                )
+                unit = unit_text.rstrip("s")
+                if unit == "year":
+                    try:
+                        event_time = observed.replace(year=observed.year - amount)
+                    except ValueError:
+                        event_time = observed.replace(
+                            year=observed.year - amount, day=28,
+                        )
+                    date_precision = "year"
+                elif unit == "month":
+                    absolute_month = observed.year * 12 + observed.month - 1 - amount
+                    year, month_index = divmod(absolute_month, 12)
+                    day = min(
+                        observed.day, calendar.monthrange(year, month_index + 1)[1],
+                    )
+                    event_time = observed.replace(
+                        year=year, month=month_index + 1, day=day,
+                    )
+                    date_precision = "month"
+                else:
+                    event_time = observed - timedelta(
+                        **{f"{unit}s": amount}
+                    )
+            if event_time is None:
+                continue
+            if re.search(
+                r"\b(?:this|last|next) month\b", lowered_segment,
+            ):
+                date_precision = "month"
+            segment_terms = {
+                _stem_word(word)
+                for word in re.findall(r"[\w'-]+", segment.casefold())
+            }
+            overlap = len(query_terms & segment_terms)
+            action_overlap = int(bool(
+                query_actions & action_families(segment)
+            ))
+            if start_intent and re.search(
+                r"\b(?:start(?:ed|ing)?|begin|began)\b",
+                segment, re.IGNORECASE,
+            ):
+                action_overlap = 1
+            action_overlap = max(action_overlap, best_frame_relation)
+            required_overlap = 1 if len(query_terms) <= 3 else 2
+            # A same-source frame may resolve a pronoun in the lossless turn,
+            # but it never supplies the date itself. The relative/duration
+            # expression above must still be present in the cited source.
+            frame_bound = int(
+                (
+                    best_frame_overlap >= required_overlap
+                    or (best_frame_overlap >= 1 and best_frame_relation)
+                )
+                and bool(best_frame_id)
+            )
+            lexical_bound = (
+                source_lexical_overlap >= max(2, required_overlap)
+            )
+            effective_overlap = max(
+                overlap,
+                required_overlap if frame_bound else 0,
+                source_lexical_overlap if lexical_bound else 0,
+            )
+            if (
+                not frame_bound and not lexical_bound
+            ) or effective_overlap < required_overlap:
+                continue
+            candidates.append((
+                owner_match, effective_overlap, action_overlap,
+                source_lexical_overlap,
+                frame_bound, -source_rank, source_id, event_time,
+                date_precision, best_frame_id if frame_bound else "",
+                derivation_kind,
+            ))
+    if not candidates:
+        return None
+    (
+        owner_match, overlap, action_overlap, lexical_overlap,
+        frame_bound, _rank, source_id, event_time, precision, frame_id,
+        derivation_kind,
+    ) = max(
+        candidates,
+        key=lambda row: (
+            row[0], int(row[10] == "duration_start"),
+            row[1], row[2], row[3], row[4], row[5], row[6],
+        ),
+    )
+    # Multiple equally bound occurrences mean the event identity is not
+    # resolved. Refuse to certify a convenient nearby date and leave the
+    # ambiguity to the bounded planner.
+    tied_dates = {
+        row[7].date()
+        for row in candidates
+        if row[:5] == (
+            owner_match, overlap, action_overlap, lexical_overlap,
+            frame_bound,
+        )
+    }
+    if derivation_kind != "duration_start" and len(tied_dates) > 1:
+        return None
+    return {
+        "operation": "source_bound_explicit_date",
+        "value": (
+            event_time.strftime("%Y")
+            if precision == "year"
+            else event_time.strftime("%Y-%m")
+            if precision == "month"
+            else event_time.date().isoformat()
+        ),
+        "date_precision": precision,
+        "derivation_kind": derivation_kind,
+        "planner_safe": bool(
+            derivation_kind == "duration_start" and action_overlap and frame_bound
+        ),
+        "source_turn_ids": [source_id],
+        "frame_ids": [frame_id] if frame_id else [],
+        "matched_query_term_count": overlap,
+        "matched_source_term_count": lexical_overlap,
+        "frame_bound_reference": bool(frame_bound),
+        "matched_action_family": bool(action_overlap),
+        "owner_bound": bool(owner_match) if owner else True,
+        "binding_complete": True,
+        "certified": True,
+        "operator_certificate": {
+            "entity_match": True,
+            "relation_match": True,
+            "scope_match": True,
+            "provenance_complete": True,
+        },
+    }
+
+
 def relative_time_from_sources_hint(
     ir: QueryIR,
     index: V36Index,

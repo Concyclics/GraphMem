@@ -493,6 +493,10 @@ class DemoConfig:
     v41_query_target_tokens: int = 10000
     v41_query_hard_limit_tokens: int = 13000
     v41_enable_planner: bool = True
+    # Full-benchmark runs may retain an already-generated over-budget answer so
+    # it can be reported instead of aborting/retrying the entire shard. Budget
+    # pass/fail metrics remain unchanged; strict enforcement is the default.
+    v41_record_query_budget_overflow: bool = False
     # Persist the V3 index and retrieval ledger without spending tokens on the
     # built-in base answer. The graph navigator can then be the sole reader.
     retrieval_only: bool = False
@@ -2536,7 +2540,16 @@ def _run_v36_case_with_memory(
         config.v41_query_hard_limit_tokens if is_v41
         else config.v36_answer_hard_budget_tokens
     )
-    if not stats.build_budget_pass or not stats.answer_budget_pass:
+    retrieval.retrieval_trace["answer_hard_budget_enforced"] = not (
+        is_v41 and config.v41_record_query_budget_overflow
+    )
+    if (
+        not stats.build_budget_pass
+        or (
+            not stats.answer_budget_pass
+            and not (is_v41 and config.v41_record_query_budget_overflow)
+        )
+    ):
         raise RuntimeError(
             f"role-graph query budget exceeded for {case.question_id}: "
             f"build={stats.build_total_tokens}, answer={stats.answer_total_tokens}"
