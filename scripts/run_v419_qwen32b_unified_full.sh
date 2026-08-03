@@ -11,12 +11,15 @@ LOCOMO_PARALLEL_SHARDS="${LOCOMO_PARALLEL_SHARDS:-10}"
 LOCOMO_INFLIGHT_PER_SHARD="${LOCOMO_INFLIGHT_PER_SHARD:-8}"
 QUERY_HARD_LIMIT="${QUERY_HARD_LIMIT:-14000}"
 SHARD_RETRIES="${SHARD_RETRIES:-6}"
+RUN_JUDGE="${RUN_JUDGE:-1}"
 
 set -a
 source "${REPO}/.env"
 set +a
 
-: "${SGAO_API_KEY:?SGAO_API_KEY is required}"
+if [[ "${RUN_JUDGE}" == "1" ]]; then
+  : "${SGAO_API_KEY:?SGAO_API_KEY is required when RUN_JUDGE=1}"
+fi
 : "${QWEN_API_KEY:?QWEN_API_KEY is required}"
 : "${EMBEDDING_API_KEY:?EMBEDDING_API_KEY is required}"
 
@@ -132,6 +135,11 @@ run_lme >"${RUN_ROOT}/lme/full.log" 2>&1 & lme_pid=$!
 run_locomo >"${RUN_ROOT}/locomo/full.log" 2>&1 & locomo_pid=$!
 wait "${lme_pid}"
 wait "${locomo_pid}"
+
+if [[ "${RUN_JUDGE}" != "1" ]]; then
+  echo "Unified Qwen3-32B-FP8 memory run complete; judge skipped: ${RUN_ROOT}"
+  exit 0
+fi
 
 "${REPO}/.venv/bin/python" "${REPO}/scripts/evaluate_mem0_judge.py" \
   --answers "${RUN_ROOT}/lme/merged/hierarchical_hybrid_graph_v4_1_query/answers.jsonl" \
