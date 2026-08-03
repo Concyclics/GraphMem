@@ -10,6 +10,7 @@ LME_INFLIGHT_PER_SHARD="${LME_INFLIGHT_PER_SHARD:-16}"
 LOCOMO_PARALLEL_SHARDS="${LOCOMO_PARALLEL_SHARDS:-10}"
 LOCOMO_INFLIGHT_PER_SHARD="${LOCOMO_INFLIGHT_PER_SHARD:-8}"
 QUERY_HARD_LIMIT="${QUERY_HARD_LIMIT:-14000}"
+V36_LLM_SESSION_CAP="${V36_LLM_SESSION_CAP:-0}"
 SHARD_RETRIES="${SHARD_RETRIES:-6}"
 RUN_JUDGE="${RUN_JUDGE:-1}"
 BENCHMARKS="${BENCHMARKS:-both}"
@@ -56,6 +57,7 @@ COMMON_ARGS=(
   --variants hierarchical_hybrid_graph_v4_1_query
   --tree-mode hierarchical_hybrid_graph_v4_1_query
   --summary-schema graphmem_v4_1_query
+  --v36-llm-session-cap "${V36_LLM_SESSION_CAP}"
   --llm-model Qwen3-32B-FP8
   --llm-base-url http://127.0.0.1:8002/v1
   --llm-api-key-env QWEN_API_KEY
