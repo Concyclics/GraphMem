@@ -128,7 +128,7 @@ credited to any accuracy table until a complete replay is judged:
   recommendations before normal evidence packing.
 
 The synthetic regression uses an unseen musical-instrument domain rather than a
-benchmark question. The complete repository suite passes 871 tests, including
+benchmark question. The complete repository suite passes 873 tests, including
 the static gold/benchmark-branch scan.
 
 ## Qwen3-32B-FP8 status and measured costs
@@ -181,8 +181,28 @@ lossless turn and deterministic routing card but performs LLM semantic correctio
 for one question-independent, timeline-stratified information-dense session per
 question. The selected call is nested inside cap-2/cap-6, so compatible
 provider-call checkpoints are reused without reusing either larger-cap final
-index. Final 500-question accuracy and token tables must be inserted only after
-strict merge, replay-aware token audit and official judgment.
+index. The cap-1 run completed all 500 questions; official accuracy remains
+pending the separately authorized judge.
+
+The replay-deduplicated LongMemEval memory bill is:
+
+| Stage | Calls | Uncached input | Cached input | Output | Total |
+|---|---:|---:|---:|---:|---:|
+| Selective session extraction | 500 | 1,636,581 | 0 | 1,065,302 | 2,701,883 |
+| Lightweight planner | 500 | 531,957 | 0 | 57,939 | 589,896 |
+| Final answer | 514 | 4,756,701 | 0 | 16,976 | 4,773,677 |
+| Query total | 1,014 | 5,288,658 | 0 | 74,915 | 5,363,573 |
+
+Build mean/P50/P95/max is 5,403.77 / 5,446 / 6,394 / 8,844 tokens per
+question. Query mean/P50/P95/max is 10,727.15 / 10,910 / 15,424 / 29,212;
+391 questions exceed 10K, 122 exceed 12K and 78 exceed 13K. The 14 answer
+retries are real provider calls and remain in spend; 14 persisted record replays
+were separately removed by provider call ID. All reasoning-token counts are zero
+and all usage equations validate.
+
+Retrieval reaches at least one gold session on 98.8% of questions, all gold
+sessions on 92.4%, and has 96.083% mean session recall. Retrieval latency
+mean/P50/P95/max is 8.66 / 8.53 / 19.72 / 35.54 seconds.
 
 The 09:00 Asia/Singapore evaluation deadline passed while this isolated cap-1
 batch was still draining the local Qwen queue. The batch was allowed to finish
@@ -201,8 +221,8 @@ The final deadline fallback was launched without exposing credentials:
 
     RUN_ROOT=/home/chenhan/graphmem_v419_qwen32b_cap1_full_20260804 \
     RUN_JUDGE=0 BENCHMARKS=lme V36_LLM_SESSION_CAP=1 \
-    LME_PARALLEL_SHARDS=25 LME_INFLIGHT_PER_SHARD=16 \
-    LME_QUESTION_WORKERS=20 \
+    LLM_TIMEOUT_SEC=600 LME_PARALLEL_SHARDS=25 \
+    LME_INFLIGHT_PER_SHARD=5 LME_QUESTION_WORKERS=10 \
     bash scripts/run_v419_qwen32b_unified_full.sh
 
 The runner loads QWEN_API_KEY and EMBEDDING_API_KEY from the remote private
@@ -218,5 +238,16 @@ Completed Qwen LoCoMo artifacts:
   /home/chenhan/graphmem_v419_qwen32b_unified_full_20260803/locomo/report_no_judge/summary.json,
   SHA-256 37bf6e4045b1e778d588a3c67b6a4a2310af60f0881a49c14edd6e72f64526e4.
 
-The final cap-1 LongMemEval paths/hashes and all external judge outputs will be
-added after strict merge and authorized judgment.
+Completed Qwen LongMemEval artifacts:
+
+- answers: /home/chenhan/graphmem_v419_qwen32b_cap1_full_20260804/lme/merged/hierarchical_hybrid_graph_v4_1_query/answers.jsonl,
+  SHA-256 fe3f9e81d220a03fe25727a7a0851c3427423cc1103b7f11ea07152cc4517b29;
+- retrieval: the same variant directory, retrieval_results.jsonl,
+  SHA-256 1ef301dd34a94fb0e6b4438adfdb4c2c233c072c33430a63d3158ca867b18d78;
+- replay-deduplicated token report:
+  /home/chenhan/graphmem_v419_qwen32b_cap1_full_20260804/lme/report_no_judge/summary.json,
+  SHA-256 5fc105d5e0ac5e991b214e3cf4404871ffa30ab006dbc64c682fe5ec845d8213.
+
+External judge outputs will be appended only after explicit authorization to
+send benchmark questions, retrieved evidence and candidate answers to the
+configured provider.
