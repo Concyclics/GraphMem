@@ -319,6 +319,7 @@ class DemoConfig:
     deepseek_base_url: str | None = None
     llm_api_key_env: str = "SGAO_API_KEY"
     llm_request_profile: str = "openai"
+    llm_timeout_sec: float = 180.0
     embedding_base_url: str = "http://127.0.0.1:8001/v1"
     embedding_model: str = "Qwen3-Embedding-0.6B"
     tree_mode: str | None = None
@@ -514,6 +515,8 @@ class DemoConfig:
             raise ValueError("question_workers must be at least 1")
         if self.summary_workers < 0 or self.max_inflight_deepseek < 0:
             raise ValueError("summary_workers and max_inflight_deepseek cannot be negative")
+        if self.llm_timeout_sec <= 0:
+            raise ValueError("llm_timeout_sec must be positive")
         if self.tree_mode is not None and self.tree_mode not in {"legacy_kway", "direct_session", "hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0", "hierarchical_hybrid_graph_v4_1_query"}:
             raise ValueError("tree_mode must be legacy_kway, direct_session, hierarchical_state_graph_v2, or hierarchical_hypergraph_v3, or hierarchical_role_graph_v3_6, or hierarchical_hybrid_graph_v4_0, or hierarchical_hybrid_graph_v4_1_query")
         if self.summary_schema not in {
@@ -945,6 +948,7 @@ def _complete_services(
             base_url=config.deepseek_base_url,
             api_key_env=config.llm_api_key_env,
             request_profile=config.llm_request_profile,
+            timeout_sec=config.llm_timeout_sec,
         )),
         embedder
         or (

@@ -11,6 +11,7 @@ LME_QUESTION_WORKERS="${LME_QUESTION_WORKERS:-20}"
 LOCOMO_PARALLEL_SHARDS="${LOCOMO_PARALLEL_SHARDS:-10}"
 LOCOMO_INFLIGHT_PER_SHARD="${LOCOMO_INFLIGHT_PER_SHARD:-8}"
 QUERY_HARD_LIMIT="${QUERY_HARD_LIMIT:-14000}"
+LLM_TIMEOUT_SEC="${LLM_TIMEOUT_SEC:-600}"
 V36_LLM_SESSION_CAP="${V36_LLM_SESSION_CAP:-0}"
 SHARD_RETRIES="${SHARD_RETRIES:-6}"
 RUN_JUDGE="${RUN_JUDGE:-1}"
@@ -63,6 +64,7 @@ COMMON_ARGS=(
   --llm-base-url http://127.0.0.1:8002/v1
   --llm-api-key-env QWEN_API_KEY
   --llm-request-profile qwen
+  --llm-timeout-sec "${LLM_TIMEOUT_SEC}"
   --embedding-base-url http://127.0.0.1:8001/v1
   --embedding-model Qwen3-Embedding-0.6B
   --reasoning-effort none

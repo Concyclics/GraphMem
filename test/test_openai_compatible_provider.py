@@ -5,7 +5,9 @@ from types import SimpleNamespace
 import pytest
 
 import graphmem_demo.clients as clients_module
+import graphmem_demo.pipeline as pipeline_module
 from graphmem_demo.clients import OpenAICompatibleClient
+from graphmem_demo.pipeline import DemoConfig
 
 
 def test_openai_profile_maps_none_to_reasoning_effort_without_thinking(
@@ -115,3 +117,39 @@ def test_provider_retries_transient_service_errors_with_bounded_backoff() -> Non
     assert not clients_module._is_retryable_llm_error(permanent)
     assert clients_module._retry_sleep_sec(8, transient) == 60.0
     assert clients_module._retry_sleep_sec(8, rate_limit) == 60.0
+
+
+def test_pipeline_propagates_configured_llm_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(pipeline_module, "OpenAICompatibleClient", FakeClient)
+    config = DemoConfig(
+        data_path=tmp_path / "data.json",
+        output_dir=tmp_path / "out",
+        variants=("hierarchical_hybrid_graph_v4_1_query",),
+        llm_timeout_sec=600.0,
+    )
+    pipeline_module._complete_services(
+        config,
+        "hierarchical_hybrid_graph_v4_1_query",
+        embedder=object(),
+        compressor=object(),
+        summarizer=object(),
+    )
+
+    assert captured["timeout_sec"] == 600.0
+
+
+def test_demo_config_rejects_nonpositive_llm_timeout(tmp_path) -> None:
+    with pytest.raises(ValueError, match="llm_timeout_sec"):
+        DemoConfig(
+            data_path=tmp_path / "data.json",
+            output_dir=tmp_path / "out",
+            llm_timeout_sec=0,
+        )

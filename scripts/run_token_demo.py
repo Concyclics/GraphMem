@@ -50,6 +50,10 @@ def parse_args() -> argparse.Namespace:
         help="Map no-reasoning to DeepSeek thinking.disabled, OpenAI reasoning_effort=none, Qwen enable_thinking=false, or no field.",
     )
     parser.add_argument(
+        "--llm-timeout-sec", type=float, default=180.0,
+        help="Per-request LLM timeout. Local models need enough time to emit the configured maximum completion.",
+    )
+    parser.add_argument(
         "--llm-local",
         action="store_true",
         help="Use local vLLM for build/answer (port 8001, dummy API key).",
@@ -463,6 +467,7 @@ def main() -> None:
         deepseek_base_url=deepseek_base_url,
         llm_api_key_env=args.llm_api_key_env,
         llm_request_profile=args.llm_request_profile,
+        llm_timeout_sec=args.llm_timeout_sec,
         embedding_base_url=args.embedding_base_url,
         embedding_model=args.embedding_model,
         tree_mode=args.tree_mode,
