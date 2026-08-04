@@ -32,6 +32,20 @@ class ModelConfig:
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     embedding_base_url: str = "http://127.0.0.1:8001/v1"
     thinking_enabled: bool = False
+    max_concurrency: int = 128
+    refine_input_tokens_per_endpoint: int = 96
+    refine_output_tokens: int = 256
+    bridge_refine_output_tokens: int = 512
+
+
+@dataclass(frozen=True, slots=True)
+class SceneConfig:
+    min_turns: int = 2
+    max_turns: int = 8
+    topic_similarity_threshold: float = 0.55
+    max_events_per_scene: int = 3
+    coreference_margin: float = 0.08
+    refine_batch_size: int = 24
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,9 +70,9 @@ class EdgeConfig:
 
 @dataclass(frozen=True, slots=True)
 class StorageConfig:
-    runtime_mode: str = "neo4j_cached"
+    runtime_mode: str = "sqlite_snapshot"
     sqlite_path: str = "artifacts/v5/graphmem.sqlite"
-    neo4j_enabled: bool = True
+    neo4j_enabled: bool = False
     neo4j_uri: str = "bolt://127.0.0.1:7687"
     neo4j_batch_nodes: int = 1000
     neo4j_batch_edges: int = 2000
@@ -70,6 +84,7 @@ class GraphMemV5Config:
     profile: str = "full_balanced"
     random_seed: int = 42
     models: ModelConfig = field(default_factory=ModelConfig)
+    scenes: SceneConfig = field(default_factory=SceneConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     coarsen: CoarsenConfig = field(default_factory=CoarsenConfig)
     edges: EdgeConfig = field(default_factory=EdgeConfig)
@@ -98,6 +113,14 @@ class GraphMemV5Config:
             "max_candidates_per_node": self.edges.max_candidates_per_node,
             "max_degree_per_relation": self.edges.max_degree_per_relation,
             "refine_batch_size": self.edges.refine_batch_size,
+            "scene_min_turns": self.scenes.min_turns,
+            "scene_max_turns": self.scenes.max_turns,
+            "max_events_per_scene": self.scenes.max_events_per_scene,
+            "coreference_batch_size": self.scenes.refine_batch_size,
+            "max_concurrency": self.models.max_concurrency,
+            "refine_input_tokens_per_endpoint": self.models.refine_input_tokens_per_endpoint,
+            "refine_output_tokens": self.models.refine_output_tokens,
+            "bridge_refine_output_tokens": self.models.bridge_refine_output_tokens,
             "neo4j_batch_nodes": self.storage.neo4j_batch_nodes,
             "neo4j_batch_edges": self.storage.neo4j_batch_edges,
         }
@@ -105,6 +128,12 @@ class GraphMemV5Config:
             raise ValueError(f"positive configuration values required: {positive}")
         if self.edges.max_refine_calls_per_1000_turns < 0:
             raise ValueError("refine call limit cannot be negative")
+        if self.scenes.min_turns > self.scenes.max_turns:
+            raise ValueError("scene min_turns cannot exceed max_turns")
+        if not 0.0 <= self.scenes.topic_similarity_threshold <= 1.0:
+            raise ValueError("scene similarity threshold must be in [0, 1]")
+        if not 0.0 <= self.scenes.coreference_margin <= 1.0:
+            raise ValueError("coreference margin must be in [0, 1]")
 
 
 def config_hash(config: GraphMemV5Config) -> str:
@@ -122,6 +151,7 @@ def config_from_dict(payload: Mapping[str, Any]) -> GraphMemV5Config:
         profile=str(value.get("profile", "full_balanced")),
         random_seed=int(value.get("random_seed", 42)),
         models=_section(ModelConfig, value.get("models")),
+        scenes=_section(SceneConfig, value.get("scenes")),
         storage=_section(StorageConfig, value.get("storage")),
         coarsen=_section(CoarsenConfig, value.get("coarsen")),
         edges=_section(EdgeConfig, value.get("edges")),

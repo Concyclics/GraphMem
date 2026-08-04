@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "hypothesis>=6"]
+experiment = ["neo4j>=5.26", "pandas>=2.2", "pyarrow>=16"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

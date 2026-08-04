@@ -38,6 +38,12 @@ def stable_id(kind: str, *parts: Any) -> str:
 
 
 class NodeType(StrEnum):
+    SCENE = "scene"
+    ENTITY_MENTION = "entity_mention"
+    CANONICAL_ENTITY = "canonical_entity"
+    EVENT_SKELETON = "event_skeleton"
+    COLLECTION_SCOPE = "collection_scope"
+    STATE_HEAD = "state_head"
     ROUTING_CARD = "routing_card"
     EVENT_FRAME = "event_frame"
     ROLE_FRAME = "role_frame"
@@ -49,6 +55,12 @@ class NodeType(StrEnum):
 
 
 class RelationType(StrEnum):
+    PORTAL = "portal"
+    SCENE_CONTAINS = "scene_contains"
+    MEMBER_OF = "member_of"
+    RESOLVES_TO = "resolves_to"
+    PARTICIPATES_IN = "participates_in"
+    TEMPORAL_AFTER = "temporal_after"
     REFINES_TO = "refines_to"
     CONTAINS = "contains"
     HAS_ACTOR = "has_actor"
@@ -129,6 +141,107 @@ class EvidenceGroup:
 
 
 @dataclass(frozen=True, slots=True)
+class Scene:
+    scene_id: str
+    memory_id: str
+    session_id: str
+    start_turn_index: int
+    end_turn_index: int
+    turn_ids: tuple[str, ...]
+    summary: str
+    evidence_group_ids: tuple[str, ...]
+    schema_version: str = SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.start_turn_index < 0 or self.end_turn_index < self.start_turn_index:
+            raise ValueError("invalid scene turn interval")
+        if not self.turn_ids or not self.evidence_group_ids:
+            raise ValueError("scene requires turns and provenance")
+
+
+@dataclass(frozen=True, slots=True)
+class EntityMention:
+    mention_id: str
+    memory_id: str
+    scene_id: str
+    turn_id: str
+    surface: str
+    normalized: str
+    entity_type: str
+    span_start: int
+    span_end: int
+    speaker_key: str | None = None
+    candidate_entity_ids: tuple[str, ...] = ()
+    schema_version: str = SCHEMA_VERSION
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalEntity:
+    entity_id: str
+    memory_id: str
+    canonical_name: str
+    entity_type: str
+    aliases: tuple[str, ...]
+    mention_ids: tuple[str, ...]
+    evidence_group_ids: tuple[str, ...]
+    schema_version: str = SCHEMA_VERSION
+
+
+@dataclass(frozen=True, slots=True)
+class EventSkeleton:
+    event_id: str
+    memory_id: str
+    scene_id: str
+    predicate: str
+    actor_entity_ids: tuple[str, ...]
+    object_entity_ids: tuple[str, ...]
+    time_values: tuple[str, ...]
+    state_values: tuple[str, ...]
+    negative_scope: bool
+    summary: str
+    evidence_group_ids: tuple[str, ...]
+    schema_version: str = SCHEMA_VERSION
+
+
+@dataclass(frozen=True, slots=True)
+class CollectionScope:
+    scope_id: str
+    memory_id: str
+    scene_id: str
+    member_event_ids: tuple[str, ...]
+    scope_kind: str
+    evidence_group_ids: tuple[str, ...]
+    schema_version: str = SCHEMA_VERSION
+
+
+@dataclass(frozen=True, slots=True)
+class StateHead:
+    state_head_id: str
+    memory_id: str
+    entity_id: str
+    state_key: str
+    current_value: str
+    prior_values: tuple[str, ...]
+    evidence_group_ids: tuple[str, ...]
+    schema_version: str = SCHEMA_VERSION
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingCard:
+    card_id: str
+    memory_id: str
+    level: int
+    parent_card_id: str | None
+    child_ids: tuple[str, ...]
+    portal_ids: tuple[str, ...]
+    summary: str
+    entity_keys: tuple[str, ...]
+    time_keys: tuple[str, ...]
+    evidence_group_ids: tuple[str, ...]
+    schema_version: str = SCHEMA_VERSION
+
+
+@dataclass(frozen=True, slots=True)
 class GraphNode:
     node_id: str
     memory_id: str
@@ -136,6 +249,7 @@ class GraphNode:
     level: int
     summary: str
     evidence_group_id: str
+    evidence_group_ids: tuple[str, ...] = ()
     entity_id: str | None = None
     event_time: str | None = None
     state: str | None = None
@@ -151,6 +265,10 @@ class GraphNode:
         if not self.evidence_group_id:
             raise ValueError("graph node requires provenance")
 
+    @property
+    def all_evidence_group_ids(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((self.evidence_group_id, *self.evidence_group_ids)))
+
 
 @dataclass(frozen=True, slots=True)
 class GraphEdge:
@@ -163,6 +281,7 @@ class GraphEdge:
     directed: bool
     confidence: float
     source: str
+    evidence_group_ids: tuple[str, ...] = ()
     schema_version: str = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -170,6 +289,10 @@ class GraphEdge:
             raise ValueError("edge confidence must be in [0, 1]")
         if not self.evidence_group_id:
             raise ValueError("graph edge requires provenance")
+
+    @property
+    def all_evidence_group_ids(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((self.evidence_group_id, *self.evidence_group_ids)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +322,34 @@ class ProofStep:
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateScore:
+    turn_id: str
+    session_id: str
+    exact_score: float
+    bm25_score: float
+    dense_score: float
+    graph_score: float
+    role_gain: float
+    slot_gain: float
+    token_cost: int
+    fused_score: float
+    source_channels: tuple[str, ...]
+    session_score: float = 0.0
+    adjacency_score: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceCertificate:
+    question_kind: str
+    required_slots: tuple[str, ...]
+    covered_slots: tuple[str, ...]
+    missing_slots: tuple[str, ...]
+    complete: bool
+    iterations: int
+    negative_scope_required: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class NavigationResult:
     question_id: str
     memory_id: str
@@ -212,6 +363,14 @@ class NavigationResult:
     evidence_tokens: int
     budget_exhausted: bool
     trace: Mapping[str, Any] = field(default_factory=dict)
+    seed_node_ids: tuple[str, ...] = ()
+    visited_path_node_ids: tuple[str, ...] = ()
+    slot_coverage: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    certificate: EvidenceCertificate | None = None
+    candidate_scores: tuple[CandidateScore, ...] = ()
+    packed_turn_ids: tuple[str, ...] = ()
+    dropped_turn_ids: tuple[str, ...] = ()
+    stage_latency_ms: Mapping[str, float] = field(default_factory=dict)
     schema_version: str = SCHEMA_VERSION
 
 
