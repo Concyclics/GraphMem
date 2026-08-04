@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>GraphMem 与 Mem0：准确率、Token 开支与核心创新</title>
+<style>
+@page { size: A4; margin: 14mm 15mm 15mm; @bottom-center { content: counter(page) " / " counter(pages); font-size: 8pt; color: #64748b; } }
+* { box-sizing: border-box; }
+body { margin: 0; color: #172033; background: #fff; font-family: "Noto Sans CJK SC", "Noto Sans SC", sans-serif; font-size: 9.4pt; line-height: 1.55; }
+h1,h2,h3,p { margin-top: 0; }
+h1 { font-family: "Noto Serif CJK SC", serif; font-size: 27pt; line-height: 1.22; letter-spacing: -0.3px; margin-bottom: 8mm; }
+h2 { font-size: 17pt; color: #102a43; margin-bottom: 5mm; border-bottom: 1px solid #d8e2ec; padding-bottom: 2.5mm; }
+h3 { font-size: 11.5pt; margin-bottom: 2.5mm; color: #243b53; }
+p { margin-bottom: 3mm; }
+.page { min-height: 267mm; break-after: page; position: relative; }
+.page:first-of-type { padding-top: 16mm; }
+.page:last-child { break-after: auto; }
+.eyebrow { color: #087e8b; font-weight: 700; letter-spacing: .8px; text-transform: uppercase; margin-bottom: 4mm; }
+.subtitle { font-size: 13pt; color: #52667a; max-width: 150mm; margin-bottom: 10mm; }
+.cover-band { height: 5mm; width: 58mm; background: linear-gradient(90deg,#087e8b,#2f80ed); margin: 0 0 13mm; border-radius: 3mm; }
+.meta { position: absolute; bottom: 12mm; left: 0; color: #64748b; }
+.grid3 { display: grid; grid-template-columns: repeat(3,1fr); gap: 4mm; }
+.grid2 { display: grid; grid-template-columns: repeat(2,1fr); gap: 6mm; }
+.stat { border: 1px solid #d8e2ec; border-radius: 3mm; padding: 5mm; background: #f8fbfd; }
+.stat .label { color: #627d98; font-size: 8.5pt; }
+.stat .value { font-size: 23pt; line-height: 1.1; font-weight: 700; color: #102a43; margin: 2mm 0; }
+.stat .delta { color: #087e8b; font-weight: 700; }
+.callout { border-left: 4px solid #087e8b; padding: 3mm 4mm; background: #f3fafb; margin: 4mm 0; }
+.callout.warn { border-left-color: #d97706; background: #fff8ed; }
+.small { font-size: 8.2pt; color: #627d98; }
+.note { color: #52667a; font-size: 8.6pt; }
+table { width: 100%; border-collapse: collapse; margin: 3mm 0 5mm; font-variant-numeric: tabular-nums; }
+th { text-align: left; color: #486581; font-size: 8pt; border-bottom: 1.5px solid #9fb3c8; padding: 2.2mm 1.8mm; }
+td { border-bottom: 1px solid #e7edf3; padding: 2.2mm 1.8mm; vertical-align: top; }
+td.num, th.num { text-align: right; white-space: nowrap; }
+tr.total td { font-weight: 700; background: #f2f7fa; }
+.pos { color: #087e8b; font-weight: 700; }
+.neg { color: #b45309; font-weight: 700; }
+.chart { width: 100%; height: auto; display: block; margin: 3mm 0 5mm; }
+.legend { display: flex; gap: 7mm; align-items: center; color: #52667a; margin-bottom: 2mm; }
+.swatch { display: inline-block; width: 3mm; height: 3mm; margin-right: 1.5mm; border-radius: .7mm; vertical-align: -0.3mm; }
+.gm { background: #087e8b; }.m0 { background: #f2994a; }.unc { background:#2f80ed; }.hit { background:#56ccf2; }.out { background:#9b51e0; }
+.pill { display: inline-block; padding: 1mm 2.5mm; border-radius: 6mm; color:#075f68; background:#e4f5f6; font-size:8pt; font-weight:700; margin-right:1mm; }
+.diagram-box { border: 1px solid #d8e2ec; border-radius: 3mm; padding: 4mm; background: #fbfdff; }
+.case { border-left: 3px solid #2f80ed; padding: 3mm 4mm; margin-top: 4mm; background: #f4f8fe; }
+.case strong { color:#163f73; }
+.foot { position:absolute; bottom: 4mm; left:0; right:0; border-top:1px solid #e7edf3; padding-top:2mm; font-size:7.5pt; color:#829ab1; }
+ul { margin: 2mm 0 4mm; padding-left: 5mm; }
+li { margin: 1.2mm 0; }
+.mono { font-family: "DejaVu Sans Mono", monospace; font-size: 8pt; }
+.tight td { padding-top: 1.5mm; padding-bottom: 1.5mm; }
+</style>
+</head>
+<body>
+
+<section class="page">
+  <div class="cover-band"></div>
+  <div class="eyebrow">GraphMem Evaluation Report · 2026-08-04</div>
+  <h1>GraphMem 与 Mem0<br>准确率、Token 开支与核心创新</h1>
+  <p class="subtitle">LongMemEval 与 LoCoMo 的同题评测、memory-backbone 成本拆分，以及 Hierarchical Navigable Memory World 和 Graph Harness Query IR 的机制说明。</p>
+  <div class="grid3">
+    <div class="stat"><div class="label">LongMemEval · 500题</div><div class="value">89.00%</div><div class="delta">较 Mem0 +18.80 pp</div></div>
+    <div class="stat"><div class="label">LoCoMo · Category 1–4</div><div class="value">86.23%</div><div class="delta">较 Mem0 +7.34 pp</div></div>
+    <div class="stat"><div class="label">平均回答 Token</div><div class="value">7.03K / 4.41K</div><div>LongMemEval / LoCoMo</div></div>
+  </div>
+  <div class="callout" style="margin-top:11mm">
+    <strong>报告成本单位</strong><br>
+    LongMemEval 构建按每题对应的一份 memory 计算；LoCoMo 构建按每个 conversation 计算；两个 benchmark 的回答成本均按每题计算。Embedding 与 judge token 全部排除。
+  </div>
+  <div class="meta">GraphMem · Persistent hierarchical memory with source-bound graph navigation</div>
+</section>
+
+<section class="page">
+  <h2>1. 准确率：同题官方 Judge 对比</h2>
+  <div class="legend"><span><i class="swatch gm"></i>GraphMem</span><span><i class="swatch m0"></i>Mem0</span></div>
+  <svg class="chart" viewBox="0 0 760 265" aria-label="GraphMem与Mem0总体准确率对比">
+    <g font-family="Noto Sans CJK SC" font-size="15" fill="#172033">
+      <g stroke="#d8e2ec" stroke-width="1"><line x1="195" y1="25" x2="195" y2="220"/><line x1="315" y1="25" x2="315" y2="220"/><line x1="435" y1="25" x2="435" y2="220"/><line x1="555" y1="25" x2="555" y2="220"/><line x1="675" y1="25" x2="675" y2="220"/></g>
+      <g fill="#627d98" font-size="12"><text x="195" y="17" text-anchor="middle">0%</text><text x="315" y="17" text-anchor="middle">25%</text><text x="435" y="17" text-anchor="middle">50%</text><text x="555" y="17" text-anchor="middle">75%</text><text x="675" y="17" text-anchor="middle">100%</text></g>
+      <text x="0" y="86">LongMemEval</text><rect x="195" y="50" width="427.2" height="28" rx="4" fill="#087e8b"/><rect x="195" y="86" width="337.0" height="28" rx="4" fill="#f2994a"/><text x="629" y="70" font-weight="700">89.00%</text><text x="539" y="106">70.20%</text>
+      <text x="0" y="181">LoCoMo C1–4</text><rect x="195" y="145" width="413.9" height="28" rx="4" fill="#087e8b"/><rect x="195" y="181" width="378.7" height="28" rx="4" fill="#f2994a"/><text x="616" y="165" font-weight="700">86.23%</text><text x="580" y="201">78.90%</text>
+      <text x="675" y="244" text-anchor="end" fill="#087e8b" font-size="13">+18.80 pp · +94题</text><text x="450" y="244" text-anchor="middle" fill="#087e8b" font-size="13">+7.34 pp · +113题</text>
+    </g>
+  </svg>
+  <div class="grid2">
+    <div>
+      <h3>LongMemEval 配对结果</h3>
+      <table class="tight"><tr><td>两者都正确</td><td class="num">316</td></tr><tr><td>仅 GraphMem 正确</td><td class="num pos">129</td></tr><tr><td>仅 Mem0 正确</td><td class="num">35</td></tr><tr><td>两者都错误</td><td class="num">20</td></tr></table>
+    </div>
+    <div>
+      <h3>LoCoMo 配对结果</h3>
+      <table class="tight"><tr><td>两者都正确</td><td class="num">1,088</td></tr><tr><td>仅 GraphMem 正确</td><td class="num pos">240</td></tr><tr><td>仅 Mem0 正确</td><td class="num">127</td></tr><tr><td>两者都错误</td><td class="num">85</td></tr></table>
+    </div>
+  </div>
+  <div class="callout">LoCoMo 的 <span class="mono">convN_qM</span> 与 <span class="mono">locomoNN_MMMM</span> 完整对齐 1,540 题，缺失 0。准确率差的配对 bootstrap 95% 区间为 +4.94 至 +9.68 pp；McNemar 双侧精确检验 p=3.82×10⁻⁹。</div>
+  <div class="foot">两方 judge 均通过 Mem0 memory-benchmarks 官方仓库执行；比较单位为同一题目集合。</div>
+</section>
+
+<section class="page">
+  <h2>2. 分类型表现：优势与剩余短板</h2>
+  <h3>LongMemEval</h3>
+  <table class="tight">
+    <thead><tr><th>题型</th><th class="num">GraphMem</th><th class="num">Mem0</th><th class="num">差值</th></tr></thead>
+    <tbody>
+      <tr><td>Knowledge update</td><td class="num">87.18%</td><td class="num">79.49%</td><td class="num pos">+7.69 pp</td></tr>
+      <tr><td>Multi-session</td><td class="num">88.72%</td><td class="num">68.42%</td><td class="num pos">+20.30 pp</td></tr>
+      <tr><td>Assistant fact</td><td class="num">96.43%</td><td class="num">85.71%</td><td class="num pos">+10.71 pp</td></tr>
+      <tr><td>Preference</td><td class="num">93.33%</td><td class="num">96.67%</td><td class="num neg">−3.33 pp</td></tr>
+      <tr><td>User fact</td><td class="num">94.29%</td><td class="num">92.86%</td><td class="num pos">+1.43 pp</td></tr>
+      <tr><td>Temporal reasoning</td><td class="num">83.46%</td><td class="num">42.11%</td><td class="num pos">+41.35 pp</td></tr>
+    </tbody>
+  </table>
+  <h3 style="margin-top:6mm">LoCoMo Category 1–4</h3>
+  <table class="tight">
+    <thead><tr><th>Category</th><th class="num">GraphMem V3.4</th><th class="num">Mem0</th><th class="num">差值</th></tr></thead>
+    <tbody>
+      <tr><td>Category 1</td><td class="num">83.33%</td><td class="num">65.96%</td><td class="num pos">+17.38 pp</td></tr>
+      <tr><td>Category 2</td><td class="num">80.69%</td><td class="num">83.80%</td><td class="num neg">−3.12 pp</td></tr>
+      <tr><td>Category 3</td><td class="num">57.29%</td><td class="num">65.63%</td><td class="num neg">−8.33 pp</td></tr>
+      <tr><td>Category 4</td><td class="num">92.63%</td><td class="num">82.88%</td><td class="num pos">+9.75 pp</td></tr>
+      <tr class="total"><td>Overall</td><td class="num">86.23%</td><td class="num">78.90%</td><td class="num pos">+7.34 pp</td></tr>
+    </tbody>
+  </table>
+  <div class="grid2">
+    <div class="callout"><strong>结构性优势</strong><br>LongMemEval 的 temporal 与 multi-session 增益最强，符合状态链、时间端点和跨会话证据装配的设计目标。</div>
+    <div class="callout warn"><strong>剩余短板</strong><br>LoCoMo Category 2/3 仍低于 Mem0，复杂多跳、指代闭包和回答推理仍有提升空间。</div>
+  </div>
+  <div class="foot">附件 Mem0 的原始 67.02% 包含 446 道 Category 5；同分母对比应使用 Category 1–4 的 78.90%。</div>
+</section>
+
+<section class="page">
+  <h2>3. Token 开支：统一到正确计算单位</h2>
+  <div class="callout"><strong>计算口径</strong>：构建成本只在 memory 创建时发生。LongMemEval 每题有独立 memory，因此按题计算；LoCoMo 只有 10 组共享 conversation，因此按 conversation 计算。回答成本均按问题数计算。</div>
+
+  <h3>LongMemEval · 构建 Token / 题（500份独立 memory）</h3>
+  <table>
+    <thead><tr><th>项目</th><th class="num">全量</th><th class="num">每题平均</th><th>分布</th></tr></thead>
+    <tbody>
+      <tr><td>Uncached input</td><td class="num">63,056,006</td><td class="num">126,112</td><td rowspan="4">P50 253,946<br>P95 271,194<br>Max 284,693</td></tr>
+      <tr><td>Cached input</td><td class="num">18,749,824</td><td class="num">37,500</td></tr>
+      <tr><td>Output</td><td class="num">45,446,463</td><td class="num">90,893</td></tr>
+      <tr class="total"><td>Total</td><td class="num">127,252,293</td><td class="num">254,505</td></tr>
+    </tbody>
+  </table>
+
+  <h3>LoCoMo · 构建 Token / conversation（10组）</h3>
+  <table>
+    <thead><tr><th>项目</th><th class="num">10组全量</th><th class="num">每组平均</th><th>分布</th></tr></thead>
+    <tbody>
+      <tr><td>Uncached input</td><td class="num">772,479</td><td class="num">77,248</td><td rowspan="4">P50 139,922<br>P95 150,802<br>Max 150,802</td></tr>
+      <tr><td>Cached input</td><td class="num">4,864</td><td class="num">486</td></tr>
+      <tr><td>Output</td><td class="num">546,158</td><td class="num">54,616</td></tr>
+      <tr class="total"><td>Total</td><td class="num">1,323,501</td><td class="num">132,350</td></tr>
+    </tbody>
+  </table>
+
+  <h3>回答 Token / 题</h3>
+  <table>
+    <thead><tr><th>Benchmark</th><th class="num">Uncached</th><th class="num">Cached</th><th class="num">Output</th><th class="num">Total / 题</th><th>分布</th></tr></thead>
+    <tbody>
+      <tr><td>LongMemEval</td><td class="num">5,428</td><td class="num">1,580</td><td class="num">23</td><td class="num"><strong>7,031</strong></td><td>P50 7,020 · P95 8,000 · Max 8,725</td></tr>
+      <tr><td>LoCoMo</td><td class="num">3,238</td><td class="num">1,046</td><td class="num">129</td><td class="num"><strong>4,413</strong></td><td>P50 4,405 · P95 5,055 · Max 5,834</td></tr>
+    </tbody>
+  </table>
+  <div class="callout">LoCoMo 的构建成本摊销到 1,986 个问题为 666 token/题；构建+回答合计平均 5,079 token/题。该摊销值用于理解复用收益，不替代“构建按 conversation、回答按题”的主报告口径。</div>
+  <div class="foot">Memory-backbone only。Embedding 与 judge token 均未计入；reasoning token 为 0。</div>
+</section>
+
+<section class="page">
+  <h2>4. 创新一：Hierarchical Navigable Memory World</h2>
+  <p>HNMW 将长期对话构造成可复用、可逐层定位、可沿关系导航并最终回溯原文的持久化记忆世界。其目标不是存储更多副本，而是让每次查询只读取最小完备证据。</p>
+  <div class="diagram-box">
+    <svg class="chart" viewBox="0 0 760 330" aria-label="HNMW分层导航流程图">
+      <defs><marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#087e8b"/></marker></defs>
+      <g font-family="Noto Sans CJK SC" text-anchor="middle">
+        <g fill="none" stroke="#087e8b" stroke-width="3" marker-end="url(#a1)"><path d="M132 67H224"/><path d="M354 67H446"/><path d="M576 67H660V164H576"/><path d="M446 164H354"/><path d="M224 164H132"/><path d="M78 199V276H224"/></g>
+        <g stroke="#b8cad8" stroke-width="1.5"><rect x="20" y="35" width="112" height="64" rx="10" fill="#fff8ed"/><rect x="224" y="31" width="130" height="72" rx="10" fill="#e9f7f8"/><rect x="446" y="31" width="130" height="72" rx="10" fill="#e9f7f8"/><rect x="446" y="128" width="130" height="72" rx="10" fill="#e9f7f8"/><rect x="224" y="128" width="130" height="72" rx="10" fill="#e9f7f8"/><rect x="20" y="128" width="112" height="72" rx="10" fill="#087e8b"/><rect x="224" y="242" width="130" height="68" rx="10" fill="#edf4ff"/></g>
+        <g font-size="17" fill="#172033"><text x="76" y="64">Question</text><text x="76" y="85" font-size="13" fill="#627d98">查询意图</text><text x="289" y="59">L2 Routing Card</text><text x="289" y="82" font-size="13" fill="#627d98">粗定位 · 100–180 token</text><text x="511" y="59">L1 Role Frame</text><text x="511" y="82" font-size="13" fill="#627d98">事实 · 事件 · 数量</text><text x="511" y="156">L3 Typed Relations</text><text x="511" y="179" font-size="13" fill="#627d98">状态 · 时间 · 对话</text><text x="289" y="156">L0 Lossless Turn</text><text x="289" y="179" font-size="13" fill="#627d98">原文与provenance</text><text x="76" y="157" fill="#fff">最小完备</text><text x="76" y="180" fill="#fff">证据子图</text><text x="289" y="272">一次回答调用</text><text x="289" y="294" font-size="13" fill="#627d98">bounded context</text></g>
+      </g>
+    </svg>
+  </div>
+  <div class="grid3" style="margin-top:6mm">
+    <div class="stat"><div class="label">Hierarchical</div><strong>卡片 → Frame → 原文</strong><p class="note">粗层只做定位，细层承载答案事实。</p></div>
+    <div class="stat"><div class="label">Navigable</div><strong>Typed relation 横向补证</strong><p class="note">状态、时间、问答和指代按需扩展。</p></div>
+    <div class="stat"><div class="label">Reusable</div><strong>一次构建，多题查询</strong><p class="note">LoCoMo构建在1,986题间共享。</p></div>
+  </div>
+  <div class="case"><strong>状态更新案例</strong><br>周一：“计划坐火车去上海” → 周三：“取消火车票” → 周三：“已预订周四航班”。<br><span class="note">问题“现在准备如何去上海？”先定位旅行卡片，沿状态链保留 train planned→cancelled 和 flight booked，再展开两条原文核验。系统不重放完整 transcript，也不会把旧计划误当当前状态。</span></div>
+  <div class="foot">HNMW解决“在哪里找、如何少读、如何复用”；它不意味着首次构建零成本。</div>
+</section>
+
+<section class="page">
+  <h2>5. 创新二：Graph Harness Query IR</h2>
+  <p>Query IR 将自然语言问题编译为可执行的证据契约，让 dense、BM25、倒排索引、图遍历和 operator 围绕同一组 required roles 工作。</p>
+  <div class="diagram-box">
+    <svg class="chart" viewBox="0 0 760 350" aria-label="Graph Harness Query IR流程图">
+      <defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2f80ed"/></marker></defs>
+      <g font-family="Noto Sans CJK SC" text-anchor="middle">
+        <g fill="none" stroke="#2f80ed" stroke-width="3" marker-end="url(#a2)"><path d="M135 62H225"/><path d="M365 62H455"/><path d="M525 98V140"/><path d="M455 176H365"/><path d="M225 176H135"/><path d="M80 212V286H225"/></g>
+        <g stroke="#b8cad8" stroke-width="1.5"><rect x="20" y="30" width="115" height="64" rx="10" fill="#fff8ed"/><rect x="225" y="26" width="140" height="72" rx="10" fill="#2f80ed"/><rect x="455" y="26" width="140" height="72" rx="10" fill="#edf4ff"/><rect x="455" y="140" width="140" height="72" rx="10" fill="#edf4ff"/><rect x="225" y="140" width="140" height="72" rx="10" fill="#edf4ff"/><rect x="20" y="140" width="115" height="72" rx="10" fill="#e9f7f8"/><rect x="225" y="252" width="140" height="68" rx="10" fill="#087e8b"/></g>
+        <g font-size="17" fill="#172033"><text x="77" y="59">Question</text><text x="77" y="81" font-size="13" fill="#627d98">自然语言</text><text x="295" y="55" fill="#fff">Query IR</text><text x="295" y="78" font-size="13" fill="#fff">entity · relation · roles</text><text x="525" y="55">Multi-channel seeds</text><text x="525" y="78" font-size="13" fill="#627d98">dense · BM25 · exact</text><text x="525" y="168">Role-gap expansion</text><text x="525" y="191" font-size="13" fill="#627d98">只补缺失角色</text><text x="295" y="168">Evidence certificate</text><text x="295" y="191" font-size="13" fill="#627d98">entity · relation · scope · source</text><text x="77" y="168">Operator</text><text x="77" y="191" font-size="13" fill="#627d98">time · state · count</text><text x="295" y="282" fill="#fff">Source-bound Answer</text><text x="295" y="304" font-size="13" fill="#fff">完整即停止扩展</text></g>
+      </g>
+    </svg>
+  </div>
+  <table class="tight" style="margin-top:5mm">
+    <thead><tr><th>查询需求</th><th>Required roles</th><th>允许的补证路径</th></tr></thead>
+    <tbody><tr><td>当前状态</td><td>旧值、新值、操作、时间、source</td><td>state transition → source</td></tr><tr><td>时间比较</td><td>事件A/B、时间A/B、source</td><td>same event / temporal endpoint</td></tr><tr><td>数量与列表</td><td>范围、成员、add/remove、source</td><td>collection member → source</td></tr><tr><td>双人对话</td><td>提问者、回复者、回复内容</td><td>dialogue pair / next turn</td></tr></tbody>
+  </table>
+  <div class="case"><strong>时间比较案例</strong><br>问题：“活动 A 比活动 B 早多少天？” Required roles = 事件A + 时间A + 事件B + 时间B + source。<br><span class="note">如果只命中A，系统只能沿 same_event / temporal_endpoint 补齐B；四项证书完整后才允许日期差 operator。最终LLM负责表达，但不得改写已认证日期差。</span></div>
+  <div class="foot">Query IR解决“要找齐什么、允许沿哪些边走、什么时候停止、如何证明证据足够”。</div>
+</section>
+
+<section class="page">
+  <h2>6. 结论、边界与复现</h2>
+  <div class="grid2">
+    <div>
+      <h3>可公开结论</h3>
+      <ul><li>LongMemEval：GraphMem 89.00%，Mem0 70.20%，提升 18.80 pp。</li><li>LoCoMo Category 1–4：GraphMem 86.23%，Mem0 78.90%，提升 7.34 pp。</li><li>回答平均：LongMemEval 7,031 token/题，LoCoMo 4,413 token/题。</li><li>LoCoMo 每 conversation 构建平均 132,350 token，可由1,986题复用。</li></ul>
+    </div>
+    <div>
+      <h3>必须保留的边界</h3>
+      <ul><li>LongMemEval 首次构建平均 254,505 token/题，并不便宜。</li><li>Mem0附件没有 memory ingestion/search/answer usage，不能声明具体Token节省百分比。</li><li>18.80 pp 是完整系统差异，不能全部归因于 Query IR 单模块。</li><li>LoCoMo Category 2/3 仍是 GraphMem 短板。</li></ul>
+    </div>
+  </div>
+  <div class="callout"><strong>两个创新的组合价值</strong><br>HNMW 把海量历史压缩成可复用、可导航的小工作集，负责“少读”；Graph Harness Query IR 把问题变成证据角色契约，负责“读对”。组合目标不是召回更多节点，而是用最少 token 构造 source-complete 的最小完备证据子图。</div>
+  <h3 style="margin-top:7mm">复现产物</h3>
+  <table class="tight">
+    <tr><td>LongMemEval 89%</td><td class="mono">runs/v3_7_hybrid_20260730/lme500_v2ledger_gpt54mini/</td></tr>
+    <tr><td>LoCoMo V3.4</td><td class="mono">runs/v3_full_20260727/locomo_full1986_lossless_nav_v34/</td></tr>
+    <tr><td>LoCoMo构建索引</td><td class="mono">runs/v3_full_20260727/locomo_full1986_base/hierarchical_hypergraph_v3/</td></tr>
+    <tr><td>完整文字报告</td><td class="mono">docs/graphmem_mem0_comprehensive_report_20260804.md</td></tr>
+  </table>
+  <h3 style="margin-top:7mm">下一步严格实验</h3>
+  <ol><li>为 Mem0 的 add/search/answer 增加 usage interceptor，获得对称的 cached、uncached、output 统计。</li><li>固定索引与回答模型，依次消融 typed edge、Query IR allowlist、role-gap expansion 与 evidence certificate。</li></ol>
+  <div class="foot">报告版本：2026-08-04 · 仅使用已冻结、可审计实验结果。</div>
+</section>
+
+</body>
+</html>

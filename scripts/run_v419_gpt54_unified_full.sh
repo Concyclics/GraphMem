@@ -8,6 +8,7 @@ LME_PARALLEL_SHARDS="${LME_PARALLEL_SHARDS:-8}"
 LME_INFLIGHT_PER_SHARD="${LME_INFLIGHT_PER_SHARD:-24}"
 LOCOMO_PARALLEL_SHARDS="${LOCOMO_PARALLEL_SHARDS:-10}"
 LOCOMO_INFLIGHT_PER_SHARD="${LOCOMO_INFLIGHT_PER_SHARD:-12}"
+QUERY_HARD_LIMIT="${QUERY_HARD_LIMIT:-14000}"
 SHARD_RETRIES="${SHARD_RETRIES:-6}"
 
 set -a
@@ -53,7 +54,8 @@ COMMON_ARGS=(
   --qa-context-token-budget 10000
   --qa-max-tokens 512
   --v41-query-target-tokens 10000
-  --v41-query-hard-limit-tokens 13000
+  --v41-query-hard-limit-tokens "${QUERY_HARD_LIMIT}"
+  --record-query-budget-overflow
   --summary-workers 32
   --resume
 )

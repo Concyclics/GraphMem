@@ -103,10 +103,17 @@ def main() -> None:
             raise RuntimeError(f"invalid judge cache breakdown for {row['question_id']}")
         return row, result, verdict(result.text)
 
+    failures: list[dict[str, str]] = []
     with ThreadPoolExecutor(max_workers=max(1,args.workers)) as pool:
-        futures=[pool.submit(judge,row) for row in rows]
+        futures={pool.submit(judge,row): row for row in rows}
         for future in as_completed(futures):
-            row,result,label=future.result()
+            source_row = futures[future]
+            try:
+                row,result,label=future.result()
+            except Exception as exc:
+                failures.append({"question_id": str(source_row.get("question_id")), "error": repr(exc)})
+                print("[judge error] %s: %s" % (source_row.get("question_id"), exc), flush=True)
+                continue
             append_jsonl(calls_path, asdict(result.record))
             append_jsonl(eval_path, {
                 "question_id":str(row["question_id"]), "question_type":row.get("question_type"),
@@ -115,7 +122,10 @@ def main() -> None:
                 "judge_prompt_commit":PINNED_COMMIT if args.mode=="answer" else None,
                 "judge_prompt_sha256":PROMPT_SOURCE_SHA256 if args.mode=="answer" else None,
             })
-            print(f"judge {row['question_id']}: {label}", flush=True)
+            print("judge %s: %s" % (row.get("question_id"), label), flush=True)
+    if failures:
+        for failure in failures:
+            append_jsonl(args.output_dir / "judge_failures.jsonl", failure)
 
     evaluations=read_jsonl(eval_path); calls=read_jsonl(calls_path)
     by_type={}
@@ -142,5 +152,8 @@ def main() -> None:
     }
     (args.output_dir/"judge_token_stats.json").write_text(json.dumps(stats,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
     print(json.dumps({"accuracy":stats["accuracy"],"questions":stats["question_count"]}))
+
+    if failures:
+        raise RuntimeError(f"{len(failures)} judge calls failed; rerun with --resume")
 
 if __name__ == "__main__": main()
