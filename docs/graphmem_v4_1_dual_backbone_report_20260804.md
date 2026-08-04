@@ -66,24 +66,59 @@ is efficient but misses hard aliases and event identities, while a large agentic
 search displaces decisive evidence from the roughly 10K shared query budget.
 GraphMem caps the planner and deducts its tokens from the evidence-pack allowance.
 
-## Verified frozen GPT-5.4-mini result
+## Unified V4.1 GPT-5.4-mini formal LongMemEval result
 
-The last fully judged, reproducible frozen accuracy reference is V3.7. It is not
+The complete single-version V4.1 replay answered and officially judged all 500
+questions. It scored **363/500 (72.60%)**. This is the authoritative result for
+the current unified V4.1 graph and query path; it does not meet the 93--95%
+target and must not be mixed with historical V3.7 answers.
+
+| Type | Correct | Total | Accuracy |
+|---|---:|---:|---:|
+| single-session-user | 57 | 70 | 81.43% |
+| multi-session | 92 | 133 | 69.17% |
+| single-session-preference | 21 | 30 | 70.00% |
+| temporal-reasoning | 98 | 133 | 73.68% |
+| knowledge-update | 60 | 78 | 76.92% |
+| single-session-assistant | 35 | 56 | 62.50% |
+
+| Stage | Calls | Uncached input | Cached input | Output | Total | Reasoning |
+|---|---:|---:|---:|---:|---:|---:|
+| Build session extraction | 23,867 | 66,746,426 | 136,192 | 35,958,254 | 102,840,872 | 0 |
+| Build consolidation | 500 | 16,870,926 | 0 | 712,827 | 17,583,753 | 0 |
+| Build repair | 1 | 2,407 | 0 | 1,101 | 3,508 | 0 |
+| Query planner | 346 | 384,663 | 98,560 | 60,303 | 543,526 | 0 |
+| Final answer | 500 | 3,065,470 | 1,360,896 | 6,431 | 4,432,797 | 0 |
+
+Build mean/P50/P95/max is 240,856.27 / 239,787 / 263,605 / 287,424
+tokens per memory. Query mean/P50/P95/max is 9,952.65 / 10,273 / 13,993 /
+16,116. Query mean meets the approximately 10K target, while 91 questions exceed
+12K and 48 exceed 13K. All usage equations validate and reasoning tokens are zero.
+
+Retrieval reaches any gold session on 98.8% of questions, all gold sessions on
+93.2%, and mean session recall is 96.403%. The 137 errors split into 9 coarse
+misses, 77 fine-retrieval or reasoning failures, and 51 answer failures despite
+gold text being present. The weakest answer algebras are inferential profile
+(52.94%), state update (60.00%) and temporal lookup (63.21%); temporal comparison
+is already 91.67%. The dominant remaining problem is therefore evidence binding
+and answer execution, not wider coarse retrieval.
+
+## Historical frozen GPT-5.4-mini reference
+
+For historical context, V3.7 remains the strongest judged composite reference. It is not
 a clean dual-backbone build comparison: LongMemEval reuses the persisted V2
 evidence ledger, and the LoCoMo component is the immutable V3.4 peer-dialogue
-route. The table is therefore the strongest verified GPT answer result, while the
-unified V4.1 rerun remains incomplete:
+route. These numbers cannot be credited to the unified V4.1 implementation:
 
 | Benchmark | Correct | Total | Accuracy |
 |---|---:|---:|---:|
 | LongMemEval | 445 | 500 | 89.00% |
 | LoCoMo Category 1-4 | 1,328 | 1,540 | 86.23% |
 
-Relative to this frozen reference, reaching 93% requires 20 additional correct
-LongMemEval answers and 105 additional correct LoCoMo answers; reaching 95%
-requires 30 and 135, respectively. The requested 93--95% target has therefore
-not yet been demonstrated by a complete, uniformly built and officially judged
-run.
+The historical table shows that some earlier benchmark-specific paths were stronger,
+but the unified V4.1 replay is 102 correct answers below 93% and 112 below 95%.
+The requested 93--95% target has not been demonstrated by a complete, uniformly
+built and officially judged dual-benchmark run.
 
 LongMemEval by type:
 
@@ -128,7 +163,7 @@ credited to any accuracy table until a complete replay is judged:
   recommendations before normal evidence packing.
 
 The synthetic regression uses an unseen musical-instrument domain rather than a
-benchmark question. The complete repository suite passes 873 tests, including
+benchmark question. The complete repository suite passes 874 tests, including
 the static gold/benchmark-branch scan.
 
 ## Qwen3-32B-FP8 status and measured costs
@@ -228,6 +263,19 @@ The final deadline fallback was launched without exposing credentials:
 The runner loads QWEN_API_KEY and EMBEDDING_API_KEY from the remote private
 environment; neither value is written to logs or this report.
 
+Completed GPT-5.4-mini LongMemEval V4.1 artifacts:
+
+- answers: /mnt/ssd1/graphmem_v419_gpt54_latest_full_v3_64shard_20260804/lme/merged/hierarchical_hybrid_graph_v4_1_query/answers.jsonl,
+  SHA-256 f80548e1cbd3f80ea60f998c1a11000afd2221995c8a5a810eb812c6d0a15d53;
+- retrieval: the same variant directory, retrieval_results.jsonl,
+  SHA-256 117928035b8ccd326b94dd0d5e0f22cff135d17344a803ff819293c3ef9d7ed7;
+- official judge: /mnt/ssd1/graphmem_v419_gpt54_latest_full_v3_64shard_20260804/lme/judge/auto_eval.jsonl,
+  SHA-256 037a1d70b5b15e27b77d7bd4871983b6ee21af707977ce652605a4009d6e2f22;
+- unified token report: /mnt/ssd1/graphmem_v419_gpt54_latest_full_v3_64shard_20260804/lme/report/summary.json,
+  SHA-256 c867cbcc4380ead5c94cadba1d61c2107b9506df4a26c7df74e47478bdf2cf95;
+- 137-question error analysis: /mnt/ssd1/graphmem_v419_gpt54_latest_full_v3_64shard_20260804/lme/error_analysis/summary.json,
+  SHA-256 302e06ee49cd8b73dde36d38e6e244d372d0e456be6c3b6e2df0503a5a27ca8c.
+
 Completed Qwen LoCoMo artifacts:
 
 - answers: /home/chenhan/graphmem_v419_qwen32b_unified_full_20260803/locomo/merged/hierarchical_hybrid_graph_v4_1_query/answers.jsonl,
@@ -248,6 +296,5 @@ Completed Qwen LongMemEval artifacts:
   /home/chenhan/graphmem_v419_qwen32b_cap1_full_20260804/lme/report_no_judge/summary.json,
   SHA-256 5fc105d5e0ac5e991b214e3cf4404871ffa30ab006dbc64c682fe5ec845d8213.
 
-External judge outputs will be appended only after explicit authorization to
-send benchmark questions, retrieved evidence and candidate answers to the
-configured provider.
+Qwen official judge outputs remain pending. They are not inferred from token-F1
+or retrieval coverage and will be added only after complete official evaluation.

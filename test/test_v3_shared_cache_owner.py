@@ -78,6 +78,35 @@ def test_v3_disk_cache_relabels_build_calls_to_new_split_owner(
     assert stats["build_total_tokens"] > 0
 
 
+def test_query_run_can_skip_duplicate_memory_artifacts(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "shared-cache"
+    data_path = tmp_path / "data.json"
+    data_path.write_text(json.dumps([_row("q")]), encoding="utf-8")
+    output_dir = tmp_path / "run"
+    run_demo(
+        DemoConfig(
+            data_path=data_path,
+            question_type="all",
+            output_dir=output_dir,
+            memory_cache_dir=cache_dir,
+            persist_memory_artifacts=False,
+            max_questions=1,
+            variants=("hierarchical_hypergraph_v3",),
+            mock_services=True,
+        )
+    )
+
+    variant_dir = output_dir / "hierarchical_hypergraph_v3"
+    assert (variant_dir / "answers.jsonl").exists()
+    assert (variant_dir / "retrieval_results.jsonl").exists()
+    assert (variant_dir / "question_stats.jsonl").exists()
+    assert (variant_dir / "llm_calls.jsonl").exists()
+    assert (variant_dir / "nodes.jsonl").stat().st_size == 0
+    assert (variant_dir / "edges.jsonl").stat().st_size == 0
+    assert not (variant_dir / "memory_indices").exists()
+    assert list(cache_dir.rglob("*.json"))
+
+
 def test_v3_cache_fingerprint_normalizes_api_base_url_trailing_slash(
     tmp_path: Path,
 ) -> None:

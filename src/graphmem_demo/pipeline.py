@@ -310,6 +310,7 @@ class DemoConfig:
     data_path: Path
     output_dir: Path
     memory_cache_dir: Path | None = None
+    persist_memory_artifacts: bool = True
     question_type: str = "multi-session"
     variants: tuple[str, ...] = (
         "direct_session_k16_compact_no_compress",
@@ -834,7 +835,8 @@ def run_demo(
             ):
                 stats.append(run.stats)
                 _write_case_outputs(
-                    variant_dir, case, run, embedding_records, compression_records
+                    variant_dir, case, run, embedding_records, compression_records,
+                    config.persist_memory_artifacts,
                 )
                 _print_case_progress(run.stats)
         elif config.question_workers > 1 and not has_injected_services:
@@ -850,7 +852,8 @@ def run_demo(
                     run, embedding_records, compression_records = future.result()
                     stats.append(run.stats)
                     _write_case_outputs(
-                        variant_dir, case, run, embedding_records, compression_records
+                        variant_dir, case, run, embedding_records, compression_records,
+                        config.persist_memory_artifacts,
                     )
                     _print_case_progress(run.stats)
         else:
@@ -878,6 +881,7 @@ def run_demo(
                         *variant_compressor.records[compression_start:],
                         *variant_summarizer.records[summarizer_start:],
                     ],
+                    config.persist_memory_artifacts,
                 )
                 _print_case_progress(run.stats)
 
@@ -1733,6 +1737,7 @@ def _write_case_outputs(
     run: CaseRun,
     embedding_records: list[Any],
     compression_records: list[Any],
+    persist_memory_artifacts: bool = True,
 ) -> None:
     _append_jsonl(variant_dir / "llm_calls.jsonl", [asdict(item) for item in run.llm_records])
     _append_jsonl(
@@ -1746,7 +1751,9 @@ def _write_case_outputs(
     # A LoCoMo conversation has many questions sharing one immutable memory.
     # Persist that index only with its build-owner question; query-only cases
     # still write retrieval, answer, and token records below.
-    persist_shared_index = not case.memory_cache_key or run.stats.build_total_tokens > 0
+    persist_shared_index = persist_memory_artifacts and (
+        not case.memory_cache_key or run.stats.build_total_tokens > 0
+    )
     if persist_shared_index:
         artifact_dir = _memory_artifact_dir(variant_dir, case)
         if run.v36_index is not None:

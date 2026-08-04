@@ -5,6 +5,8 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_ROOT="${RUN_ROOT:-/mnt/ssd1/graphmem_v419_gpt54_latest_full_20260804}"
 LME_SHARD_ROOT="${LME_SHARD_ROOT:-/mnt/ssd1/graphmem_v4_0_deepseek_20260730/query_shards}"
 MEMORY_CACHE_DIR="${MEMORY_CACHE_DIR:-/mnt/ssd1/graphmem_v419_gpt54_unified_full_20260803/memory_cache_lme}"
+LME_SHARDS="${LME_SHARDS:-25}"
+QUESTIONS_PER_SHARD="${QUESTIONS_PER_SHARD:-20}"
 PARALLEL_SHARDS="${PARALLEL_SHARDS:-25}"
 QUESTION_WORKERS="${QUESTION_WORKERS:-20}"
 INFLIGHT_PER_SHARD="${INFLIGHT_PER_SHARD:-20}"
@@ -57,6 +59,7 @@ COMMON_ARGS=(
   --v41-query-target-tokens 10000
   --v41-query-hard-limit-tokens 14000
   --record-query-budget-overflow
+  --skip-memory-artifacts
   --summary-workers 32
   --resume
 )
@@ -71,7 +74,7 @@ run_shard() {
       --data "${LME_SHARD_ROOT}/lme_${index}.json" \
       --output-dir "${shard_out}" \
       --memory-cache-dir "${MEMORY_CACHE_DIR}" \
-      --max-questions 20 \
+      --max-questions "${QUESTIONS_PER_SHARD}" \
       --question-workers "${QUESTION_WORKERS}" \
       --max-inflight-deepseek "${INFLIGHT_PER_SHARD}" \
       "${COMMON_ARGS[@]}" >>"${shard_out}/run.log" 2>&1; then
@@ -97,7 +100,7 @@ wait_batch() {
   [[ "${failed}" == 0 ]]
 }
 
-for index in $(seq -w 0 24); do
+for index in $(seq -w 0 $((LME_SHARDS - 1))); do
   run_shard "${index}" &
   pids+=("$!")
   labels+=("lme_${index}")

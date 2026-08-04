@@ -31,6 +31,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--memory-cache-dir", type=Path)
     parser.add_argument(
+        "--skip-memory-artifacts", action="store_true",
+        help=("Do not duplicate cached nodes, edges, SQLite, or vectors into "
+              "the query output; answers, retrieval, provenance, and token records remain."),
+    )
+    parser.add_argument(
         "--deepseek-model", "--llm-model", dest="deepseek_model",
         default=os.environ.get("SGAO_MODEL", "gpt-5.4-mini"),
     )
@@ -461,6 +466,7 @@ def main() -> None:
         data_path=args.data,
         output_dir=args.output_dir,
         memory_cache_dir=args.memory_cache_dir,
+        persist_memory_artifacts=not args.skip_memory_artifacts,
         question_type=args.question_type,
         variants=tuple(args.variants),
         deepseek_model=deepseek_model,
