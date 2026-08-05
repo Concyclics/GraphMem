@@ -30,23 +30,33 @@ MIGRATION_VERSION = 3
 class SQLiteGraphStore:
     """Single-writer SQLite authority for raw memory and canonical graphs."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = read_only
+        if not read_only:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(self.path, check_same_thread=False, timeout=60.0)
+        if read_only:
+            self._connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True,
+                                               check_same_thread=False, timeout=60.0)
+        else:
+            self._connection = sqlite3.connect(self.path, check_same_thread=False, timeout=60.0)
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA foreign_keys=ON")
-        self._connection.execute("PRAGMA synchronous=NORMAL")
+        if not read_only:
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.execute("PRAGMA foreign_keys=ON")
+            self._connection.execute("PRAGMA synchronous=NORMAL")
         self._connection.execute("PRAGMA busy_timeout=60000")
-        self._migrate()
+        if not read_only:
+            self._migrate()
 
     def close(self) -> None:
         self._connection.close()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
+        if self.read_only:
+            raise RuntimeError("cannot write through a read-only SQLiteGraphStore")
         with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")

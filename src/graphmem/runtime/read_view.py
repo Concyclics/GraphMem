@@ -6,6 +6,7 @@ from typing import Iterable, Sequence
 
 from ..domain import GraphEdge, GraphNode, NodeType, RelationType
 from ..storage.sqlite import SQLiteGraphStore
+from ..text import content_terms, normalize_key
 
 
 PROVENANCE_RELATIONS = {RelationType.HAS_EVIDENCE}
@@ -66,6 +67,106 @@ class GraphReadView:
             node_id: frozenset(node.all_evidence_group_ids)
             for node_id, node in self.nodes.items()
         }
+        self._compile_query_index()
+
+    def _compile_query_index(self) -> None:
+        """Compile immutable query postings from V5 canonical attributes.
+
+        This is intentionally an in-memory projection: it gives frozen graphs a
+        typed query index without mutating their authority SQLite database.
+        """
+        owner_alias: dict[str, set[str]] = defaultdict(set)
+        self.fact_owner_predicate_scope_index: dict[tuple[str, str, str], list[str]] = defaultdict(list)
+        self.owner_fact_index: dict[str, list[str]] = defaultdict(list)
+        self.predicate_fact_index: dict[str, list[str]] = defaultdict(list)
+        self.scope_fact_index: dict[str, list[str]] = defaultdict(list)
+        self.value_fact_index: dict[str, list[str]] = defaultdict(list)
+        self.collection_fact_index: dict[str, list[str]] = defaultdict(list)
+        self.session_fact_index: dict[tuple[str, str, str], list[str]] = defaultdict(list)
+        self.routing_child_postings: dict[str, list[str]] = defaultdict(list)
+        self.collection_index: dict[str, list[str]] = defaultdict(list)
+        self.manifest_value_index: dict[str, list[str]] = defaultdict(list)
+        for node in self.nodes.values():
+            attrs = node.attributes
+            if node.node_type == NodeType.CANONICAL_ENTITY:
+                for alias in (node.summary, *attrs.get("aliases", ())):
+                    key = normalize_key(str(alias))
+                    if key:
+                        owner_alias[key].add(node.node_id)
+            if node.node_type == NodeType.CANONICAL_FACT:
+                owner = str(attrs.get("owner_id", "")); predicate = normalize_key(str(attrs.get("predicate", "")))
+                scope = normalize_key(str(attrs.get("scope", ""))); value = normalize_key(str(attrs.get("value_key", attrs.get("value", ""))))
+                self.fact_owner_predicate_scope_index[(owner, predicate, scope)].append(node.node_id)
+                if owner: self.owner_fact_index[owner].append(node.node_id)
+                if predicate: self.predicate_fact_index[predicate].append(node.node_id)
+                if scope: self.scope_fact_index[scope].append(node.node_id)
+                if value: self.value_fact_index[value].append(node.node_id)
+                collection = normalize_key(str(attrs.get("collection_key", "")))
+                if collection: self.collection_fact_index[collection].append(node.node_id)
+                session = str(attrs.get("session_id", ""))
+                if session and owner and predicate:
+                    self.session_fact_index[(session, owner, predicate)].append(node.node_id)
+            elif node.node_type in {NodeType.COLLECTION_SCOPE, NodeType.COLLECTION_MANIFEST}:
+                key = normalize_key(str(attrs.get("collection_key", "")))
+                if key: self.collection_index[key].append(node.node_id)
+                for value in attrs.get("member_value_keys", ()):
+                    key = normalize_key(str(value))
+                    if key: self.manifest_value_index[key].append(node.node_id)
+            elif node.node_type == NodeType.ROUTING_CARD:
+                for key, child_ids in dict(attrs.get("child_postings", {})).items():
+                    normalized = normalize_key(str(key))
+                    if normalized:
+                        self.routing_child_postings[normalized].extend(str(row) for row in child_ids)
+        self.owner_alias_index = {key: tuple(sorted(value)) for key, value in owner_alias.items()}
+        self.predicate_index = tuple(sorted(self.predicate_fact_index))
+        for name in (
+            "fact_owner_predicate_scope_index", "owner_fact_index", "predicate_fact_index",
+            "scope_fact_index", "value_fact_index", "collection_fact_index", "session_fact_index",
+            "routing_child_postings", "collection_index",
+            "manifest_value_index",
+        ):
+            value = getattr(self, name)
+            setattr(self, name, {key: tuple(sorted(set(rows))) for key, rows in value.items()})
+
+    def lookup_facts(self, *, owner_ids: Sequence[str] = (), predicates: Sequence[str] = (),
+                     scopes: Sequence[str] = (), values: Sequence[str] = (), limit: int = 64) -> tuple[str, ...]:
+        pools: list[set[str]] = []
+        if owner_ids:
+            pools.append(set().union(*(set(self.owner_fact_index.get(item, ())) for item in owner_ids)))
+        predicate_keys = [normalize_key(item) for item in predicates if normalize_key(item)]
+        if predicate_keys:
+            matched = set().union(*(set(self.predicate_fact_index.get(item, ())) for item in predicate_keys))
+            # Query compiler candidates can be a normalized stem ("travel") while
+            # a fact retains a supported phrase ("travel to").  Token containment
+            # is deterministic and avoids an embedding-only predicate join.
+            for indexed, fact_ids in self.predicate_fact_index.items():
+                indexed_terms = set(content_terms(indexed))
+                if any(set(content_terms(item)) <= indexed_terms or indexed_terms <= set(content_terms(item))
+                       for item in predicate_keys):
+                    matched.update(fact_ids)
+            pools.append(matched)
+        scope_keys = [normalize_key(item) for item in scopes if normalize_key(item)]
+        if scope_keys:
+            pools.append(set().union(*(set(self.scope_fact_index.get(item, ())) for item in scope_keys)))
+        value_keys = [normalize_key(item) for item in values if normalize_key(item)]
+        if value_keys:
+            pools.append(set().union(*(set(self.value_fact_index.get(item, ())) for item in value_keys)))
+        if not pools:
+            return ()
+        result = set.intersection(*pools) if len(pools) > 1 else pools[0]
+        return tuple(sorted(result)[:limit])
+
+    def route_children(self, keys: Sequence[str], *, limit: int = 48) -> tuple[str, ...]:
+        rows: list[str] = []
+        for key in keys:
+            rows.extend(self.routing_child_postings.get(normalize_key(key), ()))
+        return tuple(dict.fromkeys(rows))[:limit]
+
+    def collection_facts(self, collection_key: str, *, limit: int = 64) -> tuple[str, ...]:
+        return self.collection_fact_index.get(normalize_key(collection_key), ())[:limit]
+
+    def terminal_groups_for_nodes(self, node_ids: Sequence[str]) -> tuple[str, ...]:
+        return self.evidence_group_ids_for_nodes(node_ids, terminal_only=True)
 
     @staticmethod
     def _freeze(value: dict[RelationType, dict[str, list[AdjacentEdge]]]) -> dict[

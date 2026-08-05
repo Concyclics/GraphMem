@@ -79,6 +79,13 @@ def navigation_metrics(question: DevQuestion, result: NavigationResult,
         "evidence_tokens": result.evidence_tokens,
         "budget_exhausted": result.budget_exhausted,
         "certificate_complete": bool(result.certificate and result.certificate.complete),
+        "stopped_by_certificate": bool(result.stop_reason and str(result.stop_reason) == "certificate"),
+        "search_node_cap_reached": bool(result.search_exhaustion.get("node_cap_reached")),
+        "search_edge_cap_reached": bool(result.search_exhaustion.get("edge_cap_reached")),
+        "search_hop_cap_reached": bool(result.search_exhaustion.get("hop_cap_reached")),
+        "search_frontier_truncated": bool(result.search_exhaustion.get("frontier_truncated")),
+        "pack_turn_cap_reached": bool(result.pack_exhaustion.get("turn_cap_reached")),
+        "pack_token_cap_reached": bool(result.pack_exhaustion.get("token_cap_reached")),
         **{f"latency_{key}_ms": value for key, value in result.stage_latency_ms.items()},
     }
 
@@ -99,6 +106,9 @@ def _aggregate(rows: Sequence[Mapping[str, Any]]) -> dict[str, float | int]:
         "session_any_hit", "session_all_hit", "session_recall", "turn_any_hit",
         "turn_all_hit", "turn_recall", "turn_precision", "visited_nodes", "visited_edges",
         "frontier_peak", "evidence_tokens", "budget_exhausted", "certificate_complete",
+        "stopped_by_certificate", "search_node_cap_reached", "search_edge_cap_reached",
+        "search_hop_cap_reached", "search_frontier_truncated", "pack_turn_cap_reached",
+        "pack_token_cap_reached",
         "candidate_turn_all_hit", "candidate_turn_recall", "graph_reachable_turn_recall",
         "path_provenance_complete", "proof_length",
     )

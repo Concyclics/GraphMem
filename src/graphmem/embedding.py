@@ -15,13 +15,14 @@ class QwenEmbeddingIndex:
     """Turn-level Qwen embedding index; usage is logged outside backbone tokens."""
 
     def __init__(self, store: SQLiteGraphStore, config: GraphMemV5Config,
-                 client: Any | None = None, batch_size: int = 64) -> None:
+                 client: Any | None = None, batch_size: int = 64, record_usage: bool = True) -> None:
         self.store = store
         self.config = config
         self.model_id = config.models.embedding_model
         self.batch_size = batch_size
         self._query_cache: dict[str, list[float]] = {}
         self._memory_cache: dict[str, tuple[list[str], np.ndarray]] = {}
+        self.record_usage = record_usage
         if client is None:
             from openai import OpenAI
             client = OpenAI(base_url=config.models.embedding_base_url, api_key="local")
@@ -74,10 +75,11 @@ class QwenEmbeddingIndex:
         if cache_key not in self._query_cache:
             vectors, tokens, latency = self._embed([query_text])
             self._query_cache[cache_key] = vectors[0]
-            self.store.log_embedding_call(
-                stable_id("embedding-call", memory_id, "query", cache_key), memory_id,
-                self.model_id, 1, tokens, latency,
-            )
+            if self.record_usage:
+                self.store.log_embedding_call(
+                    stable_id("embedding-call", memory_id, "query", cache_key), memory_id,
+                    self.model_id, 1, tokens, latency,
+                )
         if memory_id not in self._memory_cache:
             ids, vectors = [], []
             for row in self.store._connection.execute(

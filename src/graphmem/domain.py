@@ -56,6 +56,7 @@ class NodeType(StrEnum):
     CANONICAL_VALUE = "canonical_value"
     FACT_MENTION = "fact_mention"
     VIRTUAL_REGION = "virtual_region"
+    COLLECTION_MANIFEST = "collection_manifest"
 
 
 class RelationType(StrEnum):
@@ -90,6 +91,43 @@ class RelationType(StrEnum):
     SAME_PREFERENCE_DOMAIN = "same_preference_domain"
     STATE_NEXT = "state_next"
     COLLECTION_CO_MEMBER = "collection_co_member"
+
+
+class QueryOperator(StrEnum):
+    LOOKUP = "lookup"
+    UNION_DISTINCT = "union_distinct"
+    INTERSECTION_DISTINCT = "intersection_distinct"
+    GROUP_BY_OWNER = "group_by_owner"
+    COUNT_DISTINCT = "count_distinct"
+    EXISTS_ALL = "exists_all"
+    ARGMIN_TIME = "argmin_time"
+    ARGMAX_TIME = "argmax_time"
+    DATE_DIFFERENCE = "date_difference"
+    LATEST_STATE = "latest_state"
+    ORDINAL = "ordinal"
+
+
+class CertificateStatus(StrEnum):
+    COMPLETE = "complete"
+    INCOMPLETE_BINDING = "incomplete_binding"
+    INCOMPLETE_OPERAND = "incomplete_operand"
+    INCOMPLETE_COLLECTION = "incomplete_collection"
+    INCOMPLETE_SCOPE = "incomplete_scope"
+    INCOMPLETE_PROVENANCE = "incomplete_provenance"
+    NO_PROGRESS = "no_progress"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+
+
+class StopReason(StrEnum):
+    CERTIFICATE = "certificate"
+    NO_PROGRESS = "no_progress"
+    NODE_CAP = "node_cap"
+    EDGE_CAP = "edge_cap"
+    HOP_CAP = "hop_cap"
+    FRONTIER_TRUNCATED = "frontier_truncated"
+    PACK_TURN_CAP = "pack_turn_cap"
+    PACK_TOKEN_CAP = "pack_token_cap"
+    CANDIDATES_EXHAUSTED = "candidates_exhausted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,6 +474,63 @@ class CandidateScore:
     adjacency_score: float = 0.0
     graph_path_ids: tuple[str, ...] = ()
     relation_contributions: tuple[str, ...] = ()
+    operand_ids: tuple[str, ...] = ()
+    binding_score: float = 0.0
+    relation_path_score: float = 0.0
+    obligation_gain: float = 0.0
+    provenance_novelty: float = 0.0
+    mandatory: bool = False
+    proof_unit_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class OperandSpec:
+    operand_id: str
+    owner_aliases: tuple[str, ...] = ()
+    predicate_candidates: tuple[str, ...] = ()
+    scope_candidates: tuple[str, ...] = ()
+    value_type: str | None = None
+    temporal_constraint: str | None = None
+    polarity: str | None = None
+    modalities: tuple[str, ...] = ()
+    multiplicity: str = "one"
+    distinct_by: str = "value"
+    required_provenance: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ProofObligation:
+    obligation_id: str
+    operand_id: str | None
+    kind: str
+    required: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class FactBinding:
+    binding_id: str
+    operand_id: str
+    fact_node_id: str
+    owner_id: str | None
+    predicate: str
+    scope: str
+    value_key: str
+    event_instance_id: str | None
+    time_interval: str | None
+    evidence_group_ids: tuple[str, ...]
+    relation_path: tuple[str, ...] = ()
+    confidence: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceUnit:
+    unit_id: str
+    obligation_ids: tuple[str, ...]
+    binding_ids: tuple[str, ...]
+    source_turn_ids: tuple[str, ...]
+    relation_path_ids: tuple[str, ...]
+    token_cost: int
+    mandatory: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,6 +542,9 @@ class EvidenceCertificate:
     complete: bool
     iterations: int
     negative_scope_required: bool = False
+    status: CertificateStatus = CertificateStatus.INCOMPLETE_OPERAND
+    operand_status: Mapping[str, str] = field(default_factory=dict)
+    stop_reason: StopReason | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,6 +572,11 @@ class NavigationResult:
     graph_only_candidate_turn_ids: tuple[str, ...] = ()
     relation_trace: tuple[ProofStep, ...] = ()
     first_hit_relations: Mapping[str, str] = field(default_factory=dict)
+    search_exhaustion: Mapping[str, bool] = field(default_factory=dict)
+    pack_exhaustion: Mapping[str, bool] = field(default_factory=dict)
+    operand_coverage: Mapping[str, Mapping[str, tuple[str, ...]]] = field(default_factory=dict)
+    proof_units: tuple[EvidenceUnit, ...] = ()
+    stop_reason: StopReason | None = None
     schema_version: str = SCHEMA_VERSION
 
 
