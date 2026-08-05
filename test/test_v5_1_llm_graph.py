@@ -194,11 +194,19 @@ def test_strict_prompt_uses_local_aliases_schema_and_one_retry(tmp_path: Path) -
     assert completions.calls >= 2
     first = completions.requests[0]
     assert first["response_format"]["type"] == "json_schema"
+    fact_schema = first["response_format"]["json_schema"]["schema"]["properties"]["s"]["items"]["properties"]["f"]["items"]
+    assert set(fact_schema["properties"]) == {"o", "p", "v", "g", "n", "r", "q"}
     payload = json.loads(first["messages"][1]["content"])
     assert all(row["i"].startswith("s") for row in payload["s"])
     assert all(turn["i"].startswith("s") for row in payload["s"] for turn in row["r"])
     assert manifest.build_diagnostics["extraction_retry_calls"] >= 1
     assert manifest.build_token_usage["reasoning_tokens"] == 0
+
+
+def test_strict_value_type_is_derived_without_model_tokens() -> None:
+    assert QwenSemanticDistiller._infer_value_type("$800") == "currency"
+    assert QwenSemanticDistiller._infer_value_type("three options") == "text"
+    assert QwenSemanticDistiller._infer_value_type("2024-05-01") == "time"
 
 
 def test_g5_lean_graph_has_terminal_facts_and_no_value_nodes(tmp_path: Path) -> None:
@@ -209,10 +217,16 @@ def test_g5_lean_graph_has_terminal_facts_and_no_value_nodes(tmp_path: Path) -> 
     nodes = store.nodes("travel"); edges = store.edges("travel")
     assert NodeType.CANONICAL_FACT in {node.node_type for node in nodes}
     assert NodeType.CANONICAL_VALUE not in {node.node_type for node in nodes}
+    assert NodeType.EVIDENCE_GROUP_REF in {node.node_type for node in nodes}
     assert RelationType.SCENE_CONTAINS in {edge.relation for edge in edges}
     assert all(node.attributes.get("provenance_scope") == "route"
-               for node in nodes if node.node_type in {NodeType.ROUTING_CARD, NodeType.SCENE})
+               for node in nodes if node.node_type in {
+                   NodeType.ROUTING_CARD, NodeType.SCENE, NodeType.CANONICAL_ENTITY})
     view = GraphReadView(nodes, edges)
     route_ids = [node.node_id for node in nodes if node.attributes.get("provenance_scope") == "route"]
     assert not view.evidence_group_ids_for_nodes(route_ids)
     assert view.evidence_group_ids_for_nodes(route_ids, terminal_only=False)
+    evidence_refs = [node for node in nodes if node.node_type == NodeType.EVIDENCE_GROUP_REF]
+    assert all(node.attributes.get("provenance_scope") == "terminal" for node in evidence_refs)
+    assert all(node.attributes.get("turn_id") for node in evidence_refs)
+    assert all(len(node.summary.split()) <= 13 for node in evidence_refs)

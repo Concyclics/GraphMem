@@ -103,7 +103,28 @@ class QwenEmbeddingIndex:
 
     def _embed(self, texts: Sequence[str]) -> tuple[list[list[float]], int, float]:
         started = time.perf_counter()
-        response = self.client.embeddings.create(model=self.model_id, input=list(texts))
+        # The host GPU watchdog can terminate a low-duty-cycle embedding engine
+        # even while the supervised service is healthy enough to restart.  Keep
+        # a request alive across that bounded restart window, but never retry
+        # schema/authentication/client errors which cannot recover by waiting.
+        response = None
+        last_error: Exception | None = None
+        for attempt in range(12):
+            try:
+                response = self.client.embeddings.create(model=self.model_id, input=list(texts))
+                break
+            except Exception as error:
+                status_code = getattr(error, "status_code", None)
+                recoverable = (
+                    error.__class__.__name__ in {"APIConnectionError", "APITimeoutError", "InternalServerError"}
+                    or (isinstance(status_code, int) and status_code >= 500)
+                )
+                if not recoverable or attempt == 11:
+                    raise
+                last_error = error
+                time.sleep(5.0)
+        if response is None:  # pragma: no cover - defensive invariant
+            raise RuntimeError("embedding service retry exhausted") from last_error
         latency = (time.perf_counter() - started) * 1000
         ordered = sorted(response.data, key=lambda row: row.index)
         vectors = [list(row.embedding) for row in ordered]

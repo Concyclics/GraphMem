@@ -14,7 +14,7 @@
     "semantic_scene_input_tokens": 16000,
     "semantic_batch_output_tokens": 768,
     "semantic_average_tokens_per_memory": 220000,
-    "semantic_max_facts_per_scene": 2,
+    "semantic_max_facts_per_scene": 3,
     "semantic_summary_tokens": 48,
     "semantic_repair_output_tokens": 256,
     "semantic_constrained_json": false,

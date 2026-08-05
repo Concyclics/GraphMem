@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
+import html
 import json
 import shutil
 import sqlite3
@@ -142,7 +145,7 @@ def main() -> None:
         semantic_max_retries=0, semantic_compile_summary=False)
     strict_single = replace(base.models, semantic_extraction_mode="strict_single",
         semantic_batch_scenes=1, semantic_batch_output_tokens=768,
-        semantic_max_facts_per_scene=2, semantic_summary_tokens=48,
+        semantic_max_facts_per_scene=3, semantic_summary_tokens=48,
         semantic_max_retries=1, semantic_retry_output_tokens=1024,
         semantic_compile_summary=True)
     strict_pair = replace(strict_single, semantic_extraction_mode="strict_pair",
@@ -163,7 +166,8 @@ def main() -> None:
             coarsen=replace(base.coarsen, cross_session_merge=False),
             edges=replace(base.edges, graph_variant="g5", temporal_normalization=temporal,
                           cross_session_portals=portals))
-    summary = {}; metric_rows = []; diagnostic_rows = []; trace_rows = []; manifests = []
+    summary = {}; metric_rows = []; diagnostic_rows = []; trace_rows = []
+    navigation_rows = []; manifests = []
     for label in (item.strip() for item in args.profiles.split(",") if item.strip()):
         profile = definitions[label]; distiller = QwenSemanticDistiller(store, profile, "v5.1-holdout") \
             if profile.scenes.llm_semantic_extraction else None
@@ -202,9 +206,12 @@ def main() -> None:
         manifests.extend({"configuration": label, **dataclass_dict(item)} for item in current)
         navigator = GraphNavigator(store, variant=NavigatorVariant.N5_SET_COVER,
                                    dense_search=embedding.search if embedding else None)
-        probe = GraphDiagnosticProbe(store); nav_metrics = []
+        probe = GraphDiagnosticProbe(store, dense_search=embedding.search if embedding else None)
+        nav_metrics = []
         for question in selected:
             nav = navigator.navigate(question.memory_id, question.query, profile.query_budget)
+            navigation_rows.append({"configuration": label, "question_id": question.question_id,
+                                    **dataclass_dict(nav)})
             metric = navigation_metrics(question, nav, store); metric["configuration"] = label
             nav_metrics.append(metric); metric_rows.append(metric)
             probe_results = {}
@@ -284,9 +291,46 @@ def main() -> None:
     (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     (root / "graph_manifest.json").write_text(json.dumps(manifests, indent=2) + "\n")
     for name, rows in (("metrics.jsonl", metric_rows), ("relation_diagnostics.jsonl", diagnostic_rows),
-                       ("relation_traces.jsonl", trace_rows)):
+                       ("relation_traces.jsonl", trace_rows),
+                       ("navigation_results.jsonl", navigation_rows)):
         with (root / name).open("w") as handle:
             for row in rows: handle.write(json.dumps(row, sort_keys=True) + "\n")
+    if metric_rows:
+        columns = sorted({key for row in metric_rows for key in row})
+        with (root / "metrics.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns); writer.writeheader()
+            writer.writerows({key: json.dumps(value, sort_keys=True) if isinstance(value, (dict, list, tuple))
+                              else value for key, value in row.items()} for row in metric_rows)
+        try:
+            import pandas as pd
+            pd.DataFrame(metric_rows).to_parquet(root / "metrics.parquet", index=False)
+        except ImportError:
+            pass
+    with (root / "token_usage.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("configuration", "average_cold_equivalent_tokens",
+                                                     "retry_rate", "reasoning_tokens"))
+        writer.writeheader()
+        for label, row in summary.items():
+            writer.writerow({"configuration": label,
+                "average_cold_equivalent_tokens": row["average_cold_equivalent_backbone_tokens"],
+                "retry_rate": row["extraction_retry_rate"],
+                "reasoning_tokens": row["reasoning_tokens"]})
+    with (root / "error_cases.jsonl").open("w") as handle:
+        for row in metric_rows:
+            if not row.get("turn_all_hit"):
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+    hashes = {}
+    for path in (args.config, args.lme, args.locomo, args.gold):
+        hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    (root / "run_manifest.json").write_text(json.dumps({
+        "created_at": stamp, "split": args.split, "profiles": list(summary),
+        "questions": len(selected), "unique_question_ids": len({row.question_id for row in selected}),
+        "memories": len(memory_ids), "input_hashes": hashes,
+        "reasoning_tokens": sum(int(row["reasoning_tokens"]) for row in summary.values()),
+    }, indent=2) + "\n")
+    (root / "ablation_report.html").write_text(
+        "<!doctype html><meta charset='utf-8'><title>GraphMem V5 ablation</title>"
+        "<h1>GraphMem V5 ablation</h1><pre>" + html.escape(json.dumps(summary, indent=2)) + "</pre>")
     store.close(); print(root)
 
 

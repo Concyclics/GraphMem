@@ -39,6 +39,13 @@ NON_ENTITY_NAMES = frozenset({
     "friday", "saturday", "sunday", "january", "february", "march", "april", "may",
     "june", "july", "august", "september", "october", "november", "december",
 })
+EVIDENCE_REF_STOPWORDS = NON_ENTITY_NAMES | frozenset({
+    "and", "but", "for", "from", "have", "has", "had", "into", "just", "like",
+    "more", "much", "really", "some", "than", "they", "them", "their", "were",
+    "will", "would", "you", "your", "about", "could", "should", "because", "been",
+    "are", "was", "is", "am", "can", "did", "does", "do", "of", "to", "in", "on",
+    "at", "it", "my", "me", "we", "our", "a", "an", "i",
+})
 TIME_RE = re.compile(
     r"\b(?:\d{1,2}[:/]\d{1,2}(?:[:/]\d{2,4})?|\d{4}|monday|tuesday|wednesday|"
     r"thursday|friday|saturday|sunday|january|february|march|april|may|june|july|"
@@ -202,6 +209,14 @@ class GraphBuildPipeline:
                 )
                 scene_nodes[scene.scene_id] = scene_node
                 nodes.append(scene_node)
+                if lean_graph:
+                    for turn in scene.turns:
+                        evidence_ref = self._turn_evidence_ref(
+                            memory_id, scene.scene_id, turn, group_by_turn[turn.turn_id])
+                        nodes.append(evidence_ref)
+                        edges.append(self._edge(memory_id, scene_node,
+                                                RelationType.SCENE_CONTAINS, evidence_ref,
+                                                "lossless_terminal_ref"))
                 has_semantic_facts = bool(packet_by_scene.get(
                     scene.scene_id, ScenePacket(scene.scene_id, "", (), ())).facts)
                 for event_index, event in enumerate(() if lean_graph and has_semantic_facts
@@ -210,7 +225,8 @@ class GraphBuildPipeline:
                     nodes.append(event)
 
         if level >= 2:
-            entity_nodes.update(self._entities(memory_id, scenes, event_nodes, group_by_turn))
+            entity_nodes.update(self._entities(
+                memory_id, scenes, event_nodes, group_by_turn, route_only=lean_graph))
             nodes.extend(entity_nodes.values())
             nodes.extend(self._time_and_state_nodes(memory_id, event_nodes))
             if packets:
@@ -320,6 +336,34 @@ class GraphBuildPipeline:
             result.extend(self._scene_slice(session_id, chunk) for chunk in chunks)
         return result
 
+    @staticmethod
+    def _turn_evidence_ref(memory_id, scene_id, turn, group):
+        terms = []
+        for token in WORD_RE.findall(turn.raw_text):
+            normalized = token.casefold()
+            if normalized in EVIDENCE_REF_STOPWORDS or len(normalized) < 2:
+                continue
+            if normalized not in terms:
+                terms.append(normalized)
+            if len(terms) >= 12:
+                break
+        explicit_time = extract_time_expression(turn.raw_text)
+        interval = normalize_time(explicit_time, turn.timestamp, turn.turn_id) if explicit_time else None
+        value_type = ("currency" if re.search(r"[$£€¥]\s*\d", turn.raw_text)
+                      else "number" if re.search(r"\d", turn.raw_text)
+                      else "time" if explicit_time else "text")
+        return GraphNode(
+            stable_id("node", memory_id, "evidence-ref", turn.turn_id), memory_id,
+            NodeType.EVIDENCE_GROUP_REF, 0,
+            " ".join((turn.speaker, *terms)), group.evidence_group_id,
+            event_time=interval.start if interval and interval.start else None,
+            attributes={"scene_id": scene_id, "session_id": turn.session_id,
+                        "turn_id": turn.turn_id, "turn_index": turn.turn_index,
+                        "value_type": value_type,
+                        "time_interval": dataclass_dict(interval) if interval else None,
+                        "roles": ("evidence_turn", "terminal"),
+                        "provenance_scope": "terminal"})
+
     def _scene_slice(self, session_id: str, turns: Sequence[SourceTurn]) -> _SceneSlice:
         scene_id = stable_id("node", turns[0].memory_id, "scene", session_id,
                              turns[0].turn_index, turns[-1].turn_index)
@@ -380,7 +424,7 @@ class GraphBuildPipeline:
             ))
         return result
 
-    def _entities(self, memory_id, scenes, event_nodes, group_by_turn):
+    def _entities(self, memory_id, scenes, event_nodes, group_by_turn, *, route_only=False):
         mention_groups: dict[str, list[str]] = defaultdict(list)
         mention_turns: dict[str, list[str]] = defaultdict(list)
         for scene in scenes:
@@ -400,7 +444,8 @@ class GraphBuildPipeline:
                 entity_id, memory_id, NodeType.CANONICAL_ENTITY, 0, name,
                 groups[0], groups[1:], entity_id=entity_id,
                 attributes={"aliases": (name,), "mention_turn_ids": tuple(mention_turns.get(name, ())),
-                            "roles": ("entity",)},
+                            "roles": ("entity", "route") if route_only else ("entity",),
+                            **({"provenance_scope": "route"} if route_only else {})},
             )
         return result
 
@@ -559,8 +604,8 @@ class GraphBuildPipeline:
                 nodes.setdefault(owner_id, GraphNode(
                     owner_id, memory_id, NodeType.CANONICAL_ENTITY, 0, fact.owner,
                     groups[0], groups[1:], entity_id=owner_id,
-                    attributes={"aliases": (fact.owner,), "roles": ("entity", "owner"),
-                                "provenance_scope": "terminal"}))
+                    attributes={"aliases": (fact.owner,), "roles": ("entity", "owner", "route"),
+                                "provenance_scope": "route"}))
                 observed = observed_interval(source_turn.timestamp, source_turn.turn_id)
                 evidence_text = source_turn.raw_text[refs[0][1]:refs[0][2]]
                 explicit_time = fact.time or extract_time_expression(evidence_text)
