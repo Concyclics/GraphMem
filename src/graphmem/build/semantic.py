@@ -111,25 +111,31 @@ class QwenSemanticDistiller:
             {"i": turn.turn_id, "s": turn.speaker, "d": turn.timestamp, "l": len(turn.raw_text),
              "t": turn.raw_text}
             for turn in scene.turns]} for scene in batch]}
-        response, _ = self._call(memory_id, "scene_semantic", SYSTEM_PROMPT, payload, len(batch))
+        system = self._scene_prompt()
+        response, _ = self._call(memory_id, "scene_semantic", system, payload, len(batch))
         objects = self._parse_objects(str(response.get("content", "")))
         root = objects[0] if objects else {}
         rows = root.get("s", root.get("scenes", [])) if isinstance(root, dict) else []
+        if not isinstance(rows, list):
+            rows = []
         by_scene = {str(row.get("i", row.get("scene_id"))): row for row in rows if isinstance(row, dict)}
         missing = [scene for scene in batch if scene.scene_id not in by_scene]
         if missing:
-            repair_payload = {"repair": "Return complete valid JSON for only these missing scenes.",
+            repair_batches = [[scene] for scene in missing] if self.config.models.semantic_individual_repair else [missing]
+            for repair_batch in repair_batches:
+                repair_payload = {"repair": "Return complete valid JSON for only these missing scenes.",
                 "s": [{"i": scene.scene_id, "r": [
                     {"i": turn.turn_id, "s": turn.speaker, "d": turn.timestamp,
                      "l": len(turn.raw_text), "t": turn.raw_text}
-                    for turn in scene.turns]} for scene in missing]}
-            repaired, _ = self._call(memory_id, "scene_semantic_repair", SYSTEM_PROMPT,
-                                      repair_payload, len(missing))
-            repaired_objects = self._parse_objects(str(repaired.get("content", "")))
-            repaired_root = repaired_objects[0] if repaired_objects else {}
-            for item in repaired_root.get("s", repaired_root.get("scenes", ())) if isinstance(repaired_root, dict) else ():
-                if isinstance(item, dict):
-                    by_scene[str(item.get("i", item.get("scene_id")))] = item
+                    for turn in scene.turns]} for scene in repair_batch]}
+                repaired, _ = self._call(memory_id, "scene_semantic_repair", system,
+                    repair_payload, len(repair_batch),
+                    max_tokens=self.config.models.semantic_repair_output_tokens)
+                repaired_objects = self._parse_objects(str(repaired.get("content", "")))
+                repaired_root = repaired_objects[0] if repaired_objects else {}
+                for item in repaired_root.get("s", repaired_root.get("scenes", ())) if isinstance(repaired_root, dict) else ():
+                    if isinstance(item, dict):
+                        by_scene[str(item.get("i", item.get("scene_id")))] = item
         result = []
         for scene in batch:
             row = by_scene.get(scene.scene_id)
@@ -140,7 +146,8 @@ class QwenSemanticDistiller:
         turns = {turn.turn_id: turn for turn in scene.turns}
         facts = []
         fact_rows = row.get("f", row.get("facts", ()))
-        for item in fact_rows if isinstance(fact_rows, list) else ():
+        for item in (fact_rows[:self.config.models.semantic_max_facts_per_scene]
+                     if isinstance(fact_rows, list) else ()):
             if not isinstance(item, dict):
                 continue
             evidence = []
@@ -169,11 +176,22 @@ class QwenSemanticDistiller:
                                       str(item.get("n", item.get("polarity", "positive"))),
                                       str(item.get("t", item.get("time"))) if item.get("t", item.get("time")) else None,
                                       min(1.0, max(0.0, float(item.get("c", item.get("confidence", 0.5))))), tuple(evidence)))
-        summary = " ".join(str(row.get("m", row.get("summary", ""))).split()[:64])
+        summary = " ".join(str(row.get("m", row.get("summary", ""))).split()[
+            :self.config.models.semantic_summary_tokens])
         if not summary:
             summary = " ".join(scene.summary.split()[:96])
         return ScenePacket(scene.scene_id, summary, tuple(facts),
                            self._strings(row.get("u", row.get("unresolved"))), False)
+
+    def _scene_prompt(self) -> str:
+        if (self.config.models.semantic_max_facts_per_scene == 12
+                and self.config.models.semantic_summary_tokens == 64):
+            return SYSTEM_PROMPT
+        return SYSTEM_PROMPT + (
+            f" Hard limits: at most {self.config.models.semantic_max_facts_per_scene} facts per scene; "
+            f"summary at most {self.config.models.semantic_summary_tokens} tokens. Prioritize state, event, "
+            "time, preference and cross-session routing facts; omit greetings and acknowledgements."
+        )
 
     @staticmethod
     def _fallback(scene: Any) -> ScenePacket:
@@ -182,13 +200,26 @@ class QwenSemanticDistiller:
     def _call(self, memory_id: str, stage: str, system: str, payload: Any,
               batch_size: int, max_tokens: int | None = None) -> tuple[Mapping[str, Any], Mapping[str, int]]:
         serialized = canonical_json(payload)
-        semantic_config = hashlib.sha256(canonical_json({
+        semantic_settings = {
             "schema": self.config.schema_version, "model": self.config.models.llm_model,
             "batch_scenes": self.config.models.semantic_batch_scenes,
             "batch_input": self.config.models.semantic_batch_input_tokens,
             "scene_input": self.config.models.semantic_scene_input_tokens,
             "batch_output": self.config.models.semantic_batch_output_tokens,
-        }).encode()).hexdigest()
+        }
+        if (self.config.models.semantic_max_facts_per_scene,
+                self.config.models.semantic_summary_tokens,
+                self.config.models.semantic_repair_output_tokens,
+                self.config.models.semantic_constrained_json,
+                self.config.models.semantic_individual_repair) != (12, 64, 4096, False, False):
+            semantic_settings.update({
+                "max_facts": self.config.models.semantic_max_facts_per_scene,
+                "summary_tokens": self.config.models.semantic_summary_tokens,
+                "repair_output": self.config.models.semantic_repair_output_tokens,
+                "constrained_json": self.config.models.semantic_constrained_json,
+                "individual_repair": self.config.models.semantic_individual_repair,
+            })
+        semantic_config = hashlib.sha256(canonical_json(semantic_settings).encode()).hexdigest()
         identity = CacheIdentity(self.dataset_hash, self.config.models.llm_model, self.prompt_hash,
                                  self.config.schema_version, semantic_config,
                                  stage + ":" + hashlib.sha256(serialized.encode()).hexdigest())
@@ -196,6 +227,8 @@ class QwenSemanticDistiller:
             {"role": "system", "content": system}, {"role": "user", "content": serialized}],
             "temperature": 0, "max_tokens": max_tokens or self.config.models.semantic_batch_output_tokens,
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+        if self.config.models.semantic_constrained_json:
+            request["response_format"] = {"type": "json_object"}
         cached = self.store.cache_get(key); started = time.perf_counter()
         if cached:
             response = cached["response"]; old = cached["usage"]

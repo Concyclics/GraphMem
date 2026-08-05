@@ -15,10 +15,13 @@ from test_v5_gate_b_core import _store
 
 
 class FakeCompletions:
-    def __init__(self) -> None: self.calls = 0
+    def __init__(self) -> None:
+        self.calls = 0
+        self.requests = []
 
     def create(self, **request):
         self.calls += 1
+        self.requests.append(request)
         system = request["messages"][0]["content"]
         payload = json.loads(request["messages"][1]["content"])
         if "Compress supplied" in system:
@@ -73,6 +76,39 @@ def test_semantic_distillation_builds_grounded_fact_graph_and_reuses_cache(tmp_p
 def test_semantic_parser_accepts_concatenated_objects() -> None:
     rows = QwenSemanticDistiller._parse_objects('{"a":1},{"b":2}\n{"c":3}')
     assert rows == [{"a": 1}, {"b": 2}, {"c": 3}]
+
+
+def test_constrained_semantic_profile_requests_json_and_changes_cache_identity(tmp_path: Path) -> None:
+    store = _store(tmp_path / "graph.sqlite"); completions = FakeCompletions()
+    base = _semantic_config()
+    config = replace(base, models=replace(base.models, semantic_max_facts_per_scene=4,
+        semantic_summary_tokens=32, semantic_batch_output_tokens=1024,
+        semantic_constrained_json=True))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    GraphBuildPipeline(store, dataset_hash="dataset",
+        distiller=QwenSemanticDistiller(store, config, "dataset", client=client)).build("travel", config)
+    scene_requests = [row for row in completions.requests
+                      if "Extract grounded" in row["messages"][0]["content"]]
+    assert scene_requests
+    assert all(row["response_format"] == {"type": "json_object"} for row in scene_requests)
+    assert any("at most 4 facts" in row["messages"][0]["content"] for row in scene_requests)
+
+
+def test_graph_variants_remove_noisy_edges_and_add_collection_routes(tmp_path: Path) -> None:
+    relations = {}
+    for variant in ("g0", "g1", "g3"):
+        store = _store(tmp_path / f"{variant}.sqlite"); completions = FakeCompletions()
+        base = _semantic_config()
+        config = replace(base, edges=replace(base.edges, graph_variant=variant),
+                         coarsen=replace(base.coarsen, cross_session_merge=variant == "g0"))
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        GraphBuildPipeline(store, dataset_hash="dataset",
+            distiller=QwenSemanticDistiller(store, config, "dataset", client=client)).build("travel", config)
+        relations[variant] = {edge.relation for edge in store.edges("travel")}
+    assert RelationType.FACT_VALUE in relations["g0"]
+    assert RelationType.FACT_VALUE not in relations["g1"]
+    assert RelationType.SAME_ACTIVITY not in relations["g1"]
+    assert RelationType.FACT_VALUE not in relations["g3"]
 
 
 def test_relation_probe_is_bounded_deterministic_and_supports_ablation(tmp_path: Path) -> None:

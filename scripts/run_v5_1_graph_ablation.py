@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -42,6 +43,7 @@ def main() -> None:
     parser.add_argument("--max-questions", type=int)
     parser.add_argument("--memory-workers", type=int, default=1,
                         help="Build independent per-memory SQLite shards concurrently")
+    parser.add_argument("--e-graph-variant", choices=("g0", "g1", "g2", "g3", "g4"), default="g3")
     parser.add_argument("--stratum", choices=("lme_multi_session", "lme_temporal",
                                                "locomo_multihop", "locomo_temporal"))
     parser.add_argument("--per-stratum", type=int)
@@ -70,6 +72,33 @@ def main() -> None:
         "c4": replace(base, profile="b5", scenes=replace(base.scenes, llm_semantic_extraction=True,
              llm_hierarchy_compression=True), coarsen=replace(base.coarsen, cross_session_merge=True)),
     }
+    for graph_variant in ("g0", "g1", "g2", "g3", "g4"):
+        definitions[graph_variant] = replace(base, profile="b5",
+            scenes=replace(base.scenes, llm_semantic_extraction=True, llm_hierarchy_compression=True),
+            coarsen=replace(base.coarsen, cross_session_merge=graph_variant == "g4"),
+            edges=replace(base.edges, graph_variant=graph_variant))
+    extraction_models = {
+        "e0": base.models,
+        "e1": replace(base.models, semantic_max_facts_per_scene=4,
+                      semantic_summary_tokens=32, semantic_batch_output_tokens=1024),
+        "e2": replace(base.models, semantic_max_facts_per_scene=4,
+                      semantic_summary_tokens=32, semantic_batch_output_tokens=1024,
+                      semantic_constrained_json=True),
+        "e3": replace(base.models, semantic_batch_scenes=2, semantic_batch_output_tokens=768,
+                      semantic_max_facts_per_scene=4, semantic_summary_tokens=32,
+                      semantic_repair_output_tokens=256, semantic_constrained_json=True,
+                      semantic_individual_repair=True),
+        "e4": replace(base.models, semantic_batch_scenes=2, semantic_batch_output_tokens=768,
+                      semantic_max_facts_per_scene=4, semantic_summary_tokens=32,
+                      semantic_repair_output_tokens=256, semantic_constrained_json=True,
+                      semantic_individual_repair=True),
+    }
+    for extraction_variant, models in extraction_models.items():
+        definitions[extraction_variant] = replace(base, profile="b5", models=models,
+            scenes=replace(base.scenes, llm_semantic_extraction=True,
+                           llm_hierarchy_compression=extraction_variant != "e4"),
+            coarsen=replace(base.coarsen, cross_session_merge=args.e_graph_variant == "g4"),
+            edges=replace(base.edges, graph_variant=args.e_graph_variant))
     summary = {}; metric_rows = []; diagnostic_rows = []; trace_rows = []; manifests = []
     for label in (item.strip() for item in args.profiles.split(",") if item.strip()):
         profile = definitions[label]; distiller = QwenSemanticDistiller(store, profile, "v5.1-holdout") \
@@ -138,7 +167,8 @@ def main() -> None:
                 {"configuration": label, "mode": "oracle_seed"}); diagnostic_rows.append(oracle_row)
             trace_rows.append({"configuration": label, "question_id": question.question_id,
                                "mode": "oracle_seed", **dataclass_dict(oracle)})
-            if label in {"c2", "c3", "c4"}:
+            if label in {"c2", "c3", "c4", "g0", "g1", "g2", "g3", "g4",
+                         "e0", "e1", "e2", "e3", "e4"}:
                 for relation in (RelationType.SHARED_VALUE, RelationType.SAME_ACTIVITY,
                                  RelationType.HAS_FACT, RelationType.FACT_VALUE):
                     result = probe.run(question.memory_id, question.query, profile.query_budget,
@@ -147,16 +177,33 @@ def main() -> None:
                         {"configuration": label, "mode": "without:" + str(relation)})
                     diagnostic_rows.append(row)
         usage = [item.build_token_usage for item in current]
-        clean_tokens = 0; active_prompt_hash = distiller.prompt_hash if distiller else "disabled"
+        # Use the cache ledger attached to the exact calls made by this profile. Summing only
+        # uncached calls in the merged authority DB makes resumed/cached profiles look free and
+        # also mixes earlier profiles that share a prompt hash. The cache record retains the
+        # original cold usage, so this is reproducible across interrupted and resumed runs.
+        cold_usage = {}; stage_tokens = {}
         for memory_id in memory_ids:
-            row = store._connection.execute("SELECT COALESCE(sum(json_extract(usage_json,'$.uncached_input_tokens') + "
-                "json_extract(usage_json,'$.output_tokens')),0) FROM llm_calls WHERE memory_id=? AND cached=0 "
-                "AND prompt_hash=? AND stage IN ('scene_semantic','scene_semantic_repair','hierarchy_l1','hierarchy_l2','hierarchy_l3')",
-                (memory_id, active_prompt_hash)).fetchone()
-            clean_tokens += int(row[0])
+            shard_path = root / "memory_shards" / label / (
+                memory_id.replace(":", "_").replace("/", "_") + ".sqlite")
+            connection = sqlite3.connect(f"file:{shard_path}?mode=ro", uri=True)
+            rows = connection.execute(
+                "SELECT DISTINCT c.cache_key,c.stage,k.usage_json FROM llm_calls c "
+                "JOIN llm_cache k ON k.cache_key=c.cache_key WHERE c.stage IN "
+                "('scene_semantic','scene_semantic_repair','hierarchy_l1','hierarchy_l2','hierarchy_l3')"
+            ).fetchall()
+            connection.close()
+            for cache_key, stage, usage_json in rows:
+                cold_usage.setdefault(cache_key, json.loads(usage_json))
+                stage_tokens.setdefault(stage, {})[cache_key] = json.loads(usage_json)
+        cold_tokens = sum(int(row.get("total_tokens", 0)) for row in cold_usage.values())
+        cold_reasoning = sum(int(row.get("reasoning_tokens", 0)) for row in cold_usage.values())
         summary[label] = {"navigation": aggregate_metrics(nav_metrics), "memories": len(current),
-            "average_uncached_backbone_tokens": clean_tokens / max(1, len(memory_ids)),
-            "reasoning_tokens": sum(int(x.get("reasoning_tokens", 0)) for x in usage),
+            "average_uncached_backbone_tokens": cold_tokens / max(1, len(memory_ids)),
+            "average_cold_equivalent_backbone_tokens": cold_tokens / max(1, len(memory_ids)),
+            "cold_equivalent_stage_tokens": {stage: sum(int(row.get("total_tokens", 0))
+                for row in rows.values()) for stage, rows in sorted(stage_tokens.items())},
+            "reasoning_tokens": max(cold_reasoning,
+                sum(int(x.get("reasoning_tokens", 0)) for x in usage)),
             "config_hash": config_hash(profile)}
     (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     (root / "graph_manifest.json").write_text(json.dumps(manifests, indent=2) + "\n")

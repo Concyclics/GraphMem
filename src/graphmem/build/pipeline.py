@@ -394,7 +394,8 @@ class GraphBuildPipeline:
         turn_map = {turn.turn_id: turn for turn in turns}
         nodes: dict[str, GraphNode] = {}
         edges: list[GraphEdge] = []
-        facts: list[tuple[GraphNode, str, str, str]] = []
+        variant = profile.edges.graph_variant
+        facts: list[tuple[GraphNode, str, str, str, int]] = []
         for packet in packets:
             for fact in packet.facts:
                 refs = [ref for ref in fact.evidence if ref[0] in group_by_turn]
@@ -420,16 +421,27 @@ class GraphBuildPipeline:
                     attributes={"owner_id": owner_id, "predicate": predicate_key, "value_id": value_id,
                     "scope": scope_key, "polarity": fact.polarity, "scene_id": packet.scene_id,
                     "roles": ("fact", "predicate", "object")})
+                source_turn = turn_map[refs[0][0]]
                 nodes[fact_id] = fact_node; facts.append((fact_node, owner_id, value_id,
-                    turn_map[refs[0][0]].session_id))
+                    source_turn.session_id, source_turn.turn_index))
                 edges.append(self._edge(memory_id, nodes[owner_id], RelationType.HAS_FACT, fact_node, "semantic"))
-                edges.append(self._edge(memory_id, fact_node, RelationType.FACT_VALUE, nodes[value_id], "semantic"))
+                if variant == "g0":
+                    edges.append(self._edge(memory_id, fact_node, RelationType.FACT_VALUE, nodes[value_id], "semantic"))
         by_value: dict[str, list[tuple[GraphNode, str]]] = defaultdict(list)
         by_activity: dict[tuple[str, str], list[GraphNode]] = defaultdict(list)
-        for fact, owner_id, value_id, session_id in facts:
+        by_state: dict[tuple[str, str], list[tuple[GraphNode, str, int]]] = defaultdict(list)
+        for fact, owner_id, value_id, session_id, turn_index in facts:
             by_value[value_id].append((fact, session_id))
             by_activity[(owner_id, str(fact.attributes["predicate"]))].append(fact)
-        if profile.coarsen.cross_session_merge:
+            by_state[(owner_id, str(fact.attributes["predicate"]))].append(
+                (fact, session_id, turn_index))
+            if variant in {"g2", "g3", "g4"} and fact.event_time:
+                time_id = stable_id("node", memory_id, "semantic-time", fact.event_time)
+                nodes.setdefault(time_id, GraphNode(time_id, memory_id, NodeType.TIME_ANCHOR, 0,
+                    fact.event_time, fact.evidence_group_id, fact.evidence_group_ids,
+                    event_time=fact.event_time, attributes={"roles": ("time", "anchor")}))
+                edges.append(self._edge(memory_id, fact, RelationType.AT_TIME, nodes[time_id], "temporal"))
+        if variant in {"g0", "g4"} and profile.coarsen.cross_session_merge:
             for value_id, rows in by_value.items():
                 sessions = {session for _, session in rows}
                 if len(sessions) < 2:
@@ -443,13 +455,38 @@ class GraphBuildPipeline:
                 nodes[region_id] = region
                 for fact, _ in rows:
                     edges.append(self._edge(memory_id, region, RelationType.SHARED_VALUE, fact, "semantic"))
-        for rows in by_activity.values():
-            for left, right in zip(rows, rows[1:]):
-                edges.append(self._edge(memory_id, left, RelationType.SAME_ACTIVITY, right, "semantic"))
+        if variant == "g0":
+            for rows in by_activity.values():
+                for left, right in zip(rows, rows[1:]):
+                    edges.append(self._edge(memory_id, left, RelationType.SAME_ACTIVITY, right, "semantic"))
+        if variant in {"g2", "g3", "g4"}:
+            for rows in by_state.values():
+                ordered = sorted(rows, key=lambda row: (row[0].event_time or "", row[1], row[2], row[0].node_id))
+                for (left, _, _), (right, _, _) in zip(ordered, ordered[1:]):
+                    if left.attributes.get("value_id") != right.attributes.get("value_id"):
+                        edges.append(self._edge(memory_id, left, RelationType.STATE_NEXT, right, "temporal_state"))
+                    if left.event_time and right.event_time and left.event_time != right.event_time:
+                        edges.append(self._edge(memory_id, left, RelationType.TEMPORAL_BEFORE, right, "temporal"))
+        if variant in {"g3", "g4"}:
+            for (owner_id, predicate), rows in by_state.items():
+                values = {row[0].attributes.get("value_id") for row in rows}
+                if len(values) < 2:
+                    continue
+                evidence = tuple(dict.fromkeys(group for fact, _, _ in rows
+                                                for group in fact.all_evidence_group_ids))
+                collection_id = stable_id("node", memory_id, "semantic-collection", owner_id, predicate)
+                collection = GraphNode(collection_id, memory_id, NodeType.COLLECTION_SCOPE, 1,
+                    f"{nodes[owner_id].summary} {predicate}", evidence[0], evidence[1:],
+                    attributes={"owner_id": owner_id, "predicate": predicate,
+                                "roles": ("collection_scope", "route")})
+                nodes[collection_id] = collection
+                for fact, _, _ in rows:
+                    edges.append(self._edge(memory_id, collection, RelationType.COLLECTION_CO_MEMBER,
+                                            fact, "semantic_collection"))
         values_by_label = {self._normal(node.summary): node for node in nodes.values()
                            if node.node_type == NodeType.CANONICAL_VALUE}
         seen_aliases = set()
-        for card in hierarchy_cards:
+        for card in hierarchy_cards if variant in {"g0", "g4"} else ():
             for group in card.attributes.get("aliases", ()):
                 candidates = [values_by_label.get(self._normal(value)) for value in group]
                 candidates = [node for node in candidates if node]

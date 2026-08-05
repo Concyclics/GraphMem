@@ -41,6 +41,11 @@ class ModelConfig:
     semantic_scene_input_tokens: int = 16000
     semantic_batch_output_tokens: int = 4096
     semantic_average_tokens_per_memory: int = 180000
+    semantic_max_facts_per_scene: int = 12
+    semantic_summary_tokens: int = 64
+    semantic_repair_output_tokens: int = 4096
+    semantic_constrained_json: bool = False
+    semantic_individual_repair: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +78,7 @@ class EdgeConfig:
     refine_mode: str = "ambiguous_only"
     refine_batch_size: int = 24
     max_refine_calls_per_1000_turns: int = 20
+    graph_variant: str = "g0"
     relation_degree_caps: Mapping[str, int] = field(default_factory=lambda: {
         "same_event": 4, "same_activity": 8, "state_next": 4,
         "state_transition": 4, "temporal_before": 8, "shared_entity": 32,
@@ -116,6 +122,8 @@ class GraphMemV5Config:
             "none", "ambiguous_only", "high_value_only", "all_bounded_candidates"
         }:
             raise ValueError("invalid edge refine mode")
+        if self.edges.graph_variant not in {"g0", "g1", "g2", "g3", "g4"}:
+            raise ValueError("invalid semantic graph variant")
         if not 0 <= self.edges.low_threshold < self.edges.high_threshold <= 1:
             raise ValueError("edge thresholds must satisfy 0 <= low < high <= 1")
         positive = {
@@ -139,6 +147,9 @@ class GraphMemV5Config:
             "semantic_scene_input_tokens": self.models.semantic_scene_input_tokens,
             "semantic_batch_output_tokens": self.models.semantic_batch_output_tokens,
             "semantic_average_tokens_per_memory": self.models.semantic_average_tokens_per_memory,
+            "semantic_max_facts_per_scene": self.models.semantic_max_facts_per_scene,
+            "semantic_summary_tokens": self.models.semantic_summary_tokens,
+            "semantic_repair_output_tokens": self.models.semantic_repair_output_tokens,
             "neo4j_batch_nodes": self.storage.neo4j_batch_nodes,
             "neo4j_batch_edges": self.storage.neo4j_batch_edges,
         }
