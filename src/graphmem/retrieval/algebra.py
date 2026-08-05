@@ -30,10 +30,14 @@ def evaluate(operator: QueryOperator, bindings: Iterable[FactBinding], operand_i
             selected.extend(item for item in grouped.get(key, ())
                             if (item.event_instance_id if distinct_by == "event_instance" else item.value_key) in (common or set()))
     elif operator in {QueryOperator.ARGMIN_TIME, QueryOperator.ARGMAX_TIME, QueryOperator.ORDINAL}:
-        candidates = [item for items in grouped.values() for item in items if item.time_interval]
+        # Order by the normalized interval, never by its serialized mapping: canonical
+        # JSON sorts keys, so str(interval) starts with anchor_turn_id and the old
+        # comparison ranked events by turn-id hash.
+        candidates = [item for items in grouped.values() for item in items
+                      if item.time_interval and item.time_interval.resolved]
         if candidates:
-            selected = [sorted(candidates, key=lambda item: (item.time_interval or "", item.binding_id),
-                               reverse=operator == QueryOperator.ARGMAX_TIME)[0]]
+            ordered = sorted(candidates, key=lambda item: (item.time_interval.sort_key, item.binding_id))
+            selected = [ordered[-1] if operator == QueryOperator.ARGMAX_TIME else ordered[0]]
     else:
         seen: set[tuple[str, str]] = set()
         for item in (item for items in grouped.values() for item in items):

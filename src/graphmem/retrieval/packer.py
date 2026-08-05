@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 from ..domain import CandidateScore, EvidenceUnit, FactBinding, SourceTurn, stable_id
 from ..text import estimate_tokens
@@ -22,17 +22,26 @@ def build_proof_units(bindings: Iterable[FactBinding], group_turns: Mapping[str,
 
 
 def pack(units: Iterable[EvidenceUnit], candidates: Iterable[CandidateScore], turns: Mapping[str, SourceTurn], *,
-         max_turns: int, max_tokens: int) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, bool]]:
-    packed: list[str] = []; used = 0; mandatory = set()
+         max_turns: int, max_tokens: int,
+         token_cost: Callable[[SourceTurn], int] | None = None,
+         ) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, bool]]:
+    cost_of = token_cost or (lambda turn: estimate_tokens(turn.raw_text))
+    packed: list[str] = []; used = 0
+    # Mandatory turns must keep the order their proof units declare them in.
+    # Collecting them into a set and iterating it made both the packed order and,
+    # under the turn cap, the packed membership vary with PYTHONHASHSEED.
+    mandatory: list[str] = []; seen: set[str] = set()
     for unit in units:
-        mandatory.update(unit.source_turn_ids)
-    ordered = list(dict.fromkeys(mandatory)) + [row.turn_id for row in candidates if row.turn_id not in mandatory]
+        for turn_id in unit.source_turn_ids:
+            if turn_id not in seen:
+                seen.add(turn_id); mandatory.append(turn_id)
+    ordered = mandatory + [row.turn_id for row in candidates if row.turn_id not in seen]
     turn_cap = token_cap = False
     for turn_id in ordered:
         turn = turns.get(turn_id)
         if not turn:
             continue
-        cost = estimate_tokens(turn.raw_text)
+        cost = cost_of(turn)
         if len(packed) >= max_turns:
             turn_cap = True; break
         if used + cost > max_tokens:

@@ -49,6 +49,37 @@ def _oracle_rows(store, question, budget, probe, navigation):
     }
 
 
+def _coverage_vs_baseline(baseline_pools, baseline_rows, pools, rows):
+    """Does this profile's candidate pool still dominate the frozen navigator's?
+
+    A retrieval change may narrow what it *packs*, but narrowing what it can
+    still reach is a silent recall loss, which is exactly how V5.5 regressed
+    LongMemEval candidate coverage from 98% to 80%.
+    """
+    superset = missing = regressions = 0
+    missing_by_stratum: dict[str, int] = {}
+    for left, right, left_row, right_row in zip(baseline_pools, pools, baseline_rows, rows):
+        superset += left <= right
+        absent = left - right
+        missing += len(absent)
+        if absent:
+            missing_by_stratum[left_row["stratum"]] = (
+                missing_by_stratum.get(left_row["stratum"], 0) + len(absent))
+        if left_row["candidate_turn_all_hit"] and not right_row["candidate_turn_all_hit"]:
+            regressions += 1
+    questions = max(1, len(pools))
+    return {
+        "pool_superset_rate": superset / questions,
+        "pool_superset_questions": superset,
+        "missing_turns_total": missing,
+        "missing_turns_per_question": missing / questions,
+        "missing_turns_by_stratum": dict(sorted(missing_by_stratum.items())),
+        "candidate_all_hit_regressions": regressions,
+        "mean_pool_size": sum(len(row) for row in pools) / questions,
+        "baseline_mean_pool_size": sum(len(row) for row in baseline_pools) / questions,
+    }
+
+
 def _bootstrap_delta(h0, current, *, samples=2000, seed=42):
     baseline = {row["question_id"]: float(row["turn_all_hit"]) for row in h0}
     paired = [(baseline[row["question_id"]], float(row["turn_all_hit"])) for row in current]
@@ -81,6 +112,7 @@ def main() -> None:
         questions = questions[:args.max_questions]
     embedding = QwenEmbeddingIndex(store, config, record_usage=False) if args.embedding else None
     all_metrics = []; navigation_rows = []; oracle_rows = []; summaries = {}; by_profile = {}
+    candidate_pools: dict[str, list[set[str]]] = {}
     for label in (item.strip() for item in args.profiles.split(",") if item.strip()):
         profile = HarnessProfile(label)
         budget = config.query_budget if profile in {HarnessProfile.H0_N5, HarnessProfile.H1_TELEMETRY} else replace(
@@ -95,7 +127,11 @@ def main() -> None:
             metric.update({"configuration": label, "budget_max_evidence_turns": budget.max_evidence_turns})
             metric.update(_oracle_rows(store, question, budget, probe, result))
             rows.append(metric); all_metrics.append(metric)
-            navigation_rows.append({"configuration": label, "question_id": question.question_id,
+            candidate_pools.setdefault(label, []).append({row.turn_id for row in result.candidate_scores})
+            # dataclass_dict(result) carries its own hashed question_id, so the devset
+            # id has to be written under a distinct key or metrics.jsonl and
+            # navigation_results.jsonl cannot be joined.
+            navigation_rows.append({"configuration": label, "dev_question_id": question.question_id,
                                     **dataclass_dict(result)})
             if index % 25 == 0:
                 print(f"[{label}] navigated {index}/{len(questions)}", flush=True)
@@ -107,7 +143,13 @@ def main() -> None:
     paired = ({label: _bootstrap_delta(by_profile["h0"], rows)
                for label, rows in by_profile.items() if label != "h0"}
               if "h0" in by_profile else {})
-    (root / "summary.json").write_text(json.dumps({"profiles": summaries, "paired_turn_all_hit_vs_h0": paired}, indent=2) + "\n")
+    coverage = ({label: _coverage_vs_baseline(candidate_pools["h0"], by_profile["h0"],
+                                              candidate_pools[label], rows)
+                 for label, rows in by_profile.items() if label != "h0"}
+                if "h0" in by_profile else {})
+    (root / "summary.json").write_text(json.dumps(
+        {"profiles": summaries, "paired_turn_all_hit_vs_h0": paired,
+         "candidate_coverage_vs_h0": coverage}, indent=2) + "\n")
     for name, rows in (("metrics.jsonl", all_metrics), ("navigation_results.jsonl", navigation_rows)):
         with (root / name).open("w") as handle:
             for row in rows: handle.write(json.dumps(row, sort_keys=True) + "\n")

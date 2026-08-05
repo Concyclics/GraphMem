@@ -128,8 +128,59 @@ class GraphReadView:
             value = getattr(self, name)
             setattr(self, name, {key: tuple(sorted(set(rows))) for key, rows in value.items()})
 
+    def _fact_rank(self, node_id: str, owner_ids: frozenset[str], predicate_keys: Sequence[str],
+                   rank_terms: frozenset[str]) -> tuple[float, str]:
+        """Relevance for truncation: owner, predicate, then lexical overlap."""
+        node = self.nodes.get(node_id)
+        if node is None:
+            return (0.0, node_id)
+        attrs = node.attributes
+        score = 0.0
+        if owner_ids and str(attrs.get("owner_id", "")) in owner_ids:
+            score += 2.0
+        predicate = normalize_key(str(attrs.get("predicate", "")))
+        if predicate_keys:
+            predicate_terms = set(content_terms(predicate))
+            score += max((len(predicate_terms & set(content_terms(item))) for item in predicate_keys),
+                         default=0) * 0.75
+        if rank_terms:
+            haystack = content_terms(" ".join(str(attrs.get(key, "")) for key in
+                                              ("predicate", "value", "scope", "collection_key"))
+                                     + " " + node.summary)
+            score += len(rank_terms & haystack) * 0.25
+        return (score, node_id)
+
+    def lookup_collections(self, *, owner_ids: Sequence[str] = (), predicates: Sequence[str] = (),
+                           limit: int = 32) -> tuple[str, ...]:
+        """Collection scopes/manifests for an owner-predicate need.
+
+        ``collection_index`` and ``manifest_value_index`` were compiled but never
+        consulted; list/count questions need them as a direct entry point.
+        """
+        owners = frozenset(owner_ids)
+        predicate_terms = [set(content_terms(normalize_key(item))) for item in predicates
+                           if normalize_key(item)]
+        rows: list[tuple[float, str]] = []
+        for node in self.nodes.values():
+            if node.node_type not in {NodeType.COLLECTION_SCOPE, NodeType.COLLECTION_MANIFEST}:
+                continue
+            attrs = node.attributes
+            score = 0.0
+            if owners and str(attrs.get("owner_id", "")) in owners:
+                score += 2.0
+            elif owners:
+                continue
+            if predicate_terms:
+                indexed = set(content_terms(normalize_key(str(attrs.get("predicate", "")))))
+                score += max((len(indexed & item) for item in predicate_terms), default=0)
+            if score:
+                rows.append((score, node.node_id))
+        rows.sort(key=lambda row: (-row[0], row[1]))
+        return tuple(node_id for _, node_id in rows[:limit])
+
     def lookup_facts(self, *, owner_ids: Sequence[str] = (), predicates: Sequence[str] = (),
-                     scopes: Sequence[str] = (), values: Sequence[str] = (), limit: int = 64) -> tuple[str, ...]:
+                     scopes: Sequence[str] = (), values: Sequence[str] = (), limit: int = 64,
+                     rank_terms: frozenset[str] = frozenset()) -> tuple[str, ...]:
         pools: list[set[str]] = []
         if owner_ids:
             pools.append(set().union(*(set(self.owner_fact_index.get(item, ())) for item in owner_ids)))
@@ -154,7 +205,14 @@ class GraphReadView:
         if not pools:
             return ()
         result = set.intersection(*pools) if len(pools) > 1 else pools[0]
-        return tuple(sorted(result)[:limit])
+        if len(result) <= limit:
+            return tuple(sorted(result))
+        # Truncating by node id sorted lexicographically discards facts for no
+        # reason related to the query; rank first, then cut.
+        owners = frozenset(owner_ids)
+        ranked = sorted(result, key=lambda node_id: (
+            -self._fact_rank(node_id, owners, predicate_keys, rank_terms)[0], node_id))
+        return tuple(ranked[:limit])
 
     def route_children(self, keys: Sequence[str], *, limit: int = 48) -> tuple[str, ...]:
         rows: list[str] = []

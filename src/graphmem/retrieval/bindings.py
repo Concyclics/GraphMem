@@ -3,8 +3,42 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Iterable
 
-from ..domain import FactBinding, OperandSpec, stable_id
+from ..domain import FactBinding, OperandSpec, TemporalKey, stable_id
 from ..text import content_terms, normalize_key
+
+
+def _text(attributes, key: str) -> str | None:
+    """Read an optional string attribute without inventing the literal 'None'.
+
+    ``str(attrs.get(key)) or None`` yields the four-character string ``"None"``
+    whenever the attribute is absent, which then reads downstream as a real
+    owner id, event instance or interval.
+    """
+    value = attributes.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _binding(operand_id: str, node, score: float, path: tuple[str, ...]) -> FactBinding:
+    attrs = node.attributes
+    return FactBinding(
+        stable_id("binding", operand_id, node.node_id), operand_id, node.node_id,
+        _text(attrs, "owner_id"), str(attrs.get("predicate", "")), str(attrs.get("scope", "")),
+        normalize_key(str(attrs.get("value_key", attrs.get("value", "")))),
+        _text(attrs, "event_instance_id"),
+        TemporalKey.from_attribute(attrs.get("time_interval")),
+        tuple(node.all_evidence_group_ids), path, score,
+        value=str(attrs.get("value", "")),
+        value_type=str(attrs.get("value_type", "text") or "text"),
+        polarity=str(attrs.get("polarity", "positive") or "positive"),
+        modality=str(attrs.get("modality", "asserted") or "asserted"),
+        session_id=str(attrs.get("session_id", "") or ""),
+        turn_index=int(attrs.get("turn_index", -1) or -1),
+        collection_key=normalize_key(str(attrs.get("collection_key", "") or "")),
+        node_type=node.node_type.value,
+    )
 
 
 def binding_score(node, operand: OperandSpec, owner_ids: set[str]) -> float:
@@ -38,14 +72,7 @@ def bind_facts(view, operand_owners: dict[str, set[str]], operands: Iterable[Ope
             score = binding_score(node, operand, owners)
             if score <= 0.0:
                 continue
-            attrs = node.attributes
-            rows.append(FactBinding(
-                stable_id("binding", operand.operand_id, node_id), operand.operand_id, node_id,
-                str(attrs.get("owner_id")) or None, str(attrs.get("predicate", "")),
-                str(attrs.get("scope", "")), normalize_key(str(attrs.get("value_key", attrs.get("value", "")))),
-                str(attrs.get("event_instance_id")) or None, str(attrs.get("time_interval")) or None,
-                tuple(node.all_evidence_group_ids), paths.get(node_id, ()), score,
-            ))
+            rows.append(_binding(operand.operand_id, node, score, paths.get(node_id, ())))
     dedup = {row.binding_id: row for row in rows}
     return tuple(sorted(dedup.values(), key=lambda row: (-row.confidence, row.binding_id)))
 

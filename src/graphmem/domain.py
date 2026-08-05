@@ -114,8 +114,31 @@ class CertificateStatus(StrEnum):
     INCOMPLETE_COLLECTION = "incomplete_collection"
     INCOMPLETE_SCOPE = "incomplete_scope"
     INCOMPLETE_PROVENANCE = "incomplete_provenance"
+    PACK_INCOMPLETE = "pack_incomplete"
     NO_PROGRESS = "no_progress"
     BUDGET_EXHAUSTED = "budget_exhausted"
+
+
+class CertificatePhase(StrEnum):
+    """Ordered stages a V5.6 certificate must clear before it may claim closure.
+
+    V5.5 collapsed all of these into "the operand has at least one binding",
+    which is why a certificate could report complete while the packer had
+    already dropped the evidence that proves it.
+    """
+
+    BINDING = "binding_complete"
+    SCOPE = "scope_or_collection_saturated"
+    PROVENANCE = "provenance_hydrated"
+    POST_PACK = "post_pack_complete"
+
+
+CERTIFICATE_PHASE_ORDER: tuple[CertificatePhase, ...] = (
+    CertificatePhase.BINDING,
+    CertificatePhase.SCOPE,
+    CertificatePhase.PROVENANCE,
+    CertificatePhase.POST_PACK,
+)
 
 
 class StopReason(StrEnum):
@@ -127,6 +150,7 @@ class StopReason(StrEnum):
     FRONTIER_TRUNCATED = "frontier_truncated"
     PACK_TURN_CAP = "pack_turn_cap"
     PACK_TOKEN_CAP = "pack_token_cap"
+    PACK_INCOMPLETE = "pack_incomplete"
     CANDIDATES_EXHAUSTED = "candidates_exhausted"
 
 
@@ -294,6 +318,85 @@ class TemporalInterval:
             raise ValueError("temporal interval confidence must be in [0, 1]")
 
 
+PRECISION_RANK: Mapping[str, int] = {
+    "second": 0, "minute": 1, "day": 2, "week": 3, "month": 4, "year": 5, "unknown": 6,
+}
+TEMPORAL_KIND_RANK: Mapping[str, int] = {
+    "absolute": 0, "relative": 1, "observed": 2, "unresolved": 3,
+}
+
+
+@dataclass(frozen=True, slots=True, order=False)
+class TemporalKey:
+    """A comparable projection of a ``TemporalInterval`` for relation algebra.
+
+    V5.5 stored the whole interval mapping on a graph node and then compared
+    ``str(dict)``.  Canonical JSON sorts keys, so that string starts with
+    ``anchor_turn_id`` and every temporal ordering degenerated into a sort over
+    turn-id hashes.  Ordering must be driven by the normalized endpoints.
+    """
+
+    start: str | None = None
+    end: str | None = None
+    precision: str = "unknown"
+    kind: str = "unresolved"
+    confidence: float = 0.0
+    raw_text: str = ""
+
+    @property
+    def resolved(self) -> bool:
+        return bool(self.start)
+
+    @property
+    def sort_key(self) -> tuple[int, str, str, int, int, float]:
+        """Total order: resolved intervals first, then by start/end, then precision."""
+        return (
+            0 if self.resolved else 1,
+            self.start or "",
+            self.end or "",
+            PRECISION_RANK.get(self.precision, len(PRECISION_RANK)),
+            TEMPORAL_KIND_RANK.get(self.kind, len(TEMPORAL_KIND_RANK)),
+            -self.confidence,
+        )
+
+    def overlaps(self, other: "TemporalKey") -> bool:
+        if not (self.resolved and other.resolved):
+            return False
+        left_end = self.end or self.start
+        right_end = other.end or other.start
+        return not (left_end < (other.start or "") or right_end < (self.start or ""))
+
+    @classmethod
+    def from_attribute(cls, value: Any) -> "TemporalKey | None":
+        """Build a key from a ``dataclass_dict(TemporalInterval)`` attribute.
+
+        Returns ``None`` for a genuinely absent interval so callers can tell
+        "no time" apart from "time that would not normalize".
+        """
+        if isinstance(value, TemporalKey):
+            return value
+        if isinstance(value, TemporalInterval):
+            value = dataclass_dict(value)
+        if not isinstance(value, Mapping):
+            return None
+        start = value.get("start") or None
+        end = value.get("end") or None
+        if start is None and end is None and not value.get("raw_text"):
+            return None
+        try:
+            confidence = float(value.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return cls(
+            start=str(start) if start else None,
+            end=str(end) if end else None,
+            precision=str(value.get("precision", "unknown") or "unknown"),
+            kind=str(value.get("kind", "unresolved") or "unresolved"),
+            confidence=confidence,
+            raw_text=str(value.get("raw_text", "") or ""),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class FactMention:
     mention_id: str
@@ -441,11 +544,21 @@ class QueryBudget:
     max_evidence_turns: int = 16
     max_evidence_tokens: int = 5000
     max_llm_reranks: int = 0
+    # V5.6: the reservoir holds ids only, so it can be far wider than the
+    # hydrated evidence pack without costing context tokens.  The legacy
+    # navigator's widest measured pool is 524 turns, so anything smaller would
+    # reintroduce the coverage regression this reservoir exists to remove.
+    max_candidate_reservoir: int = 576
+    max_query_views_per_operand: int = 6
+    max_answer_tokens: int = 10000
+    max_answer_tokens_hard: int = 13000
 
     def __post_init__(self) -> None:
         for name, value in asdict(self).items():
             if value < 0 or (name != "max_llm_reranks" and value == 0):
                 raise ValueError(f"{name} must be positive")
+        if self.max_answer_tokens_hard < self.max_answer_tokens:
+            raise ValueError("max_answer_tokens_hard cannot be below max_answer_tokens")
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,6 +568,18 @@ class ProofStep:
     relation: RelationType
     dst_id: str
     evidence_group_id: str
+    # ``GraphReadView.neighbors`` traverses inverse adjacency by default.  Without
+    # recording the direction, a proof rendered from src->dst misreports how the
+    # node was actually reached.
+    inverse: bool = False
+
+    @property
+    def from_id(self) -> str:
+        return self.dst_id if self.inverse else self.src_id
+
+    @property
+    def to_id(self) -> str:
+        return self.src_id if self.inverse else self.dst_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,10 +641,75 @@ class FactBinding:
     scope: str
     value_key: str
     event_instance_id: str | None
-    time_interval: str | None
+    time_interval: TemporalKey | None
     evidence_group_ids: tuple[str, ...]
     relation_path: tuple[str, ...] = ()
     confidence: float = 0.0
+    value: str = ""
+    value_type: str = "text"
+    polarity: str = "positive"
+    modality: str = "asserted"
+    session_id: str = ""
+    turn_index: int = -1
+    collection_key: str = ""
+    node_type: str = "canonical_fact"
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerMember:
+    """One distinct element of an algebra result, with the witnesses proving it.
+
+    ``member_key`` is whatever the operator distinguishes by: a value key, an
+    event-instance id, a normalized date, or an ``owner:value`` pair.
+    """
+
+    member_key: str
+    value: str
+    value_key: str
+    owner_id: str | None = None
+    value_type: str = "text"
+    witness_binding_ids: tuple[str, ...] = ()
+    operand_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TemporalEndpoint:
+    role: str
+    key: TemporalKey
+    binding_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class StateResult:
+    owner_id: str | None
+    predicate: str
+    current_value: str
+    current_binding_id: str
+    prior_binding_ids: tuple[str, ...] = ()
+    superseded: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AlgebraResult:
+    """Structured output of the relation algebra.
+
+    V5.5 returned only ``output_binding_ids``, so the packer could not tell an
+    answer member from a mere candidate and made every binding mandatory.
+    """
+
+    operator: QueryOperator
+    bindings: tuple[FactBinding, ...]
+    output_binding_ids: tuple[str, ...]
+    members: tuple[AnswerMember, ...] = ()
+    count: int | None = None
+    groups: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    temporal_endpoints: tuple[TemporalEndpoint, ...] = ()
+    state_result: StateResult | None = None
+    witness_map: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    complete_operands: tuple[str, ...] = ()
+    scope_complete: bool = False
+    answer_kind: str = "lookup"
+    degradations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,6 +721,23 @@ class EvidenceUnit:
     relation_path_ids: tuple[str, ...]
     token_cost: int
     mandatory: bool = False
+    operand_ids: tuple[str, ...] = ()
+    member_key: str = ""
+    spans: tuple[EvidenceMember, ...] = ()
+    # Units are atomic by default: a shared value proved by two speakers is
+    # worthless if only one half survives the budget.
+    atomic: bool = True
+    rank: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ProofBundle:
+    """The packer's input contract: ordered, atomic units plus operand quotas."""
+
+    units: tuple[EvidenceUnit, ...]
+    mandatory_unit_ids: tuple[str, ...] = ()
+    operand_quota: Mapping[str, int] = field(default_factory=dict)
+    answer_kind: str = "lookup"
 
 
 @dataclass(frozen=True, slots=True)
@@ -545,6 +752,18 @@ class EvidenceCertificate:
     status: CertificateStatus = CertificateStatus.INCOMPLETE_OPERAND
     operand_status: Mapping[str, str] = field(default_factory=dict)
     stop_reason: StopReason | None = None
+    # V5.6 four-phase closure.  ``complete`` stays the legacy pre-pack flag so
+    # existing metrics keep their meaning; ``post_pack_complete`` is the one a
+    # report may call an evidence certificate.
+    phase_status: Mapping[str, bool] = field(default_factory=dict)
+    post_pack_complete: bool = False
+    unsatisfied_phase: str | None = None
+    dropped_mandatory_unit_ids: tuple[str, ...] = ()
+
+    @property
+    def false_complete(self) -> bool:
+        """True when a pre-pack certificate claimed closure the pack did not deliver."""
+        return bool(self.complete and not self.post_pack_complete)
 
 
 @dataclass(frozen=True, slots=True)

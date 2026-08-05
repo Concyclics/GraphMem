@@ -23,6 +23,7 @@ from ..domain import (
 )
 from ..runtime import SQLiteSnapshotRuntime
 from ..storage import SQLiteGraphStore
+from ..tokenization import TokenCounter, resolve_token_counter
 from .algebra import evaluate as evaluate_algebra
 from .bindings import bind_facts
 from .certificate import evaluate_certificate
@@ -32,6 +33,7 @@ from .scheduler import ScheduleResult, execute as schedule_relations
 from .seeding import seed_operands
 
 
+DEFAULT_BACKBONE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
 TOKEN_RE = re.compile(r"[\w'-]+", re.UNICODE)
 STOPWORDS = frozenset({
     "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does",
@@ -63,6 +65,10 @@ class HarnessProfile(StrEnum):
     H4_SCHEDULER = "h4"
     H5_ALGEBRA = "h5"
     H6_PROOF_PACKING = "h6"
+    # The feedback's H-series: H7 is proof-unit packing, H8 the safe-superset
+    # reservoir, H9 the operator algebra.  They are added in dependency order,
+    # which is why H8 lands before H7.
+    H8_RESERVOIR = "h8"
 
 
 VARIANT_RANK = {variant: index for index, variant in enumerate(NavigatorVariant)}
@@ -109,12 +115,21 @@ class GraphNavigator:
         variant: NavigatorVariant | str = NavigatorVariant.N5_SET_COVER,
         dense_search: DenseSearch | None = None,
         harness_profile: HarnessProfile | str | None = None,
+        token_counter: TokenCounter | None = None,
     ) -> None:
         self.store = store
         self.runtime = SQLiteSnapshotRuntime(store)
         self.variant = NavigatorVariant(variant)
         self.dense_search = dense_search
         self.harness_profile = HarnessProfile(harness_profile) if harness_profile else None
+        # Evidence budgets are only meaningful against the backbone's own
+        # vocabulary.  The word-count estimate stays available as a labelled
+        # fallback so a run without a local tokenizer still completes, but the
+        # manifest then has to say the numbers are estimates.
+        self.token_counter = token_counter or resolve_token_counter(DEFAULT_BACKBONE_MODEL)
+
+    def _turn_tokens(self, turn: SourceTurn) -> int:
+        return self.token_counter.count(turn.raw_text)
 
     def navigate(self, memory_id: str, query: str, budget: QueryBudget) -> NavigationResult:
         if self.harness_profile in {None, HarnessProfile.H0_N5, HarnessProfile.H1_TELEMETRY}:
@@ -262,12 +277,20 @@ class GraphNavigator:
         profile = self.harness_profile
         use_postings = profile in {HarnessProfile.H2_POSTINGS, HarnessProfile.H3_MULTI_ANCHOR,
                                    HarnessProfile.H4_SCHEDULER, HarnessProfile.H5_ALGEBRA,
-                                   HarnessProfile.H6_PROOF_PACKING}
+                                   HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR}
         use_rrf = profile in {HarnessProfile.H3_MULTI_ANCHOR, HarnessProfile.H4_SCHEDULER,
-                              HarnessProfile.H5_ALGEBRA, HarnessProfile.H6_PROOF_PACKING}
+                              HarnessProfile.H5_ALGEBRA, HarnessProfile.H6_PROOF_PACKING,
+                              HarnessProfile.H8_RESERVOIR}
+        # H7 is the first profile with the wide reservoir; H2-H6 keep the narrow
+        # V5.5 seeding so the ablation ladder stays interpretable.
+        wide_reservoir = profile in {HarnessProfile.H8_RESERVOIR}
         tick = time.perf_counter()
         seeded = seed_operands(self.store, view, memory_id, ir, all_turns, dense_search=self.dense_search,
-                               use_rrf=use_rrf, use_postings=use_postings)
+                               use_rrf=use_rrf, use_postings=use_postings,
+                               reservoir_limit=budget.max_candidate_reservoir,
+                               max_views_per_operand=budget.max_query_views_per_operand,
+                               node_budget=budget.max_visited_nodes,
+                               wide_reservoir=wide_reservoir)
         stage_times["seed_fusion"] = (time.perf_counter() - tick) * 1000
         route_closure = (self._route_terminal_closure(view, seeded.semantic_node_ids)
                          if profile in {HarnessProfile.H2_POSTINGS, HarnessProfile.H3_MULTI_ANCHOR} else ())
@@ -275,7 +298,7 @@ class GraphNavigator:
         direct_owner_terminals = self._owner_terminal_postings(
             view, semantic_seeds, seeded.raw_scores, query
         ) if profile in {HarnessProfile.H4_SCHEDULER, HarnessProfile.H5_ALGEBRA,
-                         HarnessProfile.H6_PROOF_PACKING} else ()
+                         HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR} else ()
         owners = {
             operand.operand_id: set().union(*(set(view.owner_alias_index.get(alias.casefold(), ()))
                                                for alias in operand.owner_aliases))
@@ -286,7 +309,8 @@ class GraphNavigator:
                                            distinct_by=ir.distinct_by, collection_complete=False)
         initial_certificate = evaluate_certificate(ir, initial_closure, no_progress=not initial_bindings)
         tick = time.perf_counter()
-        if profile in {HarnessProfile.H5_ALGEBRA, HarnessProfile.H6_PROOF_PACKING} and initial_certificate.complete:
+        if profile in {HarnessProfile.H5_ALGEBRA, HarnessProfile.H6_PROOF_PACKING,
+                       HarnessProfile.H8_RESERVOIR} and initial_certificate.complete:
             schedule = ScheduleResult(semantic_seeds, (), {}, {
                 "node_cap_reached": False, "edge_cap_reached": False,
                 "hop_cap_reached": False, "frontier_truncated": False,
@@ -295,7 +319,8 @@ class GraphNavigator:
             schedule = schedule_relations(view, ir, semantic_seeds, budget,
                                           structured=profile in {HarnessProfile.H4_SCHEDULER,
                                                                  HarnessProfile.H5_ALGEBRA,
-                                                                 HarnessProfile.H6_PROOF_PACKING})
+                                                                 HarnessProfile.H6_PROOF_PACKING,
+                                                                 HarnessProfile.H8_RESERVOIR})
         stage_times["graph_read_view"] = (time.perf_counter() - tick) * 1000
         fact_ids = set(semantic_seeds) | set(schedule.visited_node_ids) | set(direct_owner_terminals)
         paths: dict[str, tuple[str, ...]] = {}
@@ -342,6 +367,30 @@ class GraphNavigator:
         ))
         candidate_ids = tuple(dict.fromkeys((*seeded.source_turn_ids, *hydrated_turn_ids)))
         mandatory = set(proof_turn_ids)
+        # A wider pool only helps if it is ranked at least as well as the narrow
+        # one was.  The legacy scorer's lexical, session and adjacency terms are
+        # what let it pick 16 useful turns out of 278; without them a 474-turn
+        # pool ranks worse than the 45-turn pool it replaced.
+        query_terms = content_terms(query)
+        session_best: dict[str, float] = defaultdict(float)
+        by_session_index = {(row.session_id, row.turn_index): row.turn_id for row in all_turns}
+        base_score: dict[str, float] = {}
+        for turn_id in candidate_ids:
+            turn = by_id.get(turn_id)
+            if not turn: continue
+            channels = seeded.raw_scores.get(turn_id, {})
+            value = (float(channels.get("exact", 0.0)) * 1.2 + float(channels.get("bm25", 0.0))
+                     + float(channels.get("dense", 0.0)))
+            base_score[turn_id] = value
+            session_best[turn.session_id] = max(session_best[turn.session_id], value)
+        adjacency: dict[str, float] = defaultdict(float)
+        for turn_id, value in base_score.items():
+            turn = by_id[turn_id]
+            for distance in (1, 2):
+                for index in (turn.turn_index - distance, turn.turn_index + distance):
+                    neighbour = by_session_index.get((turn.session_id, index))
+                    if neighbour:
+                        adjacency[neighbour] = max(adjacency[neighbour], value * (0.35 / distance))
         rows: list[CandidateScore] = []
         for turn_id in candidate_ids:
             turn = by_id.get(turn_id)
@@ -349,6 +398,11 @@ class GraphNavigator:
             channels = seeded.raw_scores.get(turn_id, {})
             exact = float(channels.get("exact", 0.0)); bm25 = float(channels.get("bm25", 0.0)); dense = float(channels.get("dense", 0.0))
             graph = 1.0 if turn_id in hydrated_turn_ids else 0.0
+            text_terms = content_terms(turn.raw_text)
+            slot_gain = min(1.0, len(query_terms & text_terms) / max(1, len(query_terms)))
+            role_gain = (0.3 if text_terms & TIME_TERMS else 0.0) + (0.3 if text_terms & NEGATIVE_TERMS else 0.0)
+            session_score = session_best.get(turn.session_id, 0.0)
+            adjacency_score = adjacency.get(turn_id, 0.0)
             operand_ids = set(binding.operand_id for binding in closure.bindings
                                         if turn_id in set().union(*(set(group_turns.get(group_id, ()))
                                                                     for group_id in binding.evidence_group_ids)))
@@ -356,26 +410,35 @@ class GraphNavigator:
                 operand_ids.update(item.operand_id for item in ir.operands if item.owner_aliases)
             operand_ids = tuple(sorted(operand_ids))
             bscore = max((binding.confidence for binding in closure.bindings if binding.operand_id in operand_ids), default=0.0)
-            fused = exact + bm25 + dense + 0.8 * graph + 0.7 * bscore + 0.4 * len(operand_ids)
-            rows.append(CandidateScore(turn_id, turn.session_id, exact, bm25, dense, graph, 0.0, bscore,
-                                       estimate_tokens(turn.raw_text), fused,
+            # The richer lexical/session/adjacency terms exist because a 545-turn
+            # pool needs them to rank as well as the legacy scorer ranked 278.
+            # They stay off for H2-H6 so those rungs keep their frozen V5.5 values.
+            fused = ((1.2 * exact + bm25 + dense + 0.8 * graph + 0.7 * bscore
+                      + 0.4 * len(operand_ids) + 0.25 * role_gain + 0.5 * slot_gain
+                      + 0.12 * session_score + adjacency_score) if wide_reservoir else
+                     (exact + bm25 + dense + 0.8 * graph + 0.7 * bscore + 0.4 * len(operand_ids)))
+            rows.append(CandidateScore(turn_id, turn.session_id, exact, bm25, dense, graph,
+                                       role_gain, slot_gain,
+                                       self._turn_tokens(turn), fused,
                                        tuple(name for name, value in (("exact", exact), ("bm25", bm25), ("dense", dense), ("graph", graph)) if value),
+                                       session_score, adjacency_score,
                                        operand_ids=operand_ids, binding_score=bscore, obligation_gain=len(operand_ids),
                                        mandatory=turn_id in mandatory,
                                        proof_unit_ids=tuple(unit.unit_id for unit in units if turn_id in unit.source_turn_ids)))
         rows.sort(key=lambda row: (-row.mandatory, -row.fused_score, row.turn_id))
-        if profile == HarnessProfile.H6_PROOF_PACKING:
+        if profile in {HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR}:
             packed, dropped, pack_exhaustion = pack_proof_units(units, rows, by_id,
                                                                  max_turns=budget.max_evidence_turns,
-                                                                 max_tokens=budget.max_evidence_tokens)
+                                                                 max_tokens=budget.max_evidence_tokens,
+                                                                 token_cost=self._turn_tokens)
         else:
             packed, dropped, _ = self._rank_pack(rows, by_id, budget)
             pack_exhaustion = {"turn_cap_reached": len(packed) >= budget.max_evidence_turns,
-                               "token_cap_reached": sum(estimate_tokens(by_id[item].raw_text) for item in packed) >= budget.max_evidence_tokens}
+                               "token_cap_reached": sum(self._turn_tokens(by_id[item]) for item in packed) >= budget.max_evidence_tokens}
         stage_times["evidence_pack"] = (time.perf_counter() - tick) * 1000
         stage_times["total"] = (time.perf_counter() - started) * 1000
         graph_id = stable_id("graph-artifact", memory_id, self.store.graph_version(memory_id), self.store.graph_checksum(memory_id))
-        evidence_tokens = sum(estimate_tokens(by_id[item].raw_text) for item in packed)
+        evidence_tokens = sum(self._turn_tokens(by_id[item]) for item in packed)
         operand_coverage = {
             operand.operand_id: {
                 "seed_nodes": seeded.operand_nodes.get(operand.operand_id, ()),
@@ -391,7 +454,11 @@ class GraphNavigator:
             visited_edges=len(schedule.proof), frontier_peak=min(budget.max_frontier, len(seeded.semantic_node_ids)),
             evidence_tokens=evidence_tokens, budget_exhausted=any(schedule.exhaustion.values()) or any(pack_exhaustion.values()),
             trace={"variant": str(profile), "query_operator": str(ir.operator), "candidate_count": len(rows),
-                   "semantic_navigation_excludes_provenance_edges": True, "relation_counts": schedule.relation_counts},
+                   "semantic_navigation_excludes_provenance_edges": True, "relation_counts": schedule.relation_counts,
+                   # The legacy H0/H1 path keeps the historical word-count estimate so it stays
+                   # a faithful frozen baseline; the harness budgets against real tokens.
+                   "token_counter": self.token_counter.describe(),
+                   "seeding": dict(seeded.stats)},
             seed_node_ids=semantic_seeds, visited_path_node_ids=tuple(dict.fromkeys(
                 (*schedule.visited_node_ids, *direct_owner_terminals))),
             slot_coverage={item.operand_id: tuple(row.binding_id for row in bindings if row.operand_id == item.operand_id)

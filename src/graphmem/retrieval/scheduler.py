@@ -38,7 +38,8 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
         seen.add(node_id); visited.append(node_id)
         if parent is not None:
             proof.append(ProofStep(parent.edge.edge_id, parent.edge.src_id, parent.edge.relation,
-                                   parent.edge.dst_id, parent.edge.evidence_group_id))
+                                   parent.edge.dst_id, parent.edge.evidence_group_id,
+                                   inverse=parent.inverse))
             relation_counts[str(parent.edge.relation)] = relation_counts.get(str(parent.edge.relation), 0) + 1
         if hop >= budget.max_hops:
             hop_cap = hop_cap or bool(view.neighbors(node_id, semantic_only=True)); continue
@@ -60,8 +61,11 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
             fact_bonus = 1.0 if node.node_type.value == "canonical_fact" else 0.0
             return (collection_bonus + lexical + fact_bonus, row.edge.edge_id)
 
-        for row in sorted(view.neighbors(node_id, allowed, semantic_only=True),
-                          key=lambda item: (-destination_priority(item)[0], destination_priority(item)[1])):
+        # Score each neighbour once; the previous key lambda called
+        # destination_priority twice per comparison.
+        scored = [(destination_priority(row), row) for row in
+                  view.neighbors(node_id, allowed, semantic_only=True)]
+        for _, row in sorted(scored, key=lambda item: (-item[0][0], item[0][1])):
             if row.next_node_id in seen: continue
             fallback_edge = row.edge.relation == RelationType.SCENE_CONTAINS
             if fallback_edge and (fallback_nodes >= 16 or fallback_edges >= 32): continue
