@@ -21,6 +21,7 @@ from ..domain import (
     SourceTurn,
     stable_id,
 )
+from ..principals import build_principal_registry, resolution_stats
 from ..runtime import SQLiteSnapshotRuntime
 from ..storage import SQLiteGraphStore
 from ..tokenization import TokenCounter, resolve_token_counter
@@ -141,9 +142,15 @@ class GraphNavigator:
         # stays opt-in until the owner resolution it depends on is fixed.
         self.binding_discriminant = binding_discriminant
         self._turn_group_cache: dict[str, dict[str, tuple[str, ...]]] = {}
+        self._principal_cache: dict[str, object] = {}
 
     def _turn_tokens(self, turn: SourceTurn) -> int:
         return self.token_counter.count(turn.raw_text)
+
+    def _principals(self, memory_id: str, view):
+        if memory_id not in self._principal_cache:
+            self._principal_cache = {memory_id: build_principal_registry(self.store, memory_id, view)}
+        return self._principal_cache[memory_id]
 
     def _turn_groups(self, memory_id: str) -> dict[str, tuple[str, ...]]:
         if memory_id not in self._turn_group_cache:
@@ -291,7 +298,9 @@ class GraphNavigator:
         started = time.perf_counter(); stage_times: dict[str, float] = {}
         all_turns = list(self.store.turns(memory_id)); by_id = {row.turn_id: row for row in all_turns}
         view = self.runtime.view(memory_id)
-        tick = time.perf_counter(); ir = compile_query(query, view)
+        tick = time.perf_counter()
+        registry = self._principals(memory_id, view)
+        ir = compile_query(query, view, registry=registry)
         stage_times["query_compile"] = (time.perf_counter() - tick) * 1000
         profile = self.harness_profile
         use_postings = profile in {HarnessProfile.H2_POSTINGS, HarnessProfile.H3_MULTI_ANCHOR,
@@ -527,6 +536,9 @@ class GraphNavigator:
                    "ast_obligations": [f"{item.kind}:{item.operand_id or 'root'}"
                                        for item in ir.ast_obligations],
                    "parse_warnings": list(ir.parse_warnings),
+                   "principals": registry.stats(),
+                   "owner_resolution": resolution_stats(ir.resolved_owners,
+                                                        ir.owner_resolution_warnings),
                    "fact_reservoir": dict(fact_reservoir.stats) if fact_reservoir else {},
                    "binding_reasons": binding_reasons},
             seed_node_ids=semantic_seeds, visited_path_node_ids=tuple(dict.fromkeys(

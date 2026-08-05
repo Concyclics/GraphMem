@@ -24,6 +24,7 @@ from .operators import (
     requires_exhaustive_scope,
     root_operator,
 )
+from ..principals import PrincipalRegistry, ResolvedOwner, resolve_query_owners
 from .slots import QuerySlots, parse_slots
 
 if TYPE_CHECKING:
@@ -48,6 +49,10 @@ class QueryIR:
     ast_obligations: tuple[ProofObligation, ...] = ()
     slots: QuerySlots | None = None
     parse_warnings: tuple[str, ...] = ()
+    # Principal-aware owner resolution, also shadow: the legacy owner strings
+    # above still drive execution until this is validated on its own.
+    resolved_owners: tuple[ResolvedOwner, ...] = ()
+    owner_resolution_warnings: tuple[str, ...] = ()
 
     @property
     def ast_operator(self) -> QueryOperator | None:
@@ -228,7 +233,8 @@ def _scope_candidates(query: str, view: "GraphReadView") -> tuple[str, ...]:
     return tuple(value for _, value in sorted(scored, key=lambda row: (-row[0], row[1]))[:2])
 
 
-def compile_query(query: str, view: "GraphReadView") -> QueryIR:
+def compile_query(query: str, view: "GraphReadView", *,
+                  registry: PrincipalRegistry | None = None) -> QueryIR:
     operator = _operator(query)
     owners = _query_owners(query, view)
     predicates = _predicate_candidates(query, owners, view)
@@ -256,9 +262,18 @@ def compile_query(query: str, view: "GraphReadView") -> QueryIR:
     # decision, but execute neither of the AST's operands nor its operator yet.
     slots = parse_slots(query)
     scopes = _scope_candidates(query, view)
-    ast_operands = _ast_operands(query, slots, owners, predicates, scopes)
+    resolved_owners: tuple[ResolvedOwner, ...] = ()
+    owner_warnings: tuple[str, ...] = ()
+    if registry is not None:
+        resolved_owners, owner_warnings = resolve_query_owners(query, registry)
+    # AST operands prefer the principal-aware resolution when it produced one;
+    # the legacy alias list stays untouched so H0-H9 execution cannot move.
+    ast_owner_rows = (tuple((row.mention_text, row.canonical_entity_ids)
+                            for row in resolved_owners) or owners)
+    ast_operands = _ast_operands(query, slots, ast_owner_rows, predicates, scopes)
     ast = compose_operator(slots, ast_operands)
     return QueryIR(query, operator, operands, tuple(obligations), ordering, distinct_by,
                    ast=ast, ast_operands=ast_operands,
                    ast_obligations=_ast_obligations(ast, ast_operands), slots=slots,
-                   parse_warnings=slots.warnings)
+                   parse_warnings=slots.warnings, resolved_owners=resolved_owners,
+                   owner_resolution_warnings=owner_warnings)

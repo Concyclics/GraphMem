@@ -428,3 +428,77 @@ Recommended order change: **owner resolution (alias hygiene + first-person
 binding to the memory's user entity) should precede any further binding work.**
 It is cheap, it is measurable on its own, and every downstream stage is
 currently starved by it.
+
+---
+
+## PR4c — principal registry and owner resolution (shadow)
+
+Identity is rebuilt from authority instead of guessed from the extraction
+graph. Turn speaker roles define the principals; principals link to canonical
+entities; only that linked set is eligible for strong owner matching. Pronouns
+are resolved against the registry rather than dropped.
+
+What the store actually contains, and why the old resolver could not work:
+
+| memory | roles | speakers | entities / aliases |
+| --- | --- | --- | --- |
+| `00ca467f` (LongMemEval) | user 243, assistant 243 | literally `user` / `assistant` | 127 entities, 125 aliases |
+| `locomo:conv-26` | user 211, assistant 208 | `Caroline` / `Melanie` | 7 entities, 5 aliases |
+
+In `00ca467f` the gold facts are owned by `user` (133 facts) and `assistant`
+(159), but the word "user" never appears in a first-person question — while the
+alias index offers 125 competing entries including `asics` and `advertisers`.
+In `conv-26` the junk is `life`, `right`, `sounds`.
+
+### Design
+
+- `MemoryPrincipal` with roles `memory_user` / `assistant` /
+  `conversation_participant` / `mentioned_entity`, built from `SourceTurn.role`
+  and speaker labels, never from entity frequency.
+- A generic label (`user`, `assistant`) identifies a principal but is **not** a
+  matchable alias; a named speaker is.
+- `principal_alias_index` is separate from `owner_alias_index`; question words,
+  auxiliaries, pronouns and generic nouns are blocked from strong matching.
+- Three resolution layers: deictic (`I/me/my` → memory user), explicit
+  principals (longest match, token boundary), then other named entities as a
+  weak last resort.
+- `we/us/our` and `you/your` are **recorded as unresolved**, not guessed —
+  "you" may address the assistant or the other participant.
+- Multi-owner mentions stay separate owners.
+
+### Intrinsic evaluation, full 200
+
+Gold fact owners are used in the evaluator only; the resolver sees the question
+and the memory's own turns.
+
+| metric | legacy | **PR4c** | gate |
+| --- | ---: | ---: | --- |
+| gold owner recall (187 questions with an owner) | 48.7% | **95.2%** | ≥85% ✅ |
+| common-word owner rate | 17.5% | **0.0%** | 0 ✅ |
+| wrong strong-owner rate | — | **3.0%** | <5% ✅ |
+| no-owner rate | 28.0% | **1.0%** | — |
+| first-person resolution (LME strata) | ~0% | **100% / 98%** | ≥95% ✅ |
+
+By stratum:
+
+| stratum | legacy recall | PR4c recall | legacy common-word |
+| --- | ---: | ---: | ---: |
+| LongMemEval multi-session | **0.0%** | **100.0%** | 42% |
+| LongMemEval temporal | 2.3% | **90.9%** | 28% |
+| LoCoMo Cat1 | 98.0% | 98.0% | 0% |
+| LoCoMo Cat2 | 91.3% | 91.3% | 0% |
+
+LongMemEval goes from a completely unusable owner signal to essentially
+correct; LoCoMo was already fine because its speaker names appear literally in
+the questions. That split is exactly what the funnel predicted, and it explains
+why PR4b's owner veto destroyed LME bindings while leaving LoCoMo alone.
+
+### Shadow mode verified
+
+`QueryIR.operands` still carries the legacy alias strings, so execution is
+untouched: `h0/h6/h8/h9` all report IDENTICAL on execution fields. The
+principal-aware resolution populates `resolved_owners`, the AST operands and
+the trace only.
+
+Next: rerun binding with the repaired owner signal (advisory, not mandatory)
+before deciding whether the discriminant can be promoted.
