@@ -115,3 +115,153 @@ H2–H6 keep the frozen V5.5 seeding (`_seed_narrow`) and the V5.5 fused score, 
 H6 still reports 55.5% / 60.0% and every later delta stays attributable. A
 regression test asserts the narrow path stays within the V5.5 caps and remains a
 subset of the wide one.
+
+---
+
+## PR2b — operator AST compiler, shadow mode
+
+`operators.py` (PR2a) defined the algebra but nothing produced it: `query_ir.py`
+still chose a single enum by racing substring tests. This wires a compiler in
+front of it — parse the slots, then compose — while leaving execution alone.
+
+`QueryIR.operator` / `.operands` remain exactly the V5.5 values that the
+reservoir, scheduler and packer consume. `.ast`, `.ast_operands`,
+`.ast_obligations`, `.slots` and `.parse_warnings` are compiled alongside and
+written to the trace. A later profile switches execution over; until then the
+divergence can be measured before anything depends on it.
+
+### Verified inert
+
+`scripts/compare_v5_6_runs.py` compares two runs on execution-relevant fields
+only (packed/dropped/retrieved turns, proof units, certificate, candidate
+scores, coverage), ignoring trace keys:
+
+```
+h0: IDENTICAL   h6: IDENTICAL   h8: IDENTICAL   →  OK: execution unchanged
+```
+
+### What the compiler found
+
+Measured on the fixed 200 (h8):
+
+| | |
+| --- | ---: |
+| questions where the AST disagrees with the legacy classifier | **48 / 200 (24.0%)** |
+| questions whose AST is compositional (nested operators) | **41 / 200** |
+| strict all-hit where the two agree | 51.3% |
+| strict all-hit where they disagree | **43.8%** |
+
+The disagreements concentrate on the harder questions, which is what you would
+expect if the classifier is wrong precisely where the question is complex.
+
+Largest disagreement classes:
+
+| count | legacy | AST |
+| ---: | --- | --- |
+| 14 | `lookup` | `union_distinct` |
+| 12 | `union_distinct` | `lookup` |
+| 7 | `lookup` | `count_distinct` |
+| 5 | `count_distinct` | **`date_difference`** |
+| 3 | `argmax_time` | `argmin_time` |
+| 2 | `latest_state` | `ordinal` |
+
+The `count_distinct → date_difference` class is the clearest: the legacy cascade
+tests `"how many"` before `"how long"`, so *"how many days between X and Y"*
+became a count. `latest_state` drops to zero because `"now"` no longer matches
+inside `"know"` and because `"last"`/`"latest"` are ordinals over time, not state
+lookups.
+
+### Incidental finding: the dense channel is not reproducible across runs
+
+The first byte-identity attempt failed on **h0**, which PR2b cannot touch. The
+cause is the embedding service: `dense_score` drifts by ~3e-3 between runs
+(0.90817 → 0.90478), which reorders the tail of the candidate list. Within a
+single process it is stable — three successive calls return bit-identical
+vectors — so this is cross-run batching/GPU nondeterminism, not a code defect.
+
+Impact on outcomes is negligible: across h0/h6/h8 every headline metric is
+identical between the two runs except h6 `evidence_tokens` (3171.17 → 3171.40,
+one turn swapped). But it means **cross-run byte-identity is unachievable while
+dense retrieval is on**, so the inertness proof above was run with the dense
+channel disabled, where all channels are deterministic.
+
+Worth fixing before the frozen full benchmark: persist query embeddings in a
+sidecar cache keyed by `(model_id, query_text)` so a frozen run can be replayed
+exactly. Until then, any two runs differ by this noise floor.
+
+---
+
+## PR3 — proof funnel and packing oracles
+
+Run: `artifacts/v5_6/funnel2/`, profile h8, full 200, finalized gold.
+
+Each gold turn is walked through every stage it has to survive. A question
+counts only if *all* of its gold turns clear the stage.
+
+| stage | h8 |
+| --- | ---: |
+| R0 gold turn is in the reservoir | 100.0% |
+| R1 …scored as a candidate | 100.0% |
+| R2 …an EvidenceGroup resolves to it | 100.0% |
+| R3 …a CanonicalFact cites that group | **68.5%** |
+| R3b …**that fact was actually reached as a node** | **21.0%** |
+| R4 …an operand bound to it | 13.5% |
+| R5 …the algebra kept the binding | 13.5% |
+| R6 …it became a proof unit | 13.5% |
+| R7 …it was packed | 49.5% |
+
+Where each question *first* loses a gold turn:
+
+| first loss stage | questions |
+| --- | ---: |
+| **the fact was never reached as a node** | **95 / 200** |
+| no CanonicalFact exists for the turn at all | 63 / 200 |
+| reached but did not bind | 15 / 200 |
+| lost only at packing | 2 / 200 |
+| clears every stage | 25 / 200 |
+
+By stratum (h8):
+
+| stratum | has_canonical_fact | fact_reached | has_binding | packed |
+| --- | ---: | ---: | ---: | ---: |
+| LongMemEval multi-session | 68% | 12% | 6% | 56% |
+| LongMemEval temporal | 66% | 26% | 8% | 78% |
+| LoCoMo Cat1 | 54% | 6% | 4% | 8% |
+| LoCoMo Cat2 | 86% | 40% | 36% | 56% |
+
+### Three conclusions, all of which redirect the plan
+
+**1. Packing is not the bottleneck — node retrieval is.** Packing is the first
+loss on 2 of 200 questions. The dominant cliff is R3 → R3b: the fact exists in
+the graph on 68.5% of questions but is reached on only 21.0%. The mechanism is
+the exact turn-side problem PR1 fixed, one level up: memories hold **450–500
+CanonicalFacts** while the node budget is `max_visited_nodes = 96` with a
+per-operand `lookup_facts` limit of 48. The right fact is simply never
+retrieved.
+
+**2. Proof-driven packing cannot be turned on yet.** `gold_packed` (49.5%) is
+almost four times `gold_in_proof_unit` (13.5%): today's strict score is carried
+by fused-score *fill*, not by proof. Switching to strict proof-bundle packing
+before fixing reachability would drop strict all-hit toward 13.5%. Proof
+packing depends on binding coverage, which depends on fact reachability.
+
+**3. `budget_oracle_fits` is 100%.** Every question's gold turns fit inside 32
+turns and 5,000 real tokens. Budget is never the binding constraint, so the
+32-turn cap and the 5,000-token cap are not what is costing strict all-hit.
+
+### Revised order
+
+```text
+PR4a  fact reservoir  — extend the safe-superset principle to the node side
+PR4b  binding discriminant — the 15/200 that reach but do not bind
+PR7a  active shortlist   (now safe: proof coverage will be high)
+PR7b  proof bundles      (ditto)
+PR8   post-pack certificate
+Track B extraction — the 31.5% of questions with no CanonicalFact at all
+```
+
+The 68.5% canonical-fact ceiling is the answer to "do we need to rebuild the
+graph?": **eventually yes**. No retrieval change can lift proof-based strict
+all-hit above 68.5% on this graph, because on 31.5% of questions at least one
+gold turn has no fact citing it. That is now a measurement rather than a guess,
+and it sizes Track B precisely.

@@ -796,6 +796,12 @@ class NavigationResult:
     operand_coverage: Mapping[str, Mapping[str, tuple[str, ...]]] = field(default_factory=dict)
     proof_units: tuple[EvidenceUnit, ...] = ()
     stop_reason: StopReason | None = None
+    # Diagnostics only: which facts actually bound, and which the algebra kept.
+    # Without these the proof funnel cannot tell "no fact existed" apart from
+    # "a fact existed but nothing bound to it".
+    reached_fact_node_ids: tuple[str, ...] = ()
+    bound_fact_node_ids: tuple[str, ...] = ()
+    selected_fact_node_ids: tuple[str, ...] = ()
     schema_version: str = SCHEMA_VERSION
 
 

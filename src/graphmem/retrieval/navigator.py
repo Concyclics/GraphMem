@@ -458,7 +458,17 @@ class GraphNavigator:
                    # The legacy H0/H1 path keeps the historical word-count estimate so it stays
                    # a faithful frozen baseline; the harness budgets against real tokens.
                    "token_counter": self.token_counter.describe(),
-                   "seeding": dict(seeded.stats)},
+                   "seeding": dict(seeded.stats),
+                   # The AST is compiled but not executed yet.  Recording it here,
+                   # together with where it disagrees with the legacy classifier,
+                   # measures the compiler before anything depends on it.
+                   "operator_ast": ir.describe_ast(),
+                   "ast_operator": str(ir.ast_operator) if ir.ast_operator else "",
+                   "ast_diverges": ir.ast_diverges,
+                   "ast_operands": [item.operand_id for item in ir.ast_operands],
+                   "ast_obligations": [f"{item.kind}:{item.operand_id or 'root'}"
+                                       for item in ir.ast_obligations],
+                   "parse_warnings": list(ir.parse_warnings)},
             seed_node_ids=semantic_seeds, visited_path_node_ids=tuple(dict.fromkeys(
                 (*schedule.visited_node_ids, *direct_owner_terminals))),
             slot_coverage={item.operand_id: tuple(row.binding_id for row in bindings if row.operand_id == item.operand_id)
@@ -468,6 +478,11 @@ class GraphNavigator:
             first_hit_relations={item.operand_id: (paths.get(item.fact_node_id, ("posting",))[0]) for item in bindings},
             search_exhaustion=schedule.exhaustion, pack_exhaustion=pack_exhaustion,
             operand_coverage=operand_coverage, proof_units=units, stop_reason=certificate.stop_reason,
+            reached_fact_node_ids=tuple(sorted(
+                node_id for node_id in fact_ids
+                if node_id in view.nodes and view.nodes[node_id].node_type == NodeType.CANONICAL_FACT)),
+            bound_fact_node_ids=tuple(dict.fromkeys(row.fact_node_id for row in bindings)),
+            selected_fact_node_ids=tuple(dict.fromkeys(row.fact_node_id for row in closure.bindings)),
         )
 
     @staticmethod
