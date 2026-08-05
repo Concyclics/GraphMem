@@ -1,0 +1,117 @@
+# V5.6-prebench progress
+
+One page per landed PR, measured on the fixed-200 development set against the
+**finalized** LongMemEval annotations (`eval_annotations/longmemeval_v5_dev100_gold_turns.jsonl`)
+and the frozen V5.4 authority graph recorded in `V5_6_FREEZE.md`.
+
+Corrected baselines from `V5_6_REBASELINE.md`:
+
+| | strict turn all-hit | candidate all-hit |
+| --- | ---: | ---: |
+| A0 = V5.4 H0 (frozen navigator) | 50.5% | 88.0% |
+| V5.5 H6 on the same graph | 55.0% | 60.0% |
+| V5.5 H6 + G2 sidecar (gold-scoped) | 57.0% | 85.5% |
+
+Every number below is `PYTHONHASHSEED=0`, `generative_llm_calls: 0`, embedding
+query channel only.
+
+---
+
+## PR0 — re-baseline, freeze, determinism
+
+**What it fixed**
+
+| Defect | Symptom | Fix |
+| --- | --- | --- |
+| D0 | Every V5.4/V5.5 run scored against the pre-adjudication draft annotations; only 142 of 217 turn references were shared with the finalized set | Re-ran the 2×2 gold × graph matrix; `V5_6_REBASELINE.md` is now the baseline of record |
+| D1 | `packer.pack` iterated a `set` of mandatory turn ids, so packed order and (under the turn cap) packed membership varied with `PYTHONHASHSEED` | Mandatory turns keep their declared proof-unit order |
+| D2 | `FactBinding.time_interval` held `str(dict)`; canonical JSON sorts keys, so `ARGMIN/ARGMAX/ORDINAL` ranked events by `anchor_turn_id` hash | Typed `TemporalKey` with an explicit `sort_key` |
+| D3 | `lookup_facts` truncated to 24 by lexicographic node id | Rank by owner/predicate/lexical relevance, then cut |
+| D9/D10 | `destination_priority` evaluated twice per comparison; per-turn linear scans of the whole turn list | Score once; index turns by id and session |
+| D11 | `str(attrs.get(key)) or None` produced the literal string `"None"` | `_text()` helper returning a real `None` |
+| D12 | `estimate_tokens` was `words × 1.3`, so no token budget was ever actually enforced | `graphmem/tokenization.py` loads the backbone's own `tokenizer.json` offline; `require_exact=True` refuses to guess |
+
+**Verification**
+
+- 968 tests pass, including a cross-process `PYTHONHASHSEED=0/1` byte-identity
+  check that asserts its own fixture produces more than one proof unit.
+- **H0 parity is exact**: 0.505 strict / 0.880 candidate / 2011.3 evidence tokens,
+  unchanged before and after. The legacy path deliberately keeps the historical
+  word-count estimate so it remains a faithful frozen baseline; only the harness
+  budgets against real tokens.
+- H6 moved 0.550 → 0.555 strict once its budget was enforced in real tokens.
+
+**Measured along the way**: 20.4% of harness proof steps are reached via an
+inverse edge, so the missing `ProofStep.inverse` flag was misreporting direction
+on a fifth of all steps. It is now recorded.
+
+---
+
+## PR1 (H8) — safe-superset candidate reservoir
+
+Run: `artifacts/v5_6/pr1_final/v5_5_retrieval200_20260805T155045Z`
+
+### Result
+
+| Stratum | H0 strict / cand | H6 strict / cand | **H8 strict / cand** |
+| --- | ---: | ---: | ---: |
+| LongMemEval multi-session | 58.0% / 100.0% | 70.0% / 78.0% | 56.0% / **100.0%** |
+| LongMemEval temporal | 78.0% / 96.0% | 80.0% / 86.0% | 78.0% / **100.0%** |
+| LoCoMo Cat1 multi-hop | 6.0% / 60.0% | 14.0% / 16.0% | 8.0% / **100.0%** |
+| LoCoMo Cat2 temporal | 60.0% / 96.0% | 58.0% / 60.0% | 56.0% / **100.0%** |
+| **All 200** | 50.5% / 88.0% | 55.5% / 60.0% | 49.5% / **100.0%** |
+
+Coverage against the frozen navigator, per question:
+
+| | H6 | H8 |
+| --- | ---: | ---: |
+| pool is a superset of H0's | 0/200 | **188/200** |
+| H0 turns missing, per question | 235.9 | **0.09** |
+| candidate all-hit regressions vs H0 | 56 | **0** |
+| mean pool size | 45.3 | 544.8 |
+
+**LoCoMo Cat1 candidate all-hit reaches 100% with no sidecar at all.** The V5.5
+report got 82% there only via G2, whose build scope was selected from a prior
+run's `candidate_turn_all_hit`, i.e. from gold. That leakage is now unnecessary.
+
+### What was actually wrong
+
+1. **Pool membership was derived from a normalized score.** Min-max normalization
+   maps each channel's weakest hit to exactly 0.0, so a truthiness test silently
+   discarded the tail of every channel. Membership now comes from presence.
+   This one defect accounted for most of the missing turns.
+2. **Session flooding could not be reproduced by imitation.** The legacy navigator
+   floods its eight strongest sessions using its own score scale and its own
+   tokenizer — `text.terms()` strips a possessive `'s`, `navigator.terms()` does
+   not. Rather than chase that, the reservoir floods *every session holding a
+   channel hit*, which dominates the legacy choice by construction.
+3. **`lookup_facts` truncated to 24 by lexicographic node id**, discarding facts
+   for reasons unrelated to the query.
+4. **The shared 48-node cap was consumed in operand order**, so operand 2 of an
+   intersection could be starved outright. Node budgets are now per-operand and
+   round-robin merged.
+5. **A wider pool has to be ranked better, not just be wider.** With the V5.5
+   fused score, going from 45 to 545 candidates *lowered* strict all-hit: the
+   scorer lacked the lexical, session and adjacency terms the legacy scorer used
+   to pick 16 useful turns out of 278. Those terms are restored for the wide
+   profile and gated off for H2–H6.
+
+### What it does not fix
+
+Strict packed all-hit is **49.5%**, against H0's 50.5% (paired delta −0.010,
+CI [−0.055, +0.030] — indistinguishable). Every gold turn is now reachable on
+100% of questions, but the packer still selects by fused score rather than by
+answer membership, so coverage does not convert into packed evidence. That
+conversion is PR7's job, and the candidate→packed gap is now the single largest
+remaining loss: **50.5 percentage points**.
+
+The residual 0.09 missing turns/question are reachable only through the legacy
+path's own graph traversal, not through seeding; they are a scheduler concern
+(PR5), not a reservoir one.
+
+### Ladder integrity
+
+H2–H6 keep the frozen V5.5 seeding (`_seed_narrow`) and the V5.5 fused score, so
+H6 still reports 55.5% / 60.0% and every later delta stays attributable. A
+regression test asserts the narrow path stays within the V5.5 caps and remains a
+subset of the wide one.
