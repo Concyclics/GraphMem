@@ -240,6 +240,23 @@ class StateHead:
 
 
 @dataclass(frozen=True, slots=True)
+class TemporalInterval:
+    raw_text: str
+    start: str | None
+    end: str | None
+    precision: str
+    kind: str
+    anchor_turn_id: str
+    confidence: float
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"absolute", "relative", "observed", "unresolved"}:
+            raise ValueError("invalid temporal interval kind")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("temporal interval confidence must be in [0, 1]")
+
+
+@dataclass(frozen=True, slots=True)
 class FactMention:
     mention_id: str
     scene_id: str
@@ -474,6 +491,7 @@ class GraphArtifactManifest:
     model_ids: Mapping[str, str]
     prompt_hashes: Mapping[str, str]
     build_token_usage: Mapping[str, int]
+    build_diagnostics: Mapping[str, Any] = field(default_factory=dict)
     schema_version: str = SCHEMA_VERSION
 
 

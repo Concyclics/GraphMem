@@ -62,6 +62,8 @@ class GraphDiagnosticProbe:
                           NodeType.STATE_HEAD}
         for node_id in visited:
             node = nodes[node_id]
+            if node.attributes.get("provenance_scope", "terminal") != "terminal":
+                continue
             if node.node_type not in terminal_types:
                 continue
             for group_id in node.all_evidence_group_ids:

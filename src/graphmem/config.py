@@ -46,6 +46,10 @@ class ModelConfig:
     semantic_repair_output_tokens: int = 4096
     semantic_constrained_json: bool = False
     semantic_individual_repair: bool = False
+    semantic_extraction_mode: str = "legacy_batch"
+    semantic_max_retries: int = 0
+    semantic_retry_output_tokens: int = 1024
+    semantic_compile_summary: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +83,10 @@ class EdgeConfig:
     refine_batch_size: int = 24
     max_refine_calls_per_1000_turns: int = 20
     graph_variant: str = "g0"
+    temporal_normalization: bool = False
+    cross_session_portals: bool = False
+    predicate_embedding_threshold: float = 0.92
+    portal_degree_cap: int = 2
     relation_degree_caps: Mapping[str, int] = field(default_factory=lambda: {
         "same_event": 4, "same_activity": 8, "state_next": 4,
         "state_transition": 4, "temporal_before": 8, "shared_entity": 32,
@@ -122,8 +130,14 @@ class GraphMemV5Config:
             "none", "ambiguous_only", "high_value_only", "all_bounded_candidates"
         }:
             raise ValueError("invalid edge refine mode")
-        if self.edges.graph_variant not in {"g0", "g1", "g2", "g3", "g4"}:
+        if self.edges.graph_variant not in {"g0", "g1", "g2", "g3", "g4", "g5"}:
             raise ValueError("invalid semantic graph variant")
+        if self.models.semantic_extraction_mode not in {"legacy_batch", "strict_single", "strict_pair"}:
+            raise ValueError("invalid semantic extraction mode")
+        if self.models.semantic_max_retries not in {0, 1}:
+            raise ValueError("semantic_max_retries must be 0 or 1")
+        if not 0.0 <= self.edges.predicate_embedding_threshold <= 1.0:
+            raise ValueError("predicate embedding threshold must be in [0, 1]")
         if not 0 <= self.edges.low_threshold < self.edges.high_threshold <= 1:
             raise ValueError("edge thresholds must satisfy 0 <= low < high <= 1")
         positive = {
@@ -150,6 +164,8 @@ class GraphMemV5Config:
             "semantic_max_facts_per_scene": self.models.semantic_max_facts_per_scene,
             "semantic_summary_tokens": self.models.semantic_summary_tokens,
             "semantic_repair_output_tokens": self.models.semantic_repair_output_tokens,
+            "semantic_retry_output_tokens": self.models.semantic_retry_output_tokens,
+            "portal_degree_cap": self.edges.portal_degree_cap,
             "neo4j_batch_nodes": self.storage.neo4j_batch_nodes,
             "neo4j_batch_edges": self.storage.neo4j_batch_edges,
         }

@@ -321,6 +321,10 @@ class SQLiteGraphStore:
                         "SELECT DISTINCT cache_key FROM main.llm_calls WHERE memory_id=?)",
                         (memory_id,),
                     )
+                    db.execute(
+                        f"INSERT OR REPLACE INTO {alias}.embeddings "
+                        "SELECT * FROM main.embeddings WHERE memory_id=?", (memory_id,)
+                    )
             finally:
                 self._connection.execute(f"DETACH DATABASE {alias}")
 
@@ -378,6 +382,14 @@ class SQLiteGraphStore:
                     db.execute(
                         f"INSERT OR REPLACE INTO main.llm_calls SELECT * FROM {alias}.llm_calls WHERE memory_id=?",
                         (memory_id,),
+                    )
+                    db.execute(
+                        f"INSERT OR REPLACE INTO main.embeddings SELECT * FROM {alias}.embeddings WHERE memory_id=?",
+                        (memory_id,),
+                    )
+                    db.execute(
+                        f"INSERT OR REPLACE INTO main.embedding_calls SELECT * FROM {alias}.embedding_calls "
+                        "WHERE memory_id=?", (memory_id,),
                     )
                     checksum = str(shard_version[0])
                     db.execute(

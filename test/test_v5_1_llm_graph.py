@@ -10,6 +10,7 @@ from graphmem.config import GraphMemV5Config
 from graphmem.domain import NodeType, QueryBudget, RelationType
 from graphmem.retrieval import GraphDiagnosticProbe
 from graphmem.storage import SQLiteGraphStore
+from graphmem.runtime import GraphReadView
 
 from test_v5_gate_b_core import _store
 
@@ -148,3 +149,70 @@ def test_per_memory_sqlite_shard_is_isolated_and_merges_atomically(tmp_path: Pat
     assert authority._connection.execute(
         "SELECT count(*) FROM llm_calls WHERE memory_id='travel'"
     ).fetchone()[0] > 0
+
+
+class StrictCompletions:
+    def __init__(self, fail_first: bool = False) -> None:
+        self.calls = 0; self.requests = []; self.fail_first = fail_first
+
+    def create(self, **request):
+        self.calls += 1; self.requests.append(request)
+        payload = json.loads(request["messages"][1]["content"])
+        if self.fail_first and self.calls == 1:
+            content = '{}'
+        else:
+            scenes = []
+            for scene in payload["s"]:
+                turn = next(row for row in scene["r"] if "Paris" in row["t"])
+                start = turn["t"].index("Paris")
+                scenes.append({"i": scene["i"], "f": [{"o": "Alice", "p": "travel to",
+                    "v": "Paris", "y": "place", "g": "travel", "n": "positive",
+                    "t": None, "r": [turn["i"]], "q": "Paris"}]})
+            content = json.dumps({"s": scenes})
+        message = SimpleNamespace(content=content, reasoning_content=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")],
+            model="qwen30b", usage=SimpleNamespace(prompt_tokens=80, completion_tokens=20,
+                                                    total_tokens=100))
+
+
+def _strict_config(*, variant="g5", retries=1, temporal=True):
+    base = _semantic_config()
+    return replace(base, models=replace(base.models, semantic_extraction_mode="strict_single",
+        semantic_batch_scenes=1, semantic_batch_output_tokens=768,
+        semantic_max_facts_per_scene=4, semantic_max_retries=retries,
+        semantic_retry_output_tokens=1024, semantic_compile_summary=True),
+        scenes=replace(base.scenes, llm_hierarchy_compression=False),
+        edges=replace(base.edges, graph_variant=variant, temporal_normalization=temporal),
+        coarsen=replace(base.coarsen, cross_session_merge=False))
+
+
+def test_strict_prompt_uses_local_aliases_schema_and_one_retry(tmp_path: Path) -> None:
+    store = _store(tmp_path / "strict.sqlite"); completions = StrictCompletions(fail_first=True)
+    config = _strict_config(); client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    manifest = GraphBuildPipeline(store, dataset_hash="dataset",
+        distiller=QwenSemanticDistiller(store, config, "dataset", client=client)).build("travel", config)
+    assert completions.calls >= 2
+    first = completions.requests[0]
+    assert first["response_format"]["type"] == "json_schema"
+    payload = json.loads(first["messages"][1]["content"])
+    assert all(row["i"].startswith("s") for row in payload["s"])
+    assert all(turn["i"].startswith("s") for row in payload["s"] for turn in row["r"])
+    assert manifest.build_diagnostics["extraction_retry_calls"] >= 1
+    assert manifest.build_token_usage["reasoning_tokens"] == 0
+
+
+def test_g5_lean_graph_has_terminal_facts_and_no_value_nodes(tmp_path: Path) -> None:
+    store = _store(tmp_path / "lean.sqlite"); completions = StrictCompletions()
+    config = _strict_config(); client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    GraphBuildPipeline(store, dataset_hash="dataset",
+        distiller=QwenSemanticDistiller(store, config, "dataset", client=client)).build("travel", config)
+    nodes = store.nodes("travel"); edges = store.edges("travel")
+    assert NodeType.CANONICAL_FACT in {node.node_type for node in nodes}
+    assert NodeType.CANONICAL_VALUE not in {node.node_type for node in nodes}
+    assert RelationType.SCENE_CONTAINS in {edge.relation for edge in edges}
+    assert all(node.attributes.get("provenance_scope") == "route"
+               for node in nodes if node.node_type in {NodeType.ROUTING_CARD, NodeType.SCENE})
+    view = GraphReadView(nodes, edges)
+    route_ids = [node.node_id for node in nodes if node.attributes.get("provenance_scope") == "route"]
+    assert not view.evidence_group_ids_for_nodes(route_ids)
+    assert view.evidence_group_ids_for_nodes(route_ids, terminal_only=False)

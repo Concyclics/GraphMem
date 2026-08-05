@@ -14,6 +14,8 @@ def projection_checksum(nodes: Iterable[GraphNode], edges: Iterable[GraphEdge]) 
         "summary": node.summary[:512], "evidence_group_ids": node.all_evidence_group_ids,
         "entity_id": node.entity_id, "event_time": node.event_time, "state": node.state,
         "confidence": node.confidence,
+        "provenance_scope": node.attributes.get("provenance_scope", "terminal"),
+        "roles": tuple(node.attributes.get("roles", ())),
     }) for node in nodes)
     edge_rows = sorted(canonical_json({
         "edge_id": edge.edge_id, "src_id": edge.src_id, "relation": str(edge.relation),
@@ -83,6 +85,8 @@ class Neo4jProjector:
                     "evidence_group_ids": list(node.all_evidence_group_ids),
                     "entity_id": node.entity_id, "event_time": node.event_time,
                     "state": node.state, "confidence": node.confidence,
+                    "provenance_scope": node.attributes.get("provenance_scope", "terminal"),
+                    "roles": list(node.attributes.get("roles", ())),
                     "graph_version": self.store.graph_version(memory_id),
                 } for node in nodes[start:start + self.node_batch]]
                 session.run(

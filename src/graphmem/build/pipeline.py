@@ -4,7 +4,7 @@ import hashlib
 import re
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, Sequence
 
 from ..config import GraphMemV5Config, config_hash
@@ -18,12 +18,15 @@ from ..domain import (
     RelationType,
     SourceTurn,
     canonical_json,
+    dataclass_dict,
     logical_graph_checksum,
     stable_id,
 )
 from ..storage import SQLiteGraphStore
 from .refine import Qwen30BRefiner, RefineCandidate
 from .semantic import QwenSemanticDistiller, ScenePacket
+from .temporal import extract_time_expression, normalize_time, observed_interval
+from .canonicalize import PredicateCanonicalizer
 
 
 WORD_RE = re.compile(r"[\w'-]+", re.UNICODE)
@@ -61,11 +64,13 @@ class _SceneSlice:
 class GraphBuildPipeline:
     def __init__(self, store: SQLiteGraphStore, *, dataset_hash: str,
                  refiner: Qwen30BRefiner | None = None,
-                 distiller: QwenSemanticDistiller | None = None) -> None:
+                 distiller: QwenSemanticDistiller | None = None,
+                 predicate_canonicalizer: PredicateCanonicalizer | None = None) -> None:
         self.store = store
         self.dataset_hash = dataset_hash
         self.refiner = refiner
         self.distiller = distiller
+        self.predicate_canonicalizer = predicate_canonicalizer
 
     def build(self, memory_id: str, profile: GraphMemV5Config) -> GraphArtifactManifest:
         started = time.perf_counter()
@@ -92,6 +97,7 @@ class GraphBuildPipeline:
         event_nodes: dict[str, list[GraphNode]] = defaultdict(list)
         entity_nodes: dict[str, GraphNode] = {}
 
+        lean_graph = profile.edges.graph_variant == "g5"
         session_cards: dict[str, GraphNode] = {}
         session_compressed = {}
         if profile.scenes.llm_hierarchy_compression and self.distiller:
@@ -112,6 +118,14 @@ class GraphBuildPipeline:
             evidence_ids = tuple(group_by_turn[turn.turn_id].evidence_group_id for turn in session_turns)
             card_summary = self._bounded_summary(" ".join(turn.raw_text for turn in session_turns), 80)
             card_attrs: dict[str, Any] = {"session_id": session.session_id, "roles": ("route",)}
+            if lean_graph:
+                card_attrs["provenance_scope"] = "route"
+            if lean_graph:
+                children = [self._packet_record(packet_by_scene[scene.scene_id])
+                            for scene in scenes if scene.session_id == session.session_id
+                            and scene.scene_id in packet_by_scene]
+                compiled = self._compile_routing(children, 80)
+                card_summary = compiled["summary"]; card_attrs.update(compiled)
             if session.session_id in session_compressed:
                 compressed = session_compressed[session.session_id]
                 card_summary = str(compressed["summary"]); card_attrs.update(compressed)
@@ -140,12 +154,17 @@ class GraphBuildPipeline:
                     "child_session_ids": tuple(child.attributes["session_id"] for child in children),
                     "roles": ("route", "cross_session"),
                 }
+                if lean_graph:
+                    l2_attrs["provenance_scope"] = "route"
                 l2_id = stable_id("node", memory_id, "routing-card", 2,
                                   tuple(child.node_id for child in children))
                 if profile.scenes.llm_hierarchy_compression and self.distiller:
                     compressed = self.distiller.compress(memory_id, 2, l2_id,
                         [self._node_record(child) for child in children], 160)
                     l2_summary = str(compressed["summary"]); l2_attrs.update(compressed)
+                elif lean_graph:
+                    compiled = self._compile_routing([self._node_record(child) for child in children], 120)
+                    l2_summary = compiled["summary"]; l2_attrs.update(compiled)
                 l2_cards.append(GraphNode(
                     l2_id,
                     memory_id, NodeType.ROUTING_CARD, 2,
@@ -157,10 +176,15 @@ class GraphBuildPipeline:
         memory_children = l2_cards or list(session_cards.values())
         memory_summary = self._bounded_summary(" ".join(card.summary for card in memory_children), 160)
         memory_attrs: dict[str, Any] = {"roles": ("route", "memory")}
+        if lean_graph:
+            memory_attrs["provenance_scope"] = "route"
         if profile.scenes.llm_hierarchy_compression and self.distiller:
             compressed = self.distiller.compress(memory_id, 3, memory_card_id,
                                                   [self._node_record(x) for x in memory_children], 192)
             memory_summary = str(compressed["summary"]); memory_attrs.update(compressed)
+        elif lean_graph:
+            compiled = self._compile_routing([self._node_record(x) for x in memory_children], 160)
+            memory_summary = compiled["summary"]; memory_attrs.update(compiled)
         memory_card = GraphNode(memory_card_id, memory_id, NodeType.ROUTING_CARD, 3,
             memory_summary, memory_evidence[0], memory_evidence[1:], attributes=memory_attrs)
         nodes.append(memory_card)
@@ -173,11 +197,15 @@ class GraphBuildPipeline:
                     packet_by_scene.get(scene.scene_id, ScenePacket(scene.scene_id, scene.summary, (), ())).summary,
                     evidence_ids[0], evidence_ids[1:],
                     attributes={"session_id": scene.session_id, "turn_ids": tuple(x.turn_id for x in scene.turns),
-                                "roles": ("scene",)},
+                                "roles": ("scene", "route") if lean_graph else ("scene",),
+                                **({"provenance_scope": "route"} if lean_graph else {})},
                 )
                 scene_nodes[scene.scene_id] = scene_node
                 nodes.append(scene_node)
-                for event_index, event in enumerate(self._events(scene, profile)):
+                has_semantic_facts = bool(packet_by_scene.get(
+                    scene.scene_id, ScenePacket(scene.scene_id, "", (), ())).facts)
+                for event_index, event in enumerate(() if lean_graph and has_semantic_facts
+                                                     else self._events(scene, profile)):
                     event_nodes[scene.scene_id].append(event)
                     nodes.append(event)
 
@@ -187,7 +215,7 @@ class GraphBuildPipeline:
             nodes.extend(self._time_and_state_nodes(memory_id, event_nodes))
             if packets:
                 semantic_nodes, semantic_edges = self._semantic_graph(
-                    memory_id, packets, turns, group_by_turn, profile,
+                    memory_id, packets, turns, group_by_turn, profile, scene_nodes,
                     (*session_cards.values(), *l2_cards, memory_card)
                 )
                 nodes.extend(semantic_nodes); edges.extend(semantic_edges)
@@ -225,6 +253,8 @@ class GraphBuildPipeline:
 
         nodes = self._dedup_nodes(nodes)
         edges = self._bounded_edges(self._dedup_edges(edges), profile)
+        if lean_graph:
+            nodes = self._propagate_time_ranges(nodes, edges)
         version = self.store.replace_graph(memory_id, nodes, edges, groups)
         checksum = logical_graph_checksum(nodes, edges)
         artifact_id = stable_id("graph-artifact", memory_id, self.dataset_hash,
@@ -245,6 +275,7 @@ class GraphBuildPipeline:
             prompt_hashes={"selective_refine": self.refiner.prompt_hash if self.refiner else "disabled",
                            "semantic_distill": self.distiller.prompt_hash if self.distiller else "disabled"},
             build_token_usage=token_usage,
+            build_diagnostics=self._build_diagnostics(memory_id, nodes, edges, packets),
         )
 
     @staticmethod
@@ -344,6 +375,7 @@ class GraphBuildPipeline:
                     "entity_names": entity_names,
                     "coreference_source": coreference_source,
                     "roles": ("event", "negative_scope") if NEGATION_RE.search(sentence) else ("event",),
+                    **({"provenance_scope": "terminal"} if profile.edges.graph_variant == "g5" else {}),
                 },
             ))
         return result
@@ -390,11 +422,15 @@ class GraphBuildPipeline:
                     ))
         return self._dedup_nodes(result)
 
-    def _semantic_graph(self, memory_id, packets, turns, group_by_turn, profile, hierarchy_cards=()):
+    def _semantic_graph(self, memory_id, packets, turns, group_by_turn, profile,
+                        scene_nodes, hierarchy_cards=()):
         turn_map = {turn.turn_id: turn for turn in turns}
         nodes: dict[str, GraphNode] = {}
         edges: list[GraphEdge] = []
         variant = profile.edges.graph_variant
+        if variant == "g5":
+            return self._lean_semantic_graph(
+                memory_id, packets, turn_map, group_by_turn, profile, scene_nodes)
         facts: list[tuple[GraphNode, str, str, str, int]] = []
         for packet in packets:
             for fact in packet.facts:
@@ -497,6 +533,190 @@ class GraphBuildPipeline:
                     edges.append(self._edge(memory_id, left, RelationType.COREFERENCE, right, "semantic_alias"))
         return list(nodes.values()), edges
 
+    def _lean_semantic_graph(self, memory_id, packets, turn_map, group_by_turn,
+                             profile, scene_nodes):
+        nodes: dict[str, GraphNode] = {}; edges: list[GraphEdge] = []
+        chains: dict[tuple[str, str, str], list[tuple[GraphNode, str, int, Any, Any]]] = defaultdict(list)
+        predicate_keys = [(self._normal(fact.owner), self._normal(fact.predicate),
+                           self._normal(fact.scope), self._normal(fact.value_type), fact.polarity)
+                          for packet in packets for fact in packet.facts]
+        predicate_map = (self.predicate_canonicalizer.canonicalize(memory_id, predicate_keys)
+                         if self.predicate_canonicalizer and predicate_keys else
+                         {key: key[1] for key in predicate_keys})
+        for packet in packets:
+            for fact in packet.facts:
+                refs = [ref for ref in fact.evidence if ref[0] in group_by_turn]
+                if not refs:
+                    continue
+                groups = tuple(dict.fromkeys(group_by_turn[turn_id].evidence_group_id
+                                             for turn_id, _, _ in refs))
+                source_turn = turn_map[refs[0][0]]
+                owner_key = self._normal(fact.owner); raw_predicate = self._normal(fact.predicate)
+                value_key = self._normal(fact.value); scope_key = self._normal(fact.scope)
+                predicate_key = predicate_map[(owner_key, raw_predicate, scope_key,
+                                               self._normal(fact.value_type), fact.polarity)]
+                owner_id = stable_id("node", memory_id, "semantic-owner", owner_key)
+                nodes.setdefault(owner_id, GraphNode(
+                    owner_id, memory_id, NodeType.CANONICAL_ENTITY, 0, fact.owner,
+                    groups[0], groups[1:], entity_id=owner_id,
+                    attributes={"aliases": (fact.owner,), "roles": ("entity", "owner"),
+                                "provenance_scope": "terminal"}))
+                observed = observed_interval(source_turn.timestamp, source_turn.turn_id)
+                evidence_text = source_turn.raw_text[refs[0][1]:refs[0][2]]
+                explicit_time = fact.time or extract_time_expression(evidence_text)
+                interval = (normalize_time(explicit_time, source_turn.timestamp, source_turn.turn_id)
+                            if profile.edges.temporal_normalization and explicit_time else None)
+                fact_id = stable_id("node", memory_id, "lean-fact", owner_key, predicate_key,
+                                    value_key, scope_key, fact.polarity, tuple(refs))
+                attrs = {"owner_id": owner_id, "predicate": predicate_key, "value": fact.value,
+                         "value_key": value_key, "value_type": fact.value_type, "scope": scope_key,
+                         "polarity": fact.polarity, "scene_id": packet.scene_id,
+                         "session_id": source_turn.session_id, "turn_index": source_turn.turn_index,
+                         "roles": ("fact", "predicate", "object") +
+                                  (("negative_scope",) if fact.polarity == "negative" else ()),
+                         "provenance_scope": "terminal",
+                         "observed_at": dataclass_dict(observed) if observed else None,
+                         "time_interval": dataclass_dict(interval) if interval else None}
+                fact_node = GraphNode(
+                    fact_id, memory_id, NodeType.CANONICAL_FACT, 0,
+                    f"{fact.owner} {fact.predicate} {fact.value}" +
+                    (f" {explicit_time}" if explicit_time else ""), groups[0], groups[1:],
+                    event_time=interval.start if interval and interval.start else None,
+                    state=fact.value, confidence=fact.confidence, attributes=attrs)
+                nodes[fact_id] = fact_node
+                edges.append(self._edge(memory_id, nodes[owner_id], RelationType.HAS_FACT,
+                                        fact_node, "lean_semantic"))
+                if packet.scene_id in scene_nodes:
+                    edges.append(self._edge(memory_id, scene_nodes[packet.scene_id],
+                                            RelationType.SCENE_CONTAINS, fact_node, "lean_semantic"))
+                if interval and interval.start:
+                    time_id = stable_id("node", memory_id, "time-interval", interval.start,
+                                        interval.end, interval.precision)
+                    nodes.setdefault(time_id, GraphNode(
+                        time_id, memory_id, NodeType.TIME_ANCHOR, 0, interval.raw_text,
+                        groups[0], groups[1:], event_time=interval.start,
+                        attributes={"interval": dataclass_dict(interval),
+                                    "roles": ("time", "temporal_left", "temporal_right"),
+                                    "provenance_scope": "terminal"}))
+                    edges.append(self._edge(memory_id, fact_node, RelationType.AT_TIME,
+                                            nodes[time_id], "normalized_temporal"))
+                chains[(owner_id, predicate_key, scope_key)].append(
+                    (fact_node, source_turn.session_id, source_turn.turn_index, interval, observed))
+
+        for (owner_id, predicate, scope), rows in sorted(chains.items()):
+            values = {str(row[0].attributes["value_key"]) for row in rows}
+            if len(values) < 2:
+                continue
+            ordered = sorted(rows, key=lambda row: (
+                row[3].start if row[3] and row[3].start else
+                row[4].start if row[4] and row[4].start else "",
+                row[1], row[2], row[0].node_id))
+            evidence = tuple(dict.fromkeys(group for fact, *_ in ordered
+                                            for group in fact.all_evidence_group_ids))
+            collection_id = stable_id("node", memory_id, "lean-collection", owner_id, predicate, scope)
+            collection = GraphNode(
+                collection_id, memory_id, NodeType.COLLECTION_SCOPE, 1,
+                f"{nodes[owner_id].summary} {predicate} " +
+                " ".join(str(row[0].attributes["value"]) for row in ordered[:8]),
+                evidence[0], evidence[1:], attributes={
+                    "owner_id": owner_id, "predicate": predicate, "scope": scope,
+                    "roles": ("collection_scope", "route"), "provenance_scope": "route"})
+            nodes[collection_id] = collection
+            state_id = stable_id("node", memory_id, "state-head", owner_id, predicate, scope)
+            state = GraphNode(
+                state_id, memory_id, NodeType.STATE_HEAD, 0,
+                f"{nodes[owner_id].summary} {predicate} {ordered[-1][0].attributes['value']}",
+                evidence[0], evidence[1:], state=str(ordered[-1][0].attributes["value"]),
+                attributes={"owner_id": owner_id, "predicate": predicate, "scope": scope,
+                            "roles": ("prior_state", "current_state"),
+                            "provenance_scope": "terminal",
+                            "event_time_range": self._range_from_intervals(
+                                [row[3] for row in ordered]),
+                            "observation_time_range": self._range_from_intervals(
+                                [row[4] for row in ordered])})
+            nodes[state_id] = state
+            edges.append(self._edge(memory_id, nodes[owner_id], RelationType.HAS_FACT,
+                                    state, "lean_state"))
+            for fact, *_ in ordered[:32]:
+                edges.append(self._edge(memory_id, collection, RelationType.COLLECTION_CO_MEMBER,
+                                        fact, "lean_collection"))
+            for left, right in zip(ordered, ordered[1:]):
+                if left[0].attributes["value_key"] == right[0].attributes["value_key"]:
+                    continue
+                edges.append(self._edge(memory_id, left[0], RelationType.STATE_NEXT,
+                                        right[0], "normalized_state"))
+                if (left[3] and right[3] and left[3].end and right[3].start
+                        and left[3].end < right[3].start):
+                    edges.append(self._edge(memory_id, left[0], RelationType.TEMPORAL_BEFORE,
+                                            right[0], "normalized_temporal"))
+            if profile.edges.cross_session_portals:
+                degree: dict[str, int] = defaultdict(int)
+                for left, right in zip(ordered, ordered[1:]):
+                    if left[1] == right[1]:
+                        continue
+                    if (degree[left[0].node_id] >= profile.edges.portal_degree_cap or
+                            degree[right[0].node_id] >= profile.edges.portal_degree_cap):
+                        continue
+                    edges.append(self._edge(memory_id, left[0], RelationType.PORTAL,
+                                            right[0], "bounded_exact_portal"))
+                    degree[left[0].node_id] += 1; degree[right[0].node_id] += 1
+        return list(nodes.values()), edges
+
+    @staticmethod
+    def _range_from_intervals(intervals):
+        starts = [row.start for row in intervals if row and row.start]
+        ends = [row.end for row in intervals if row and row.end]
+        return (min(starts), max(ends)) if starts and ends else None
+
+    def _propagate_time_ranges(self, nodes, edges):
+        node_map = {node.node_id: node for node in nodes}
+        children: dict[str, list[str]] = defaultdict(list)
+        for edge in edges:
+            if edge.relation in {RelationType.REFINES_TO, RelationType.SCENE_CONTAINS,
+                                 RelationType.HAS_FACT, RelationType.COLLECTION_CO_MEMBER}:
+                children[edge.src_id].append(edge.dst_id)
+
+        def own_ranges(node):
+            interval = node.attributes.get("time_interval") or node.attributes.get("interval")
+            observed = node.attributes.get("observed_at")
+            event_range = ((interval.get("start"), interval.get("end"))
+                           if isinstance(interval, dict) and interval.get("start") and interval.get("end")
+                           else node.attributes.get("event_time_range"))
+            observed_range = ((observed.get("start"), observed.get("end"))
+                              if isinstance(observed, dict) and observed.get("start") and observed.get("end")
+                              else node.attributes.get("observation_time_range"))
+            return event_range, observed_range
+
+        def aggregate(node_id):
+            event_rows = []; observed_rows = []
+            own_event, own_observed = own_ranges(node_map[node_id])
+            if own_event: event_rows.append(own_event)
+            if own_observed: observed_rows.append(own_observed)
+            for child_id in children.get(node_id, ()):
+                if child_id not in node_map:
+                    continue
+                child_event, child_observed = own_ranges(node_map[child_id])
+                if child_event: event_rows.append(child_event)
+                if child_observed: observed_rows.append(child_observed)
+            event_range = ((min(row[0] for row in event_rows), max(row[1] for row in event_rows))
+                           if event_rows else None)
+            observed_range = ((min(row[0] for row in observed_rows), max(row[1] for row in observed_rows))
+                              if observed_rows else None)
+            attrs = dict(node_map[node_id].attributes)
+            attrs["event_time_range"] = event_range
+            attrs["observation_time_range"] = observed_range
+            node_map[node_id] = replace(node_map[node_id], attributes=attrs,
+                                        event_time=event_range[0] if event_range else node_map[node_id].event_time)
+
+        first = [node for node in nodes if node.node_type in {
+            NodeType.CANONICAL_ENTITY, NodeType.SCENE, NodeType.COLLECTION_SCOPE, NodeType.STATE_HEAD}]
+        for node in sorted(first, key=lambda row: (row.level, row.node_id)):
+            aggregate(node.node_id)
+        routes = [node for node in nodes if node.node_type == NodeType.ROUTING_CARD]
+        for node in sorted(routes, key=lambda row: (row.level, row.node_id)):
+            aggregate(node.node_id)
+        return [node_map[node.node_id] for node in nodes]
+
     @staticmethod
     def _normal(value):
         return " ".join(re.findall(r"[\w'-]+", value.casefold()))
@@ -509,6 +729,31 @@ class GraphBuildPipeline:
                 "values": tuple(dict.fromkeys(fact.value for fact in packet.facts)),
                 "scopes": tuple(dict.fromkeys(fact.scope for fact in packet.facts)),
                 "times": tuple(dict.fromkeys(fact.time for fact in packet.facts if fact.time))}
+
+    def _compile_routing(self, children, limit):
+        fields = ("owners", "predicates", "values", "scopes", "times")
+        collected = {field: [] for field in fields}; postings: dict[str, list[str]] = defaultdict(list)
+        summary_parts = []
+        for child in children:
+            child_id = str(child["child_id"])
+            for field in fields:
+                for value in child.get(field, ()):
+                    text = " ".join(str(value).split())
+                    if not text:
+                        continue
+                    collected[field].append(text)
+                    keys = {self._normal(text), *self._terms(text)} - {""}
+                    for key in keys:
+                        postings[key].append(child_id)
+            summary_parts.extend(str(child.get("summary", "")).split())
+        if not summary_parts:
+            for field in fields:
+                summary_parts.extend(collected[field])
+        return {
+            "summary": " ".join(summary_parts[:limit]),
+            **{field: tuple(dict.fromkeys(values))[:64] for field, values in collected.items()},
+            "child_postings": {key: tuple(dict.fromkeys(ids)) for key, ids in sorted(postings.items())},
+        }
 
     @staticmethod
     def _node_record(node):
@@ -639,6 +884,44 @@ class GraphBuildPipeline:
             for key in totals:
                 totals[key] += int(usage.get(key, 0))
         return totals
+
+    def _build_diagnostics(self, memory_id, nodes, edges, packets):
+        import json
+        scopes = defaultdict(int); terminal_groups = set(); relations = defaultdict(int)
+        degrees: dict[tuple[str, str], int] = defaultdict(int)
+        for node in nodes:
+            scope = str(node.attributes.get("provenance_scope", "terminal"))
+            scopes[scope] += 1
+            if scope == "terminal":
+                terminal_groups.update(node.all_evidence_group_ids)
+        for edge in edges:
+            relations[str(edge.relation)] += 1; degrees[(edge.src_id, str(edge.relation))] += 1
+        terminal_turns = set()
+        for group_id in terminal_groups:
+            group = self.store.evidence_group(group_id)
+            if group:
+                terminal_turns.update(member.turn_id for member in group.members)
+        stage_usage: dict[str, dict[str, Mapping[str, Any]]] = defaultdict(dict)
+        for row in self.store._connection.execute(
+            "SELECT c.stage,c.cache_key,k.usage_json FROM llm_calls c JOIN llm_cache k "
+            "ON k.cache_key=c.cache_key WHERE c.memory_id=?", (memory_id,)):
+            stage_usage[str(row["stage"])][str(row["cache_key"])] = json.loads(row["usage_json"])
+        degree_values = sorted(degrees.values())
+        retries = self.store._connection.execute(
+            "SELECT count(*) FROM llm_calls WHERE memory_id=? AND stage='scene_semantic_retry'",
+            (memory_id,)).fetchone()[0]
+        return {
+            "extraction_scenes": len(packets),
+            "extraction_success_scenes": sum(bool(packet.facts) and not packet.fallback for packet in packets),
+            "extraction_fallback_scenes": sum(packet.fallback for packet in packets),
+            "extraction_retry_calls": int(retries),
+            "terminal_turn_coverage": len(terminal_turns) / max(1, len(self.store.turns(memory_id))),
+            "provenance_scope_nodes": dict(sorted(scopes.items())),
+            "relation_counts": dict(sorted(relations.items())),
+            "degree_p95": degree_values[max(0, int(len(degree_values) * 0.95) - 1)] if degree_values else 0,
+            "cold_equivalent_stage_tokens": {stage: sum(int(usage.get("total_tokens", 0))
+                for usage in keys.values()) for stage, keys in sorted(stage_usage.items())},
+        }
 
     @staticmethod
     def _terms(text):

@@ -73,7 +73,9 @@ class Neo4jDirectRuntime:
         return GraphNode(
             row["node_id"], row["memory_id"], NodeType(row["node_type"]), int(row["level"]),
             row.get("summary", ""), evidence[0], evidence[1:], row.get("entity_id"),
-            row.get("event_time"), row.get("state"), float(row.get("confidence", 1.0)), {},
+            row.get("event_time"), row.get("state"), float(row.get("confidence", 1.0)),
+            {"provenance_scope": row.get("provenance_scope", "terminal"),
+             "roles": tuple(row.get("roles") or ())},
         )
 
     @staticmethod

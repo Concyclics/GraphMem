@@ -29,6 +29,7 @@ from .domain import (
     Scene,
     Session,
     StateHead,
+    TemporalInterval,
     SourceTurn,
     stable_id,
 )
@@ -59,6 +60,7 @@ __all__ = [
     "Session",
     "SourceTurn",
     "StateHead",
+    "TemporalInterval",
     "config_hash",
     "load_config",
     "stable_id",

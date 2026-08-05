@@ -52,6 +52,16 @@ class GraphReadView:
             node_id: frozenset(str(value) for value in node.attributes.get("roles", ()))
             for node_id, node in self.nodes.items()
         }
+        self.terminal_provenance_bitset = {
+            node_id: frozenset(node.all_evidence_group_ids)
+            for node_id, node in self.nodes.items()
+            if node.attributes.get("provenance_scope", "terminal") == "terminal"
+        }
+        self.routing_provenance_bitset = {
+            node_id: frozenset(node.all_evidence_group_ids)
+            for node_id, node in self.nodes.items()
+            if node.attributes.get("provenance_scope") == "route"
+        }
         self.provenance_bitset = {
             node_id: frozenset(node.all_evidence_group_ids)
             for node_id, node in self.nodes.items()
@@ -98,10 +108,13 @@ class GraphReadView:
         dedup = {(row.edge.edge_id, row.next_node_id, row.inverse): row for row in rows}
         return tuple(sorted(dedup.values(), key=lambda row: (row.edge.edge_id, row.next_node_id)))
 
-    def evidence_group_ids_for_nodes(self, node_ids: Iterable[str]) -> tuple[str, ...]:
+    def evidence_group_ids_for_nodes(self, node_ids: Iterable[str], *,
+                                     terminal_only: bool = True) -> tuple[str, ...]:
+        source = self.terminal_provenance_bitset if terminal_only else {
+            **self.routing_provenance_bitset, **self.terminal_provenance_bitset}
         groups: list[str] = []
         for node_id in node_ids:
-            groups.extend(self.provenance_bitset.get(node_id, ()))
+            groups.extend(source.get(node_id, ()))
         return tuple(dict.fromkeys(groups))
 
     def nodes_by_type(self, node_type: NodeType) -> tuple[GraphNode, ...]:

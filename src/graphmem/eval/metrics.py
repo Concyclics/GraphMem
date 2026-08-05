@@ -31,6 +31,8 @@ def navigation_metrics(question: DevQuestion, result: NavigationResult,
         node = node_map.get(node_id)
         if not node:
             continue
+        if node.attributes.get("provenance_scope", "terminal") != "terminal":
+            continue
         for group_id in node.all_evidence_group_ids:
             group = store.evidence_group(group_id)
             if not group:

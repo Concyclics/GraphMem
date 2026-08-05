@@ -14,8 +14,34 @@ from ..storage import SQLiteGraphStore
 
 
 PROMPT_VERSION = "graphmem-v5.1-scene-semantic-v1"
+STRICT_PROMPT_VERSION = "graphmem-v5.3-strict-scene-facts-v2"
 SYSTEM_PROMPT = """Extract grounded memory facts. Return compact JSON {"s":[{"i":scene_id,"m":summary,"f":[{"o":owner,"p":predicate,"v":value,"y":value_type,"g":scope,"n":"positive|negative","t":time_or_null,"c":confidence,"e":[{"i":turn_id,"a":start,"b":end}]}],"u":[]}]}. Every fact must cite exact supplied offsets. No invention, markdown, explanations, or reasoning. Summary <=64 tokens. Omit empty optional fields."""
+STRICT_PROMPT = """Extract only durable memory facts useful for routing a later question to source turns. Return only schema JSON and use local aliases exactly. For each fact: o=the person/entity the fact is about; p=a short canonical predicate; v=the concrete value; y=value type; g=a short semantic domain such as travel/work/family (never a turn ID); n=positive or negative; t=explicit event-time text or null; r=one or two cited turn aliases; q=a short exact quote copied from one cited turn. Prefer events, state changes, preferences, relationships, quantities, collections and times. Omit greetings, acknowledgements, generic advice and filler. Input d is observation metadata, not event time: never copy d into t. t must occur verbatim in cited turn text. Do not invent, explain, reason, summarize, or create aliases."""
 HIERARCHY_PROMPT = """Compress supplied child semantic records for routing. Return compact JSON with summary, owners, predicates, values, scopes, times, child_postings mapping keys to child ID arrays, and aliases as arrays of equivalent value strings found in the children. Only copy supported values and IDs. Never put IDs in scopes or aliases. No markdown or reasoning."""
+EXPLICIT_TIME_RE = re.compile(
+    r"\b(?:\d{1,4}[:/\-]\d{1,2}|\d{4}|monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday|january|february|march|april|may|june|july|august|september|"
+    r"october|november|december|today|yesterday|tomorrow|last|next|ago|week|month|year)\b", re.I)
+
+
+def strict_scene_schema(max_scenes: int, max_facts: int) -> Mapping[str, Any]:
+    fact = {"type": "object", "additionalProperties": False,
+            "required": ["o", "p", "v", "y", "g", "n", "t", "r", "q"], "properties": {
+                "o": {"type": "string", "minLength": 1}, "p": {"type": "string", "minLength": 1},
+                "v": {"type": "string", "minLength": 1}, "y": {"type": "string", "minLength": 1},
+                "g": {"type": "string", "minLength": 1},
+                "n": {"type": "string", "enum": ["positive", "negative"]},
+                "t": {"type": ["string", "null"]},
+                "r": {"type": "array", "minItems": 1, "maxItems": 2,
+                      "items": {"type": "string"}},
+                "q": {"type": "string", "minLength": 1, "maxLength": 160}}}
+    scene = {"type": "object", "additionalProperties": False,
+             "required": ["i", "f"], "properties": {
+                 "i": {"type": "string"},
+                 "f": {"type": "array", "maxItems": max_facts, "items": fact}}}
+    return {"type": "object", "additionalProperties": False, "required": ["s"],
+            "properties": {"s": {"type": "array", "minItems": 1, "maxItems": max_scenes,
+                                     "items": scene}}}
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +70,12 @@ class QwenSemanticDistiller:
     def __init__(self, store: SQLiteGraphStore, config: GraphMemV5Config,
                  dataset_hash: str, client: Any | None = None) -> None:
         self.store, self.config, self.dataset_hash = store, config, dataset_hash
-        self.prompt_hash = hashlib.sha256((PROMPT_VERSION + SYSTEM_PROMPT + HIERARCHY_PROMPT).encode()).hexdigest()
+        strict_prompt = STRICT_PROMPT + (
+            f" Return at most {config.models.semantic_max_facts_per_scene} highest-routing-value facts per scene.")
+        prompt_material = (STRICT_PROMPT_VERSION + strict_prompt if
+                           config.models.semantic_extraction_mode != "legacy_batch" else
+                           PROMPT_VERSION + SYSTEM_PROMPT + HIERARCHY_PROMPT)
+        self.prompt_hash = hashlib.sha256(prompt_material.encode()).hexdigest()
         if client is None:
             from openai import OpenAI
             client = OpenAI(base_url=config.models.llm_base_url, api_key="local")
@@ -54,9 +85,12 @@ class QwenSemanticDistiller:
         batches: list[list[Any]] = []
         current: list[Any] = []
         estimate = 0
+        mode = self.config.models.semantic_extraction_mode
+        batch_limit = {"strict_single": 1, "strict_pair": 2}.get(
+            mode, self.config.models.semantic_batch_scenes)
         for scene in scenes:
             scene_tokens = sum(max(1, len(turn.raw_text.split()) * 13 // 10) for turn in scene.turns)
-            if current and (len(current) >= self.config.models.semantic_batch_scenes
+            if current and (len(current) >= batch_limit
                             or estimate + scene_tokens > self.config.models.semantic_batch_input_tokens):
                 batches.append(current); current = []; estimate = 0
             current.append(scene); estimate += scene_tokens
@@ -107,6 +141,8 @@ class QwenSemanticDistiller:
         }
 
     def _extract_batch(self, memory_id: str, batch: Sequence[Any]) -> list[ScenePacket]:
+        if self.config.models.semantic_extraction_mode != "legacy_batch":
+            return self._extract_strict_batch(memory_id, batch)
         payload = {"s": [{"i": scene.scene_id, "r": [
             {"i": turn.turn_id, "s": turn.speaker, "d": turn.timestamp, "l": len(turn.raw_text),
              "t": turn.raw_text}
@@ -142,6 +178,74 @@ class QwenSemanticDistiller:
             result.append(self._validate_scene(scene, row) if row else self._fallback(scene))
         return result
 
+    def _extract_strict_batch(self, memory_id: str, batch: Sequence[Any]) -> list[ScenePacket]:
+        payload, scene_aliases, turn_aliases = self._strict_payload(batch)
+        strict_prompt = STRICT_PROMPT + (
+            f" Return at most {self.config.models.semantic_max_facts_per_scene} highest-routing-value facts per scene.")
+        response, _ = self._call(memory_id, "scene_semantic", strict_prompt, payload, len(batch))
+        rows = self._strict_rows(response, scene_aliases, turn_aliases)
+        by_scene = {str(row.get("i")): row for row in rows}
+        missing = [scene for scene in batch if scene.scene_id not in by_scene]
+        if missing and self.config.models.semantic_max_retries:
+            for scene in missing:
+                retry_payload, retry_scenes, retry_turns = self._strict_payload((scene,))
+                repaired, _ = self._call(
+                    memory_id, "scene_semantic_retry", strict_prompt, retry_payload, 1,
+                    max_tokens=self.config.models.semantic_retry_output_tokens, retry_count=1)
+                for row in self._strict_rows(repaired, retry_scenes, retry_turns):
+                    by_scene[str(row.get("i"))] = row
+        result = []
+        for scene in batch:
+            row = by_scene.get(scene.scene_id)
+            result.append(self._validate_scene(scene, row) if row else self._fallback(scene))
+        return result
+
+    @staticmethod
+    def _strict_payload(batch: Sequence[Any]) -> tuple[Mapping[str, Any], Mapping[str, str], Mapping[str, str]]:
+        scene_aliases: dict[str, str] = {}
+        turn_aliases: dict[str, str] = {}
+        rows = []
+        for scene_index, scene in enumerate(batch):
+            scene_alias = f"s{scene_index}"; scene_aliases[scene_alias] = scene.scene_id
+            turns = []
+            for turn_index, turn in enumerate(scene.turns):
+                alias = f"s{scene_index}t{turn_index}"; turn_aliases[alias] = turn.turn_id
+                turns.append({"i": alias, "s": turn.speaker, "d": turn.timestamp, "t": turn.raw_text})
+            rows.append({"i": scene_alias, "r": turns})
+        return {"s": rows}, scene_aliases, turn_aliases
+
+    def _strict_rows(self, response: Mapping[str, Any], scene_aliases: Mapping[str, str],
+                     turn_aliases: Mapping[str, str]) -> list[Mapping[str, Any]]:
+        if str(response.get("finish_reason", "")).casefold() == "length":
+            return []
+        objects = self._parse_objects(str(response.get("content", "")))
+        root = objects[0] if objects else {}
+        rows = root.get("s", ()) if isinstance(root, dict) else ()
+        result = []
+        for source in rows if isinstance(rows, list) else ():
+            if not isinstance(source, dict):
+                continue
+            alias = str(source.get("i"))
+            if alias not in scene_aliases and alias in turn_aliases:
+                alias = alias.split("t", 1)[0]
+            if alias not in scene_aliases:
+                continue
+            row = dict(source); row["i"] = scene_aliases[alias]
+            facts = []
+            for source_fact in source.get("f", ()) if isinstance(source.get("f"), list) else ():
+                if not isinstance(source_fact, dict):
+                    continue
+                fact = dict(source_fact); refs = []
+                quote = " ".join(str(source_fact.get("q", "")).split())
+                for alias in source_fact.get("r", ()) if isinstance(source_fact.get("r"), list) else ():
+                    turn_id = turn_aliases.get(str(alias))
+                    if not turn_id:
+                        continue
+                    refs.append({"i": turn_id, "q": quote})
+                fact["e"] = refs; facts.append(fact)
+            row["f"] = facts; result.append(row)
+        return result
+
     def _validate_scene(self, scene: Any, row: Mapping[str, Any]) -> ScenePacket:
         turns = {turn.turn_id: turn for turn in scene.turns}
         facts = []
@@ -154,9 +258,18 @@ class QwenSemanticDistiller:
             for ref in item.get("e", item.get("evidence", ())):
                 try:
                     turn = turns[str(ref.get("i", ref.get("turn_id")))]
-                    start, end = int(ref.get("a", ref.get("start"))), int(ref.get("b", ref.get("end")))
-                except (KeyError, TypeError, ValueError):
+                except (KeyError, TypeError):
                     continue
+                quote = " ".join(str(ref.get("q", "")).split())
+                if quote:
+                    start = turn.raw_text.casefold().find(quote.casefold())
+                    end = start + len(quote) if start >= 0 else -1
+                else:
+                    try:
+                        start = int(ref.get("a", ref.get("start")))
+                        end = int(ref.get("b", ref.get("end")))
+                    except (TypeError, ValueError):
+                        continue
                 if 0 <= start < end <= len(turn.raw_text):
                     evidence.append((turn.turn_id, start, end))
             owner = str(item.get("o", item.get("owner", ""))).strip()
@@ -170,18 +283,42 @@ class QwenSemanticDistiller:
                             evidence.append((turn.turn_id, start, start + len(value))); break
                 if not evidence or not owner or not predicate or not value:
                     continue
+            cited_turns = [turns[turn_id] for turn_id, _, _ in evidence]
+            if owner.casefold() in {"user", "assistant", "speaker", "questioner"} and cited_turns:
+                owner = cited_turns[0].speaker
+            scope = str(item.get("g", item.get("scope", "scene"))).strip()
+            if re.fullmatch(r"s?\d+t\d+|t\d+", scope.casefold()):
+                scope = "scene"
+            raw_time = str(item.get("t", item.get("time"))).strip() \
+                if item.get("t", item.get("time")) else None
+            if raw_time and (len(raw_time.split()) > 12 or not EXPLICIT_TIME_RE.search(raw_time)
+                    or not any(raw_time.casefold() in turn.raw_text.casefold()
+                               for turn in cited_turns)):
+                raw_time = None
             facts.append(SemanticFact(owner, predicate, value,
                                       str(item.get("y", item.get("value_type", "unknown"))),
-                                      str(item.get("g", item.get("scope", "scene"))),
+                                      scope,
                                       str(item.get("n", item.get("polarity", "positive"))),
-                                      str(item.get("t", item.get("time"))) if item.get("t", item.get("time")) else None,
+                                      raw_time,
                                       min(1.0, max(0.0, float(item.get("c", item.get("confidence", 0.5))))), tuple(evidence)))
         summary = " ".join(str(row.get("m", row.get("summary", ""))).split()[
             :self.config.models.semantic_summary_tokens])
+        if self.config.models.semantic_compile_summary:
+            summary = self._compiled_summary(facts)
         if not summary:
             summary = " ".join(scene.summary.split()[:96])
         return ScenePacket(scene.scene_id, summary, tuple(facts),
                            self._strings(row.get("u", row.get("unresolved"))), False)
+
+    @staticmethod
+    def _compiled_summary(facts: Sequence[SemanticFact]) -> str:
+        parts = []
+        for fact in facts:
+            text = f"{fact.owner} {fact.predicate} {fact.value}"
+            if fact.time:
+                text += f" {fact.time}"
+            parts.extend(text.split())
+        return " ".join(parts[:48])
 
     def _scene_prompt(self) -> str:
         if (self.config.models.semantic_max_facts_per_scene == 12
@@ -198,7 +335,8 @@ class QwenSemanticDistiller:
         return ScenePacket(scene.scene_id, " ".join(scene.summary.split()[:96]), (), ("llm_parse_fallback",), True)
 
     def _call(self, memory_id: str, stage: str, system: str, payload: Any,
-              batch_size: int, max_tokens: int | None = None) -> tuple[Mapping[str, Any], Mapping[str, int]]:
+              batch_size: int, max_tokens: int | None = None,
+              retry_count: int = 0) -> tuple[Mapping[str, Any], Mapping[str, int]]:
         serialized = canonical_json(payload)
         semantic_settings = {
             "schema": self.config.schema_version, "model": self.config.models.llm_model,
@@ -207,6 +345,13 @@ class QwenSemanticDistiller:
             "scene_input": self.config.models.semantic_scene_input_tokens,
             "batch_output": self.config.models.semantic_batch_output_tokens,
         }
+        if self.config.models.semantic_extraction_mode != "legacy_batch":
+            semantic_settings.update({
+                "extraction_mode": self.config.models.semantic_extraction_mode,
+                "max_retries": self.config.models.semantic_max_retries,
+                "retry_output": self.config.models.semantic_retry_output_tokens,
+                "compile_summary": self.config.models.semantic_compile_summary,
+            })
         if (self.config.models.semantic_max_facts_per_scene,
                 self.config.models.semantic_summary_tokens,
                 self.config.models.semantic_repair_output_tokens,
@@ -227,7 +372,11 @@ class QwenSemanticDistiller:
             {"role": "system", "content": system}, {"role": "user", "content": serialized}],
             "temperature": 0, "max_tokens": max_tokens or self.config.models.semantic_batch_output_tokens,
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
-        if self.config.models.semantic_constrained_json:
+        if self.config.models.semantic_extraction_mode != "legacy_batch":
+            request["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": "graphmem_scene_facts", "strict": True,
+                "schema": strict_scene_schema(batch_size, self.config.models.semantic_max_facts_per_scene)}}
+        elif self.config.models.semantic_constrained_json:
             request["response_format"] = {"type": "json_object"}
         cached = self.store.cache_get(key); started = time.perf_counter()
         if cached:
@@ -240,7 +389,9 @@ class QwenSemanticDistiller:
             result = self.client.chat.completions.create(**request); message = result.choices[0].message
             if getattr(message, "reasoning_content", None):
                 raise RuntimeError("semantic distillation returned reasoning content")
-            response = {"content": message.content or "", "model": getattr(result, "model", "")}
+            choice = result.choices[0]
+            response = {"content": message.content or "", "model": getattr(result, "model", ""),
+                        "finish_reason": getattr(choice, "finish_reason", None)}
             raw = getattr(result, "usage", None); prompt = int(getattr(raw, "prompt_tokens", 0) or 0)
             output = int(getattr(raw, "completion_tokens", 0) or 0)
             usage = {"cached_input_tokens": 0, "uncached_input_tokens": prompt,
@@ -251,7 +402,7 @@ class QwenSemanticDistiller:
         self.store.log_llm_call(call_id=stable_id("llm-call", memory_id, key, is_cached, occurrence),
             memory_id=memory_id, stage=stage, cache_key=key, cached=is_cached, request=request,
             response=response, usage=usage, latency_ms=(time.perf_counter()-started)*1000,
-            retry_count=0, batch_size=batch_size, prompt_hash=self.prompt_hash)
+            retry_count=retry_count, batch_size=batch_size, prompt_hash=self.prompt_hash)
         return response, usage
 
     @staticmethod

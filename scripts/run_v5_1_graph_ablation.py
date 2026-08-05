@@ -5,12 +5,13 @@ import argparse
 import json
 import shutil
 import sqlite3
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from graphmem.build import GraphBuildPipeline, QwenSemanticDistiller
+from graphmem.build import GraphBuildPipeline, PredicateCanonicalizer, QwenSemanticDistiller
 from graphmem.config import config_hash, load_config
 from graphmem.domain import RelationType, dataclass_dict
 from graphmem.embedding import QwenEmbeddingIndex
@@ -25,12 +26,45 @@ def diagnostic_metric(question, result, store):
     predicted = {(turns[item].session_id, turns[item].turn_index) for item in result.candidate_turn_ids if item in turns}
     gold = {(item.session_id, item.turn_index) for item in question.gold_turns}
     sessions = set(result.candidate_session_ids); gold_sessions = set(question.gold_sessions)
+    nodes = {node.node_id: node for node in store.nodes(question.memory_id)}
+    adjacency = {}
+    for edge in store.edges(question.memory_id):
+        adjacency.setdefault(edge.src_id, []).append(edge.dst_id)
+        adjacency.setdefault(edge.dst_id, []).append(edge.src_id)
+    distance = {node_id: 0 for node_id in result.seed_node_ids}; queue = deque(result.seed_node_ids)
+    while queue:
+        node_id = queue.popleft()
+        if distance[node_id] >= 2:
+            continue
+        for neighbor in adjacency.get(node_id, ()):
+            if neighbor not in distance:
+                distance[neighbor] = distance[node_id] + 1; queue.append(neighbor)
+    gold_distance = {}
+    terminal_turn_ids = set()
+    for node_id, node in nodes.items():
+        if node.attributes.get("provenance_scope", "terminal") != "terminal":
+            continue
+        for group_id in node.all_evidence_group_ids:
+            group = store.evidence_group(group_id)
+            if not group:
+                continue
+            for member in group.members:
+                terminal_turn_ids.add(member.turn_id)
+                turn = turns.get(member.turn_id)
+                key = (turn.session_id, turn.turn_index) if turn else None
+                if key in gold and node_id in distance:
+                    gold_distance[key] = min(gold_distance.get(key, 99), distance[node_id])
     return {"question_id": question.question_id, "stratum": question.stratum, "mode": result.mode,
             "session_all_hit": gold_sessions <= sessions,
             "session_recall": len(sessions & gold_sessions) / max(1, len(gold_sessions)),
             "turn_all_hit": gold <= predicted, "turn_recall": len(gold & predicted) / max(1, len(gold)),
             "visited_nodes": len(result.visited_node_ids), "visited_edges": len(result.proof),
-            "candidate_turns": len(result.candidate_turn_ids), "relation_counts": result.relation_counts}
+            "candidate_turns": len(result.candidate_turn_ids), "relation_counts": result.relation_counts,
+            "terminal_reachable_all_hit": gold <= set(gold_distance),
+            "terminal_reachable_recall": len(set(gold_distance) & gold) / max(1, len(gold)),
+            "gold_turn_shortest_path": (sum(gold_distance.values()) / len(gold_distance)
+                                          if gold_distance else None),
+            "abstract_provenance_leakage": len(set(result.candidate_turn_ids) - terminal_turn_ids)}
 
 
 def main() -> None:
@@ -44,6 +78,8 @@ def main() -> None:
     parser.add_argument("--memory-workers", type=int, default=1,
                         help="Build independent per-memory SQLite shards concurrently")
     parser.add_argument("--e-graph-variant", choices=("g0", "g1", "g2", "g3", "g4"), default="g3")
+    parser.add_argument("--f-extraction-mode", choices=("strict_single", "strict_pair"),
+                        default="strict_single")
     parser.add_argument("--stratum", choices=("lme_multi_session", "lme_temporal",
                                                "locomo_multihop", "locomo_temporal"))
     parser.add_argument("--per-stratum", type=int)
@@ -99,6 +135,33 @@ def main() -> None:
                            llm_hierarchy_compression=extraction_variant != "e4"),
             coarsen=replace(base.coarsen, cross_session_merge=args.e_graph_variant == "g4"),
             edges=replace(base.edges, graph_variant=args.e_graph_variant))
+    f0_models = replace(base.models, semantic_batch_scenes=2, semantic_batch_output_tokens=768,
+        semantic_max_facts_per_scene=4, semantic_summary_tokens=32,
+        semantic_repair_output_tokens=256, semantic_constrained_json=True,
+        semantic_individual_repair=True)
+    strict_single = replace(base.models, semantic_extraction_mode="strict_single",
+        semantic_batch_scenes=1, semantic_batch_output_tokens=768,
+        semantic_max_facts_per_scene=2, semantic_summary_tokens=48,
+        semantic_max_retries=1, semantic_retry_output_tokens=1024,
+        semantic_compile_summary=True)
+    strict_pair = replace(strict_single, semantic_extraction_mode="strict_pair",
+                          semantic_batch_scenes=2, semantic_batch_output_tokens=1024)
+    selected_strict = strict_single if args.f_extraction_mode == "strict_single" else strict_pair
+    definitions["f0"] = replace(base, profile="b5", models=f0_models,
+        scenes=replace(base.scenes, llm_semantic_extraction=True, llm_hierarchy_compression=False),
+        coarsen=replace(base.coarsen, cross_session_merge=False),
+        edges=replace(base.edges, graph_variant="g3"))
+    for label, models in (("f1", strict_single), ("f2", strict_pair)):
+        definitions[label] = replace(base, profile="b5", models=models,
+            scenes=replace(base.scenes, llm_semantic_extraction=True, llm_hierarchy_compression=False),
+            coarsen=replace(base.coarsen, cross_session_merge=False),
+            edges=replace(base.edges, graph_variant="g3"))
+    for label, temporal, portals in (("f3", False, False), ("f4", True, False), ("f5", True, True)):
+        definitions[label] = replace(base, profile="b5", models=selected_strict,
+            scenes=replace(base.scenes, llm_semantic_extraction=True, llm_hierarchy_compression=False),
+            coarsen=replace(base.coarsen, cross_session_merge=False),
+            edges=replace(base.edges, graph_variant="g5", temporal_normalization=temporal,
+                          cross_session_portals=portals))
     summary = {}; metric_rows = []; diagnostic_rows = []; trace_rows = []; manifests = []
     for label in (item.strip() for item in args.profiles.split(",") if item.strip()):
         profile = definitions[label]; distiller = QwenSemanticDistiller(store, profile, "v5.1-holdout") \
@@ -115,9 +178,12 @@ def main() -> None:
             worker_distiller = QwenSemanticDistiller(
                 worker_store, profile, "v5.1-holdout"
             ) if profile.scenes.llm_semantic_extraction else None
+            predicate_canonicalizer = (PredicateCanonicalizer(worker_store, profile)
+                                       if profile.edges.graph_variant == "g5" else None)
             try:
                 manifest = GraphBuildPipeline(
-                    worker_store, dataset_hash="v5.1-holdout", distiller=worker_distiller
+                    worker_store, dataset_hash="v5.1-holdout", distiller=worker_distiller,
+                    predicate_canonicalizer=predicate_canonicalizer,
                 ).build(memory_id, profile)
             finally:
                 worker_store.close()
@@ -168,9 +234,12 @@ def main() -> None:
             trace_rows.append({"configuration": label, "question_id": question.question_id,
                                "mode": "oracle_seed", **dataclass_dict(oracle)})
             if label in {"c2", "c3", "c4", "g0", "g1", "g2", "g3", "g4",
-                         "e0", "e1", "e2", "e3", "e4"}:
+                         "e0", "e1", "e2", "e3", "e4", "f0", "f1", "f2", "f3", "f4", "f5"}:
                 for relation in (RelationType.SHARED_VALUE, RelationType.SAME_ACTIVITY,
-                                 RelationType.HAS_FACT, RelationType.FACT_VALUE):
+                                 RelationType.HAS_FACT, RelationType.FACT_VALUE,
+                                 RelationType.SCENE_CONTAINS, RelationType.AT_TIME,
+                                 RelationType.STATE_NEXT, RelationType.TEMPORAL_BEFORE,
+                                 RelationType.COLLECTION_CO_MEMBER, RelationType.PORTAL):
                     result = probe.run(question.memory_id, question.query, profile.query_budget,
                                        mode="relation_only", excluded_relations=(relation,))
                     row = diagnostic_metric(question, result, store); row.update(
@@ -189,7 +258,8 @@ def main() -> None:
             rows = connection.execute(
                 "SELECT DISTINCT c.cache_key,c.stage,k.usage_json FROM llm_calls c "
                 "JOIN llm_cache k ON k.cache_key=c.cache_key WHERE c.stage IN "
-                "('scene_semantic','scene_semantic_repair','hierarchy_l1','hierarchy_l2','hierarchy_l3')"
+                "('scene_semantic','scene_semantic_retry','scene_semantic_repair',"
+                "'hierarchy_l1','hierarchy_l2','hierarchy_l3')"
             ).fetchall()
             connection.close()
             for cache_key, stage, usage_json in rows:
@@ -204,6 +274,11 @@ def main() -> None:
                 for row in rows.values()) for stage, rows in sorted(stage_tokens.items())},
             "reasoning_tokens": max(cold_reasoning,
                 sum(int(x.get("reasoning_tokens", 0)) for x in usage)),
+            "extraction_retry_rate": sum(int(item.build_diagnostics.get("extraction_retry_calls", 0))
+                for item in current) / max(1, sum(int(item.build_diagnostics.get("extraction_scenes", 0))
+                for item in current)),
+            "terminal_turn_coverage": sum(float(item.build_diagnostics.get("terminal_turn_coverage", 0))
+                for item in current) / max(1, len(current)),
             "config_hash": config_hash(profile)}
     (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     (root / "graph_manifest.json").write_text(json.dumps(manifests, indent=2) + "\n")
