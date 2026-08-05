@@ -91,6 +91,7 @@ class QuerySlots:
     possessive: bool = False
     expects_multiple: bool = False
     indirect: bool = False
+    temporal_key: object | None = None
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -174,6 +175,12 @@ def parse_slots(query: str) -> QuerySlots:
     from ..build.temporal import extract_time_expression
 
     temporal_phrase = extract_time_expression(query) or ""
+    temporal_key = None
+    if temporal_phrase:
+        from ..build.temporal import normalize_time
+        from ..domain import TemporalKey
+        temporal_key = TemporalKey.from_attribute(
+            normalize_time(temporal_phrase, None, "query"))
     possessive = "'s" in lowered or "'" in lowered
 
     if is_count and is_existence:
@@ -189,5 +196,6 @@ def parse_slots(query: str) -> QuerySlots:
         negation=negation, is_count=is_count, is_existence=is_existence,
         is_duration=is_duration, is_latest=is_latest, is_list=is_list,
         possessive=possessive, expects_multiple=expects_multiple, indirect=indirect,
+        temporal_key=temporal_key,
         warnings=tuple(warnings),
     )

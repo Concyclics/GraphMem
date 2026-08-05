@@ -25,7 +25,7 @@ from ..runtime import SQLiteSnapshotRuntime
 from ..storage import SQLiteGraphStore
 from ..tokenization import TokenCounter, resolve_token_counter
 from .algebra import evaluate as evaluate_algebra
-from .bindings import bind_facts
+from .bindings import bind_facts, bind_facts_discriminant
 from .certificate import evaluate_certificate
 from .packer import build_proof_units, pack as pack_proof_units
 from .query_ir import compile_query
@@ -122,6 +122,7 @@ class GraphNavigator:
         harness_profile: HarnessProfile | str | None = None,
         token_counter: TokenCounter | None = None,
         fact_channels: Sequence[str] | None = None,
+        binding_discriminant: bool = False,
     ) -> None:
         self.store = store
         self.runtime = SQLiteSnapshotRuntime(store)
@@ -135,6 +136,10 @@ class GraphNavigator:
         self.token_counter = token_counter or resolve_token_counter(DEFAULT_BACKBONE_MODEL)
         # Channel set for the fact reservoir, so F0-F5 can be ablated.
         self.fact_channels = tuple(fact_channels) if fact_channels is not None else FACT_CHANNELS
+        # PR4b is measured but not yet promoted: on the fixed 200 it halves
+        # binding coverage because operand owners are junk or unresolved, so it
+        # stays opt-in until the owner resolution it depends on is fixed.
+        self.binding_discriminant = binding_discriminant
         self._turn_group_cache: dict[str, dict[str, tuple[str, ...]]] = {}
 
     def _turn_tokens(self, turn: SourceTurn) -> int:
@@ -363,12 +368,27 @@ class GraphNavigator:
         paths: dict[str, tuple[str, ...]] = {}
         for step in schedule.proof:
             paths.setdefault(step.dst_id, (step.edge_id,))
-        bindings = bind_facts(view, owners, ir.operands, fact_ids, paths)
+        binding_reasons: dict[str, int] = {}
+        if fact_reservoir_enabled and self.binding_discriminant:
+            # A wide fact pool scored by the permissive V5.5 rule would
+            # manufacture bindings, so H9 uses the dimension-based discriminant:
+            # hard conflicts veto, and an ownerless operand needs corroboration.
+            projected = {row.fact_id: bool(row.source_rank) for row in fact_reservoir.entries}
+            bindings, binding_reasons = bind_facts_discriminant(
+                view, owners, ir.operands, fact_ids, paths,
+                query_terms=content_terms(query), source_projected=projected,
+                temporal_constraint=(ir.slots.temporal_key if ir.slots is not None else None))
+        else:
+            bindings = bind_facts(view, owners, ir.operands, fact_ids, paths)
         collection_ops = {"union_distinct", "intersection_distinct", "group_by_owner", "count_distinct"}
         if str(ir.operator) in collection_ops and any(item.predicate_candidates for item in ir.operands):
             # Owner equality alone is insufficient proof for a list/count.  It
             # previously made every fact spoken by an owner mandatory and
-            # crowded out lossless terminal rescue evidence.
+            # crowded out lossless terminal rescue evidence.  Measured: removing
+            # this blunt threshold doubles binding coverage (10% -> 20%) but
+            # costs 4pp of strict all-hit, because the extra bindings are
+            # low-precision and crowd the pack.  It stays until the discriminant
+            # can replace it with something better than a single float.
             bindings = tuple(item for item in bindings if item.confidence >= 0.70)
         manifests = [view.nodes[item] for item in fact_ids if item in view.nodes and view.nodes[item].node_type in {
             NodeType.COLLECTION_SCOPE, NodeType.COLLECTION_MANIFEST
@@ -507,7 +527,8 @@ class GraphNavigator:
                    "ast_obligations": [f"{item.kind}:{item.operand_id or 'root'}"
                                        for item in ir.ast_obligations],
                    "parse_warnings": list(ir.parse_warnings),
-                   "fact_reservoir": dict(fact_reservoir.stats) if fact_reservoir else {}},
+                   "fact_reservoir": dict(fact_reservoir.stats) if fact_reservoir else {},
+                   "binding_reasons": binding_reasons},
             seed_node_ids=semantic_seeds, visited_path_node_ids=tuple(dict.fromkeys(
                 (*schedule.visited_node_ids, *direct_owner_terminals))),
             slot_coverage={item.operand_id: tuple(row.binding_id for row in bindings if row.operand_id == item.operand_id)

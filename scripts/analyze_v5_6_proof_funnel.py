@@ -156,6 +156,8 @@ def main() -> None:
     parser.add_argument("--profiles", default="h6,h8")
     parser.add_argument("--embedding", action="store_true")
     parser.add_argument("--max-questions", type=int)
+    parser.add_argument("--fact-channels",
+                        help="comma-separated fact reservoir channels (F0-F5 ablation)")
     args = parser.parse_args()
 
     store = SQLiteGraphStore(args.source_db, read_only=True)
@@ -172,8 +174,10 @@ def main() -> None:
     for label in (item.strip() for item in args.profiles.split(",") if item.strip()):
         profile = HarnessProfile(label)
         budget = replace(config.query_budget, max_evidence_turns=32)
+        channels = (tuple(item.strip() for item in args.fact_channels.split(",") if item.strip())
+                    if args.fact_channels is not None else None)
         navigator = GraphNavigator(store, dense_search=embedding.search if embedding else None,
-                                   harness_profile=profile)
+                                   harness_profile=profile, fact_channels=channels)
         rows = []
         for index, question in enumerate(questions, 1):
             result = navigator.navigate(question.memory_id, question.query, budget)

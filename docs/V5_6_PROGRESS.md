@@ -336,3 +336,95 @@ figure is held down by the graph, not by retrieval.
 
 Next: PR4b (binding discriminant), which is now the sole thing standing between
 reached facts and proof units.
+
+### F-channel ablation
+
+Conditional on a CanonicalFact existing, full 200:
+
+| run | channels | reservoir recall | active recall |
+| --- | --- | ---: | ---: |
+| F0 | h8, no fact reservoir | — | 42.8% |
+| **F1** | **source projection only** | **84.4%** | **71.1%** |
+| F2 | + composite postings | 86.5% | 70.2% |
+| F3 | + routing postings | 86.5% | 70.2% |
+| F4 | + fact lexical | 89.0% | 73.1% |
+
+Reverse projection alone delivers 84.4 of the final 89.0 points. Structured and
+routing postings add ~2pp; the lexical index adds 2.5pp. This is the expected
+shape: source turns are already 100% reachable, so projecting back through
+their evidence groups is the channel that matters, and it does not depend on
+the query compiler having guessed the right predicate.
+
+---
+
+## PR4b — binding discriminant: measured, **not promoted**
+
+Two changes were implemented, measured, and both made the system worse. They
+are kept behind `GraphNavigator(binding_discriminant=...)`, off by default.
+
+### Attempt 1: dimension-based discriminant with hard vetoes
+
+`BindingEvidence` decomposes the decision into owner / predicate / scope /
+value_type / temporal / polarity / modality / session / source_projection /
+graph_path, with conflicts vetoing and an ownerless operand needing two
+independent signals.
+
+Result: binding coverage **halved**, 10.0% → 5.0%. P(bind | reached) 28.6% → 14.3%.
+
+The telemetry says why, and it is not the scoring function:
+
+| reason | per question |
+| --- | ---: |
+| candidate facts | 115.6 |
+| rejected: insufficient signals | 25.9 |
+| **veto: owner conflict** | **19.5** |
+| accepted | 2.8 |
+| **matched: owner** | **0.0** |
+
+`matched:owner` never fires. Sampling the compiler's owner resolution against
+the gold facts' owners:
+
+- 5 of 8 questions resolve **no** owner at all — LongMemEval questions are
+  first-person ("I", "my") while the graph's owner entities are speaker names;
+- the 3 that do resolve produce **`'have'` and `'how'`** — the graph contains
+  `CanonicalEntity` nodes minted from common words, and `_query_owners` matches
+  any alias appearing in the question;
+- **0 of 8** have the gold fact's owner among the operand's owners.
+
+So owner is not a usable veto today, and treating it as one deletes correct
+bindings. Demoting it to a soft signal did not recover the loss, because the
+blocker then moves to `insufficient_signals`.
+
+### Attempt 2: drop the blunt 0.70 collection threshold
+
+The V5.5 filter `confidence >= 0.70` is, given the {0.55, 0.73, 0.90} score
+lattice, just "at least one predicate term overlapped". Removing it for h9
+**doubled binding coverage, 10% → 20%** — and cost 4 points of strict all-hit:
+
+| | strict | candidate | paired vs H0 |
+| --- | ---: | ---: | --- |
+| h9 with the filter | .485 | 1.000 | −0.020 [−0.075, +0.040] |
+| h9 without it | **.445** | 1.000 | **−0.060 [−0.120, 0.000]** |
+
+That is the first configuration measurably worse than H0. The extra bindings
+are low precision: they become proof units, become mandatory turns, and crowd
+gold out of the pack. This is exactly the failure mode of judging a wide
+reservoir by recall alone, so the filter is restored.
+
+### What this establishes
+
+The binding bottleneck is **not** the scoring function. It is that operand
+owners and fact owners systematically disagree, for two separable reasons:
+
+1. **Owner resolution is broken upstream.** First-person questions resolve
+   nothing, and `owner_alias_index` is polluted by entities minted from common
+   words. Both are query-compiler / graph-quality problems, and neither can be
+   fixed by reweighting a binding score.
+2. **Precision has to be measured alongside recall.** Every attempt that raised
+   binding coverage lowered strict all-hit. Until proof units are atomic and
+   answer-member-driven (PR7b), extra bindings are actively harmful.
+
+Recommended order change: **owner resolution (alias hygiene + first-person
+binding to the memory's user entity) should precede any further binding work.**
+It is cheap, it is measurable on its own, and every downstream stage is
+currently starved by it.
