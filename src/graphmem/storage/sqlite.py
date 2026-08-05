@@ -34,11 +34,12 @@ class SQLiteGraphStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(self.path, check_same_thread=False)
+        self._connection = sqlite3.connect(self.path, check_same_thread=False, timeout=60.0)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._connection.execute("PRAGMA synchronous=NORMAL")
+        self._connection.execute("PRAGMA busy_timeout=60000")
         self._migrate()
 
     def close(self) -> None:
@@ -291,6 +292,107 @@ class SQLiteGraphStore:
                 db.executemany("DELETE FROM source_turns_fts WHERE turn_id=?", [(x,) for x in turn_ids])
             except sqlite3.OperationalError:
                 pass
+
+    def prepare_memory_shard(self, shard_path: str | Path, memory_id: str) -> None:
+        """Create/resume a self-contained raw/cache shard for one memory."""
+        shard_path = Path(shard_path)
+        shard = SQLiteGraphStore(shard_path)
+        shard.close()
+        alias = "graphmem_memory_shard"
+        with self._lock:
+            self._connection.execute(f"ATTACH DATABASE ? AS {alias}", (str(shard_path),))
+            try:
+                with self.transaction() as db:
+                    db.execute(
+                        f"INSERT OR REPLACE INTO {alias}.conversations "
+                        "SELECT * FROM main.conversations WHERE memory_id=?", (memory_id,)
+                    )
+                    db.execute(
+                        f"INSERT OR REPLACE INTO {alias}.sessions "
+                        "SELECT * FROM main.sessions WHERE memory_id=?", (memory_id,)
+                    )
+                    db.execute(
+                        f"INSERT OR REPLACE INTO {alias}.source_turns "
+                        "SELECT * FROM main.source_turns WHERE memory_id=?", (memory_id,)
+                    )
+                    db.execute(
+                        f"INSERT OR IGNORE INTO {alias}.llm_cache "
+                        "SELECT cache.* FROM main.llm_cache AS cache WHERE cache.cache_key IN ("
+                        "SELECT DISTINCT cache_key FROM main.llm_calls WHERE memory_id=?)",
+                        (memory_id,),
+                    )
+            finally:
+                self._connection.execute(f"DETACH DATABASE {alias}")
+
+    def merge_memory_shard(self, shard_path: str | Path, memory_id: str) -> int:
+        """Atomically merge one completed memory graph and its LLM ledger."""
+        alias = "graphmem_memory_shard"
+        with self._lock:
+            self._connection.execute(f"ATTACH DATABASE ? AS {alias}", (str(Path(shard_path)),))
+            try:
+                with self.transaction() as db:
+                    shard_memory = db.execute(
+                        f"SELECT memory_id FROM {alias}.conversations"
+                    ).fetchall()
+                    if [str(row[0]) for row in shard_memory] != [memory_id]:
+                        raise ValueError("memory shard must contain exactly the requested memory")
+                    shard_version = db.execute(
+                        f"SELECT graph_checksum FROM {alias}.graph_versions WHERE memory_id=?",
+                        (memory_id,),
+                    ).fetchone()
+                    if not shard_version:
+                        raise ValueError("memory shard has no completed graph")
+                    previous = db.execute(
+                        "SELECT graph_version FROM main.graph_versions WHERE memory_id=?", (memory_id,)
+                    ).fetchone()
+                    version = int(previous[0]) + 1 if previous else 1
+                    old_groups = [row[0] for row in db.execute(
+                        "SELECT evidence_group_id FROM main.evidence_groups WHERE memory_id=?", (memory_id,)
+                    )]
+                    db.execute("DELETE FROM main.graph_nodes WHERE memory_id=?", (memory_id,))
+                    db.execute("DELETE FROM main.graph_edges WHERE memory_id=?", (memory_id,))
+                    db.executemany("DELETE FROM main.evidence_groups WHERE evidence_group_id=?",
+                                   [(item,) for item in old_groups])
+                    db.execute(
+                        f"INSERT INTO main.evidence_groups SELECT * FROM {alias}.evidence_groups "
+                        "WHERE memory_id=?", (memory_id,)
+                    )
+                    db.execute(
+                        f"INSERT INTO main.evidence_members SELECT member.* FROM {alias}.evidence_members member "
+                        f"JOIN {alias}.evidence_groups evidence USING(evidence_group_id) WHERE evidence.memory_id=?",
+                        (memory_id,),
+                    )
+                    db.execute(
+                        f"INSERT INTO main.graph_nodes SELECT * FROM {alias}.graph_nodes WHERE memory_id=?",
+                        (memory_id,),
+                    )
+                    db.execute(
+                        f"INSERT INTO main.graph_edges SELECT * FROM {alias}.graph_edges WHERE memory_id=?",
+                        (memory_id,),
+                    )
+                    db.execute(
+                        f"INSERT OR REPLACE INTO main.llm_cache SELECT cache.* FROM {alias}.llm_cache cache "
+                        f"WHERE cache.cache_key IN (SELECT cache_key FROM {alias}.llm_calls WHERE memory_id=?)",
+                        (memory_id,),
+                    )
+                    db.execute(
+                        f"INSERT OR REPLACE INTO main.llm_calls SELECT * FROM {alias}.llm_calls WHERE memory_id=?",
+                        (memory_id,),
+                    )
+                    checksum = str(shard_version[0])
+                    db.execute(
+                        "INSERT INTO main.graph_versions(memory_id,graph_version,graph_checksum) VALUES(?,?,?) "
+                        "ON CONFLICT(memory_id) DO UPDATE SET graph_version=excluded.graph_version,"
+                        "graph_checksum=excluded.graph_checksum,updated_at=CURRENT_TIMESTAMP",
+                        (memory_id, version, checksum),
+                    )
+                    db.execute(
+                        "INSERT INTO main.outbox(memory_id,graph_version,event_type,payload_json) VALUES(?,?,?,?)",
+                        (memory_id, version, "merge_memory_shard", canonical_json({"checksum": checksum})),
+                    )
+                return version
+            finally:
+                self._connection.execute(f"DETACH DATABASE {alias}")
 
     def replace_graph(
         self,

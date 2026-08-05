@@ -96,11 +96,49 @@ The new graph is **not promoted**. Current evidence shows:
 - the token gate is missed by a wide margin and the full development/validation
   gates have not run.
 
-The next authorized experiment should run C0-C4 on the frozen development
-split using four scenes per batch, then select at most two configurations for a
-single validation run. Until those results pass the declared relation-only,
-edge-precision and token gates, V5 C0 remains authoritative and Neo4j should
-not receive a V5.1 projection.
+## Full 200-question hard-set confirmation
+
+The frozen C0 baseline and C3/C4 semantic graphs were compared on all 200 hard
+questions (50 per stratum). C3 and C4 were identical, so cross-session merge as
+currently implemented adds no measurable navigation behavior.
+
+| Profile | Equal-stratum turn all-hit | LME multi-session | LME temporal | LoCoMo Cat1 | LoCoMo Cat2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| C0 | 51.5% | 68% | 80% | 4% | 54% |
+| C3 | 48.0% | 62% | 76% | 2% | 52% |
+| C4 | 48.0% | 62% | 76% | 2% | 52% |
+
+The comparison is paired: 193 questions were unchanged and seven regressed;
+no question changed from miss to all-hit. At the same time C3/C4 achieved 100%
+candidate all-hit and 100% graph-reachable recall in every stratum. The graph
+therefore contains and reaches the gold evidence, but N5 does not preserve it
+through scoring and packing.
+
+Relation-only traversal reached 93% all-hit versus 40% for seed-only and 88%
+for degree-preserving shuffled edges. Typed relations carry a real but modest
+five-point advantage over graph connectivity alone. Removing `FACT_VALUE`
+increased relation-only all-hit from 93.0% to 95.5%; removing `SAME_ACTIVITY`
+increased it to 94.0%; removing `SHARED_VALUE` had no effect. These relations
+should not receive positive ranking credit without stronger selectivity.
+
+The full build used 34,492,165 uncached backbone tokens, or 313,565 per memory:
+22,810,454 scene extraction, 6,607,421 repair, and 5,074,290 hierarchy
+compression. There were 1,707 repair calls after 4,599 scene calls (37.1%).
+The result misses both the quality and token gates and is not promoted.
+
+For the full run, construction was changed to one SQLite shard per memory.
+Each shard contains only that memory's raw rows, graph, LLM cache and ledger;
+eight shards run concurrently and merge atomically into the run authority.
+At 128 in-flight requests, TP2 generation throughput reached roughly 3,629
+tokens/s. Shards remain available for per-memory audit and restart.
+
+The next experiment should stay on the frozen development split and first
+preserve relation-derived gold candidates through a relation-aware packer.
+Separately, it should cap per-scene facts/output and replace broad repair with
+missing-scene-only extraction. `FACT_VALUE`, `SAME_ACTIVITY` and
+`SHARED_VALUE` should default to neutral ranking credit until precision gates
+pass. Until those changes pass the declared quality and token gates, V5 C0
+remains authoritative and Neo4j should not receive a V5.1 projection.
 
 ## Artifact paths
 
@@ -111,3 +149,7 @@ not receive a V5.1 projection.
   `/ssd3/chenhan/Spark_MemGraph_Dev/artifacts/v5_1/v5_1_graph_ablation_development_20260805T024950Z`
 - Four-stratum C0-C4 engineering probe:
   `/ssd3/chenhan/Spark_MemGraph_Dev/artifacts/v5_1/v5_1_graph_ablation_development_20260805T030512Z`
+- Full 200-question C0 baseline:
+  `/ssd3/chenhan/Spark_MemGraph_Dev/artifacts/v5_1/v5_1_graph_ablation_full_20260805T035454Z`
+- Full 200-question C3/C4 run with per-memory SQLite shards:
+  `/ssd3/chenhan/Spark_MemGraph_Dev/artifacts/v5_1/v5_1_graph_ablation_full_20260805T040219Z`

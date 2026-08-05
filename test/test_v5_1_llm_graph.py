@@ -9,6 +9,7 @@ from graphmem.build import GraphBuildPipeline, QwenSemanticDistiller
 from graphmem.config import GraphMemV5Config
 from graphmem.domain import NodeType, QueryBudget, RelationType
 from graphmem.retrieval import GraphDiagnosticProbe
+from graphmem.storage import SQLiteGraphStore
 
 from test_v5_gate_b_core import _store
 
@@ -89,3 +90,25 @@ def test_relation_probe_is_bounded_deterministic_and_supports_ablation(tmp_path:
     assert len(relation.proof) <= budget.max_visited_edges
     assert shuffled_a == shuffled_b
     assert all(step.relation != RelationType.SHARED_VALUE for step in without.proof)
+
+
+def test_per_memory_sqlite_shard_is_isolated_and_merges_atomically(tmp_path: Path) -> None:
+    authority = _store(tmp_path / "authority.sqlite")
+    shard_path = tmp_path / "shards" / "travel.sqlite"
+    authority.prepare_memory_shard(shard_path, "travel")
+    shard = SQLiteGraphStore(shard_path)
+    assert shard.conversation("travel") is not None
+    assert {row.memory_id for row in shard.turns("travel")} == {"travel"}
+    completions = FakeCompletions(); config = _semantic_config()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    GraphBuildPipeline(shard, dataset_hash="dataset",
+        distiller=QwenSemanticDistiller(shard, config, "dataset", client=client)).build("travel", config)
+    checksum = shard.graph_checksum("travel"); shard.close()
+
+    version = authority.merge_memory_shard(shard_path, "travel")
+    assert version == authority.graph_version("travel")
+    assert authority.graph_checksum("travel") == checksum
+    assert any(node.node_type == NodeType.CANONICAL_FACT for node in authority.nodes("travel"))
+    assert authority._connection.execute(
+        "SELECT count(*) FROM llm_calls WHERE memory_id='travel'"
+    ).fetchone()[0] > 0

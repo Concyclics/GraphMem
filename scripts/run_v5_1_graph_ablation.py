@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,8 @@ def main() -> None:
     parser.add_argument("--split", choices=("development", "validation", "final", "full"), default="development")
     parser.add_argument("--profiles", default="c0,c1,c2,c3,c4"); parser.add_argument("--embedding", action="store_true")
     parser.add_argument("--max-questions", type=int)
+    parser.add_argument("--memory-workers", type=int, default=1,
+                        help="Build independent per-memory SQLite shards concurrently")
     parser.add_argument("--stratum", choices=("lme_multi_session", "lme_temporal",
                                                "locomo_multihop", "locomo_temporal"))
     parser.add_argument("--per-stratum", type=int)
@@ -71,8 +74,35 @@ def main() -> None:
     for label in (item.strip() for item in args.profiles.split(",") if item.strip()):
         profile = definitions[label]; distiller = QwenSemanticDistiller(store, profile, "v5.1-holdout") \
             if profile.scenes.llm_semantic_extraction else None
-        builder = GraphBuildPipeline(store, dataset_hash="v5.1-holdout", distiller=distiller)
-        current = [builder.build(memory_id, profile) for memory_id in memory_ids]
+        if args.memory_workers < 1:
+            raise ValueError("--memory-workers must be positive")
+
+        def build_one(memory_id: str):
+            shard_dir = root / "memory_shards" / label
+            shard_dir.mkdir(parents=True, exist_ok=True)
+            shard_path = shard_dir / (memory_id.replace(":", "_").replace("/", "_") + ".sqlite")
+            store.prepare_memory_shard(shard_path, memory_id)
+            worker_store = SQLiteGraphStore(shard_path)
+            worker_distiller = QwenSemanticDistiller(
+                worker_store, profile, "v5.1-holdout"
+            ) if profile.scenes.llm_semantic_extraction else None
+            try:
+                manifest = GraphBuildPipeline(
+                    worker_store, dataset_hash="v5.1-holdout", distiller=worker_distiller
+                ).build(memory_id, profile)
+            finally:
+                worker_store.close()
+            merged_version = store.merge_memory_shard(shard_path, memory_id)
+            return replace(manifest, graph_version=merged_version)
+
+        current = []
+        workers = min(args.memory_workers, len(memory_ids))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(build_one, memory_id): memory_id for memory_id in memory_ids}
+            for completed, future in enumerate(as_completed(futures), 1):
+                current.append(future.result())
+                print(f"[{label}] built {completed}/{len(memory_ids)} memories", flush=True)
+        current.sort(key=lambda item: item.memory_id)
         manifests.extend({"configuration": label, **dataclass_dict(item)} for item in current)
         navigator = GraphNavigator(store, variant=NavigatorVariant.N5_SET_COVER,
                                    dense_search=embedding.search if embedding else None)
