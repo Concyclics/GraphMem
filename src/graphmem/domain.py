@@ -552,6 +552,9 @@ class QueryBudget:
     max_query_views_per_operand: int = 6
     max_answer_tokens: int = 10000
     max_answer_tokens_hard: int = 13000
+    # The fact reservoir is id-only and wide; only this many facts reach binding.
+    max_active_facts: int = 96
+    max_active_facts_per_operand: int = 32
 
     def __post_init__(self) -> None:
         for name, value in asdict(self).items():
@@ -799,6 +802,7 @@ class NavigationResult:
     # Diagnostics only: which facts actually bound, and which the algebra kept.
     # Without these the proof funnel cannot tell "no fact existed" apart from
     # "a fact existed but nothing bound to it".
+    reservoir_fact_node_ids: tuple[str, ...] = ()
     reached_fact_node_ids: tuple[str, ...] = ()
     bound_fact_node_ids: tuple[str, ...] = ()
     selected_fact_node_ids: tuple[str, ...] = ()

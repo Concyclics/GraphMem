@@ -38,7 +38,8 @@ from graphmem.tokenization import resolve_token_counter
 
 BACKBONE = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
 STAGES = ("gold_in_reservoir", "gold_in_candidates", "gold_has_evidence_group",
-          "gold_has_canonical_fact", "gold_fact_reached", "gold_has_operand_binding",
+          "gold_has_canonical_fact", "gold_fact_in_reservoir", "gold_fact_reached",
+          "gold_has_operand_binding",
           "gold_selected_by_algebra", "gold_in_proof_unit", "gold_packed")
 
 
@@ -82,6 +83,7 @@ def funnel_row(store, question, result, budget, counter) -> dict:
     turn_facts = _turn_to_facts(store, question.memory_id, turn_groups)
 
     reservoir = {row.turn_id for row in result.candidate_scores}
+    reservoir_facts = set(result.reservoir_fact_node_ids)
     reached_facts = set(result.reached_fact_node_ids)
     bound_facts = set(result.bound_fact_node_ids)
     selected_facts = set(result.selected_fact_node_ids)
@@ -99,6 +101,8 @@ def funnel_row(store, question, result, budget, counter) -> dict:
         "gold_has_canonical_fact": {t for t in gold if turn_facts.get(t)},
         # Separating these two says whether the fix is node retrieval or the
         # binding discriminant: a fact that was never reached cannot bind.
+        # Reservoir vs active separates a channel gap from a quota gap.
+        "gold_fact_in_reservoir": {t for t in gold if turn_facts.get(t, set()) & reservoir_facts},
         "gold_fact_reached": {t for t in gold if turn_facts.get(t, set()) & reached_facts},
         "gold_has_operand_binding": {t for t in gold if turn_facts.get(t, set()) & bound_facts},
         "gold_selected_by_algebra": {t for t in gold if turn_facts.get(t, set()) & selected_facts},
@@ -121,6 +125,10 @@ def funnel_row(store, question, result, budget, counter) -> dict:
         "gold_turns": len(gold),
         "gold_tokens": gold_tokens,
         "budget_oracle_fits": budget_oracle,
+        "cond_reservoir_recall": (len(stages["gold_fact_in_reservoir"]) / len(stages["gold_has_canonical_fact"])
+                                  if stages["gold_has_canonical_fact"] else None),
+        "cond_active_recall": (len(stages["gold_fact_reached"]) / len(stages["gold_has_canonical_fact"])
+                               if stages["gold_has_canonical_fact"] else None),
         "binding_oracle_all_hit": binding_oracle,
         "operator": str(result.trace.get("query_operator", "")),
         "operator_ast": str(result.trace.get("operator_ast", "")),
@@ -189,6 +197,9 @@ def main() -> None:
                 "budget_oracle_fits": sum(row["budget_oracle_fits"] for row in rows) / len(rows),
                 "binding_oracle_all_hit": sum(row["binding_oracle_all_hit"] for row in rows) / len(rows),
                 "ast_diverges": sum(row["ast_diverges"] for row in rows) / len(rows),
+                **{key: (sum(row[key] for row in rows if row[key] is not None)
+                         / max(1, sum(1 for row in rows if row[key] is not None)))
+                   for key in ("cond_reservoir_recall", "cond_active_recall")},
                 "questions": len(rows),
             },
             "by_stratum": by_stratum,

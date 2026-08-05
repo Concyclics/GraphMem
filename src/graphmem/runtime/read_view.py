@@ -86,6 +86,14 @@ class GraphReadView:
         self.routing_child_postings: dict[str, list[str]] = defaultdict(list)
         self.collection_index: dict[str, list[str]] = defaultdict(list)
         self.manifest_value_index: dict[str, list[str]] = defaultdict(list)
+        # Reverse provenance: which facts cite a given evidence group.  Source
+        # turns are already fully reachable, so projecting back through their
+        # groups finds facts that no owner/predicate posting would return.
+        self.evidence_group_fact_index: dict[str, list[str]] = defaultdict(list)
+        # A compact searchable surface per fact, so a fact can be found
+        # lexically without giving every fact its own embedding.
+        self.fact_term_index: dict[str, list[str]] = defaultdict(list)
+        self.fact_owner_predicate_index: dict[tuple[str, str], list[str]] = defaultdict(list)
         for node in self.nodes.values():
             attrs = node.attributes
             if node.node_type == NodeType.CANONICAL_ENTITY:
@@ -106,6 +114,16 @@ class GraphReadView:
                 session = str(attrs.get("session_id", ""))
                 if session and owner and predicate:
                     self.session_fact_index[(session, owner, predicate)].append(node.node_id)
+                if owner and predicate:
+                    self.fact_owner_predicate_index[(owner, predicate)].append(node.node_id)
+                for group_id in node.all_evidence_group_ids:
+                    self.evidence_group_fact_index[group_id].append(node.node_id)
+                surface = " ".join((
+                    node.summary, predicate, str(attrs.get("value", "")), scope, collection,
+                    str(attrs.get("value_type", "")), str(attrs.get("modality", "")),
+                ))
+                for term in content_terms(surface):
+                    self.fact_term_index[term].append(node.node_id)
             elif node.node_type in {NodeType.COLLECTION_SCOPE, NodeType.COLLECTION_MANIFEST}:
                 key = normalize_key(str(attrs.get("collection_key", "")))
                 if key: self.collection_index[key].append(node.node_id)
@@ -123,7 +141,8 @@ class GraphReadView:
             "fact_owner_predicate_scope_index", "owner_fact_index", "predicate_fact_index",
             "scope_fact_index", "value_fact_index", "collection_fact_index", "session_fact_index",
             "routing_child_postings", "collection_index",
-            "manifest_value_index",
+            "manifest_value_index", "evidence_group_fact_index", "fact_term_index",
+            "fact_owner_predicate_index",
         ):
             value = getattr(self, name)
             setattr(self, name, {key: tuple(sorted(set(rows))) for key, rows in value.items()})
@@ -222,6 +241,45 @@ class GraphReadView:
 
     def collection_facts(self, collection_key: str, *, limit: int = 64) -> tuple[str, ...]:
         return self.collection_fact_index.get(normalize_key(collection_key), ())[:limit]
+
+    def facts_for_evidence_groups(self, group_ids: Sequence[str], *,
+                                  limit: int = 256) -> tuple[str, ...]:
+        """Facts whose provenance cites any of these evidence groups."""
+        rows: list[str] = []
+        for group_id in group_ids:
+            rows.extend(self.evidence_group_fact_index.get(group_id, ()))
+        return tuple(dict.fromkeys(rows))[:limit]
+
+    def facts_for_terms(self, query_terms: frozenset[str], *, limit: int = 64) -> tuple[str, ...]:
+        """Facts ranked by how much of their searchable surface the query hits."""
+        if not query_terms:
+            return ()
+        hits: dict[str, int] = {}
+        for term in query_terms:
+            for node_id in self.fact_term_index.get(term, ()):
+                hits[node_id] = hits.get(node_id, 0) + 1
+        ranked = sorted(hits.items(), key=lambda row: (-row[1], row[0]))
+        return tuple(node_id for node_id, _ in ranked[:limit])
+
+    def facts_for_owner_predicate(self, owner_ids: Sequence[str], predicates: Sequence[str], *,
+                                  limit: int = 128) -> tuple[str, ...]:
+        """Composite (owner, predicate) postings, with token-containment widening.
+
+        A predicate candidate is often a stem ("travel") while the fact keeps a
+        phrase ("travel to"), so exact key equality alone under-retrieves.
+        """
+        predicate_keys = [normalize_key(item) for item in predicates if normalize_key(item)]
+        rows: list[str] = []
+        for owner in owner_ids:
+            for (indexed_owner, indexed_predicate), fact_ids in self.fact_owner_predicate_index.items():
+                if indexed_owner != owner:
+                    continue
+                indexed_terms = set(content_terms(indexed_predicate))
+                if not predicate_keys or any(
+                        set(content_terms(item)) <= indexed_terms or indexed_terms <= set(content_terms(item))
+                        for item in predicate_keys):
+                    rows.extend(fact_ids)
+        return tuple(dict.fromkeys(rows))[:limit]
 
     def terminal_groups_for_nodes(self, node_ids: Sequence[str]) -> tuple[str, ...]:
         return self.evidence_group_ids_for_nodes(node_ids, terminal_only=True)

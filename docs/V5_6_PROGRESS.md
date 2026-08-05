@@ -265,3 +265,74 @@ graph?": **eventually yes**. No retrieval change can lift proof-based strict
 all-hit above 68.5% on this graph, because on 31.5% of questions at least one
 gold turn has no fact citing it. That is now a measurement rather than a guess,
 and it sizes Track B precisely.
+
+---
+
+## PR4a (h9) — semantic fact reservoir
+
+The reservoir principle from PR1, applied one level up: a wide id-only pool of
+CanonicalFacts, then a bounded active shortlist that is what actually enters
+binding, scheduling and algebra. Widening alone would only move the noise
+downstream, so the two layers are separate and separately measured.
+
+Channels, per operand: **reverse projection** (turn → evidence group → citing
+facts), composite owner/predicate postings, RoutingCard child postings, and a
+fact lexical index over a compact per-fact surface. Dense fact retrieval is
+behind an ablation flag and off by default. Nothing hydrates source text.
+
+### Reachability moved; the end metric did not
+
+Measured with the funnel (20-question probe, conditional on a CanonicalFact
+existing so the 68.5% graph ceiling does not mask the retrieval question):
+
+| | h8 | h9 |
+| --- | ---: | ---: |
+| gold fact **in reservoir** \| fact exists | — | **90.3%** |
+| gold fact **in active shortlist** \| fact exists | 40.0% | **75.9%** |
+| gold_fact_reached (unconditional) | 16.7% | 35.0% |
+| gold_has_operand_binding | 8.3% | **10.0%** |
+
+Full 200, strict / candidate:
+
+| Stratum | H0 | H6 | H8 | **H9** |
+| --- | ---: | ---: | ---: | ---: |
+| LongMemEval multi-session | .580 / 1.000 | .700 / .780 | .560 / 1.000 | .520 / 1.000 |
+| LongMemEval temporal | .780 / .960 | .800 / .860 | .780 / 1.000 | .740 / 1.000 |
+| LoCoMo Cat1 | .060 / .600 | .140 / .160 | .080 / 1.000 | **.100** / 1.000 |
+| LoCoMo Cat2 | .600 / .960 | .580 / .600 | .560 / 1.000 | .580 / 1.000 |
+| **All 200** | .505 / .880 | .555 / .600 | .495 / 1.000 | **.485** / 1.000 |
+
+Paired vs H0: h8 −0.010 [−0.055, +0.030], h9 −0.020 [−0.075, +0.040]. h9 and h8
+are indistinguishable on strict; the source-turn reservoir stays at 100%
+candidate all-hit with 0 regressions.
+
+### Why the gain is invisible, and what it implies
+
+`gold_has_operand_binding` moved only 8.3% → 10.0%. Facts are now reached but
+still do not bind, so they produce no proof units, so strict all-hit cannot
+move. **PR4a's payoff is gated behind PR4b**, exactly the dependency the funnel
+predicted, and it is the reason strict is flat rather than up.
+
+The one place it already shows is LoCoMo Cat1 (.080 → .100), the stratum whose
+facts were least reachable.
+
+### Gates: partially met
+
+| gate | target | actual |
+| --- | ---: | ---: |
+| source-turn reservoir candidate all-hit | 100% | **100%** ✅ |
+| conditional gold-fact reservoir recall | ≥95% | 90.3% ⚠️ |
+| conditional gold-fact active recall | 75–85% | 75.9% ✅ (low end) |
+| overall reached-fact all-hit | 55–60% | 35% ❌ |
+| no historical profile regression | — | h0/h6/h8 unchanged ✅ |
+| mean active facts | ≤96 | ~32 ✅ |
+| reservoir hydrates raw text | 0 | 0 ✅ |
+
+The overall reached-fact target is not met, but it is bounded above by the
+68.5% existence ceiling: 35% unconditional against a 55% ceiling on that probe
+is 75.9% conditional. The honest reading is that the reservoir is close to
+target and the shortlist is at the low end of target, while the unconditional
+figure is held down by the graph, not by retrieval.
+
+Next: PR4b (binding discriminant), which is now the sole thing standing between
+reached facts and proof units.

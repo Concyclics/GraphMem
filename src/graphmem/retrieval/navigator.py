@@ -30,6 +30,8 @@ from .certificate import evaluate_certificate
 from .packer import build_proof_units, pack as pack_proof_units
 from .query_ir import compile_query
 from .scheduler import ScheduleResult, execute as schedule_relations
+from .facts import (CHANNELS as FACT_CHANNELS, build_fact_reservoir,
+                    select_active_facts, turn_group_index)
 from .seeding import seed_operands
 
 
@@ -69,6 +71,9 @@ class HarnessProfile(StrEnum):
     # reservoir, H9 the operator algebra.  They are added in dependency order,
     # which is why H8 lands before H7.
     H8_RESERVOIR = "h8"
+    # PR4a: the reservoir principle applied to CanonicalFacts.  The proof funnel
+    # showed the fact exists on 68.5% of questions but is reached on 21.0%.
+    H9_FACT_RESERVOIR = "h9"
 
 
 VARIANT_RANK = {variant: index for index, variant in enumerate(NavigatorVariant)}
@@ -116,6 +121,7 @@ class GraphNavigator:
         dense_search: DenseSearch | None = None,
         harness_profile: HarnessProfile | str | None = None,
         token_counter: TokenCounter | None = None,
+        fact_channels: Sequence[str] | None = None,
     ) -> None:
         self.store = store
         self.runtime = SQLiteSnapshotRuntime(store)
@@ -127,9 +133,17 @@ class GraphNavigator:
         # fallback so a run without a local tokenizer still completes, but the
         # manifest then has to say the numbers are estimates.
         self.token_counter = token_counter or resolve_token_counter(DEFAULT_BACKBONE_MODEL)
+        # Channel set for the fact reservoir, so F0-F5 can be ablated.
+        self.fact_channels = tuple(fact_channels) if fact_channels is not None else FACT_CHANNELS
+        self._turn_group_cache: dict[str, dict[str, tuple[str, ...]]] = {}
 
     def _turn_tokens(self, turn: SourceTurn) -> int:
         return self.token_counter.count(turn.raw_text)
+
+    def _turn_groups(self, memory_id: str) -> dict[str, tuple[str, ...]]:
+        if memory_id not in self._turn_group_cache:
+            self._turn_group_cache = {memory_id: turn_group_index(self.store, memory_id)}
+        return self._turn_group_cache[memory_id]
 
     def navigate(self, memory_id: str, query: str, budget: QueryBudget) -> NavigationResult:
         if self.harness_profile in {None, HarnessProfile.H0_N5, HarnessProfile.H1_TELEMETRY}:
@@ -277,13 +291,16 @@ class GraphNavigator:
         profile = self.harness_profile
         use_postings = profile in {HarnessProfile.H2_POSTINGS, HarnessProfile.H3_MULTI_ANCHOR,
                                    HarnessProfile.H4_SCHEDULER, HarnessProfile.H5_ALGEBRA,
-                                   HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR}
+                                   HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
+                                   HarnessProfile.H9_FACT_RESERVOIR}
         use_rrf = profile in {HarnessProfile.H3_MULTI_ANCHOR, HarnessProfile.H4_SCHEDULER,
                               HarnessProfile.H5_ALGEBRA, HarnessProfile.H6_PROOF_PACKING,
-                              HarnessProfile.H8_RESERVOIR}
+                              HarnessProfile.H8_RESERVOIR, HarnessProfile.H9_FACT_RESERVOIR}
         # H7 is the first profile with the wide reservoir; H2-H6 keep the narrow
         # V5.5 seeding so the ablation ladder stays interpretable.
-        wide_reservoir = profile in {HarnessProfile.H8_RESERVOIR}
+        wide_reservoir = profile in {HarnessProfile.H8_RESERVOIR,
+                                     HarnessProfile.H9_FACT_RESERVOIR}
+        fact_reservoir_enabled = profile is HarnessProfile.H9_FACT_RESERVOIR
         tick = time.perf_counter()
         seeded = seed_operands(self.store, view, memory_id, ir, all_turns, dense_search=self.dense_search,
                                use_rrf=use_rrf, use_postings=use_postings,
@@ -298,7 +315,8 @@ class GraphNavigator:
         direct_owner_terminals = self._owner_terminal_postings(
             view, semantic_seeds, seeded.raw_scores, query
         ) if profile in {HarnessProfile.H4_SCHEDULER, HarnessProfile.H5_ALGEBRA,
-                         HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR} else ()
+                         HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
+                         HarnessProfile.H9_FACT_RESERVOIR} else ()
         owners = {
             operand.operand_id: set().union(*(set(view.owner_alias_index.get(alias.casefold(), ()))
                                                for alias in operand.owner_aliases))
@@ -310,7 +328,8 @@ class GraphNavigator:
         initial_certificate = evaluate_certificate(ir, initial_closure, no_progress=not initial_bindings)
         tick = time.perf_counter()
         if profile in {HarnessProfile.H5_ALGEBRA, HarnessProfile.H6_PROOF_PACKING,
-                       HarnessProfile.H8_RESERVOIR} and initial_certificate.complete:
+                       HarnessProfile.H8_RESERVOIR,
+                       HarnessProfile.H9_FACT_RESERVOIR} and initial_certificate.complete:
             schedule = ScheduleResult(semantic_seeds, (), {}, {
                 "node_cap_reached": False, "edge_cap_reached": False,
                 "hop_cap_reached": False, "frontier_truncated": False,
@@ -320,9 +339,27 @@ class GraphNavigator:
                                           structured=profile in {HarnessProfile.H4_SCHEDULER,
                                                                  HarnessProfile.H5_ALGEBRA,
                                                                  HarnessProfile.H6_PROOF_PACKING,
-                                                                 HarnessProfile.H8_RESERVOIR})
+                                                                 HarnessProfile.H8_RESERVOIR,
+                                                                 HarnessProfile.H9_FACT_RESERVOIR})
         stage_times["graph_read_view"] = (time.perf_counter() - tick) * 1000
         fact_ids = set(semantic_seeds) | set(schedule.visited_node_ids) | set(direct_owner_terminals)
+        fact_reservoir = None
+        if fact_reservoir_enabled:
+            # Facts the narrow path already reached are the precision core and are
+            # never displaced; the reservoir only adds rescues, and only the
+            # bounded active shortlist reaches binding.
+            tick = time.perf_counter()
+            core_facts = tuple(node_id for node_id in fact_ids if node_id in view.nodes
+                               and view.nodes[node_id].node_type == NodeType.CANONICAL_FACT)
+            fact_reservoir = select_active_facts(
+                build_fact_reservoir(view, ir, seeded, self._turn_groups(memory_id),
+                                     core_fact_ids=core_facts,
+                                     channels=self.fact_channels),
+                view, ir,
+                per_operand=budget.max_active_facts_per_operand,
+                total=budget.max_active_facts)
+            fact_ids |= set(fact_reservoir.active)
+            stage_times["fact_reservoir"] = (time.perf_counter() - tick) * 1000
         paths: dict[str, tuple[str, ...]] = {}
         for step in schedule.proof:
             paths.setdefault(step.dst_id, (step.edge_id,))
@@ -426,7 +463,8 @@ class GraphNavigator:
                                        mandatory=turn_id in mandatory,
                                        proof_unit_ids=tuple(unit.unit_id for unit in units if turn_id in unit.source_turn_ids)))
         rows.sort(key=lambda row: (-row.mandatory, -row.fused_score, row.turn_id))
-        if profile in {HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR}:
+        if profile in {HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
+                       HarnessProfile.H9_FACT_RESERVOIR}:
             packed, dropped, pack_exhaustion = pack_proof_units(units, rows, by_id,
                                                                  max_turns=budget.max_evidence_turns,
                                                                  max_tokens=budget.max_evidence_tokens,
@@ -468,7 +506,8 @@ class GraphNavigator:
                    "ast_operands": [item.operand_id for item in ir.ast_operands],
                    "ast_obligations": [f"{item.kind}:{item.operand_id or 'root'}"
                                        for item in ir.ast_obligations],
-                   "parse_warnings": list(ir.parse_warnings)},
+                   "parse_warnings": list(ir.parse_warnings),
+                   "fact_reservoir": dict(fact_reservoir.stats) if fact_reservoir else {}},
             seed_node_ids=semantic_seeds, visited_path_node_ids=tuple(dict.fromkeys(
                 (*schedule.visited_node_ids, *direct_owner_terminals))),
             slot_coverage={item.operand_id: tuple(row.binding_id for row in bindings if row.operand_id == item.operand_id)
@@ -478,6 +517,8 @@ class GraphNavigator:
             first_hit_relations={item.operand_id: (paths.get(item.fact_node_id, ("posting",))[0]) for item in bindings},
             search_exhaustion=schedule.exhaustion, pack_exhaustion=pack_exhaustion,
             operand_coverage=operand_coverage, proof_units=units, stop_reason=certificate.stop_reason,
+            reservoir_fact_node_ids=tuple(row.fact_id for row in fact_reservoir.entries)
+                                     if fact_reservoir else (),
             reached_fact_node_ids=tuple(sorted(
                 node_id for node_id in fact_ids
                 if node_id in view.nodes and view.nodes[node_id].node_type == NodeType.CANONICAL_FACT)),
