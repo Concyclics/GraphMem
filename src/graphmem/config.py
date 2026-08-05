@@ -36,6 +36,11 @@ class ModelConfig:
     refine_input_tokens_per_endpoint: int = 96
     refine_output_tokens: int = 256
     bridge_refine_output_tokens: int = 512
+    semantic_batch_scenes: int = 4
+    semantic_batch_input_tokens: int = 12000
+    semantic_scene_input_tokens: int = 16000
+    semantic_batch_output_tokens: int = 4096
+    semantic_average_tokens_per_memory: int = 180000
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +51,8 @@ class SceneConfig:
     max_events_per_scene: int = 3
     coreference_margin: float = 0.08
     refine_batch_size: int = 24
+    llm_semantic_extraction: bool = False
+    llm_hierarchy_compression: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +73,12 @@ class EdgeConfig:
     refine_mode: str = "ambiguous_only"
     refine_batch_size: int = 24
     max_refine_calls_per_1000_turns: int = 20
+    relation_degree_caps: Mapping[str, int] = field(default_factory=lambda: {
+        "same_event": 4, "same_activity": 8, "state_next": 4,
+        "state_transition": 4, "temporal_before": 8, "shared_entity": 32,
+        "shared_value": 32, "collection_co_member": 128,
+        "has_fact": 64, "fact_value": 64, "coreference": 32,
+    })
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +134,11 @@ class GraphMemV5Config:
             "refine_input_tokens_per_endpoint": self.models.refine_input_tokens_per_endpoint,
             "refine_output_tokens": self.models.refine_output_tokens,
             "bridge_refine_output_tokens": self.models.bridge_refine_output_tokens,
+            "semantic_batch_scenes": self.models.semantic_batch_scenes,
+            "semantic_batch_input_tokens": self.models.semantic_batch_input_tokens,
+            "semantic_scene_input_tokens": self.models.semantic_scene_input_tokens,
+            "semantic_batch_output_tokens": self.models.semantic_batch_output_tokens,
+            "semantic_average_tokens_per_memory": self.models.semantic_average_tokens_per_memory,
             "neo4j_batch_nodes": self.storage.neo4j_batch_nodes,
             "neo4j_batch_edges": self.storage.neo4j_batch_edges,
         }

@@ -144,7 +144,7 @@ class GraphNavigator:
 
         kind, required_slots, negative_required = question_slots(query)
         candidate_rows = self._candidate_rows(
-            candidate_ids, by_id, scores, query_terms, visited, view
+            candidate_ids, by_id, scores, query_terms, visited, view, proof
         )
         tick = time.perf_counter()
         if VARIANT_RANK[self.variant] >= VARIANT_RANK[NavigatorVariant.N5_SET_COVER]:
@@ -204,6 +204,12 @@ class GraphNavigator:
             packed_turn_ids=packed,
             dropped_turn_ids=dropped,
             stage_latency_ms=stage_times,
+            graph_only_candidate_turn_ids=tuple(row.turn_id for row in candidate_rows
+                                                if row.graph_score > 0 and not any((row.exact_score,
+                                                   row.bm25_score, row.dense_score))),
+            relation_trace=tuple(proof),
+            first_hit_relations={row.turn_id: row.relation_contributions[0]
+                                 for row in candidate_rows if row.relation_contributions},
         )
 
     def _raw_candidates(
@@ -303,12 +309,26 @@ class GraphNavigator:
         unique_proof = {step.edge_id: step for step in proof}
         return visited, list(unique_proof.values())[: budget.max_visited_edges], peak, exhausted
 
-    def _candidate_rows(self, candidate_ids, by_id, raw_scores, query_terms, visited, view):
+    def _candidate_rows(self, candidate_ids, by_id, raw_scores, query_terms, visited, view, proof=()):
         graph_turns: set[str] = set()
+        path_by_turn: dict[str, list[str]] = defaultdict(list)
+        relation_by_turn: dict[str, list[str]] = defaultdict(list)
+        proof_by_node = defaultdict(list)
+        for step in proof:
+            proof_by_node[step.dst_id].append(step)
         for group_id in view.evidence_group_ids_for_nodes(visited):
             group = self.store.evidence_group(group_id)
             if group:
                 graph_turns.update(member.turn_id for member in group.members)
+        for node_id in visited:
+            for group_id in view.evidence_group_ids_for_nodes((node_id,)):
+                group = self.store.evidence_group(group_id)
+                if not group:
+                    continue
+                for member in group.members:
+                    for step in proof_by_node.get(node_id, ()):
+                        path_by_turn[member.turn_id].append(step.edge_id)
+                        relation_by_turn[member.turn_id].append(str(step.relation))
         base_by_turn = {
             turn_id: channels.get("exact", 0.0) * 1.2 + channels.get("bm25", 0.0)
             + channels.get("dense", 0.0)
@@ -355,6 +375,8 @@ class GraphNavigator:
                 turn_id, turn.session_id, exact, bm25, dense, graph,
                 role_gain, slot_gain, estimate_tokens(turn.raw_text), fused, channels_used,
                 session_score, adjacency_score,
+                tuple(dict.fromkeys(path_by_turn.get(turn_id, ()))),
+                tuple(dict.fromkeys(relation_by_turn.get(turn_id, ()))),
             ))
         return sorted(rows, key=lambda row: (-row.fused_score, row.turn_id))
 

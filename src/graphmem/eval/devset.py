@@ -88,6 +88,30 @@ def calibration40(questions: Sequence[DevQuestion], seed: int = 42) -> list[DevQ
     return selected
 
 
+def conversation_holdout_split(questions: Sequence[DevQuestion], seed: int = 42) -> dict[str, list[DevQuestion]]:
+    """Leakage-resistant 6/2/2 LoCoMo and 30/10/10-per-stratum LME split."""
+    result = {"development": [], "validation": [], "final": []}
+    locomo = [row for row in questions if row.benchmark == "locomo"]
+    conversation_ids = sorted({row.memory_id for row in locomo}, key=lambda value:
+                              hashlib.sha256(f"{seed}:{value}".encode()).hexdigest())
+    assignment = {value: ("development" if index < 6 else "validation" if index < 8 else "final")
+                  for index, value in enumerate(conversation_ids)}
+    if len(conversation_ids) != 10:
+        raise ValueError("LoCoMo holdout protocol requires exactly 10 conversations")
+    for row in locomo:
+        result[assignment[row.memory_id]].append(row)
+    for stratum in ("lme_multi_session", "lme_temporal"):
+        rows = sorted((row for row in questions if row.stratum == stratum), key=lambda row:
+                      hashlib.sha256(f"{seed}:{row.question_id}".encode()).hexdigest())
+        if len(rows) != 50:
+            raise ValueError(f"LME holdout protocol requires 50 questions in {stratum}")
+        result["development"].extend(rows[:30]); result["validation"].extend(rows[30:40])
+        result["final"].extend(rows[40:])
+    for rows in result.values():
+        rows.sort(key=lambda row: (row.stratum, row.question_id))
+    return result
+
+
 def ingest_questions(store: SQLiteGraphStore, questions: Sequence[DevQuestion]) -> tuple[str, ...]:
     by_memory: dict[str, DevQuestion] = {}
     for question in questions:

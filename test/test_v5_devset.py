@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from graphmem.eval import calibration40, load_dev_questions, load_gold_turns
+from graphmem.eval import calibration40, conversation_holdout_split, load_dev_questions, load_gold_turns
 from graphmem.eval.devset import parse_locomo_evidence
 
 
@@ -34,3 +34,13 @@ def test_real_devset_has_four_equal_strata_and_stable_calibration() -> None:
     second = calibration40(list(reversed(questions)))
     assert [row.question_id for row in first] == [row.question_id for row in second]
     assert len(first) == len({row.question_id for row in first}) == 40
+
+    split = conversation_holdout_split(questions)
+    locomo_memories = {name: {row.memory_id for row in rows if row.benchmark == "locomo"}
+                       for name, rows in split.items()}
+    assert {name: len(ids) for name, ids in locomo_memories.items()} == {
+        "development": 6, "validation": 2, "final": 2}
+    assert not (locomo_memories["development"] & locomo_memories["validation"])
+    assert not (locomo_memories["development"] & locomo_memories["final"])
+    for name, expected in (("development", 60), ("validation", 20), ("final", 20)):
+        assert sum(row.benchmark == "longmemeval" for row in split[name]) == expected

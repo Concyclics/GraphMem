@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
+
+from graphmem.build import GraphBuildPipeline, QwenSemanticDistiller
+from graphmem.config import config_hash, load_config
+from graphmem.domain import RelationType, dataclass_dict
+from graphmem.embedding import QwenEmbeddingIndex
+from graphmem.eval import (aggregate_metrics, conversation_holdout_split, load_dev_questions,
+                           load_gold_turns, navigation_metrics)
+from graphmem.retrieval import GraphDiagnosticProbe, GraphNavigator, NavigatorVariant
+from graphmem.storage import SQLiteGraphStore
+
+
+def diagnostic_metric(question, result, store):
+    turns = {turn.turn_id: turn for turn in store.turns(question.memory_id)}
+    predicted = {(turns[item].session_id, turns[item].turn_index) for item in result.candidate_turn_ids if item in turns}
+    gold = {(item.session_id, item.turn_index) for item in question.gold_turns}
+    sessions = set(result.candidate_session_ids); gold_sessions = set(question.gold_sessions)
+    return {"question_id": question.question_id, "stratum": question.stratum, "mode": result.mode,
+            "session_all_hit": gold_sessions <= sessions,
+            "session_recall": len(sessions & gold_sessions) / max(1, len(gold_sessions)),
+            "turn_all_hit": gold <= predicted, "turn_recall": len(gold & predicted) / max(1, len(gold)),
+            "visited_nodes": len(result.visited_node_ids), "visited_edges": len(result.proof),
+            "candidate_turns": len(result.candidate_turn_ids), "relation_counts": result.relation_counts}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source-db", type=Path, required=True); parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--lme", type=Path, required=True); parser.add_argument("--locomo", type=Path, required=True)
+    parser.add_argument("--gold", type=Path, required=True); parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--split", choices=("development", "validation", "final", "full"), default="development")
+    parser.add_argument("--profiles", default="c0,c1,c2,c3,c4"); parser.add_argument("--embedding", action="store_true")
+    parser.add_argument("--max-questions", type=int)
+    parser.add_argument("--stratum", choices=("lme_multi_session", "lme_temporal",
+                                               "locomo_multihop", "locomo_temporal"))
+    parser.add_argument("--per-stratum", type=int)
+    args = parser.parse_args(); stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    root = args.output_root / f"v5_1_graph_ablation_{args.split}_{stamp}"; root.mkdir(parents=True)
+    db_path = root / "graphmem.sqlite"; shutil.copy2(args.source_db, db_path)
+    store = SQLiteGraphStore(db_path); base = load_config(args.config)
+    all_questions = load_dev_questions(args.lme, args.locomo, load_gold_turns(args.gold))
+    selected = all_questions if args.split == "full" else conversation_holdout_split(all_questions, base.random_seed)[args.split]
+    if args.stratum: selected = [row for row in selected if row.stratum == args.stratum]
+    if args.per_stratum:
+        selected = [row for name in ("lme_multi_session", "lme_temporal", "locomo_multihop", "locomo_temporal")
+                    for row in [next(iter([item for item in selected if item.stratum == name][index:index+1]), None)
+                                for index in range(args.per_stratum)] if row is not None]
+    if args.max_questions: selected = selected[:args.max_questions]
+    memory_ids = sorted({row.memory_id for row in selected}); embedding = QwenEmbeddingIndex(store, base) if args.embedding else None
+    definitions = {
+        "c0": replace(base, profile="b5", scenes=replace(base.scenes, llm_semantic_extraction=False,
+             llm_hierarchy_compression=False), coarsen=replace(base.coarsen, cross_session_merge=True)),
+        "c1": replace(base, profile="b1", scenes=replace(base.scenes, llm_semantic_extraction=True,
+             llm_hierarchy_compression=False), coarsen=replace(base.coarsen, cross_session_merge=False)),
+        "c2": replace(base, profile="b2", scenes=replace(base.scenes, llm_semantic_extraction=True,
+             llm_hierarchy_compression=False), coarsen=replace(base.coarsen, cross_session_merge=False)),
+        "c3": replace(base, profile="b5", scenes=replace(base.scenes, llm_semantic_extraction=True,
+             llm_hierarchy_compression=True), coarsen=replace(base.coarsen, cross_session_merge=False)),
+        "c4": replace(base, profile="b5", scenes=replace(base.scenes, llm_semantic_extraction=True,
+             llm_hierarchy_compression=True), coarsen=replace(base.coarsen, cross_session_merge=True)),
+    }
+    summary = {}; metric_rows = []; diagnostic_rows = []; trace_rows = []; manifests = []
+    for label in (item.strip() for item in args.profiles.split(",") if item.strip()):
+        profile = definitions[label]; distiller = QwenSemanticDistiller(store, profile, "v5.1-holdout") \
+            if profile.scenes.llm_semantic_extraction else None
+        builder = GraphBuildPipeline(store, dataset_hash="v5.1-holdout", distiller=distiller)
+        current = [builder.build(memory_id, profile) for memory_id in memory_ids]
+        manifests.extend({"configuration": label, **dataclass_dict(item)} for item in current)
+        navigator = GraphNavigator(store, variant=NavigatorVariant.N5_SET_COVER,
+                                   dense_search=embedding.search if embedding else None)
+        probe = GraphDiagnosticProbe(store); nav_metrics = []
+        for question in selected:
+            nav = navigator.navigate(question.memory_id, question.query, profile.query_budget)
+            metric = navigation_metrics(question, nav, store); metric["configuration"] = label
+            nav_metrics.append(metric); metric_rows.append(metric)
+            probe_results = {}
+            for mode in ("seed_only", "relation_only", "shuffled"):
+                result = probe.run(question.memory_id, question.query, profile.query_budget, mode=mode)
+                probe_results[mode] = result
+                row = diagnostic_metric(question, result, store); row["configuration"] = label
+                diagnostic_rows.append(row)
+                trace_rows.append({"configuration": label, "question_id": question.question_id,
+                                   **dataclass_dict(result)})
+            turns = list(store.turns(question.memory_id)); gold_keys = {
+                (item.session_id, item.turn_index) for item in question.gold_turns}
+            gold_turn_ids = {turn.turn_id for turn in turns if (turn.session_id, turn.turn_index) in gold_keys}
+            seed_ids = set(probe_results["seed_only"].candidate_turn_ids)
+            relation_ids = set(probe_results["relation_only"].candidate_turn_ids)
+            diagnostic_rows[-2]["graph_unique_gold_turn_recall"] = len(
+                (relation_ids - seed_ids) & gold_turn_ids) / max(1, len(gold_turn_ids))
+            oracle_nodes = []
+            for node in store.nodes(question.memory_id):
+                if node.node_type.value in {"routing_card", "virtual_region"}: continue
+                if any(member.turn_id in gold_turn_ids for group_id in node.all_evidence_group_ids
+                       for group in [store.evidence_group(group_id)] if group for member in group.members):
+                    oracle_nodes.append(node.node_id)
+            oracle = probe.run(question.memory_id, question.query, profile.query_budget,
+                               mode="relation_only", oracle_seed_ids=tuple(sorted(oracle_nodes)[:8]))
+            oracle_row = diagnostic_metric(question, oracle, store); oracle_row.update(
+                {"configuration": label, "mode": "oracle_seed"}); diagnostic_rows.append(oracle_row)
+            trace_rows.append({"configuration": label, "question_id": question.question_id,
+                               "mode": "oracle_seed", **dataclass_dict(oracle)})
+            if label in {"c2", "c3", "c4"}:
+                for relation in (RelationType.SHARED_VALUE, RelationType.SAME_ACTIVITY,
+                                 RelationType.HAS_FACT, RelationType.FACT_VALUE):
+                    result = probe.run(question.memory_id, question.query, profile.query_budget,
+                                       mode="relation_only", excluded_relations=(relation,))
+                    row = diagnostic_metric(question, result, store); row.update(
+                        {"configuration": label, "mode": "without:" + str(relation)})
+                    diagnostic_rows.append(row)
+        usage = [item.build_token_usage for item in current]
+        clean_tokens = 0; active_prompt_hash = distiller.prompt_hash if distiller else "disabled"
+        for memory_id in memory_ids:
+            row = store._connection.execute("SELECT COALESCE(sum(json_extract(usage_json,'$.uncached_input_tokens') + "
+                "json_extract(usage_json,'$.output_tokens')),0) FROM llm_calls WHERE memory_id=? AND cached=0 "
+                "AND prompt_hash=? AND stage IN ('scene_semantic','scene_semantic_repair','hierarchy_l1','hierarchy_l2','hierarchy_l3')",
+                (memory_id, active_prompt_hash)).fetchone()
+            clean_tokens += int(row[0])
+        summary[label] = {"navigation": aggregate_metrics(nav_metrics), "memories": len(current),
+            "average_uncached_backbone_tokens": clean_tokens / max(1, len(memory_ids)),
+            "reasoning_tokens": sum(int(x.get("reasoning_tokens", 0)) for x in usage),
+            "config_hash": config_hash(profile)}
+    (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    (root / "graph_manifest.json").write_text(json.dumps(manifests, indent=2) + "\n")
+    for name, rows in (("metrics.jsonl", metric_rows), ("relation_diagnostics.jsonl", diagnostic_rows),
+                       ("relation_traces.jsonl", trace_rows)):
+        with (root / name).open("w") as handle:
+            for row in rows: handle.write(json.dumps(row, sort_keys=True) + "\n")
+    store.close(); print(root)
+
+
+if __name__ == "__main__": main()

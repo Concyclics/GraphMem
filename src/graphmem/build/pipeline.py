@@ -5,7 +5,7 @@ import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from ..config import GraphMemV5Config, config_hash
 from ..domain import (
@@ -23,6 +23,7 @@ from ..domain import (
 )
 from ..storage import SQLiteGraphStore
 from .refine import Qwen30BRefiner, RefineCandidate
+from .semantic import QwenSemanticDistiller, ScenePacket
 
 
 WORD_RE = re.compile(r"[\w'-]+", re.UNICODE)
@@ -59,10 +60,12 @@ class _SceneSlice:
 
 class GraphBuildPipeline:
     def __init__(self, store: SQLiteGraphStore, *, dataset_hash: str,
-                 refiner: Qwen30BRefiner | None = None) -> None:
+                 refiner: Qwen30BRefiner | None = None,
+                 distiller: QwenSemanticDistiller | None = None) -> None:
         self.store = store
         self.dataset_hash = dataset_hash
         self.refiner = refiner
+        self.distiller = distiller
 
     def build(self, memory_id: str, profile: GraphMemV5Config) -> GraphArtifactManifest:
         started = time.perf_counter()
@@ -80,6 +83,9 @@ class GraphBuildPipeline:
         groups = [self._turn_group(turn) for turn in turns]
         group_by_turn = {group.members[0].turn_id: group for group in groups}
         scenes = self._segment(turns, profile)
+        packets = (self.distiller.extract(memory_id, scenes)
+                   if profile.scenes.llm_semantic_extraction and self.distiller else ())
+        packet_by_scene = {packet.scene_id: packet for packet in packets}
         nodes: list[GraphNode] = []
         edges: list[GraphEdge] = []
         scene_nodes: dict[str, GraphNode] = {}
@@ -87,27 +93,40 @@ class GraphBuildPipeline:
         entity_nodes: dict[str, GraphNode] = {}
 
         session_cards: dict[str, GraphNode] = {}
+        session_compressed = {}
+        if profile.scenes.llm_hierarchy_compression and self.distiller:
+            requests = []
+            request_sessions = []
+            for session in sessions:
+                children = [self._packet_record(packet_by_scene[scene.scene_id])
+                            for scene in scenes if scene.session_id == session.session_id
+                            and scene.scene_id in packet_by_scene]
+                if children:
+                    requests.append((stable_id("node", memory_id, "routing-card", 1, session.session_id),
+                                     children, 128)); request_sessions.append(session.session_id)
+            if requests:
+                session_compressed = dict(zip(request_sessions,
+                    self.distiller.compress_many(memory_id, 1, requests)))
         for session in sessions:
             session_turns = [turn for turn in turns if turn.session_id == session.session_id]
             evidence_ids = tuple(group_by_turn[turn.turn_id].evidence_group_id for turn in session_turns)
+            card_summary = self._bounded_summary(" ".join(turn.raw_text for turn in session_turns), 80)
+            card_attrs: dict[str, Any] = {"session_id": session.session_id, "roles": ("route",)}
+            if session.session_id in session_compressed:
+                compressed = session_compressed[session.session_id]
+                card_summary = str(compressed["summary"]); card_attrs.update(compressed)
             card = GraphNode(
                 node_id=stable_id("node", memory_id, "routing-card", 1, session.session_id),
                 memory_id=memory_id, node_type=NodeType.ROUTING_CARD, level=1,
-                summary=self._bounded_summary(" ".join(turn.raw_text for turn in session_turns), 80),
+                summary=card_summary,
                 evidence_group_id=evidence_ids[0], evidence_group_ids=evidence_ids[1:],
-                attributes={"session_id": session.session_id, "roles": ("route",)},
+                attributes=card_attrs,
             )
             session_cards[session.session_id] = card
             nodes.append(card)
 
         memory_evidence = tuple(group.evidence_group_id for group in groups)
-        memory_card = GraphNode(
-            stable_id("node", memory_id, "routing-card", 3), memory_id,
-            NodeType.ROUTING_CARD, 3,
-            self._bounded_summary(" ".join(card.summary for card in session_cards.values()), 160),
-            memory_evidence[0], memory_evidence[1:], attributes={"roles": ("route", "memory")},
-        )
-        nodes.append(memory_card)
+        memory_card_id = stable_id("node", memory_id, "routing-card", 3)
         l2_cards: list[GraphNode] = []
         if level >= 5:
             ordered_cards = list(session_cards.values())
@@ -116,24 +135,42 @@ class GraphBuildPipeline:
                 evidence_ids = tuple(dict.fromkeys(
                     group_id for child in children for group_id in child.all_evidence_group_ids
                 ))
+                l2_summary = self._bounded_summary(" ".join(child.summary for child in children), 120)
+                l2_attrs: dict[str, Any] = {
+                    "child_session_ids": tuple(child.attributes["session_id"] for child in children),
+                    "roles": ("route", "cross_session"),
+                }
+                l2_id = stable_id("node", memory_id, "routing-card", 2,
+                                  tuple(child.node_id for child in children))
+                if profile.scenes.llm_hierarchy_compression and self.distiller:
+                    compressed = self.distiller.compress(memory_id, 2, l2_id,
+                        [self._node_record(child) for child in children], 160)
+                    l2_summary = str(compressed["summary"]); l2_attrs.update(compressed)
                 l2_cards.append(GraphNode(
-                    stable_id("node", memory_id, "routing-card", 2,
-                              tuple(child.node_id for child in children)),
+                    l2_id,
                     memory_id, NodeType.ROUTING_CARD, 2,
-                    self._bounded_summary(" ".join(child.summary for child in children), 120),
+                    l2_summary,
                     evidence_ids[0], evidence_ids[1:],
-                    attributes={
-                        "child_session_ids": tuple(child.attributes["session_id"] for child in children),
-                        "roles": ("route", "cross_session"),
-                    },
+                    attributes=l2_attrs,
                 ))
             nodes.extend(l2_cards)
+        memory_children = l2_cards or list(session_cards.values())
+        memory_summary = self._bounded_summary(" ".join(card.summary for card in memory_children), 160)
+        memory_attrs: dict[str, Any] = {"roles": ("route", "memory")}
+        if profile.scenes.llm_hierarchy_compression and self.distiller:
+            compressed = self.distiller.compress(memory_id, 3, memory_card_id,
+                                                  [self._node_record(x) for x in memory_children], 192)
+            memory_summary = str(compressed["summary"]); memory_attrs.update(compressed)
+        memory_card = GraphNode(memory_card_id, memory_id, NodeType.ROUTING_CARD, 3,
+            memory_summary, memory_evidence[0], memory_evidence[1:], attributes=memory_attrs)
+        nodes.append(memory_card)
 
         if level >= 1:
             for scene in scenes:
                 evidence_ids = tuple(group_by_turn[turn.turn_id].evidence_group_id for turn in scene.turns)
                 scene_node = GraphNode(
-                    scene.scene_id, memory_id, NodeType.SCENE, 0, scene.summary,
+                    scene.scene_id, memory_id, NodeType.SCENE, 0,
+                    packet_by_scene.get(scene.scene_id, ScenePacket(scene.scene_id, scene.summary, (), ())).summary,
                     evidence_ids[0], evidence_ids[1:],
                     attributes={"session_id": scene.session_id, "turn_ids": tuple(x.turn_id for x in scene.turns),
                                 "roles": ("scene",)},
@@ -148,6 +185,12 @@ class GraphBuildPipeline:
             entity_nodes.update(self._entities(memory_id, scenes, event_nodes, group_by_turn))
             nodes.extend(entity_nodes.values())
             nodes.extend(self._time_and_state_nodes(memory_id, event_nodes))
+            if packets:
+                semantic_nodes, semantic_edges = self._semantic_graph(
+                    memory_id, packets, turns, group_by_turn, profile,
+                    (*session_cards.values(), *l2_cards, memory_card)
+                )
+                nodes.extend(semantic_nodes); edges.extend(semantic_edges)
 
         if level >= 3:
             edges.extend(self._hierarchy_edges(
@@ -177,7 +220,7 @@ class GraphBuildPipeline:
             refine_tokens = {key: usage_after[key] - usage_before[key] for key in usage_after}
 
         if level >= 5:
-            if profile.coarsen.cross_session_merge:
+            if profile.coarsen.cross_session_merge and not packets:
                 edges.extend(self._portal_edges(memory_id, session_cards, scene_nodes))
 
         nodes = self._dedup_nodes(nodes)
@@ -186,7 +229,8 @@ class GraphBuildPipeline:
         checksum = logical_graph_checksum(nodes, edges)
         artifact_id = stable_id("graph-artifact", memory_id, self.dataset_hash,
                                 config_hash(profile), checksum, version)
-        token_usage = dict(refine_tokens)
+        usage_after = self._usage(memory_id)
+        token_usage = {key: usage_after[key] - usage_before[key] for key in usage_after}
         token_usage.update({
             "truncated_candidates": len(truncated),
             "wall_time_ms": round((time.perf_counter() - started) * 1000),
@@ -198,7 +242,8 @@ class GraphBuildPipeline:
             edge_count=len(edges), evidence_group_count=len(groups),
             model_ids={"llm": profile.models.llm_model,
                        "embedding": profile.models.embedding_model},
-            prompt_hashes={"selective_refine": self.refiner.prompt_hash if self.refiner else "disabled"},
+            prompt_hashes={"selective_refine": self.refiner.prompt_hash if self.refiner else "disabled",
+                           "semantic_distill": self.distiller.prompt_hash if self.distiller else "disabled"},
             build_token_usage=token_usage,
         )
 
@@ -345,6 +390,97 @@ class GraphBuildPipeline:
                     ))
         return self._dedup_nodes(result)
 
+    def _semantic_graph(self, memory_id, packets, turns, group_by_turn, profile, hierarchy_cards=()):
+        turn_map = {turn.turn_id: turn for turn in turns}
+        nodes: dict[str, GraphNode] = {}
+        edges: list[GraphEdge] = []
+        facts: list[tuple[GraphNode, str, str, str]] = []
+        for packet in packets:
+            for fact in packet.facts:
+                refs = [ref for ref in fact.evidence if ref[0] in group_by_turn]
+                if not refs:
+                    continue
+                groups = tuple(dict.fromkeys(group_by_turn[turn_id].evidence_group_id
+                                             for turn_id, _, _ in refs))
+                owner_key = self._normal(fact.owner); predicate_key = self._normal(fact.predicate)
+                value_key = self._normal(fact.value); scope_key = self._normal(fact.scope)
+                owner_id = stable_id("node", memory_id, "semantic-owner", owner_key)
+                value_id = stable_id("node", memory_id, "canonical-value", fact.value_type, value_key)
+                fact_id = stable_id("node", memory_id, "canonical-fact", owner_key, predicate_key,
+                                    value_key, scope_key, fact.polarity)
+                nodes.setdefault(owner_id, GraphNode(owner_id, memory_id, NodeType.CANONICAL_ENTITY, 0,
+                    fact.owner, groups[0], groups[1:], entity_id=owner_id,
+                    attributes={"aliases": (fact.owner,), "roles": ("entity", "owner")}))
+                nodes.setdefault(value_id, GraphNode(value_id, memory_id, NodeType.CANONICAL_VALUE, 0,
+                    fact.value, groups[0], groups[1:], attributes={"value_type": fact.value_type,
+                    "normalized": value_key, "roles": ("value",)}))
+                fact_node = GraphNode(fact_id, memory_id, NodeType.CANONICAL_FACT, 0,
+                    f"{fact.owner} {fact.predicate} {fact.value}", groups[0], groups[1:],
+                    event_time=fact.time, confidence=fact.confidence,
+                    attributes={"owner_id": owner_id, "predicate": predicate_key, "value_id": value_id,
+                    "scope": scope_key, "polarity": fact.polarity, "scene_id": packet.scene_id,
+                    "roles": ("fact", "predicate", "object")})
+                nodes[fact_id] = fact_node; facts.append((fact_node, owner_id, value_id,
+                    turn_map[refs[0][0]].session_id))
+                edges.append(self._edge(memory_id, nodes[owner_id], RelationType.HAS_FACT, fact_node, "semantic"))
+                edges.append(self._edge(memory_id, fact_node, RelationType.FACT_VALUE, nodes[value_id], "semantic"))
+        by_value: dict[str, list[tuple[GraphNode, str]]] = defaultdict(list)
+        by_activity: dict[tuple[str, str], list[GraphNode]] = defaultdict(list)
+        for fact, owner_id, value_id, session_id in facts:
+            by_value[value_id].append((fact, session_id))
+            by_activity[(owner_id, str(fact.attributes["predicate"]))].append(fact)
+        if profile.coarsen.cross_session_merge:
+            for value_id, rows in by_value.items():
+                sessions = {session for _, session in rows}
+                if len(sessions) < 2:
+                    continue
+                evidence = tuple(dict.fromkeys(group for fact, _ in rows for group in fact.all_evidence_group_ids))
+                region_id = stable_id("node", memory_id, "virtual-region", value_id, tuple(sorted(sessions)))
+                region = GraphNode(region_id, memory_id, NodeType.VIRTUAL_REGION, 2,
+                    nodes[value_id].summary, evidence[0], evidence[1:],
+                    attributes={"value_id": value_id, "session_ids": tuple(sorted(sessions)),
+                                "roles": ("route", "cross_session", "value")})
+                nodes[region_id] = region
+                for fact, _ in rows:
+                    edges.append(self._edge(memory_id, region, RelationType.SHARED_VALUE, fact, "semantic"))
+        for rows in by_activity.values():
+            for left, right in zip(rows, rows[1:]):
+                edges.append(self._edge(memory_id, left, RelationType.SAME_ACTIVITY, right, "semantic"))
+        values_by_label = {self._normal(node.summary): node for node in nodes.values()
+                           if node.node_type == NodeType.CANONICAL_VALUE}
+        seen_aliases = set()
+        for card in hierarchy_cards:
+            for group in card.attributes.get("aliases", ()):
+                candidates = [values_by_label.get(self._normal(value)) for value in group]
+                candidates = [node for node in candidates if node]
+                for left, right in zip(candidates, candidates[1:]):
+                    key = tuple(sorted((left.node_id, right.node_id)))
+                    if key in seen_aliases: continue
+                    seen_aliases.add(key)
+                    edges.append(self._edge(memory_id, left, RelationType.COREFERENCE, right, "semantic_alias"))
+        return list(nodes.values()), edges
+
+    @staticmethod
+    def _normal(value):
+        return " ".join(re.findall(r"[\w'-]+", value.casefold()))
+
+    @staticmethod
+    def _packet_record(packet):
+        return {"child_id": packet.scene_id, "summary": " ".join(packet.summary.split()[:48]),
+                "owners": tuple(dict.fromkeys(fact.owner for fact in packet.facts)),
+                "predicates": tuple(dict.fromkeys(fact.predicate for fact in packet.facts)),
+                "values": tuple(dict.fromkeys(fact.value for fact in packet.facts)),
+                "scopes": tuple(dict.fromkeys(fact.scope for fact in packet.facts)),
+                "times": tuple(dict.fromkeys(fact.time for fact in packet.facts if fact.time))}
+
+    @staticmethod
+    def _node_record(node):
+        return {"child_id": node.node_id, "summary": node.summary,
+                "owners": node.attributes.get("owners", ()),
+                "predicates": node.attributes.get("predicates", ()),
+                "values": node.attributes.get("values", ()), "scopes": node.attributes.get("scopes", ()),
+                "times": node.attributes.get("times", ())}
+
     def _hierarchy_edges(self, memory_id, memory_card, l2_cards, session_cards, scene_nodes, event_nodes):
         edges = []
         if l2_cards:
@@ -447,7 +583,10 @@ class GraphBuildPipeline:
         by_relation: dict[tuple[str, RelationType], list[GraphEdge]] = defaultdict(list)
         for edge in sorted(edges, key=lambda item: (-item.confidence, item.edge_id)):
             key = (edge.src_id, edge.relation)
-            if len(by_relation[key]) < profile.edges.max_degree_per_relation:
+            cap = int(profile.edges.relation_degree_caps.get(
+                str(edge.relation), profile.edges.max_degree_per_relation
+            ))
+            if len(by_relation[key]) < cap:
                 by_relation[key].append(edge)
         return [edge for rows in by_relation.values() for edge in rows]
 

@@ -11,6 +11,7 @@ EMBED_SERVED_NAME="Qwen/Qwen3-Embedding-0.6B"
 LLM_SERVED_NAME="Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
 EMBED_GPU="${EMBED_GPU:-1}"
 LLM_GPUS="${LLM_GPUS:-2,3}"
+LLM_TP_SIZE="${LLM_TP_SIZE:-2}"
 LLM_MAX_MODEL_LEN="${LLM_MAX_MODEL_LEN:-65536}"
 
 mkdir -p "${STATE_DIR}"
@@ -58,7 +59,7 @@ run_llm_supervisor() {
       VLLM_DISABLED_KERNELS=FlashInferFp8DeepGEMMDynamicBlockScaledKernel,DeepGemmFp8BlockScaledMMKernel \
       "${VLLM_BIN}" serve "${LLM_MODEL_PATH}" \
       --served-model-name "${LLM_SERVED_NAME}" --host 127.0.0.1 --port 8002 \
-      --tensor-parallel-size 2 --max-model-len "${LLM_MAX_MODEL_LEN}" \
+      --tensor-parallel-size "${LLM_TP_SIZE}" --max-model-len "${LLM_MAX_MODEL_LEN}" \
       --gpu-memory-utilization 0.88 --max-num-seqs 128 \
       --max-num-batched-tokens 65536 --trust-remote-code \
       >>"${STATE_DIR}/llm.log" 2>&1
@@ -128,7 +129,7 @@ start_llm() {
     return 0
   fi
   tmux new-session -d -s graphmem-v5-llm \
-    "cd '${REPO}' && exec env HF_HOME='${HF_CACHE_ROOT}' LLM_GPUS='${LLM_GPUS}' STATE_DIR='${STATE_DIR}' VLLM_BIN='${VLLM_BIN}' LLM_MODEL_PATH='${LLM_MODEL_PATH}' LLM_MAX_MODEL_LEN='${LLM_MAX_MODEL_LEN}' bash scripts/v5_gate_a_model_services.sh supervise-llm"
+    "cd '${REPO}' && exec env HF_HOME='${HF_CACHE_ROOT}' LLM_GPUS='${LLM_GPUS}' LLM_TP_SIZE='${LLM_TP_SIZE}' STATE_DIR='${STATE_DIR}' VLLM_BIN='${VLLM_BIN}' LLM_MODEL_PATH='${LLM_MODEL_PATH}' LLM_MAX_MODEL_LEN='${LLM_MAX_MODEL_LEN}' bash scripts/v5_gate_a_model_services.sh supervise-llm"
   wait_one graphmem-v5-llm 8002 "${STATE_DIR}/llm.log"
 }
 

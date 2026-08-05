@@ -52,6 +52,10 @@ class NodeType(StrEnum):
     STATE_VALUE = "state_value"
     SESSION = "session"
     EVIDENCE_GROUP_REF = "evidence_group_ref"
+    CANONICAL_FACT = "canonical_fact"
+    CANONICAL_VALUE = "canonical_value"
+    FACT_MENTION = "fact_mention"
+    VIRTUAL_REGION = "virtual_region"
 
 
 class RelationType(StrEnum):
@@ -77,6 +81,15 @@ class RelationType(StrEnum):
     COREFERENCE = "coreference"
     OWNED_BY = "owned_by"
     HAS_EVIDENCE = "has_evidence"
+    HAS_FACT = "has_fact"
+    FACT_VALUE = "fact_value"
+    IN_SCOPE = "in_scope"
+    SHARED_ENTITY = "shared_entity"
+    SHARED_VALUE = "shared_value"
+    SAME_ACTIVITY = "same_activity"
+    SAME_PREFERENCE_DOMAIN = "same_preference_domain"
+    STATE_NEXT = "state_next"
+    COLLECTION_CO_MEMBER = "collection_co_member"
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +240,74 @@ class StateHead:
 
 
 @dataclass(frozen=True, slots=True)
+class FactMention:
+    mention_id: str
+    scene_id: str
+    turn_id: str
+    span_start: int
+    span_end: int
+    surface: str
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalValue:
+    value_id: str
+    memory_id: str
+    normalized: str
+    value_type: str
+    evidence_group_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalFact:
+    fact_id: str
+    memory_id: str
+    owner_id: str
+    predicate_id: str
+    value_id: str
+    scope_id: str
+    polarity: str
+    evidence_group_ids: tuple[str, ...]
+    confidence: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticExtractionManifest:
+    memory_id: str
+    scene_count: int
+    parsed_scene_count: int
+    fallback_scene_count: int
+    fact_count: int
+    valid_evidence_refs: int
+    invalid_evidence_refs: int
+    token_usage: Mapping[str, int]
+    prompt_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticResult:
+    memory_id: str
+    mode: str
+    seed_node_ids: tuple[str, ...]
+    visited_node_ids: tuple[str, ...]
+    candidate_turn_ids: tuple[str, ...]
+    candidate_session_ids: tuple[str, ...]
+    proof: tuple["ProofStep", ...]
+    relation_counts: Mapping[str, int]
+    first_hit_relations: Mapping[str, str]
+    budget_exhausted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticRunManifest:
+    run_id: str
+    graph_checksum: str
+    modes: tuple[str, ...]
+    question_count: int
+    config_hash: str
+
+
+@dataclass(frozen=True, slots=True)
 class RoutingCard:
     card_id: str
     memory_id: str
@@ -336,6 +417,8 @@ class CandidateScore:
     source_channels: tuple[str, ...]
     session_score: float = 0.0
     adjacency_score: float = 0.0
+    graph_path_ids: tuple[str, ...] = ()
+    relation_contributions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,6 +454,9 @@ class NavigationResult:
     packed_turn_ids: tuple[str, ...] = ()
     dropped_turn_ids: tuple[str, ...] = ()
     stage_latency_ms: Mapping[str, float] = field(default_factory=dict)
+    graph_only_candidate_turn_ids: tuple[str, ...] = ()
+    relation_trace: tuple[ProofStep, ...] = ()
+    first_hit_relations: Mapping[str, str] = field(default_factory=dict)
     schema_version: str = SCHEMA_VERSION
 
 
