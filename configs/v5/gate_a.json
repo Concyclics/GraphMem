@@ -1,0 +1,41 @@
+{
+  "schema_version": "graphmem-v5",
+  "profile": "legacy_v41_reference",
+  "random_seed": 42,
+  "models": {
+    "llm_model": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+    "llm_base_url": "http://127.0.0.1:8002/v1",
+    "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+    "embedding_base_url": "http://127.0.0.1:8001/v1",
+    "thinking_enabled": false
+  },
+  "storage": {
+    "runtime_mode": "sqlite_snapshot",
+    "sqlite_path": "artifacts/v5/graphmem.sqlite",
+    "neo4j_enabled": false,
+    "neo4j_uri": "bolt://127.0.0.1:7687",
+    "neo4j_batch_nodes": 1000,
+    "neo4j_batch_edges": 2000
+  },
+  "coarsen": {"fanout": 8, "max_levels": 3, "summary_tokens": 320, "cross_session_merge": true},
+  "edges": {
+    "embedding_k": 8,
+    "max_candidates_per_node": 24,
+    "max_degree_per_relation": 12,
+    "low_threshold": 0.45,
+    "high_threshold": 0.78,
+    "refine_mode": "ambiguous_only",
+    "refine_batch_size": 24,
+    "max_refine_calls_per_1000_turns": 20
+  },
+  "query_budget": {
+    "max_hops": 2,
+    "max_iterations": 4,
+    "max_visited_nodes": 96,
+    "max_visited_edges": 192,
+    "max_frontier": 32,
+    "max_evidence_turns": 16,
+    "max_evidence_tokens": 5000,
+    "max_llm_reranks": 0
+  }
+}

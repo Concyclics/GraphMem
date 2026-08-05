@@ -1,0 +1,18 @@
+{
+  "schema_version": "graphmem-v5-lme-gold-turn-manifest-v1",
+  "annotation_version": "lme-v5-dev100-r1",
+  "source_dataset": "hard_lme_multisession50_temporal50-20260804",
+  "source_dataset_sha256": "566d250a6b013f384d9f7966aee5427a80f490f10e82b2de3067add85d5b828f",
+  "annotation_file": "longmemeval_v5_dev100_gold_turns.jsonl",
+  "annotation_sha256": "58a931e2337462013d96f97720cb74be1757caeb7290644cb9914a5f34019de6",
+  "questions": 100,
+  "annotations": 217,
+  "changed_during_adjudication": 51,
+  "source_role": "user",
+  "span_policy": "exact full source-turn offsets",
+  "candidate_reviewer": "qwen3-30b-session-and-question-level",
+  "semantic_review": "codex-semantic-review-r1",
+  "adjudication": "codex-semantic-adjudication-r2",
+  "contains_dialogue_text": false,
+  "online_import_allowed": false
+}

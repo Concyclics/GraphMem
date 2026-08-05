@@ -1,0 +1,13 @@
+services:
+  neo4j:
+    image: neo4j:5.26.2-community
+    container_name: graphmem-v5-neo4j
+    restart: "no"
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    env_file:
+      - .env
+    volumes:
+      - ${GRAPHMEM_V5_ARTIFACT_ROOT}/neo4j/data:/data
+      - ${GRAPHMEM_V5_ARTIFACT_ROOT}/neo4j/logs:/logs

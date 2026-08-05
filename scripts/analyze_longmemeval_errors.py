@@ -217,7 +217,9 @@ def main() -> None:
         retrieval = retrievals.get(qid, {})
         stats = question_stats.get(qid, {})
         op_row = ops.get(qid)
-        correct = bool(eval_row.get("autoeval_label", {}).get("label"))
+        correct = bool(
+            eval_row.get("correct", eval_row.get("autoeval_label", {}).get("label"))
+        )
         context_overlap = gold_lexical_overlap(case.get("answer"), str(retrieval.get("context_text") or ""))
         qa_tokens = int(stats.get("answer_prompt_tokens") or 0) + int(
             stats.get("answer_completion_tokens") or 0

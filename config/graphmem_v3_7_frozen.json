@@ -1,0 +1,54 @@
+{
+  "release": "graphmem_v3.7.0-rc1",
+  "frozen_at": "2026-07-30",
+  "base_commit": "da2870b686fcc5442c8d4694923352ee3a34f120",
+  "backbone": {
+    "provider": "https://sub2api.sgao.me/v1/",
+    "model": "gpt-5.4-mini",
+    "thinking": "disabled",
+    "reasoning_tokens_required": 0
+  },
+  "embedding": {
+    "base_url": "http://127.0.0.1:8001/v1",
+    "model": "Qwen3-Embedding-0.6B",
+    "dimensions": 1024,
+    "excluded_from_answer_budget": true
+  },
+  "routing_policy": {
+    "selector": "dialogue_topology",
+    "benchmark_name_used": false,
+    "assistant_mediated": "v2_evidence_ledger_gpt_answer",
+    "peer_dialogue": "v34_lossless_first_graph_navigator"
+  },
+  "longmemeval": {
+    "questions": 500,
+    "correct": 445,
+    "accuracy": 0.89,
+    "judge": "mem0_longmemeval_bd063ee",
+    "judge_prompt_sha256": "ba8cf60d26f1390ecbef0f07b3e950556fe3bc5a37ba4b5343f28217f18c144f",
+    "answers": "runs/v3_7_hybrid_20260730/lme500_v2ledger_gpt54mini/answers.jsonl",
+    "answers_sha256": "5ed0cd784876cf5aa7594fd139362bd4df18ec2ff8b0ae336d60d05c12f8c883",
+    "judgments": "runs/v3_7_hybrid_20260730/lme500_v2ledger_gpt54mini/judge/auto_eval.jsonl",
+    "judgments_sha256": "327c85821bbbdbc3a2d3c4f20c40501a5fe0c065840e5ae65a74ad6841346d58"
+  },
+  "locomo": {
+    "answered_questions": 1986,
+    "judged_questions": 1540,
+    "categories": [1, 2, 3, 4],
+    "correct": 1328,
+    "accuracy": 0.8623376623376623,
+    "judge": "mem0ai_memory_benchmarks_locomo",
+    "answers": "runs/v3_full_20260727/locomo_full1986_lossless_nav_v34/answers.jsonl",
+    "answers_sha256": "0eb26dc5fd4f24d8e2183e83fc6cd07bbc4dfec6b8f8db0aa2d8c55cda2130e7",
+    "judgments": "runs/v3_full_20260727/locomo_full1986_lossless_nav_v34/memory_benchmarks_judge/auto_eval.jsonl",
+    "judgments_sha256": "dfe6daa715f9e24b7592132e49d8a07f18c71e713c35fc6d13e13c13e9eebf04",
+    "route_artifact_origin": "v3.4",
+    "route_frozen_unchanged_in_v3.7": true
+  },
+  "code_sha256": {
+    "assistant_mediated_runner": "b7bcfbcba3b85ce7e6e00d3328b5a6e4374e0cdbacef12acd24dddb7ea51f210",
+    "peer_dialogue_runner": "df4e6c3faba204e1a496ebbf989aa412998264e7ddbc2010ca557c5177a6305e",
+    "v2_ledger": "c5daa70db6ff3f1d42a5e8a3a2f0303dbcc27d1079792d777cf222c59c2a741c",
+    "dialogue_topology": "84cdb0b819baeed456dc21ca4a04dfbc38e58f63c4c90fd6645c4763e0231437"
+  }
+}

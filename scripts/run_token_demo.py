@@ -17,9 +17,9 @@ from graphmem_demo.pipeline import DemoConfig, run_demo  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the GraphMem DeepSeek token demo.")
+    parser = argparse.ArgumentParser(description="Run the GraphMem LLM token demo.")
     parser.add_argument("--data", type=Path, required=True)
-    parser.add_argument("--question-type", default="multi-session")
+    parser.add_argument("--question-type", default="all")
     parser.add_argument(
         "--variants",
         nargs="+",
@@ -30,11 +30,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--memory-cache-dir", type=Path)
-    parser.add_argument("--deepseek-model")
     parser.add_argument(
-        "--deepseek-base-url",
-        default=None,
+        "--skip-memory-artifacts", action="store_true",
+        help=("Do not duplicate cached nodes, edges, SQLite, or vectors into "
+              "the query output; answers, retrieval, provenance, and token records remain."),
+    )
+    parser.add_argument(
+        "--deepseek-model", "--llm-model", dest="deepseek_model",
+        default=os.environ.get("SGAO_MODEL", "gpt-5.4-mini"),
+    )
+    parser.add_argument(
+        "--deepseek-base-url", "--llm-base-url",
+        dest="deepseek_base_url",
+        default=os.environ.get("SGAO_BASE_URL", "https://sub2api.sgao.me/v1/"),
         help="OpenAI-compatible LLM base URL (local vLLM: http://127.0.0.1:8001/v1).",
+    )
+    parser.add_argument(
+        "--llm-api-key-env", default="SGAO_API_KEY",
+        help="Environment variable containing the OpenAI-compatible LLM API key.",
+    )
+    parser.add_argument(
+        "--llm-request-profile", choices=["deepseek", "openai", "qwen", "omit"],
+        default="openai",
+        help="Map no-reasoning to DeepSeek thinking.disabled, OpenAI reasoning_effort=none, Qwen enable_thinking=false, or no field.",
+    )
+    parser.add_argument(
+        "--llm-timeout-sec", type=float, default=180.0,
+        help="Per-request LLM timeout. Local models need enough time to emit the configured maximum completion.",
     )
     parser.add_argument(
         "--llm-local",
@@ -42,9 +64,9 @@ def parse_args() -> argparse.Namespace:
         help="Use local vLLM for build/answer (port 8001, dummy API key).",
     )
     parser.add_argument("--llm-local-port", type=int, default=8001)
-    parser.add_argument("--embedding-base-url", default="http://127.0.0.1:8002/v1")
-    parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
-    parser.add_argument("--tree-mode", choices=["legacy_kway", "direct_session", "hierarchical_state_graph_v2"])
+    parser.add_argument("--embedding-base-url", default=os.environ.get("EMBEDDING_BASE_URL", "http://127.0.0.1:8001/v1"))
+    parser.add_argument("--embedding-model", default=os.environ.get("EMBEDDING_MODEL", "Qwen3-Embedding-0.6B"))
+    parser.add_argument("--tree-mode", choices=["legacy_kway", "direct_session", "hierarchical_state_graph_v2", "hierarchical_hypergraph_v3", "hierarchical_role_graph_v3_6", "hierarchical_hybrid_graph_v4_0", "hierarchical_hybrid_graph_v4_1_query"])
     parser.add_argument("--fanout-k", type=int, default=16)
     parser.add_argument("--max-group-rough-tokens", type=int, default=6000)
     parser.add_argument("--leaf-top-k", type=int, default=14)
@@ -66,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-inflight-deepseek", type=int, default=32)
     parser.add_argument(
         "--summary-schema",
-        choices=["minimal_memory_v1", "compact_memory_v2", "multilingual_memory_v1", "graphmem_v2"],
+        choices=["minimal_memory_v1", "compact_memory_v2", "multilingual_memory_v1", "graphmem_v2", "graphmem_v3", "graphmem_v3_6", "graphmem_v4_0", "graphmem_v4_1_query"],
     )
     parser.add_argument(
         "--summarizer-kind",
@@ -384,6 +406,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v2-context-token-budget", type=int, default=8200)
     parser.add_argument("--v2-semantic-k", type=int, default=3)
     parser.add_argument("--v2-semantic-floor", type=float, default=0.55)
+    parser.add_argument("--v3-session-extraction-max-tokens", type=int, default=3072)
+    parser.add_argument("--v3-context-token-budget", type=int, default=3600)
+    parser.add_argument("--v36-session-extraction-max-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--v36-llm-session-cap", type=int, default=0,
+        help="Question-independent cap on LLM-corrected sessions; 0 extracts all.",
+    )
+    parser.add_argument("--v36-context-token-budget", type=int, default=8000)
+    parser.add_argument("--v36-answer-hard-budget-tokens", type=int, default=10500)
+    parser.add_argument("--v41-normal-context-target", type=int, default=8400)
+    parser.add_argument("--v41-complex-context-target", type=int, default=9200)
+    parser.add_argument("--v41-planner-prompt-max", type=int, default=700)
+    parser.add_argument("--v41-planner-output-max", type=int, default=256)
+    parser.add_argument("--v41-query-target-tokens", type=int, default=10000)
+    parser.add_argument("--v41-query-hard-limit-tokens", type=int, default=13000)
+    parser.add_argument(
+        "--record-query-budget-overflow",
+        action="store_true",
+        help=(
+            "Persist V4.1 answers that exceed the query hard limit and mark "
+            "their budget failure instead of aborting/retrying the shard."
+        ),
+    )
+    parser.add_argument("--disable-v41-planner", action="store_true")
+    parser.add_argument(
+        "--retrieval-only",
+        action="store_true",
+        help=(
+            "For V3, persist the index and retrieval ledger without calling the "
+            "built-in base answer; use with the graph navigator as the sole reader."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--mock-services",
@@ -406,18 +460,20 @@ def main() -> None:
     deepseek_model = args.deepseek_model
     if args.llm_local:
         deepseek_base_url = deepseek_base_url or f"http://127.0.0.1:{args.llm_local_port}/v1"
-        deepseek_model = deepseek_model or os.environ.get("DEEPSEEK_MODEL", DEFAULT_LOCAL_LLM_MODEL)
-        os.environ.setdefault("DEEPSEEK_API_KEY", "local-llm")
-        os.environ.setdefault("DEEPSEEK_BASE_URL", deepseek_base_url)
-        os.environ.setdefault("DEEPSEEK_MODEL", deepseek_model)
+        deepseek_model = deepseek_model or DEFAULT_LOCAL_LLM_MODEL
+        os.environ.setdefault(args.llm_api_key_env, "local-llm")
     config = DemoConfig(
         data_path=args.data,
         output_dir=args.output_dir,
         memory_cache_dir=args.memory_cache_dir,
+        persist_memory_artifacts=not args.skip_memory_artifacts,
         question_type=args.question_type,
         variants=tuple(args.variants),
         deepseek_model=deepseek_model,
         deepseek_base_url=deepseek_base_url,
+        llm_api_key_env=args.llm_api_key_env,
+        llm_request_profile=args.llm_request_profile,
+        llm_timeout_sec=args.llm_timeout_sec,
         embedding_base_url=args.embedding_base_url,
         embedding_model=args.embedding_model,
         tree_mode=args.tree_mode,
@@ -545,12 +601,27 @@ def main() -> None:
         v2_context_token_budget=args.v2_context_token_budget,
         v2_semantic_k=args.v2_semantic_k,
         v2_semantic_floor=args.v2_semantic_floor,
+        v3_session_extraction_max_tokens=args.v3_session_extraction_max_tokens,
+        v3_context_token_budget=args.v3_context_token_budget,
+        v36_session_extraction_max_tokens=args.v36_session_extraction_max_tokens,
+        v36_llm_session_cap=args.v36_llm_session_cap,
+        v36_context_token_budget=args.v36_context_token_budget,
+        v36_answer_hard_budget_tokens=args.v36_answer_hard_budget_tokens,
+        v41_normal_context_target=args.v41_normal_context_target,
+        v41_complex_context_target=args.v41_complex_context_target,
+        v41_planner_prompt_max=args.v41_planner_prompt_max,
+        v41_planner_output_max=args.v41_planner_output_max,
+        v41_query_target_tokens=args.v41_query_target_tokens,
+        v41_query_hard_limit_tokens=args.v41_query_hard_limit_tokens,
+        v41_enable_planner=not args.disable_v41_planner,
+        v41_record_query_budget_overflow=args.record_query_budget_overflow,
+        retrieval_only=args.retrieval_only,
     )
     aggregates = run_demo(config)
     for aggregate in aggregates:
         print(
             f"{aggregate.variant}: questions={aggregate.question_count} "
-            f"deepseek_tokens={aggregate.total_deepseek_tokens} "
+            f"llm_tokens={aggregate.total_deepseek_tokens} "
             f"calls={aggregate.deepseek_call_count}"
         )
     print(f"summary={config.output_dir / 'summary.md'}")

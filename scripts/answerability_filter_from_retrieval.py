@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
 import re
 import sys
 import time
@@ -15,7 +16,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from graphmem_demo.clients import DeepSeekClient, rough_token_count  # noqa: E402
+from graphmem_demo.clients import OpenAICompatibleClient, rough_token_count  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,8 +28,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrieval-results", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--variant", default="answerability_filter")
-    parser.add_argument("--model")
-    parser.add_argument("--base-url")
+    parser.add_argument("--model", default=os.environ.get("SGAO_MODEL", "gpt-5.4-mini"))
+    parser.add_argument("--base-url", default=os.environ.get("SGAO_BASE_URL", "https://sub2api.sgao.me/v1/"))
+    parser.add_argument("--api-key-env", default="SGAO_API_KEY")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=384)
     parser.add_argument("--context-rough-tokens", type=int, default=5200)
@@ -392,7 +394,9 @@ def filter_one(
         str(retrieval.get("context_text") or ""), args.context_rough_tokens
     )
     diagnostics = evidence_owner_diagnostics(str(case.get("question") or ""), context)
-    llm = DeepSeekClient(model=args.model, base_url=args.base_url)
+    llm = OpenAICompatibleClient(
+        model=args.model, base_url=args.base_url, api_key_env=args.api_key_env, request_profile="openai"
+    )
     started = time.perf_counter()
     result = llm.chat(
         question_id=str(case["question_id"]),

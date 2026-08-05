@@ -1,0 +1,63 @@
+"""GraphMem V3: role-neutral, provenance-first hierarchical hypergraph memory."""
+
+from .build import (
+    V3_BUILD_VERSION,
+    V3_PROMPT_VERSION,
+    build_hypergraph,
+    build_turn_nodes,
+    parse_session_extraction,
+    session_extraction_messages,
+    validate_hypergraph,
+)
+from .retrieval import (
+    V3_RETRIEVAL_VERSION,
+    answer_messages,
+    authoritative_catalog_answer,
+    build_query_frame,
+    retrieve,
+)
+from .schema import (
+    GRAPHMEM_V3_SCHEMA,
+    ClaimNode,
+    EventFrameV3,
+    OperandRecordV3,
+    ClosureCertificate,
+    EpisodeNode,
+    EventNode,
+    EventEntityNode,
+    HyperEdge,
+    QueryFrame,
+    StateChainV3,
+    ThemeNode,
+    TurnNode,
+    V3Index,
+)
+
+__all__ = [
+    "GRAPHMEM_V3_SCHEMA",
+    "V3_BUILD_VERSION",
+    "V3_PROMPT_VERSION",
+    "V3_RETRIEVAL_VERSION",
+    "ClaimNode",
+    "EventFrameV3",
+    "OperandRecordV3",
+    "ClosureCertificate",
+    "EpisodeNode",
+    "EventNode",
+    "EventEntityNode",
+    "HyperEdge",
+    "QueryFrame",
+    "StateChainV3",
+    "ThemeNode",
+    "TurnNode",
+    "V3Index",
+    "answer_messages",
+    "authoritative_catalog_answer",
+    "build_hypergraph",
+    "build_query_frame",
+    "build_turn_nodes",
+    "parse_session_extraction",
+    "retrieve",
+    "session_extraction_messages",
+    "validate_hypergraph",
+]

@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GraphMem: Token-Efficient, Evidence-Complete Long-Term Memory</title>
+<style>
+@page { size: 13.333in 7.5in; margin: 0; }
+* { box-sizing: border-box; }
+html, body { margin: 0; background: #dbe4ea; color: #152238; font-family: Inter, "Noto Sans", "Noto Sans CJK SC", Arial, sans-serif; }
+.slide { width: 13.333in; height: 7.5in; overflow: hidden; break-after: page; position: relative; background: #fbfdff; padding: .48in .62in .42in; }
+.slide:last-child { break-after: auto; }
+.dark { background: #102a43; color: #f5f9fc; }
+.dark .muted { color: #b9c9d8; }
+.kicker { font-size: 11pt; letter-spacing: 1.7px; text-transform: uppercase; font-weight: 700; color: #0b8390; margin-bottom: .16in; }
+.dark .kicker { color: #64d2da; }
+h1 { font-size: 37pt; line-height: 1.08; letter-spacing: -.8px; margin: 0 0 .22in; max-width: 10.8in; }
+h2 { font-size: 25pt; line-height: 1.15; letter-spacing: -.4px; margin: 0 0 .2in; }
+h3 { font-size: 15pt; margin: 0 0 .1in; }
+p { font-size: 13pt; line-height: 1.45; margin: 0 0 .16in; }
+.lead { font-size: 17pt; line-height: 1.42; max-width: 10.6in; }
+.muted { color: #627d98; }
+.small { font-size: 9.5pt; line-height: 1.35; }
+.page-no { position: absolute; bottom: .19in; right: .34in; font-size: 8.5pt; color: #829ab1; }
+.footer { position:absolute; left:.62in; right:.62in; bottom:.18in; border-top:1px solid #d8e2ec; padding-top:.07in; font-size:8.5pt; color:#829ab1; }
+.dark .footer { border-color:#36536d; color:#9fb3c8; }
+.accent-line { width: 1.05in; height: .08in; border-radius: 9px; background: linear-gradient(90deg,#0b8390,#2f80ed); margin: .18in 0 .34in; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: .3in; }
+.row-40 { display: grid; grid-template-columns: .82fr 1.18fr; gap: .34in; }
+.row-60 { display: grid; grid-template-columns: 1.18fr .82fr; gap: .34in; }
+.three { display: grid; grid-template-columns: repeat(3,1fr); gap: .22in; }
+.four { display: grid; grid-template-columns: repeat(4,1fr); gap: .18in; }
+.card { border: 1px solid #d8e2ec; border-radius: .14in; background: #fff; padding: .2in; }
+.dark .card { background:#163b59; border-color:#31556f; }
+.metric .label { font-size: 10pt; color:#627d98; }
+.dark .metric .label { color:#b9c9d8; }
+.metric .value { font-size: 28pt; line-height: 1.08; font-weight: 750; margin:.07in 0; }
+.metric .delta { font-size: 12pt; font-weight: 700; color:#0b8390; }
+.dark .metric .delta { color:#64d2da; }
+.pill { display:inline-block; padding:.04in .12in; border-radius:.2in; background:#e7f7f8; color:#08717c; font-size:9pt; font-weight:700; margin-right:.05in; }
+.pill.blue { background:#eaf2ff; color:#215fa8; }
+.pill.orange { background:#fff1e3; color:#a9570a; }
+.callout { border-left: 4px solid #0b8390; padding: .12in .16in; background:#eef9fa; font-size:12pt; line-height:1.42; }
+.warn { border-left-color:#e07a18; background:#fff5e9; }
+.dark .callout { background:#163b59; color:#eaf2f8; }
+ul { margin:.08in 0 0; padding-left:.22in; font-size:12.5pt; line-height:1.42; }
+li { margin:.07in 0; }
+table { width:100%; border-collapse:collapse; font-size:10.5pt; font-variant-numeric:tabular-nums; }
+th { text-align:left; color:#526b80; border-bottom:2px solid #a8bac9; padding:.075in .08in; }
+td { border-bottom:1px solid #e1e8ee; padding:.075in .08in; }
+.num { text-align:right; white-space:nowrap; }
+.pos { color:#087b86; font-weight:700; }.neg { color:#b35d0e; font-weight:700; }
+.diagram { width:100%; height:auto; display:block; }
+.legend { display:flex; gap:.25in; align-items:center; color:#627d98; font-size:10pt; margin-bottom:.08in; }
+.swatch { width:.12in; height:.12in; display:inline-block; border-radius:2px; margin-right:.05in; vertical-align:-1px; }
+.gm { background:#0b8390; }.m0 { background:#f2994a; }
+.step { display:flex; gap:.12in; align-items:flex-start; margin:.12in 0; }
+.step .n { flex:0 0 .28in; width:.28in; height:.28in; border-radius:50%; background:#0b8390; color:white; display:grid; place-items:center; font-weight:700; font-size:10pt; }
+.step .copy { font-size:11.5pt; line-height:1.35; }
+.equation { font-family:"DejaVu Sans Mono",monospace; font-size:11pt; background:#f3f7fa; padding:.12in .15in; border-radius:.08in; }
+.timeline { display:grid; grid-template-columns:repeat(3,1fr); gap:.14in; margin:.12in 0; position:relative; }
+.timeline:before { content:""; position:absolute; top:.17in; left:12%; right:12%; height:3px; background:#9fb3c8; }
+.event { position:relative; padding-top:.38in; text-align:center; font-size:10.5pt; }
+.event:before { content:""; position:absolute; width:.17in; height:.17in; border-radius:50%; top:.09in; left:calc(50% - .085in); background:#0b8390; border:3px solid #fbfdff; box-shadow:0 0 0 2px #0b8390; }
+.event.cancel:before { background:#f2994a; box-shadow:0 0 0 2px #f2994a; }
+.example-query { font-size:15pt; font-weight:700; color:#173e67; margin:.18in 0 .12in; }
+.big-quote { font-size:22pt; line-height:1.34; font-weight:650; max-width:10in; }
+.center { text-align:center; }
+.arrow-title { font-size:11pt; color:#627d98; text-align:center; margin-top:.05in; }
+</style>
+</head>
+<body>
+
+<section class="slide dark">
+  <div class="kicker">GraphMem · Benchmark & Architecture Report</div>
+  <div class="accent-line"></div>
+  <h1>Token-Efficient,<br>Evidence-Complete<br>Long-Term Memory</h1>
+  <p class="lead muted">GraphMem versus Mem0 on LongMemEval and LoCoMo — and the two architectural ideas that make retrieval both smaller and more reliable.</p>
+  <div class="three" style="margin-top:.45in">
+    <div class="card metric"><div class="label">LongMemEval</div><div class="value">89.00%</div><div class="delta">+18.80 pp vs Mem0</div></div>
+    <div class="card metric"><div class="label">LoCoMo · 4 scored QA types</div><div class="value">86.23%</div><div class="delta">+7.34 pp vs Mem0</div></div>
+    <div class="card metric"><div class="label">Answer tokens / question</div><div class="value">7.03K · 4.41K</div><div class="delta">LME · LoCoMo</div></div>
+  </div>
+  <div class="footer">Memory-backbone tokens only · Embedding and judge excluded · August 2026</div><div class="page-no">1</div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Benchmark outcome</div>
+  <h2>GraphMem wins on both matched evaluation sets</h2>
+  <div class="row-60">
+    <div>
+      <div class="legend"><span><i class="swatch gm"></i>GraphMem</span><span><i class="swatch m0"></i>Mem0</span></div>
+      <svg class="diagram" viewBox="0 0 760 365" aria-label="Overall benchmark accuracy comparison">
+        <g font-family="Noto Sans" fill="#152238" font-size="16">
+          <g stroke="#d8e2ec"><line x1="190" y1="32" x2="190" y2="330"/><line x1="315" y1="32" x2="315" y2="330"/><line x1="440" y1="32" x2="440" y2="330"/><line x1="565" y1="32" x2="565" y2="330"/><line x1="690" y1="32" x2="690" y2="330"/></g>
+          <g fill="#627d98" font-size="12"><text x="190" y="22" text-anchor="middle">0%</text><text x="315" y="22" text-anchor="middle">25%</text><text x="440" y="22" text-anchor="middle">50%</text><text x="565" y="22" text-anchor="middle">75%</text><text x="690" y="22" text-anchor="middle">100%</text></g>
+          <text x="0" y="118">LongMemEval</text><rect x="190" y="72" width="445" height="34" rx="5" fill="#0b8390"/><rect x="190" y="116" width="351" height="34" rx="5" fill="#f2994a"/><text x="642" y="96" font-weight="700">89.00%</text><text x="548" y="140">70.20%</text>
+          <text x="0" y="257">LoCoMo scored types</text><rect x="190" y="211" width="431" height="34" rx="5" fill="#0b8390"/><rect x="190" y="255" width="395" height="34" rx="5" fill="#f2994a"/><text x="628" y="235" font-weight="700">86.23%</text><text x="592" y="279">78.90%</text>
+          <text x="690" y="323" text-anchor="end" fill="#0b8390" font-weight="700">+18.80 pp</text><text x="492" y="323" text-anchor="middle" fill="#0b8390" font-weight="700">+7.34 pp</text>
+        </g>
+      </svg>
+    </div>
+    <div>
+      <div class="card metric"><div class="label">LongMemEval paired wins</div><div class="value">129 vs 35</div><div class="delta">Net +94 correct answers</div></div>
+      <div class="card metric" style="margin-top:.18in"><div class="label">LoCoMo paired wins</div><div class="value">240 vs 127</div><div class="delta">Net +113 correct answers</div></div>
+      <div class="callout" style="margin-top:.18in">LoCoMo IDs align across all 1,540 <strong>Multi-hop, Temporal, Open-domain, and Single-hop</strong> questions. Paired bootstrap 95% CI: <strong>+4.94 to +9.68 pp</strong>.</div>
+    </div>
+  </div>
+  <div class="footer">Both judges were executed through the official mem0ai/memory-benchmarks repository.</div><div class="page-no">2</div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Where the gains come from</div>
+  <h2>Graph structure matters most when evidence must be assembled</h2>
+  <div class="row">
+    <div>
+      <h3>LongMemEval accuracy delta vs Mem0</h3>
+      <table><tr><td>Temporal reasoning</td><td class="num pos">+41.35 pp</td></tr><tr><td>Multi-session</td><td class="num pos">+20.30 pp</td></tr><tr><td>Assistant facts</td><td class="num pos">+10.71 pp</td></tr><tr><td>Knowledge update</td><td class="num pos">+7.69 pp</td></tr><tr><td>User facts</td><td class="num pos">+1.43 pp</td></tr><tr><td>Preference</td><td class="num neg">−3.33 pp</td></tr></table>
+      <div class="callout">The strongest gains require <strong>multiple roles</strong>: two temporal endpoints, prior/current state, or evidence across sessions.</div>
+    </div>
+    <div>
+      <h3>LoCoMo accuracy delta vs Mem0</h3>
+      <table><tr><td>Multi-hop</td><td class="num pos">+17.38 pp</td></tr><tr><td>Single-hop</td><td class="num pos">+9.75 pp</td></tr><tr><td>Temporal</td><td class="num neg">−3.12 pp</td></tr><tr><td>Open-domain</td><td class="num neg">−8.33 pp</td></tr></table>
+      <div class="callout warn"><strong>Remaining weakness:</strong> Open-domain questions remain the weakest type, exposing world-knowledge integration and answer-reasoning gaps.</div>
+      <p class="small muted" style="margin-top:.2in">Raw Mem0 67.02% includes 446 Adversarial questions, which are excluded from the official scored set. The matched four-type baseline is 78.90%.</p>
+    </div>
+  </div>
+  <div class="footer">End-to-end deltas include indexing, retrieval, operators, evidence packing, and answer prompting.</div><div class="page-no">3</div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Token economics</div>
+  <h2>Report cost in the unit where it is actually incurred</h2>
+  <div class="four" style="margin-bottom:.2in">
+    <div class="card metric"><div class="label">LME build / question</div><div class="value">254.5K</div><div class="delta">P95 271.2K</div></div>
+    <div class="card metric"><div class="label">LoCoMo build / conversation</div><div class="value">132.4K</div><div class="delta">10 builds total</div></div>
+    <div class="card metric"><div class="label">LME answer / question</div><div class="value">7,031</div><div class="delta">P95 8,000</div></div>
+    <div class="card metric"><div class="label">LoCoMo answer / question</div><div class="value">4,413</div><div class="delta">P95 5,055</div></div>
+  </div>
+  <div class="row">
+    <div>
+      <h3>Average token decomposition</h3>
+      <table><thead><tr><th>Unit</th><th class="num">Uncached</th><th class="num">Cached</th><th class="num">Output</th><th class="num">Total</th></tr></thead><tbody><tr><td>LME build / question</td><td class="num">126,112</td><td class="num">37,500</td><td class="num">90,893</td><td class="num"><strong>254,505</strong></td></tr><tr><td>LoCoMo build / conversation</td><td class="num">77,248</td><td class="num">486</td><td class="num">54,616</td><td class="num"><strong>132,350</strong></td></tr><tr><td>LME answer / question</td><td class="num">5,428</td><td class="num">1,580</td><td class="num">23</td><td class="num"><strong>7,031</strong></td></tr><tr><td>LoCoMo answer / question</td><td class="num">3,238</td><td class="num">1,046</td><td class="num">129</td><td class="num"><strong>4,413</strong></td></tr></tbody></table>
+    </div>
+    <div>
+      <h3>Why persistent memory changes the equation</h3>
+      <div class="equation">Total cost = Build(memory) + Σ Queryᵢ(memory)</div>
+      <div class="step"><div class="n">1</div><div class="copy"><strong>LongMemEval:</strong> one independent memory per question — build cannot be amortized across the benchmark.</div></div>
+      <div class="step"><div class="n">2</div><div class="copy"><strong>LoCoMo:</strong> ten conversations serve 1,986 questions — build amortizes to 666 tokens per question.</div></div>
+      <div class="callout warn">Mem0 memory-stage usage is absent from the supplied artifacts. We report GraphMem exactly, but do not invent a cross-system token-saving percentage.</div>
+    </div>
+  </div>
+  <div class="footer">Memory-backbone only · Embedding and judge excluded · Reasoning tokens = 0.</div><div class="page-no">4</div>
+</section>
+
+<section class="slide dark">
+  <div class="kicker">Innovation 1 · Hierarchical Navigable Memory World</div>
+  <h2>Long-term memory should be a world you can navigate — not a document you repeatedly reread</h2>
+  <div class="row-40" style="margin-top:.3in">
+    <div>
+      <p class="big-quote">“Locate broadly, move structurally, verify losslessly.”</p>
+      <div class="accent-line"></div>
+      <p class="muted">HNMW separates three jobs that flat vector memory conflates:</p>
+      <ul><li><strong>Routing</strong> to the right memory region</li><li><strong>Navigation</strong> across state, time, event, and dialogue relations</li><li><strong>Verification</strong> against source turns</li></ul>
+    </div>
+    <div>
+      <svg class="diagram" viewBox="0 0 720 420" aria-label="Flat retrieval versus hierarchical navigable memory">
+        <defs><marker id="d1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#64d2da"/></marker></defs>
+        <g font-family="Noto Sans" text-anchor="middle">
+          <text x="180" y="28" fill="#b9c9d8" font-size="15">Flat memory</text><text x="545" y="28" fill="#64d2da" font-size="15" font-weight="700">HNMW</text>
+          <rect x="55" y="55" width="250" height="290" rx="18" fill="#163b59" stroke="#44657e"/><g fill="#244d6b" stroke="#5d7d94"><rect x="85" y="85" width="190" height="34" rx="6"/><rect x="85" y="130" width="190" height="34" rx="6"/><rect x="85" y="175" width="190" height="34" rx="6"/><rect x="85" y="220" width="190" height="34" rx="6"/><rect x="85" y="265" width="190" height="34" rx="6"/></g><text x="180" y="325" fill="#b9c9d8" font-size="13">top-k similar chunks</text>
+          <g fill="none" stroke="#64d2da" stroke-width="2.5" marker-end="url(#d1)"><path d="M430 90H515"/><path d="M575 122V176"/><path d="M515 205H450"/><path d="M450 237H515"/><path d="M575 266V318"/></g>
+          <g stroke="#44657e"><rect x="365" y="62" width="130" height="60" rx="10" fill="#163b59"/><rect x="515" y="62" width="120" height="60" rx="10" fill="#1b5263"/><rect x="515" y="176" width="120" height="60" rx="10" fill="#1b5263"/><rect x="365" y="176" width="120" height="60" rx="10" fill="#1b5263"/><rect x="515" y="300" width="120" height="60" rx="10" fill="#0b8390"/></g>
+          <g fill="#f5f9fc" font-size="14"><text x="430" y="88">Question</text><text x="430" y="106" fill="#b9c9d8" font-size="11">intent</text><text x="575" y="88">Routing Card</text><text x="575" y="106" fill="#b9c9d8" font-size="11">region</text><text x="575" y="202">Role Frames</text><text x="575" y="220" fill="#b9c9d8" font-size="11">facts</text><text x="425" y="202">Typed Graph</text><text x="425" y="220" fill="#b9c9d8" font-size="11">relations</text><text x="575" y="326">Source Pack</text><text x="575" y="344" fill="#fff" font-size="11">lossless</text></g>
+        </g>
+      </svg>
+    </div>
+  </div>
+  <div class="footer">The graph is a navigation structure; source turns remain the final authority.</div><div class="page-no">5</div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Innovation 1 · Architecture</div>
+  <h2>Coarse-to-fine hierarchy with lateral, typed movement</h2>
+  <svg class="diagram" viewBox="0 0 1100 410" aria-label="Detailed HNMW architecture">
+    <defs><marker id="d2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#0b8390"/></marker><marker id="d2b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2f80ed"/></marker></defs>
+    <g font-family="Noto Sans" text-anchor="middle">
+      <g fill="none" stroke="#0b8390" stroke-width="3" marker-end="url(#d2)"><path d="M145 84H270"/><path d="M455 84H570"/><path d="M755 84H875"/><path d="M967 121V220"/></g>
+      <g fill="none" stroke="#2f80ed" stroke-width="2.5" marker-end="url(#d2b)"><path d="M660 121V220"/><path d="M570 260H455"/><path d="M270 260H145"/></g>
+      <rect x="25" y="45" width="120" height="78" rx="12" fill="#fff3e7" stroke="#e6b47f"/><rect x="270" y="40" width="185" height="88" rx="12" fill="#e7f7f8" stroke="#75bcc3"/><rect x="570" y="40" width="185" height="88" rx="12" fill="#e7f7f8" stroke="#75bcc3"/><rect x="875" y="40" width="185" height="88" rx="12" fill="#e7f7f8" stroke="#75bcc3"/>
+      <rect x="875" y="220" width="185" height="88" rx="12" fill="#edf4ff" stroke="#8ab2e2"/><rect x="570" y="220" width="185" height="88" rx="12" fill="#edf4ff" stroke="#8ab2e2"/><rect x="270" y="220" width="185" height="88" rx="12" fill="#edf4ff" stroke="#8ab2e2"/><rect x="25" y="220" width="120" height="88" rx="12" fill="#0b8390" stroke="#0b8390"/>
+      <g fill="#152238" font-size="17"><text x="85" y="79">Question</text><text x="85" y="101" font-size="12" fill="#627d98">Query intent</text><text x="362" y="72">L2 Routing Cards</text><text x="362" y="97" font-size="12" fill="#627d98">themes · entities · time range</text><text x="662" y="72">L1 Role Frames</text><text x="662" y="97" font-size="12" fill="#627d98">state · event · quantity</text><text x="967" y="72">L3 Relations</text><text x="967" y="97" font-size="12" fill="#627d98">state · temporal · dialogue</text><text x="967" y="252">Typed expansion</text><text x="967" y="277" font-size="12" fill="#627d98">only missing roles</text><text x="662" y="252">Evidence Groups</text><text x="662" y="277" font-size="12" fill="#627d98">atomic packing</text><text x="362" y="252">L0 Source Turns</text><text x="362" y="277" font-size="12" fill="#627d98">lossless provenance</text><text x="85" y="251" fill="#fff">Minimal</text><text x="85" y="274" fill="#fff">complete</text><text x="85" y="297" fill="#fff">subgraph</text></g>
+      <text x="545" y="172" fill="#627d98" font-size="13">vertical refinement</text><text x="827" y="259" fill="#2f80ed" font-size="13">lateral navigation</text>
+    </g>
+  </svg>
+  <div class="three">
+    <div class="card"><h3>Lossless provenance</h3><p class="small">Every frame and edge resolves to original turns. Summaries route; they do not become unverified answer facts.</p></div>
+    <div class="card"><h3>State-aware world model</h3><p class="small">Planned, completed, cancelled, added, and removed states coexist as ordered versions—not flattened mentions.</p></div>
+    <div class="card"><h3>Bounded working set</h3><p class="small">Low-value history stays outside the prompt. Complete evidence groups enter atomically and stop expansion.</p></div>
+  </div>
+  <div class="footer">HNMW is not “retrieve a summary, then expand downward”; it supports relation-driven lateral recovery.</div><div class="page-no">6</div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Innovation 1 · Worked example</div>
+  <h2>A state change becomes a navigable chain, not three competing chunks</h2>
+  <div class="timeline">
+    <div class="event"><strong>Monday</strong><br>Train to Shanghai<br><span class="pill blue">planned</span></div>
+    <div class="event cancel"><strong>Wednesday</strong><br>Train ticket<br><span class="pill orange">cancelled</span></div>
+    <div class="event"><strong>Wednesday</strong><br>Thursday flight<br><span class="pill">booked</span></div>
+  </div>
+  <div class="example-query">Question: “How am I travelling to Shanghai now?”</div>
+  <div class="row">
+    <div>
+      <h3>Flat retrieval failure mode</h3>
+      <div class="card"><p>All three chunks are semantically relevant. A top-k prompt may over-weight the oldest explicit travel plan.</p><p class="small muted">Similarity does not encode lifecycle or validity.</p></div>
+    </div>
+    <div>
+      <h3>HNMW navigation</h3>
+      <div class="step"><div class="n">1</div><div class="copy">Route to the travel memory region.</div></div><div class="step"><div class="n">2</div><div class="copy">Follow <strong>state_transition</strong>: planned → cancelled.</div></div><div class="step"><div class="n">3</div><div class="copy">Recover the replacement event: flight → booked.</div></div><div class="step"><div class="n">4</div><div class="copy">Expand only the two decisive source turns.</div></div>
+    </div>
+  </div>
+  <div class="callout"><strong>Result:</strong> “By flight on Thursday.” The old train plan remains auditable as superseded evidence, but cannot overwrite the latest valid state.</div>
+  <div class="three" style="margin-top:.18in"><div class="card metric"><div class="label">LME answer mean</div><div class="value">7,031</div><div class="delta">tokens / question</div></div><div class="card metric"><div class="label">LoCoMo answer mean</div><div class="value">4,413</div><div class="delta">tokens / question</div></div><div class="card metric"><div class="label">LoCoMo build reuse</div><div class="value">1 → many</div><div class="delta">10 conversations · 1,986 queries</div></div></div>
+  <div class="page-no">7</div>
+</section>
+
+<section class="slide dark">
+  <div class="kicker">Innovation 2 · Online Graph Harness</div>
+  <h2>A question-time execution layer turns every query into an evidence contract</h2>
+  <div class="row-40" style="margin-top:.26in">
+    <div>
+      <p class="big-quote">“At query time, compile the question into the roles a correct answer must prove.”</p>
+      <div class="accent-line"></div>
+      <p class="muted">Query IR binds all retrieval components to one plan:</p>
+      <div><span class="pill">target entity</span><span class="pill">owner / speaker</span><span class="pill">relation</span><span class="pill">value type</span><span class="pill">time</span><span class="pill">scope</span><span class="pill">polarity</span><span class="pill">required roles</span></div>
+    </div>
+    <div>
+      <svg class="diagram" viewBox="0 0 720 420" aria-label="Similarity retrieval versus Query IR evidence contract">
+        <defs><marker id="d3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#64d2da"/></marker></defs>
+        <g font-family="Noto Sans" text-anchor="middle">
+          <text x="180" y="28" fill="#b9c9d8" font-size="15">Similarity-first</text><text x="540" y="28" fill="#64d2da" font-size="15" font-weight="700">Contract-first</text>
+          <rect x="45" y="58" width="270" height="265" rx="18" fill="#163b59" stroke="#44657e"/><circle cx="180" cy="116" r="34" fill="#244d6b"/><circle cx="125" cy="194" r="27" fill="#244d6b"/><circle cx="230" cy="194" r="27" fill="#244d6b"/><circle cx="180" cy="267" r="27" fill="#244d6b"/><g stroke="#5d7d94"><line x1="180" y1="150" x2="125" y2="167"/><line x1="180" y1="150" x2="230" y2="167"/><line x1="125" y1="221" x2="180" y2="240"/></g><text x="180" y="345" fill="#b9c9d8" font-size="13">relevant ≠ sufficient</text>
+          <g fill="none" stroke="#64d2da" stroke-width="2.5" marker-end="url(#d3)"><path d="M400 94H490"/><path d="M550 126V178"/><path d="M490 213H400"/><path d="M460 244V298"/></g>
+          <g stroke="#44657e"><rect x="350" y="62" width="130" height="64" rx="10" fill="#163b59"/><rect x="490" y="62" width="130" height="64" rx="10" fill="#1b5263"/><rect x="490" y="178" width="130" height="70" rx="10" fill="#1b5263"/><rect x="350" y="178" width="130" height="70" rx="10" fill="#1b5263"/><rect x="400" y="298" width="150" height="64" rx="10" fill="#0b8390"/></g>
+          <g fill="#f5f9fc" font-size="14"><text x="415" y="89">Question</text><text x="415" y="108" fill="#b9c9d8" font-size="11">intent</text><text x="555" y="87">Query IR</text><text x="555" y="107" fill="#b9c9d8" font-size="11">required roles</text><text x="555" y="205">Role-gap</text><text x="555" y="225" fill="#b9c9d8" font-size="11">typed expansion</text><text x="415" y="205">Certificate</text><text x="415" y="225" fill="#b9c9d8" font-size="11">E · R · S · P</text><text x="475" y="325">Certified answer</text><text x="475" y="345" fill="#fff" font-size="11">source-bound</text></g>
+        </g>
+      </svg>
+    </div>
+  </div>
+  <div class="footer">The graph stores what can be known; the online harness decides what must be proven for this question.</div><div class="page-no">8</div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Innovation 2 · Runtime boundary</div>
+  <h2>Graph Harness runs online over a question-independent memory world</h2>
+  <div class="row" style="margin-top:.2in">
+    <div class="card" style="border-top:5px solid #0b8390">
+      <span class="pill">Offline · once per memory</span>
+      <h3 style="margin-top:.14in">Build the reusable memory world</h3>
+      <div class="step"><div class="n">1</div><div class="copy">Lossless turns preserve source authority.</div></div>
+      <div class="step"><div class="n">2</div><div class="copy">Routing cards, role frames, state chains, and typed relations organize memory.</div></div>
+      <div class="step"><div class="n">3</div><div class="copy">Dense, FTS/BM25, exact, and inverted indexes are persisted.</div></div>
+      <p class="small muted"><strong>No question, gold answer, or gold session ID is read during construction.</strong></p>
+    </div>
+    <div class="card" style="border-top:5px solid #2f80ed">
+      <span class="pill blue">Online · once per question</span>
+      <h3 style="margin-top:.14in">Execute a bounded evidence program</h3>
+      <div class="step"><div class="n">1</div><div class="copy">Compile the incoming question into deterministic Query IR.</div></div>
+      <div class="step"><div class="n">2</div><div class="copy">Seed, diagnose missing roles, traverse allowed edges, and certify evidence.</div></div>
+      <div class="step"><div class="n">3</div><div class="copy">Pack the smallest complete subgraph and call the answer model once.</div></div>
+      <p class="small muted"><strong>Local Query IR, retrieval, traversal, and operators use 0 LLM tokens.</strong> An optional short planner and the final answer count toward query usage.</p>
+    </div>
+  </div>
+  <div class="four" style="margin-top:.2in">
+    <div class="card"><h3>Compiler</h3><p class="small">Question → targets, constraints, answer algebra, required roles.</p></div>
+    <div class="card"><h3>Orchestrator</h3><p class="small">Coordinates dense, BM25, exact, inverted, adjacency, and graph channels.</p></div>
+    <div class="card"><h3>Verifier</h3><p class="small">Checks entity, relation, scope, and provenance before computation.</p></div>
+    <div class="card"><h3>Governor</h3><p class="small">Controls edge allowlists, depth, stopping, packing, and token budget.</p></div>
+  </div>
+  <div class="footer">Graph Harness is the control plane over the graph — not the graph itself, not an LLM agent roaming it, and not a topic-answer rulebook.</div><div class="page-no">9</div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Innovation 2 · Online execution loop</div>
+  <h2>One query contract governs retrieval, graph expansion, operators, and stopping</h2>
+  <svg class="diagram" viewBox="0 0 1120 390" aria-label="Detailed Graph Harness Query IR pipeline">
+    <defs><marker id="d4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2f80ed"/></marker></defs>
+    <g font-family="Noto Sans" text-anchor="middle">
+      <g fill="none" stroke="#2f80ed" stroke-width="3" marker-end="url(#d4)"><path d="M145 76H245"/><path d="M425 76H525"/><path d="M705 76H805"/><path d="M895 116V210"/><path d="M805 252H705"/><path d="M525 252H425"/><path d="M245 252H145"/></g>
+      <rect x="25" y="42" width="120" height="68" rx="11" fill="#fff3e7" stroke="#e6b47f"/><rect x="245" y="36" width="180" height="80" rx="11" fill="#2f80ed" stroke="#2f80ed"/><rect x="525" y="36" width="180" height="80" rx="11" fill="#edf4ff" stroke="#8ab2e2"/><rect x="805" y="36" width="180" height="80" rx="11" fill="#edf4ff" stroke="#8ab2e2"/>
+      <rect x="805" y="210" width="180" height="84" rx="11" fill="#e7f7f8" stroke="#75bcc3"/><rect x="525" y="210" width="180" height="84" rx="11" fill="#e7f7f8" stroke="#75bcc3"/><rect x="245" y="210" width="180" height="84" rx="11" fill="#e7f7f8" stroke="#75bcc3"/><rect x="25" y="210" width="120" height="84" rx="11" fill="#0b8390" stroke="#0b8390"/>
+      <g fill="#152238" font-size="17"><text x="85" y="70">Question</text><text x="85" y="92" font-size="12" fill="#627d98">arrives online</text><text x="335" y="66" fill="#fff">Query IR</text><text x="335" y="90" font-size="12" fill="#fff">deterministic · 0 LLM tokens</text><text x="615" y="66">Multi-channel seeds</text><text x="615" y="90" font-size="12" fill="#627d98">dense · BM25 · exact</text><text x="895" y="66">RRF + quotas</text><text x="895" y="90" font-size="12" fill="#627d98">no channel dominates</text><text x="895" y="240">Completeness gap</text><text x="895" y="265" font-size="12" fill="#627d98">which roles are missing?</text><text x="615" y="240">Typed expansion</text><text x="615" y="265" font-size="12" fill="#627d98">depth ≤ 2 · allowlist</text><text x="335" y="240">4-part certificate</text><text x="335" y="265" font-size="12" fill="#627d98">entity · relation · scope · source</text><text x="85" y="238" fill="#fff">LLM answer</text><text x="85" y="262" fill="#fff">+ certified</text><text x="85" y="282" fill="#fff">constraint</text></g>
+      <text x="560" y="350" fill="#627d98" font-size="14">Stop when required roles are complete — not when top-k is exhausted</text>
+    </g>
+  </svg>
+  <div class="four">
+    <div class="card"><h3>Entity</h3><p class="small">Is this the exact person, object, or event?</p></div><div class="card"><h3>Relation</h3><p class="small">Does the evidence prove the requested relation?</p></div><div class="card"><h3>Scope</h3><p class="small">Is time, collection, owner, and lifecycle correct?</p></div><div class="card"><h3>Provenance</h3><p class="small">Can every operand resolve to source turns?</p></div>
+  </div>
+  <div class="footer">If roles remain missing, one short planner may propose aliases or roles; its output must still pass source-bound verification.</div><div class="page-no">10</div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Innovation 2 · Worked examples</div>
+  <h2>Required roles turn ambiguous retrieval into verifiable evidence assembly</h2>
+  <div class="row">
+    <div class="card">
+      <span class="pill blue">Temporal comparison</span>
+      <div class="example-query">“How many days earlier was Event A than Event B?”</div>
+      <div class="equation">roles = {A, time(A), B, time(B), source}</div>
+      <div class="step"><div class="n">1</div><div class="copy">Retrieve A and candidate temporal facts.</div></div><div class="step"><div class="n">2</div><div class="copy">If B is missing, expand only via <strong>same_event / temporal_endpoint</strong>.</div></div><div class="step"><div class="n">3</div><div class="copy">Run date-difference only after both endpoints and sources pass certificates.</div></div>
+      <p class="small muted">Prevents the model from inferring a difference from one endpoint.</p>
+    </div>
+    <div class="card">
+      <span class="pill">Peer dialogue</span>
+      <div class="example-query">“What gift did Speaker B buy?”</div>
+      <div class="equation">roles = {speaker B, purchase, object, reply, source}</div>
+      <div class="step"><div class="n">1</div><div class="copy">Seed on “gift” and candidate purchase events.</div></div><div class="step"><div class="n">2</div><div class="copy">Recover the answer turn via <strong>dialogue_pair / next_turn</strong>.</div></div><div class="step"><div class="n">3</div><div class="copy">Use owner/speaker certificate to reject Speaker A’s preference as the answer.</div></div>
+      <p class="small muted">Preserves who asked, who answered, and who owns the fact.</p>
+    </div>
+  </div>
+  <div class="callout" style="margin-top:.24in"><strong>Why it helps:</strong> post-retrieval logic is not a collection of topic-specific answers. It is a small evidence algebra: latest state, add/remove, distinct set, temporal order, date difference, lifecycle filter, and exact-entity mismatch.</div>
+  <div class="footer">The final answer is still generated by one LLM call; certified values and members cannot be silently rewritten.</div><div class="page-no">11</div>
+</section>
+
+<section class="slide">
+  <div class="kicker">System-level synthesis</div>
+  <h2>HNMW makes the search space small; Query IR makes the evidence complete</h2>
+  <svg class="diagram" viewBox="0 0 1120 330" aria-label="How the two GraphMem innovations work together">
+    <defs><marker id="d5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#0b8390"/></marker></defs>
+    <g font-family="Noto Sans" text-anchor="middle">
+      <rect x="35" y="55" width="300" height="190" rx="18" fill="#e7f7f8" stroke="#75bcc3"/><text x="185" y="90" font-size="21" font-weight="700" fill="#08717c">HNMW</text><text x="185" y="120" font-size="14" fill="#526b80">Persistent memory world</text><text x="185" y="160" font-size="16" fill="#152238">ROUTE → NAVIGATE → VERIFY</text><text x="185" y="195" font-size="13" fill="#627d98">Small reusable working set</text><text x="185" y="220" font-size="13" fill="#627d98">Lossless source authority</text>
+      <path d="M335 150H505" fill="none" stroke="#0b8390" stroke-width="4" marker-end="url(#d5)"/><text x="420" y="133" font-size="12" fill="#627d98">candidate subgraph</text>
+      <rect x="505" y="55" width="300" height="190" rx="18" fill="#edf4ff" stroke="#8ab2e2"/><text x="655" y="90" font-size="21" font-weight="700" fill="#215fa8">Graph Harness Query IR</text><text x="655" y="120" font-size="14" fill="#526b80">Evidence contract</text><text x="655" y="160" font-size="16" fill="#152238">REQUIRE → COMPLETE → CERTIFY</text><text x="655" y="195" font-size="13" fill="#627d98">Typed role-gap expansion</text><text x="655" y="220" font-size="13" fill="#627d98">Entity · relation · scope · source</text>
+      <path d="M805 150H925" fill="none" stroke="#0b8390" stroke-width="4" marker-end="url(#d5)"/><rect x="925" y="93" width="165" height="114" rx="16" fill="#0b8390"/><text x="1007" y="133" fill="#fff" font-size="18" font-weight="700">Minimal complete</text><text x="1007" y="159" fill="#fff" font-size="18" font-weight="700">evidence pack</text><text x="1007" y="186" fill="#d9f5f7" font-size="12">one answer call</text>
+    </g>
+  </svg>
+  <div class="three">
+    <div class="card metric"><div class="label">LoCoMo evidence fully present</div><div class="value">90.81%</div><div class="delta">answer accuracy</div></div>
+    <div class="card metric"><div class="label">Evidence partially present</div><div class="value">81.44%</div><div class="delta">−9.37 pp</div></div>
+    <div class="card metric"><div class="label">No supporting evidence</div><div class="value">55.70%</div><div class="delta">−35.11 pp</div></div>
+  </div>
+  <p class="small muted center" style="margin-top:.16in">These support-stratified results motivate completeness-aware navigation; they are not a standalone Query IR ablation.</p>
+  <div class="footer">The design objective is not “retrieve more.” It is “prove the answer with the smallest source-complete subgraph.”</div><div class="page-no">12</div>
+</section>
+
+<section class="slide dark">
+  <div class="kicker">Takeaway</div>
+  <h2>From retrieval-augmented memory to a queryable memory system</h2>
+  <div class="row" style="margin-top:.32in">
+    <div>
+      <p class="big-quote">GraphMem turns long history into a persistent world, then compiles each question into a proof obligation.</p>
+      <div class="accent-line"></div>
+      <p class="muted">That combination delivers stronger accuracy while keeping answer-time context bounded.</p>
+    </div>
+    <div>
+      <div class="card"><h3>What is established</h3><ul><li>89.00% on LongMemEval vs Mem0 70.20%</li><li>86.23% on LoCoMo scored types vs Mem0 78.90%</li><li>7.03K / 4.41K answer tokens per question</li><li>Source-traceable facts and typed relations</li></ul></div>
+      <div class="card" style="margin-top:.18in"><h3>What remains to prove</h3><ul><li>Instrument Mem0 build/search/answer token usage</li><li>Run fixed-index module ablations</li><li>Close LoCoMo Temporal and Open-domain gaps</li><li>Reduce first-build cost without losing coverage</li></ul></div>
+    </div>
+  </div>
+  <div class="footer">Reproducible artifacts: GraphMem V2 ledger for LongMemEval · V3.4 lossless-first for LoCoMo</div><div class="page-no">13</div>
+</section>
+
+</body>
+</html>

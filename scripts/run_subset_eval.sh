@@ -35,7 +35,7 @@ EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-Embedding-0.6B}"
 EMBED_PORT="${EMBED_PORT:-8002}"
 EMBED_TRUNCATE_TOKENS="${EMBED_TRUNCATE_TOKENS:-16384}"
 EMBED_BATCH_SIZE="${EMBED_BATCH_SIZE:-16}"
-JUDGE_MODEL="${JUDGE_MODEL:-deepseek-v4-flash}"
+JUDGE_MODEL="${JUDGE_MODEL:-gpt-5.4-mini}"
 JUDGE_WORKERS="${JUDGE_WORKERS:-6}"
 
 QWORKERS="${QWORKERS:-2}"
@@ -74,9 +74,9 @@ _run_demo() {
   export HF_HOME="${RUN_HF_HOME}"
   export HF_HUB_OFFLINE="0"
   mkdir -p "${RUN_HF_HOME}"
-  export DEEPSEEK_API_KEY="dummy"
-  export DEEPSEEK_BASE_URL="http://127.0.0.1:${LLM_PORT}/v1"
-  export DEEPSEEK_MODEL="${LLM_MODEL}"
+  export SGAO_API_KEY="dummy"
+  export SGAO_BASE_URL="http://127.0.0.1:${LLM_PORT}/v1"
+  export SGAO_MODEL="${LLM_MODEL}"
   export EMBEDDING_TRUNCATE_TOKENS="${EMBED_TRUNCATE_TOKENS}"
   export EMBEDDING_BATCH_SIZE="${EMBED_BATCH_SIZE}"
   python scripts/run_token_demo.py \
@@ -99,12 +99,12 @@ _run_demo() {
 
 _run_judge() {
   _require_file "${RUN_DIR}/answers.jsonl"
-  if [[ -z "${DEEPSEEK_API_KEY:-}" || "${DEEPSEEK_API_KEY}" == "dummy" ]]; then
-    echo "[warn] DEEPSEEK_API_KEY is not set for judge; export a real key before judging." >&2
+  if [[ -z "${SGAO_API_KEY:-}" || "${SGAO_API_KEY}" == "dummy" ]]; then
+    echo "[warn] SGAO_API_KEY is not set for judge; export a real key before judging." >&2
   fi
   _activate "${RUN_ENV}"
   cd "${REPO}"
-  export DEEPSEEK_MODEL="${JUDGE_MODEL}"
+  export SGAO_MODEL="${JUDGE_MODEL}"
   python scripts/evaluate_answers.py \
     --answers "${RUN_DIR}/answers.jsonl" \
     --data "${DATA}" \

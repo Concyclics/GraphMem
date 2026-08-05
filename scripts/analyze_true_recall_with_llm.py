@@ -30,9 +30,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--question-type", default="all")
     parser.add_argument("--max-questions", type=int)
-    parser.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL"))
-    parser.add_argument("--base-url", default=os.environ.get("DEEPSEEK_BASE_URL"))
-    parser.add_argument("--api-key", default=os.environ.get("DEEPSEEK_API_KEY", "dummy"))
+    parser.add_argument("--model", default=os.environ.get("SGAO_MODEL", "gpt-5.4-mini"))
+    parser.add_argument("--base-url", default=os.environ.get("SGAO_BASE_URL", "https://sub2api.sgao.me/v1/"))
+    parser.add_argument("--api-key", default=os.environ.get("SGAO_API_KEY"))
     parser.add_argument("--leaf-text-max-chars", type=int, default=900)
     parser.add_argument("--temperature", type=float, default=0.0)
     return parser.parse_args()
@@ -163,6 +163,7 @@ def judge_support_indices(
                 ],
                 temperature=temperature,
                 max_tokens=500,
+                reasoning_effort="none",
             )
             content = response.choices[0].message.content or "{}"
             try:
@@ -184,9 +185,9 @@ def judge_support_indices(
 def main() -> None:
     args = parse_args()
     if not args.model:
-        raise ValueError("model is required (set --model or DEEPSEEK_MODEL).")
+        raise ValueError("model is required (set --model or SGAO_MODEL).")
     if not args.base_url:
-        raise ValueError("base_url is required (set --base-url or DEEPSEEK_BASE_URL).")
+        raise ValueError("base_url is required (set --base-url or SGAO_BASE_URL).")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     client = OpenAI(api_key=args.api_key, base_url=args.base_url, timeout=240)

@@ -30,6 +30,35 @@ Every L1 fact cites an existing L0 source. Consolidation may normalize aliases a
 
 Build and answer phases separately report cache-miss / cache-hit input, output, and total tokens. Default hard gates: **300,000** build tokens and **10,000** answer tokens per question.
 
+## Current V4.1 development snapshot
+
+The latest cross-backbone implementation and experiment history are maintained on
+`codex/graphmem-v419-qwen32b`. It includes the V4.1 online Graph Harness,
+resumable GPT/Qwen runners, token accounting, shard recovery, and the unified
+dual-backbone report. See:
+
+- [Repository handoff and artifact index](docs/repository_handoff_20260804.md)
+- [Graph Harness Query IR presentation notes](docs/graph_harness_query_ir_speaker_notes_20260804.md)
+- [GraphMem vs Mem0 comprehensive report](docs/graphmem_mem0_comprehensive_report_20260804.md)
+- [V4.1 query design](docs/V4_1_QUERY.md)
+
+```bash
+git clone https://github.com/Concyclics/GraphMem.git
+cd GraphMem
+git switch codex/graphmem-v419-qwen32b
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## GraphMem V4.0
+
+The `hierarchical_hybrid_graph_v4_0` variant uses one physical RoleFrame graph with topology-aware state/collection/temporal and peer-dialogue capability projections. See [the V4.0 design and reproducibility guide](docs/graphmem_v4_0.md).
+
+```bash
+DATA=data/longmemeval_s_cleaned.json bash scripts/run_v4_benchmark.sh
+```
+
 ## Setup
 
 ```bash

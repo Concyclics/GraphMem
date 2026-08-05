@@ -10,7 +10,8 @@ from graphmem_demo.hierarchical_v2 import (
     _current_competitive_record_result, _event_companion_result, _previous_status_result,
     apply_answer_constraint,
     _preference_context_facts, _preference_focus_instruction,
-    _question_date_scope, _target_date_answer_result, _temporal_calculation_result,
+    _question_date_scope, _question_derived_answer_policy,
+    _target_date_answer_result, _temporal_calculation_result,
     _typed_expand,
     apply_consolidation, build_evidence_ledger, build_graph_edges, build_state_chains,
     canonical_key, clean_entities, parse_session_extraction, provider_token_estimate, query_kind, retrieve,
@@ -1893,3 +1894,23 @@ def test_blind8_relative_art_event_routes_to_nearest_attended_exhibit():
         [city_fact,met_fact],[city,met],"2023-02-01",
     )
     assert result and result[1]["value"]=="the Metropolitan Museum of Art"
+
+
+def test_question_derived_answer_policy_is_role_based_and_topic_agnostic():
+    aggregate = _question_derived_answer_policy(
+        "How many devices did Alex acquire in all?"
+    ).casefold()
+    assert "all matching facts" in aggregate
+    assert "deduplicate" in aggregate
+    temporal = _question_derived_answer_policy(
+        "How many days passed between deployment and the audit?"
+    ).casefold()
+    assert "both named endpoints" in temporal
+    ordinal = _question_derived_answer_policy(
+        "What was the 7th item in the list?"
+    ).casefold()
+    assert "one-based order" in ordinal
+    for text in (aggregate, temporal, ordinal):
+        assert "longmemeval" not in text
+        assert "locomo" not in text
+        assert "question_id" not in text

@@ -27,7 +27,7 @@ for index in $(seq 0 $((SHARD_COUNT - 1))); do
     --data "${SHARD_DATA_DIR}/shard_${index}.json" \
     --question-type all --variants hierarchical_state_graph_v2 \
     --output-dir "${shard_out}" --memory-cache-dir "${MEMORY_CACHE_DIR}" \
-    --deepseek-model deepseek-v4-flash --deepseek-base-url https://api.deepseek.com \
+    --llm-model gpt-5.4-mini --llm-base-url https://sub2api.sgao.me/v1/ \
     --embedding-base-url http://127.0.0.1:8001/v1 \
     --embedding-model Qwen3-Embedding-0.6B \
     --max-questions 1986 --question-workers "${QUESTION_WORKERS}" \

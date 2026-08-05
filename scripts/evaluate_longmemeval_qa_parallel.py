@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Parallel LongMemEval-compatible QA judge using official prompts."
     )
-    parser.add_argument("metric_model", choices=["deepseek-v4-flash", "deepseek-v4-pro"])
+    parser.add_argument("metric_model", choices=["gpt-5.4-mini"])
     parser.add_argument("hyp_file", type=Path)
     parser.add_argument("ref_file", type=Path)
     parser.add_argument("--output-file", type=Path)
@@ -54,8 +54,8 @@ def main() -> None:
         client = getattr(client_state, "client", None)
         if client is None:
             client = OpenAI(
-                api_key=os.environ["DEEPSEEK_API_KEY"],
-                base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+                api_key=os.environ["SGAO_API_KEY"],
+                base_url=os.environ.get("SGAO_BASE_URL", "https://sub2api.sgao.me/v1/"),
                 timeout=120,
             )
             client_state.client = client
@@ -79,6 +79,7 @@ def main() -> None:
                     n=1,
                     temperature=0,
                     max_tokens=512,
+                    reasoning_effort="none",
                 )
                 eval_response = (completion.choices[0].message.content or "").strip()
                 result = dict(entry)

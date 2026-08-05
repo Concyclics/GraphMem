@@ -26,7 +26,7 @@ fi
 "${REPO}/.venv/bin/python" "${REPO}/scripts/run_token_demo.py" \
   --data "${DATA}" --question-type all --variants hierarchical_state_graph_v2 \
   --output-dir "${OUT}" --memory-cache-dir "${MEMORY_CACHE_DIR}" \
-  --deepseek-model deepseek-v4-flash --deepseek-base-url https://api.deepseek.com \
+  --llm-model gpt-5.4-mini --llm-base-url https://sub2api.sgao.me/v1/ \
   --embedding-base-url http://127.0.0.1:8001/v1 --embedding-model Qwen3-Embedding-0.6B \
   --max-questions "${MAX_QUESTIONS}" --question-workers "${QUESTION_WORKERS}" \
   --summary-workers "${BUILD_LLM_MAX_INFLIGHT}" \

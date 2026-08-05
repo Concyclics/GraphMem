@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graphmem"
+version = "5.0.0a1"
+description = "Versioned graph-memory construction and navigation contracts"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "openai>=1.0",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "hypothesis>=6"]
+experiment = ["neo4j>=5.26", "pandas>=2.2", "pyarrow>=16"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["graphmem*"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+asyncio_default_fixture_loop_scope = "function"

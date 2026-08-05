@@ -24,10 +24,15 @@ def pct(numerator: int, denominator: int) -> float:
     return round(100.0 * ratio(numerator, denominator), 2)
 
 
-def evidence_leaf_id(question_id: str, label: str) -> str | None:
+def evidence_leaf_id(question_id: str, label: str, *, v3: bool = False) -> str | None:
     match = re.fullmatch(r"D(\d+):(\d+)", str(label), flags=re.IGNORECASE)
     if not match:
         return None
+    if v3:
+        return (
+            f"{question_id}:session_{int(match.group(1))}:turn:"
+            f"{int(match.group(2)) - 1}"
+        )
     return (
         f"{question_id}:session_{int(match.group(1))}:leaf:"
         f"{(int(match.group(2)) - 1) // 2}"
@@ -43,6 +48,15 @@ def owner_id(question_id: str) -> str:
 
 def owner_node_id(node_id: str, question_id: str) -> str:
     return owner_id(question_id) + node_id[node_id.index(":") :]
+
+
+def conversation_node_id(node_id: str) -> str:
+    """Remove the per-question alias while preserving conversation and node suffix."""
+
+    match = re.match(r"locomo(\d+)_\d+(:.*)", node_id)
+    if not match:
+        return node_id
+    return f"locomo{int(match.group(1)):02d}{match.group(2)}"
 
 
 def coverage_bucket(hits: int, total: int) -> str:
@@ -61,7 +75,18 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
 
-    variant = args.run_dir / "hierarchical_state_graph_v2"
+    candidates = (
+        args.run_dir / "hierarchical_hypergraph_v3",
+        args.run_dir / "hierarchical_state_graph_v2",
+        args.run_dir,
+    )
+    variant = next(
+        (path for path in candidates if (path / "retrieval_results.jsonl").exists()),
+        None,
+    )
+    if variant is None:
+        raise FileNotFoundError(f"no retrieval artifacts found under {args.run_dir}")
+    v3 = variant.name == "hierarchical_hypergraph_v3"
     cases = {row["question_id"]: row for row in json.loads(args.data.read_text())}
     answers = {row["question_id"]: row for row in read_jsonl(variant / "answers.jsonl")}
     retrieval = {
@@ -73,12 +98,27 @@ def main() -> None:
 
     facts_by_id: dict[str, dict[str, Any]] = {}
     facts_by_source: dict[str, set[str]] = defaultdict(set)
-    for node in read_jsonl(variant / "nodes.jsonl"):
-        if node.get("node_type") != "atomic_fact":
+    node_rows = list(read_jsonl(variant / "nodes.jsonl"))
+    if v3:
+        for filename in ("operands.jsonl", "event_frames.jsonl"):
+            path = variant / filename
+            if path.exists():
+                node_rows.extend(read_jsonl(path))
+    for node in node_rows:
+        if not v3 and node.get("node_type") != "atomic_fact":
             continue
-        facts_by_id[node["node_id"]] = node
-        for source_id in node.get("source_leaf_ids") or []:
-            facts_by_source[source_id].add(node["node_id"])
+        if v3 and node.get("node_type") == "turn":
+            continue
+        node_id = node.get("node_id") or node.get("operand_id") or node.get("frame_id")
+        if not node_id:
+            continue
+        facts_by_id[str(node_id)] = node
+        for source_id in (
+            node.get("source_turn_ids") or node.get("source_leaf_ids") or []
+        ):
+            source_key = conversation_node_id(source_id) if v3 else source_id
+            fact_key = conversation_node_id(str(node_id)) if v3 else str(node_id)
+            facts_by_source[source_key].add(fact_key)
 
     aggregates: dict[str, Counter[str]] = defaultdict(Counter)
     channel_hits: dict[str, Counter[str]] = defaultdict(Counter)
@@ -119,24 +159,48 @@ def main() -> None:
         evidence_ids = [
             item
             for label in evidence_labels
-            if (item := evidence_leaf_id(question_id, label)) is not None
+            if (item := evidence_leaf_id(question_id, label, v3=v3)) is not None
         ]
-        evidence_owner_ids = [owner_node_id(item, question_id) for item in evidence_ids]
+        evidence_owner_ids = (
+            [conversation_node_id(item) for item in evidence_ids] if v3
+            else [owner_node_id(item, question_id) for item in evidence_ids]
+        )
         evidence_turn_text: dict[str, str] = {}
         for session in case.get("haystack_sessions") or []:
             for turn in session:
                 evidence_turn_text[str(turn.get("dia_id"))] = str(turn.get("content") or "")
 
-        leaf_channels = trace.get("leaf_channels") or {}
-        semantic = set((leaf_channels.get("semantic_rank_ids") or [])[:28])
-        bm25 = set((leaf_channels.get("bm25_rank_ids") or [])[:28])
-        entity = set((leaf_channels.get("entity_rank_ids") or [])[:28])
-        postpack_leaves = set((trace.get("postpack") or {}).get("leaf_ids") or [])
-        selected_fact_ids = {
-            owner_node_id(item, question_id)
-            for item in ((trace.get("postpack") or {}).get("fact_ids") or [])
-        }
+        if v3:
+            channels = trace.get("channels") or {}
+            semantic = set((channels.get("dense") or [])[:50])
+            bm25 = set((channels.get("bm25") or [])[:50])
+            entity = set((channels.get("exact") or [])[:50])
+            postpack_leaves = set(row.get("leaf_node_ids") or []) | set(
+                row.get("evidence_leaf_ids") or []
+            )
+            selected_fact_ids = {
+                conversation_node_id(item)
+                for item in row.get("fact_node_ids") or []
+            }
+        else:
+            leaf_channels = trace.get("leaf_channels") or {}
+            semantic = set((leaf_channels.get("semantic_rank_ids") or [])[:28])
+            bm25 = set((leaf_channels.get("bm25_rank_ids") or [])[:28])
+            entity = set((leaf_channels.get("entity_rank_ids") or [])[:28])
+            postpack_leaves = set((trace.get("postpack") or {}).get("leaf_ids") or [])
+            selected_fact_ids = {
+                owner_node_id(item, question_id)
+                for item in ((trace.get("postpack") or {}).get("fact_ids") or [])
+            }
         context = str(row.get("context_text") or "").casefold()
+        answer_context_raw = trace.get("answer_evidence_text")
+        answer_context = str(
+            answer_context_raw if answer_context_raw is not None else context
+        ).casefold()
+        answer_node_ids = {
+            str(value) for value in trace.get("answer_evidence_block_ids") or []
+        }
+        has_answer_evidence_trace = answer_context_raw is not None
 
         index_hits = sum(bool(facts_by_source.get(item)) for item in evidence_owner_ids)
         semantic_hits = sum(item in semantic for item in evidence_ids)
@@ -144,20 +208,39 @@ def main() -> None:
         entity_hits = sum(item in entity for item in evidence_ids)
         postpack_leaf_hits = sum(item in postpack_leaves for item in evidence_ids)
         exact_text_hits = sum(
-            bool((text := evidence_turn_text.get(label, "").strip()) and text.casefold() in context)
+            bool(
+                (text := evidence_turn_text.get(label, "").strip())
+                and text.casefold() in answer_context
+            )
             for label in evidence_labels
         )
         selected_fact_source_hits = sum(
             bool(facts_by_source.get(item, set()) & selected_fact_ids)
             for item in evidence_owner_ids
         )
-        prompt_support_hits = sum(
-            (
-                evidence_ids[index] in postpack_leaves
-                or bool(facts_by_source.get(evidence_owner_ids[index], set()) & selected_fact_ids)
+        if has_answer_evidence_trace:
+            prompt_support_hits = sum(
+                (
+                    evidence_ids[index] in answer_node_ids
+                    or evidence_owner_ids[index] in answer_node_ids
+                    or bool(
+                        facts_by_source.get(evidence_owner_ids[index], set())
+                        & answer_node_ids
+                    )
+                )
+                for index in range(len(evidence_ids))
             )
-            for index in range(len(evidence_ids))
-        )
+        else:
+            prompt_support_hits = sum(
+                (
+                    evidence_ids[index] in postpack_leaves
+                    or bool(
+                        facts_by_source.get(evidence_owner_ids[index], set())
+                        & selected_fact_ids
+                    )
+                )
+                for index in range(len(evidence_ids))
+            )
 
         prediction = str(answer.get("prediction") or "")
         abstention = bool(
@@ -168,28 +251,60 @@ def main() -> None:
                 prediction.casefold(),
             )
         )
-        initial = set(trace.get("initial_card_ids") or []) | set(
-            trace.get("initial_fact_ids") or []
-        )
-        expanded = set(trace.get("typed_expanded_node_ids") or []) | set(
-            trace.get("operand_expanded_fact_ids") or []
-        )
-        postpack_nodes = set((trace.get("postpack") or {}).get("card_ids") or []) | set(
-            (trace.get("postpack") or {}).get("fact_ids") or []
-        )
-        operator_sources = set(trace.get("operator_operand_fact_ids") or [])
+        if v3:
+            initial = set(trace.get("seed_ids") or [])
+            expanded = {
+                str(step.get("node_id") or step.get("target_id") or "")
+                for step in trace.get("expansion_steps") or []
+                if isinstance(step, dict)
+            }
+            postpack_nodes = postpack_leaves | selected_fact_ids | set(
+                row.get("routing_card_ids") or []
+            )
+            operator_sources = set(trace.get("catalog_protected_ids") or [])
+        else:
+            initial = set(trace.get("initial_card_ids") or []) | set(
+                trace.get("initial_fact_ids") or []
+            )
+            expanded = set(trace.get("typed_expanded_node_ids") or []) | set(
+                trace.get("operand_expanded_fact_ids") or []
+            )
+            postpack_nodes = set((trace.get("postpack") or {}).get("card_ids") or []) | set(
+                (trace.get("postpack") or {}).get("fact_ids") or []
+            )
+            operator_sources = set(trace.get("operator_operand_fact_ids") or [])
         retained_graph = expanded & postpack_nodes
         novel_operator = (expanded - initial) & operator_sources
-        for relation, counts in (trace.get("relation_contributions") or {}).items():
-            relation_totals[relation]["expanded"] += int(counts.get("expanded") or 0)
-            relation_totals[relation]["postpack"] += int(counts.get("postpack") or 0)
-            relation_totals[relation]["operator_source"] += int(
-                counts.get("operator_source") or 0
-            )
-            relation_totals[relation]["questions"] += 1
-            relation_totals[relation]["wrong_postpack"] += int(
-                (not judgment["correct"]) and bool(counts.get("postpack"))
-            )
+        if v3:
+            relation_seen: set[str] = set()
+            for step in trace.get("expansion_steps") or []:
+                if not isinstance(step, dict):
+                    continue
+                relation = str(step.get("relation") or "unknown")
+                node_id = str(step.get("node_id") or "")
+                relation_seen.add(relation)
+                relation_totals[relation]["expanded"] += 1
+                relation_totals[relation]["postpack"] += int(node_id in postpack_nodes)
+                relation_totals[relation]["operator_source"] += int(
+                    node_id in operator_sources
+                    or conversation_node_id(node_id) in operator_sources
+                )
+                relation_totals[relation]["wrong_postpack"] += int(
+                    (not judgment["correct"]) and node_id in postpack_nodes
+                )
+            for relation in relation_seen:
+                relation_totals[relation]["questions"] += 1
+        else:
+            for relation, counts in (trace.get("relation_contributions") or {}).items():
+                relation_totals[relation]["expanded"] += int(counts.get("expanded") or 0)
+                relation_totals[relation]["postpack"] += int(counts.get("postpack") or 0)
+                relation_totals[relation]["operator_source"] += int(
+                    counts.get("operator_source") or 0
+                )
+                relation_totals[relation]["questions"] += 1
+                relation_totals[relation]["wrong_postpack"] += int(
+                    (not judgment["correct"]) and bool(counts.get("postpack"))
+                )
 
         metrics = {
             "index_fact_hits": index_hits,
@@ -201,6 +316,7 @@ def main() -> None:
             "selected_fact_source_hits": selected_fact_source_hits,
             "prompt_support_hits": prompt_support_hits,
             "prompt_support_bucket": coverage_bucket(prompt_support_hits, len(evidence_ids)),
+            "answer_evidence_trace_available": has_answer_evidence_trace,
             "exact_text_bucket": coverage_bucket(exact_text_hits, len(evidence_ids)),
             "abstention": abstention,
             "retained_graph_count": len(retained_graph),

@@ -16,3 +16,8 @@ ref/
 *.log
 
 .venv/
+
+# Local patch/back-up artifacts
+*.orig
+/0
+/20

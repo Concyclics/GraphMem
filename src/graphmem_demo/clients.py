@@ -108,28 +108,49 @@ def _is_rate_limit_error(error: Exception) -> bool:
     return "429" in text or "rate_limit" in text or "too many pending requests" in text
 
 
+def _is_transient_service_error(error: Exception) -> bool:
+    text = str(error).casefold()
+    return any(marker in text for marker in (
+        "500", "502", "503", "504", "connection error", "connection reset",
+        "service temporarily unavailable", "temporarily unavailable", "timeout",
+        "timed out",
+    ))
+
+
+def _is_retryable_llm_error(error: Exception) -> bool:
+    return _is_rate_limit_error(error) or _is_transient_service_error(error)
+
+
 def _retry_sleep_sec(retry_count: int, error: Exception) -> float:
     if _is_rate_limit_error(error):
         return min(60.0, 5.0 * (2**retry_count))
+    if _is_transient_service_error(error):
+        return min(60.0, 2.0**retry_count)
     return min(2**retry_count, 4.0)
 
 
-class DeepSeekClient:
+class OpenAICompatibleClient:
     def __init__(
         self,
         model: str | None = None,
         base_url: str | None = None,
-        max_retries: int = 6,
+        api_key_env: str = "SGAO_API_KEY",
+        request_profile: str = "openai",
+        max_retries: int = 10,
         timeout_sec: float = 180.0,
     ) -> None:
-        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        api_key = os.environ.get(api_key_env)
         if not api_key:
-            raise RuntimeError("DEEPSEEK_API_KEY is required for real DeepSeek calls")
-        self.model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+            raise RuntimeError(f"{api_key_env} is required for real LLM calls")
+        if request_profile not in {"deepseek", "openai", "qwen", "omit"}:
+            raise ValueError(f"Unsupported request_profile: {request_profile}")
+        self.model = model or os.environ.get("SGAO_MODEL", "gpt-5.4-mini")
+        self.request_profile = request_profile
         OpenAI = _openai_client_class()
         self.client = OpenAI(
             api_key=api_key,
-            base_url=base_url or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            base_url=base_url
+            or os.environ.get("SGAO_BASE_URL", "https://sub2api.sgao.me/v1/"),
             timeout=timeout_sec,
         )
         self.max_retries = max_retries
@@ -161,14 +182,31 @@ class DeepSeekClient:
                 if seed is not None:
                     request["seed"] = seed
                 if thinking_mode == "enabled":
-                    request["extra_body"] = {"thinking": {"type": "enabled"}}
-                    request["reasoning_effort"] = "high"
+                    if self.request_profile == "deepseek":
+                        request["extra_body"] = {"thinking": {"type": "enabled"}}
+                        request["reasoning_effort"] = "high"
+                    elif self.request_profile == "openai":
+                        request["reasoning_effort"] = "high"
+                    elif self.request_profile == "qwen":
+                        request["extra_body"] = {
+                            "chat_template_kwargs": {"enable_thinking": True}
+                        }
                 elif thinking_mode in {"disabled", "none"}:
-                    request["extra_body"] = {"thinking": {"type": "disabled"}}
+                    if self.request_profile == "deepseek":
+                        request["extra_body"] = {"thinking": {"type": "disabled"}}
+                    elif self.request_profile == "openai":
+                        request["reasoning_effort"] = "none"
+                    elif self.request_profile == "qwen":
+                        request["extra_body"] = {
+                            "chat_template_kwargs": {"enable_thinking": False}
+                        }
                 else:
                     raise ValueError(f"Unsupported thinking_mode: {thinking_mode}")
                 if max_tokens is not None:
-                    request["max_tokens"] = max_tokens
+                    if self.request_profile == "openai" and self.model.casefold().startswith("gpt-5"):
+                        request["max_completion_tokens"] = max_tokens
+                    else:
+                        request["max_tokens"] = max_tokens
                 if json_mode:
                     request["response_format"] = {"type": "json_object"}
                 response = self.client.chat.completions.create(**request)
@@ -191,9 +229,34 @@ class DeepSeekClient:
                 return LLMResult(text=text.strip(), record=record)
             except Exception as error:  # pragma: no cover - depends on remote API behavior
                 last_error = error
-                if retry_count < self.max_retries:
+                if retry_count < self.max_retries and _is_retryable_llm_error(error):
                     time.sleep(_retry_sleep_sec(retry_count, error))
-        raise RuntimeError(f"DeepSeek {stage} call failed: {last_error}") from last_error
+                    continue
+                break
+        raise RuntimeError(f"LLM {stage} call failed: {last_error}") from last_error
+
+
+class DeepSeekClient(OpenAICompatibleClient):
+    """Explicit legacy DeepSeek entry point for replaying historical experiments."""
+
+    def __init__(
+        self,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key_env: str = "DEEPSEEK_API_KEY",
+        request_profile: str = "deepseek",
+        max_retries: int = 6,
+        timeout_sec: float = 180.0,
+    ) -> None:
+        super().__init__(
+            model=model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+            base_url=base_url
+            or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            api_key_env=api_key_env,
+            request_profile=request_profile,
+            max_retries=max_retries,
+            timeout_sec=timeout_sec,
+        )
 
 
 class MockDeepSeekClient:
@@ -231,6 +294,44 @@ class MockDeepSeekClient:
                     )
             else:
                 text = "Summary: " + compact
+        elif stage == "build_v36_session":
+            turn_ids = list(dict.fromkeys(re.findall(
+                r"[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+:turn:\d+", prompt
+            )))
+            source_id = turn_ids[0] if turn_ids else f"{question_id}:mock:turn:0"
+            text = json.dumps({
+                "frames": [[
+                    "fact", "participant_1", "participant_1", "said",
+                    "mock fact", "default", "positive", "asserted",
+                    "unknown", "none", None, "", None, None, None, None,
+                    "unknown", None, "", ["statement"], [source_id], 0.9
+                ]],
+                "routing_card": {
+                    "entities": ["participant_1"], "relations": ["said"],
+                    "events": [], "current_states": ["mock fact"],
+                    "time_range": "unknown"
+                },
+                "coverage": [
+                    [turn_id, "memory_frame" if turn_id == source_id else "dialogue_context", [0] if turn_id == source_id else []]
+                    for turn_id in turn_ids
+                ],
+            })
+        elif stage == "build_v36_identity_consolidation":
+            text = json.dumps({"edges": []})
+        elif stage == "build_v3_session":
+            turn_ids = re.findall(r"[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+:turn:\d+", prompt)
+            source_id = turn_ids[0] if turn_ids else f"{question_id}:mock:turn:0"
+            text = json.dumps({
+                "claims": [[
+                    "participant_1", "said", "mock fact", "general", "positive",
+                    "asserted", "none", "default", None, [source_id], None, "", 0.9
+                ]],
+                "events": [],
+                "episodes": [{
+                    "label": "mock episode", "turn_ids": [source_id],
+                    "claim_indices": [0], "event_indices": []
+                }],
+            })
         elif stage == "build_fact_extraction":
             leaf_ids = re.findall(r"leaf_id=([^;\]]+)", prompt)
             source_id = leaf_ids[0] if leaf_ids else f"{question_id}:mock:leaf:0"
@@ -297,7 +398,7 @@ class EmbeddingClient:
         self,
         base_url: str,
         model: str,
-        api_key: str = "local-embedding",
+        api_key: str | None = None,
         batch_size: int = 64,
     ) -> None:
         OpenAI = _openai_client_class()
@@ -306,9 +407,14 @@ class EmbeddingClient:
         timeout = _env_float("EMBEDDING_TIMEOUT", 1800.0)
         max_retries = _env_int("EMBEDDING_MAX_RETRIES", 4)
         self.base_url = base_url
-        self.api_key = api_key
+        self.api_key = api_key or os.environ.get(
+            "EMBEDDING_API_KEY", "local-embedding"
+        )
         self.client = OpenAI(
-            api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries
+            api_key=self.api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
         )
         self.model = model
         # 减小批大小，让每个 embedding 请求更轻、更快返回，降低超时概率。
