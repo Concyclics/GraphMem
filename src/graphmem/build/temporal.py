@@ -115,6 +115,9 @@ def normalize_time(raw_text: str, observed_at: str | None,
                 lowered)
             if ago:
                 count = int(ago.group(1) or 1); unit = ago.group(2)
+                if count > {"day": 36500, "week": 5200, "month": 1200, "year": 100}[unit]:
+                    return TemporalInterval(raw, None, None, "unknown", "unresolved",
+                                            anchor_turn_id, 0.0)
                 if unit == "day":
                     start = (anchor - timedelta(days=count)).replace(hour=0, minute=0, second=0, microsecond=0)
                 elif unit == "week":
@@ -132,6 +135,9 @@ def normalize_time(raw_text: str, observed_at: str | None,
             if duration:
                 qualifier = duration.group(1) or ""
                 count = int(duration.group(2) or 1); unit = duration.group(3)
+                if count > {"day": 36500, "week": 5200, "month": 1200, "year": 100}[unit]:
+                    return TemporalInterval(raw, None, None, "unknown", "unresolved",
+                                            anchor_turn_id, 0.0)
                 if unit == "day":
                     start = (anchor - timedelta(days=count)).replace(hour=0, minute=0, second=0, microsecond=0)
                 elif unit == "week":

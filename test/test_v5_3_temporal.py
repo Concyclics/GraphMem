@@ -45,3 +45,9 @@ def test_duration_produces_approximate_start_month() -> None:
     assert row.kind == "relative"
     assert row.precision == "month"
     assert row.start == "2023-01-01T00:00:00"
+
+
+def test_out_of_range_relative_year_is_unresolved() -> None:
+    row = normalize_time("6000 years ago", "2023-05-29", "turn:7")
+    assert row.kind == "unresolved"
+    assert row.start is None and row.end is None
