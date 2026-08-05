@@ -75,8 +75,15 @@ class PredicateCanonicalizer:
                 pending.append((predicate, item_id, content_hash))
         if pending:
             started = time.perf_counter()
-            response = self.client.embeddings.create(model=self.model_id,
-                                                     input=[row[0] for row in pending])
+            for attempt in range(3):
+                try:
+                    response = self.client.embeddings.create(
+                        model=self.model_id, input=[row[0] for row in pending])
+                    break
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.25 * (2 ** attempt))
             latency = (time.perf_counter() - started) * 1000
             ordered = sorted(response.data, key=lambda row: row.index)
             inserts = []

@@ -29,3 +29,19 @@ def test_rule_extractor_resolves_relative_phrase_against_turn_timestamp() -> Non
     row = normalize_time(phrase, "2023-05-27", "turn:4")
     assert row.kind == "relative"
     assert row.start == "2023-04-01T00:00:00"
+
+
+def test_last_weekday_resolves_backwards_not_forwards() -> None:
+    phrase = extract_time_expression("I won the final last Friday.")
+    assert phrase == "last Friday"
+    row = normalize_time(phrase, "2023-05-29", "turn:5")
+    assert row.start == "2023-05-26T00:00:00"
+
+
+def test_duration_produces_approximate_start_month() -> None:
+    phrase = extract_time_expression("I've been playing professionally for just under a year now.")
+    assert phrase == "for just under a year now"
+    row = normalize_time(phrase, "2023-12-06", "turn:6")
+    assert row.kind == "relative"
+    assert row.precision == "month"
+    assert row.start == "2023-01-01T00:00:00"

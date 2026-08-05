@@ -59,6 +59,10 @@ VERB_RE = re.compile(r"\b([A-Za-z]+(?:ed|ing|s)|went|go|got|made|took|had|has|is
 
 PROFILE_LEVEL = {f"b{index}": index for index in range(7)}
 
+OCCURRENCE_PREDICATES = frozenset({
+    "win", "participate", "receive", "write", "visit", "read", "buy", "get", "attend",
+})
+
 
 @dataclass(frozen=True, slots=True)
 class _SceneSlice:
@@ -338,14 +342,25 @@ class GraphBuildPipeline:
 
     @staticmethod
     def _turn_evidence_ref(memory_id, scene_id, turn, group):
+        raw_tokens = WORD_RE.findall(turn.raw_text)
+        priority = []
+        media = re.findall(r"caption:\s*([^\]]+)", turn.raw_text, re.I)
+        quoted = re.findall(r'["“]([^"”]{2,80})["”]', turn.raw_text)
+        for phrase in (*media, *quoted):
+            priority.extend(WORD_RE.findall(phrase))
+        priority.extend(token for token in raw_tokens if any(char.isdigit() for char in token))
+        # Head-only sketches systematically hid late-turn payloads in LoCoMo.
+        # Interleave salient caption/number tokens with the head and tail while
+        # keeping this lossless terminal reference compact.
+        ordered_tokens = [*priority, *raw_tokens[:12], *raw_tokens[-12:]]
         terms = []
-        for token in WORD_RE.findall(turn.raw_text):
+        for token in ordered_tokens:
             normalized = token.casefold()
             if normalized in EVIDENCE_REF_STOPWORDS or len(normalized) < 2:
                 continue
             if normalized not in terms:
                 terms.append(normalized)
-            if len(terms) >= 12:
+            if len(terms) >= 18:
                 break
         explicit_time = extract_time_expression(turn.raw_text)
         interval = normalize_time(explicit_time, turn.timestamp, turn.turn_id) if explicit_time else None
@@ -581,23 +596,36 @@ class GraphBuildPipeline:
     def _lean_semantic_graph(self, memory_id, packets, turn_map, group_by_turn,
                              profile, scene_nodes):
         nodes: dict[str, GraphNode] = {}; edges: list[GraphEdge] = []
-        chains: dict[tuple[str, str, str], list[tuple[GraphNode, str, int, Any, Any]]] = defaultdict(list)
-        predicate_keys = [(self._normal(fact.owner), self._normal(fact.predicate),
-                           self._normal(fact.scope), self._normal(fact.value_type), fact.polarity)
-                          for packet in packets for fact in packet.facts]
+        chains: dict[tuple[str, str, str, str, str, str], list[
+            tuple[GraphNode, str, int, Any, Any]
+        ]] = defaultdict(list)
+        predicate_keys = []
+        for packet in packets:
+            for fact in packet.facts:
+                if not self._keep_lean_fact(fact):
+                    continue
+                owner_key = self._normal(fact.owner)
+                predicate_key = self._canonical_predicate(fact.predicate, fact.value)
+                scope_key = self._canonical_scope(predicate_key, fact.scope, fact.value)
+                predicate_keys.append((owner_key, predicate_key, scope_key,
+                                       self._normal(fact.value_type), fact.polarity))
         predicate_map = (self.predicate_canonicalizer.canonicalize(memory_id, predicate_keys)
                          if self.predicate_canonicalizer and predicate_keys else
                          {key: key[1] for key in predicate_keys})
         for packet in packets:
             for fact in packet.facts:
+                if not self._keep_lean_fact(fact):
+                    continue
                 refs = [ref for ref in fact.evidence if ref[0] in group_by_turn]
                 if not refs:
                     continue
                 groups = tuple(dict.fromkeys(group_by_turn[turn_id].evidence_group_id
                                              for turn_id, _, _ in refs))
                 source_turn = turn_map[refs[0][0]]
-                owner_key = self._normal(fact.owner); raw_predicate = self._normal(fact.predicate)
-                value_key = self._normal(fact.value); scope_key = self._normal(fact.scope)
+                owner_key = self._normal(fact.owner)
+                raw_predicate = self._canonical_predicate(fact.predicate, fact.value)
+                value_key = self._normal(fact.value)
+                scope_key = self._canonical_scope(raw_predicate, fact.scope, fact.value)
                 predicate_key = predicate_map[(owner_key, raw_predicate, scope_key,
                                                self._normal(fact.value_type), fact.polarity)]
                 owner_id = stable_id("node", memory_id, "semantic-owner", owner_key)
@@ -608,7 +636,13 @@ class GraphBuildPipeline:
                                 "provenance_scope": "route"}))
                 observed = observed_interval(source_turn.timestamp, source_turn.turn_id)
                 evidence_text = source_turn.raw_text[refs[0][1]:refs[0][2]]
-                explicit_time = fact.time or extract_time_expression(evidence_text)
+                # Modality must describe this fact, not a nearby sentence in the
+                # same turn. Neighbour context caused completed events to inherit
+                # unrelated phrases such as "would love to".
+                modality = self._fact_modality(
+                    f"{fact.predicate} {fact.value} {evidence_text}")
+                explicit_time = (fact.time or extract_time_expression(evidence_text)
+                                 or extract_time_expression(source_turn.raw_text))
                 interval = (normalize_time(explicit_time, source_turn.timestamp, source_turn.turn_id)
                             if profile.edges.temporal_normalization and explicit_time else None)
                 fact_id = stable_id("node", memory_id, "lean-fact", owner_key, predicate_key,
@@ -616,15 +650,21 @@ class GraphBuildPipeline:
                 attrs = {"owner_id": owner_id, "predicate": predicate_key, "value": fact.value,
                          "value_key": value_key, "value_type": fact.value_type, "scope": scope_key,
                          "polarity": fact.polarity, "scene_id": packet.scene_id,
+                         "modality": modality,
                          "session_id": source_turn.session_id, "turn_index": source_turn.turn_index,
                          "roles": ("fact", "predicate", "object") +
-                                  (("negative_scope",) if fact.polarity == "negative" else ()),
+                                  (("negative_scope",) if fact.polarity == "negative" else ()) +
+                                  ((modality,) if modality != "asserted" else ()),
                          "provenance_scope": "terminal",
                          "observed_at": dataclass_dict(observed) if observed else None,
                          "time_interval": dataclass_dict(interval) if interval else None}
+                if predicate_key in OCCURRENCE_PREDICATES:
+                    attrs["event_instance_id"] = stable_id(
+                        "event-instance", memory_id, predicate_key, tuple(refs))
                 fact_node = GraphNode(
                     fact_id, memory_id, NodeType.CANONICAL_FACT, 0,
-                    f"{fact.owner} {fact.predicate} {fact.value}" +
+                    f"{fact.owner} " + (f"{modality} " if modality != "asserted" else "") +
+                    f"{fact.predicate} {fact.value}" +
                     (f" {explicit_time}" if explicit_time else ""), groups[0], groups[1:],
                     event_time=interval.start if interval and interval.start else None,
                     state=fact.value, confidence=fact.confidence, attributes=attrs)
@@ -634,6 +674,12 @@ class GraphBuildPipeline:
                 if packet.scene_id in scene_nodes:
                     edges.append(self._edge(memory_id, scene_nodes[packet.scene_id],
                                             RelationType.SCENE_CONTAINS, fact_node, "lean_semantic"))
+                    # Query seeds are scenes. This explicit owner link makes
+                    # related facts reachable as Scene -> Entity -> Fact within
+                    # the fixed two-hop budget, without fuzzy person merging.
+                    edges.append(self._edge(memory_id, scene_nodes[packet.scene_id],
+                                            RelationType.PARTICIPATES_IN, nodes[owner_id],
+                                            "lean_scene_owner"))
                 if interval and interval.start:
                     time_id = stable_id("node", memory_id, "time-interval", interval.start,
                                         interval.end, interval.precision)
@@ -645,12 +691,21 @@ class GraphBuildPipeline:
                                     "provenance_scope": "terminal"}))
                     edges.append(self._edge(memory_id, fact_node, RelationType.AT_TIME,
                                             nodes[time_id], "normalized_temporal"))
-                chains[(owner_id, predicate_key, scope_key)].append(
+                collection_key = self._collection_key(predicate_key, fact.value,
+                                                      fact.value_type)
+                attrs["collection_key"] = collection_key
+                # attrs changed after GraphNode creation; preserve the value on
+                # the immutable node used by downstream chain compilation.
+                fact_node = replace(fact_node, attributes=attrs)
+                nodes[fact_id] = fact_node
+                chains[(owner_id, predicate_key, scope_key, collection_key,
+                        fact.polarity, modality)].append(
                     (fact_node, source_turn.session_id, source_turn.turn_index, interval, observed))
 
-        for (owner_id, predicate, scope), rows in sorted(chains.items()):
+        for (owner_id, predicate, scope, collection_key, polarity, modality), rows in sorted(chains.items()):
             values = {str(row[0].attributes["value_key"]) for row in rows}
-            if len(values) < 2:
+            occurrence_collection = predicate in OCCURRENCE_PREDICATES
+            if len(rows) < 2 or (len(values) < 2 and not occurrence_collection):
                 continue
             ordered = sorted(rows, key=lambda row: (
                 row[3].start if row[3] and row[3].start else
@@ -658,35 +713,66 @@ class GraphBuildPipeline:
                 row[1], row[2], row[0].node_id))
             evidence = tuple(dict.fromkeys(group for fact, *_ in ordered
                                             for group in fact.all_evidence_group_ids))
-            collection_id = stable_id("node", memory_id, "lean-collection", owner_id, predicate, scope)
+            collection_id = stable_id("node", memory_id, "lean-collection", owner_id,
+                                      predicate, scope, collection_key, polarity, modality)
             collection = GraphNode(
                 collection_id, memory_id, NodeType.COLLECTION_SCOPE, 1,
-                f"{nodes[owner_id].summary} {predicate} " +
+                f"{nodes[owner_id].summary} " +
+                ("not " if polarity == "negative" else "") +
+                (f"{modality} " if modality != "asserted" else "") + f"{predicate} " +
                 " ".join(str(row[0].attributes["value"]) for row in ordered[:8]),
                 evidence[0], evidence[1:], attributes={
                     "owner_id": owner_id, "predicate": predicate, "scope": scope,
+                    "collection_key": collection_key,
+                    "polarity": polarity, "modality": modality,
+                    "member_count": len(ordered),
+                    "collection_semantics": ("event_instances" if occurrence_collection
+                                             else "distinct_values"),
                     "roles": ("collection_scope", "route"), "provenance_scope": "route"})
             nodes[collection_id] = collection
-            state_id = stable_id("node", memory_id, "state-head", owner_id, predicate, scope)
-            state = GraphNode(
-                state_id, memory_id, NodeType.STATE_HEAD, 0,
-                f"{nodes[owner_id].summary} {predicate} {ordered[-1][0].attributes['value']}",
-                evidence[0], evidence[1:], state=str(ordered[-1][0].attributes["value"]),
-                attributes={"owner_id": owner_id, "predicate": predicate, "scope": scope,
-                            "roles": ("prior_state", "current_state"),
-                            "provenance_scope": "terminal",
-                            "event_time_range": self._range_from_intervals(
-                                [row[3] for row in ordered]),
-                            "observation_time_range": self._range_from_intervals(
-                                [row[4] for row in ordered])})
-            nodes[state_id] = state
             edges.append(self._edge(memory_id, nodes[owner_id], RelationType.HAS_FACT,
-                                    state, "lean_state"))
+                                    collection, "lean_collection_route"))
+            if not occurrence_collection:
+                state_id = stable_id("node", memory_id, "state-head", owner_id, predicate,
+                                     scope, collection_key, polarity, modality)
+                state = GraphNode(
+                    state_id, memory_id, NodeType.STATE_HEAD, 0,
+                    f"{nodes[owner_id].summary} {predicate} {ordered[-1][0].attributes['value']}",
+                    evidence[0], evidence[1:], state=str(ordered[-1][0].attributes["value"]),
+                    attributes={"owner_id": owner_id, "predicate": predicate, "scope": scope,
+                                "roles": ("prior_state", "current_state"),
+                                "polarity": polarity, "modality": modality,
+                                "provenance_scope": "terminal",
+                                "event_time_range": self._range_from_intervals(
+                                    [row[3] for row in ordered]),
+                                "observation_time_range": self._range_from_intervals(
+                                    [row[4] for row in ordered])})
+                nodes[state_id] = state
+                edges.append(self._edge(memory_id, nodes[owner_id], RelationType.HAS_FACT,
+                                        state, "lean_state"))
             for fact, *_ in ordered[:32]:
                 edges.append(self._edge(memory_id, collection, RelationType.COLLECTION_CO_MEMBER,
                                         fact, "lean_collection"))
+            # The collection hub path needs three hops from a Scene. Compile a
+            # bounded member projection so list/count evidence is navigable in
+            # two hops while retaining CollectionScope as the authority node.
+            members = [row[0] for row in ordered[:32]]
+            member_cap = int(profile.edges.relation_degree_caps.get(
+                str(RelationType.COLLECTION_CO_MEMBER), profile.edges.max_degree_per_relation))
+            member_degree: dict[str, int] = defaultdict(int)
+            for left_index, left in enumerate(members):
+                for right in members[left_index + 1:]:
+                    if (member_degree[left.node_id] >= member_cap
+                            or member_degree[right.node_id] >= member_cap):
+                        continue
+                    edges.append(self._edge(memory_id, left,
+                                            RelationType.COLLECTION_CO_MEMBER, right,
+                                            "lean_collection_projection"))
+                    member_degree[left.node_id] += 1
+                    member_degree[right.node_id] += 1
             for left, right in zip(ordered, ordered[1:]):
-                if left[0].attributes["value_key"] == right[0].attributes["value_key"]:
+                if (not occurrence_collection
+                        and left[0].attributes["value_key"] == right[0].attributes["value_key"]):
                     continue
                 edges.append(self._edge(memory_id, left[0], RelationType.STATE_NEXT,
                                         right[0], "normalized_state"))
@@ -765,6 +851,99 @@ class GraphBuildPipeline:
     @staticmethod
     def _normal(value):
         return " ".join(re.findall(r"[\w'-]+", value.casefold()))
+
+    @classmethod
+    def _canonical_predicate(cls, predicate, value):
+        raw = cls._normal(str(predicate).replace("_", " "))
+        context = f"{raw} {cls._normal(value)}"
+        if re.search(r"\b(?:won|win|wins|winning)\b", raw):
+            return "win"
+        if re.search(r"\b(?:participat\w*|compet\w*|entered?)\b", raw):
+            return "participate"
+        if (re.search(r"\b(?:write|writes|wrote|written|writing|complete\w*|finish\w*)\b", raw)
+                and re.search(r"\b(?:screenplay|script|story|book|novel|letter|poem)\b", context)):
+            return "write"
+        if (re.search(r"\b(?:receive\w*|got|get)\b", raw)
+                and re.search(r"\b(?:letter|message|email|note)\b", context)):
+            return "receive"
+        if re.search(r"\b(?:visit\w*|travel(?:led|ed)? to|went to)\b", raw):
+            return "visit"
+        if (re.search(r"\b(?:read|reads|reading|reread\w*)\b", raw)
+                and not re.search(r"\b(?:recommend\w*|suggest\w*|advise\w*)\b", raw)):
+            return "read"
+        if re.search(r"\b(?:attend\w*|went to event)\b", raw):
+            return "attend"
+        if re.search(r"\b(?:buy|buys|bought|purchase\w*)\b", raw):
+            return "buy"
+        return raw
+
+    @classmethod
+    def _canonical_scope(cls, predicate, scope, value):
+        context = f"{predicate} {cls._normal(scope)} {cls._normal(value)}"
+        if predicate in {"win", "participate"}:
+            return "competition"
+        if predicate == "write":
+            return "writing"
+        if predicate == "receive" and re.search(r"\b(?:letter|message|email|note)\b", context):
+            return "correspondence"
+        if predicate == "visit":
+            return "travel"
+        if predicate == "read":
+            return "reading"
+        if predicate in {"buy", "get"}:
+            return "acquisition"
+        normalized = cls._normal(scope)
+        return normalized if normalized else "general"
+
+    @classmethod
+    def _collection_key(cls, predicate, value, value_type):
+        text = cls._normal(value)
+        if predicate in {"win", "participate"}:
+            # Extraction occasionally puts only the temporal adjunct in value
+            # ("last week"). Predicate semantics still identify the event family.
+            return "tournament"
+        families = (
+            ("tournament", r"\b(?:tournament|tourney|championship|valorant final)\b"),
+            ("game", r"\b(?:game|match)\b"),
+            ("screenplay", r"\b(?:screenplay|script)\b"),
+            ("letter", r"\b(?:letter|email|message|note)\b"),
+            ("book", r"\b(?:book|novel)\b"),
+            ("poem", r"\b(?:poem|poetry)\b"),
+            ("pet", r"\b(?:pet|dog|cat|turtle|puppy|kitten)\b"),
+        )
+        for label, pattern in families:
+            if re.search(pattern, text):
+                return label
+        if predicate == "read":
+            return "reading_item"
+        if predicate == "visit":
+            return "location"
+        return cls._normal(value_type) or "value"
+
+    @classmethod
+    def _keep_lean_fact(cls, fact):
+        predicate = cls._normal(str(fact.predicate).replace("_", " "))
+        value = cls._normal(fact.value)
+        if re.search(r"\b(?:shared|showed|sent)\b.*\b(?:media|photo|picture|image|caption)\b",
+                     predicate):
+            return False
+        canonical = cls._canonical_predicate(predicate, value)
+        if canonical in OCCURRENCE_PREDICATES and value in {"yes", "true", "it", "that"}:
+            return False
+        return True
+
+    @staticmethod
+    def _fact_modality(text):
+        normalized = " ".join(str(text).casefold().split())
+        if re.search(r"\b(?:currently|right now|at the moment)\b", normalized):
+            return "current"
+        if re.search(
+            r"\b(?:plan(?:s|ned|ning)? to|planning on|want(?:s|ed)? to|hope(?:s|d)? to|"
+            r"would love to|going to|will|next (?:week|month|year)|to-do list|dream trip|"
+            r"can't wait to|cannot wait to|upcoming)\b", normalized
+        ):
+            return "planned"
+        return "asserted"
 
     @staticmethod
     def _packet_record(packet):
@@ -933,12 +1112,18 @@ class GraphBuildPipeline:
     def _build_diagnostics(self, memory_id, nodes, edges, packets):
         import json
         scopes = defaultdict(int); terminal_groups = set(); relations = defaultdict(int)
+        semantic_groups = set(); collection_semantics = defaultdict(int)
         degrees: dict[tuple[str, str], int] = defaultdict(int)
         for node in nodes:
             scope = str(node.attributes.get("provenance_scope", "terminal"))
             scopes[scope] += 1
             if scope == "terminal":
                 terminal_groups.update(node.all_evidence_group_ids)
+            if node.node_type in {NodeType.CANONICAL_FACT, NodeType.EVENT_SKELETON}:
+                semantic_groups.update(node.all_evidence_group_ids)
+            if node.node_type == NodeType.COLLECTION_SCOPE:
+                collection_semantics[str(node.attributes.get(
+                    "collection_semantics", "distinct_values"))] += 1
         for edge in edges:
             relations[str(edge.relation)] += 1; degrees[(edge.src_id, str(edge.relation))] += 1
         terminal_turns = set()
@@ -946,6 +1131,13 @@ class GraphBuildPipeline:
             group = self.store.evidence_group(group_id)
             if group:
                 terminal_turns.update(member.turn_id for member in group.members)
+        semantic_turns = set()
+        for group_id in semantic_groups:
+            group = self.store.evidence_group(group_id)
+            if group:
+                semantic_turns.update(member.turn_id for member in group.members)
+        source_turn_count = max(1, len(self.store.turns(memory_id)))
+        facts_per_scene = sorted(len(packet.facts) for packet in packets)
         stage_usage: dict[str, dict[str, Mapping[str, Any]]] = defaultdict(dict)
         for row in self.store._connection.execute(
             "SELECT c.stage,c.cache_key,k.usage_json FROM llm_calls c JOIN llm_cache k "
@@ -960,7 +1152,14 @@ class GraphBuildPipeline:
             "extraction_success_scenes": sum(bool(packet.facts) and not packet.fallback for packet in packets),
             "extraction_fallback_scenes": sum(packet.fallback for packet in packets),
             "extraction_retry_calls": int(retries),
-            "terminal_turn_coverage": len(terminal_turns) / max(1, len(self.store.turns(memory_id))),
+            "terminal_turn_coverage": len(terminal_turns) / source_turn_count,
+            "semantic_terminal_turn_coverage": len(semantic_turns) / source_turn_count,
+            "semantic_fact_turns": len(semantic_turns),
+            "facts_per_scene_mean": (sum(facts_per_scene) / max(1, len(facts_per_scene))),
+            "facts_per_scene_p95": (facts_per_scene[max(0, int(len(facts_per_scene) * 0.95) - 1)]
+                                    if facts_per_scene else 0),
+            "collection_semantics": dict(sorted(collection_semantics.items())),
+            "semantic_prompt_hash": (self.distiller.prompt_hash if self.distiller else None),
             "provenance_scope_nodes": dict(sorted(scopes.items())),
             "relation_counts": dict(sorted(relations.items())),
             "degree_p95": degree_values[max(0, int(len(degree_values) * 0.95) - 1)] if degree_values else 0,

@@ -14,9 +14,9 @@ from ..storage import SQLiteGraphStore
 
 
 PROMPT_VERSION = "graphmem-v5.1-scene-semantic-v1"
-STRICT_PROMPT_VERSION = "graphmem-v5.3-strict-scene-facts-v3"
+STRICT_PROMPT_VERSION = "graphmem-v5.4-strict-scene-facts-v5"
 SYSTEM_PROMPT = """Extract grounded memory facts. Return compact JSON {"s":[{"i":scene_id,"m":summary,"f":[{"o":owner,"p":predicate,"v":value,"y":value_type,"g":scope,"n":"positive|negative","t":time_or_null,"c":confidence,"e":[{"i":turn_id,"a":start,"b":end}]}],"u":[]}]}. Every fact must cite exact supplied offsets. No invention, markdown, explanations, or reasoning. Summary <=64 tokens. Omit empty optional fields."""
-STRICT_PROMPT = """Extract durable facts that help route later questions to source turns. Return only schema JSON; copy local aliases exactly. Fact keys: o=owner entity; p=short canonical predicate; v=concrete value; g=short domain (travel/work/family/etc., never an ID); n=positive or negative; r=one or two cited turn aliases; q=short exact quote from a cited turn. Prefer events, state changes, preferences, relationships, quantities, collections, and dated facts. Omit greetings, acknowledgements, advice, and filler. Input d is observation metadata only. Do not copy d, invent, explain, reason, summarize, or create aliases."""
+STRICT_PROMPT = """Extract durable facts that help route later questions to exact source turns. Return only schema JSON and copy local aliases exactly. Fact keys: o=owner entity; p=short canonical verb phrase; v=the concrete value including names and ordinals; g=short domain; n=positive or negative; r=one or two cited turn aliases; q=one exact quote containing the value and any explicit time. Cover every informative turn before adding a second fact from any turn. Highest priority: quantities and ordinals, named people/places/books/pets, acquisitions and state changes, participation or wins, preferences, explicit or relative time, and factual media-caption details. Preserve words such as first/second/third and numeric caption facts. Never emit generic facts such as shared/showed/sent a photo when the caption supports a more concrete fact. Omit greetings, acknowledgements, emotions without a durable state, advice, and filler. Input d is observation metadata and may only anchor relative time; never copy it as event time. Do not invent, explain, reason, summarize, or create aliases."""
 HIERARCHY_PROMPT = """Compress supplied child semantic records for routing. Return compact JSON with summary, owners, predicates, values, scopes, times, child_postings mapping keys to child ID arrays, and aliases as arrays of equivalent value strings found in the children. Only copy supported values and IDs. Never put IDs in scopes or aliases. No markdown or reasoning."""
 EXPLICIT_TIME_RE = re.compile(
     r"\b(?:\d{1,4}[:/\-]\d{1,2}|\d{4}|monday|tuesday|wednesday|thursday|friday|"
@@ -39,7 +39,7 @@ def strict_scene_schema(max_scenes: int, max_facts: int) -> Mapping[str, Any]:
                  "i": {"type": "string"},
                  "f": {"type": "array", "maxItems": max_facts, "items": fact}}}
     return {"type": "object", "additionalProperties": False, "required": ["s"],
-            "properties": {"s": {"type": "array", "minItems": 1, "maxItems": max_scenes,
+            "properties": {"s": {"type": "array", "minItems": max_scenes, "maxItems": max_scenes,
                                      "items": scene}}}
 
 
@@ -199,8 +199,7 @@ class QwenSemanticDistiller:
             result.append(self._validate_scene(scene, row) if row else self._fallback(scene))
         return result
 
-    @staticmethod
-    def _strict_payload(batch: Sequence[Any]) -> tuple[Mapping[str, Any], Mapping[str, str], Mapping[str, str]]:
+    def _strict_payload(self, batch: Sequence[Any]) -> tuple[Mapping[str, Any], Mapping[str, str], Mapping[str, str]]:
         scene_aliases: dict[str, str] = {}
         turn_aliases: dict[str, str] = {}
         rows = []
@@ -209,26 +208,44 @@ class QwenSemanticDistiller:
             turns = []
             for turn_index, turn in enumerate(scene.turns):
                 alias = f"s{scene_index}t{turn_index}"; turn_aliases[alias] = turn.turn_id
-                turns.append({"i": alias, "s": turn.speaker, "d": turn.timestamp, "t": turn.raw_text})
+                turns.append({"i": alias, "s": turn.speaker, "d": turn.timestamp,
+                              "t": self._compact_turn(turn.raw_text)})
             rows.append({"i": scene_alias, "r": turns})
         return {"s": rows}, scene_aliases, turn_aliases
 
     def _strict_rows(self, response: Mapping[str, Any], scene_aliases: Mapping[str, str],
                      turn_aliases: Mapping[str, str]) -> list[Mapping[str, Any]]:
-        if str(response.get("finish_reason", "")).casefold() == "length":
-            return []
-        objects = self._parse_objects(str(response.get("content", "")))
+        content = str(response.get("content", ""))
+        objects = self._parse_objects(content)
         root = objects[0] if objects else {}
         rows = root.get("s", ()) if isinstance(root, dict) else ()
+        if not isinstance(rows, list) or not rows:
+            rows = self._parse_complete_scene_rows(content)
         result = []
-        for source in rows if isinstance(rows, list) else ():
+        source_rows = rows if isinstance(rows, list) else ()
+        expected_aliases = tuple(scene_aliases)
+        raw_aliases = tuple(str(row.get("i")) for row in source_rows if isinstance(row, dict))
+        aliases_are_permutation = (len(raw_aliases) == len(expected_aliases)
+                                   and len(set(raw_aliases)) == len(expected_aliases)
+                                   and set(raw_aliases) == set(expected_aliases))
+        used_aliases: set[str] = set()
+        for position, source in enumerate(source_rows):
             if not isinstance(source, dict):
                 continue
             alias = str(source.get("i"))
             if alias not in scene_aliases and alias in turn_aliases:
                 alias = alias.split("t", 1)[0]
+            # Guided JSON guarantees the array shape but cannot express that each
+            # scene alias is unique. Qwen occasionally emits s0 twice for a
+            # two-scene batch while preserving row order. Recover that row
+            # deterministically instead of paying for a redundant single-scene
+            # retry. Positional recovery is only safe at exact cardinality.
+            if (not aliases_are_permutation and len(source_rows) == len(expected_aliases)
+                    and position < len(expected_aliases)):
+                alias = expected_aliases[position]
             if alias not in scene_aliases:
                 continue
+            used_aliases.add(alias)
             row = dict(source); row["i"] = scene_aliases[alias]
             facts = []
             for source_fact in source.get("f", ()) if isinstance(source.get("f"), list) else ():
@@ -244,6 +261,46 @@ class QwenSemanticDistiller:
                 fact["e"] = refs; facts.append(fact)
             row["f"] = facts; result.append(row)
         return result
+
+    def _compact_turn(self, text: str) -> str:
+        limit = int(self.config.models.semantic_turn_input_chars)
+        if not limit or len(text) <= limit:
+            return text
+        head = int(limit * 0.72)
+        tail = limit - head
+        return text[:head].rstrip() + "\n[...middle omitted...]\n" + text[-tail:].lstrip()
+
+    @staticmethod
+    def _parse_complete_scene_rows(text: str) -> list[Mapping[str, Any]]:
+        """Recover complete scene objects from a length-truncated JSON root."""
+        rows = []
+        for match in re.finditer(r'\{\s*"i"\s*:', text):
+            start = match.start(); depth = 0; quoted = False; escaped = False
+            for index in range(start, len(text)):
+                char = text[index]
+                if quoted:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        quoted = False
+                    continue
+                if char == '"':
+                    quoted = True
+                elif char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            row = json.loads(text[start:index + 1])
+                        except json.JSONDecodeError:
+                            break
+                        if isinstance(row, dict) and isinstance(row.get("f"), list):
+                            rows.append(row)
+                        break
+        return rows
 
     def _validate_scene(self, scene: Any, row: Mapping[str, Any]) -> ScenePacket:
         turns = {turn.turn_id: turn for turn in scene.turns}
@@ -356,6 +413,7 @@ class QwenSemanticDistiller:
             "batch_scenes": self.config.models.semantic_batch_scenes,
             "batch_input": self.config.models.semantic_batch_input_tokens,
             "scene_input": self.config.models.semantic_scene_input_tokens,
+            "turn_input_chars": self.config.models.semantic_turn_input_chars,
             "batch_output": self.config.models.semantic_batch_output_tokens,
         }
         if self.config.models.semantic_extraction_mode != "legacy_batch":

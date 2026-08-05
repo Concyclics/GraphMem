@@ -39,6 +39,7 @@ class ModelConfig:
     semantic_batch_scenes: int = 4
     semantic_batch_input_tokens: int = 12000
     semantic_scene_input_tokens: int = 16000
+    semantic_turn_input_chars: int = 0
     semantic_batch_output_tokens: int = 4096
     semantic_average_tokens_per_memory: int = 180000
     semantic_max_facts_per_scene: int = 12
@@ -136,6 +137,8 @@ class GraphMemV5Config:
             raise ValueError("invalid semantic extraction mode")
         if self.models.semantic_max_retries not in {0, 1}:
             raise ValueError("semantic_max_retries must be 0 or 1")
+        if self.models.semantic_turn_input_chars < 0:
+            raise ValueError("semantic_turn_input_chars cannot be negative")
         if not 0.0 <= self.edges.predicate_embedding_threshold <= 1.0:
             raise ValueError("predicate embedding threshold must be in [0, 1]")
         if not 0 <= self.edges.low_threshold < self.edges.high_threshold <= 1:

@@ -196,6 +196,8 @@ def test_strict_prompt_uses_local_aliases_schema_and_one_retry(tmp_path: Path) -
     assert first["response_format"]["type"] == "json_schema"
     fact_schema = first["response_format"]["json_schema"]["schema"]["properties"]["s"]["items"]["properties"]["f"]["items"]
     assert set(fact_schema["properties"]) == {"o", "p", "v", "g", "n", "r", "q"}
+    scene_array = first["response_format"]["json_schema"]["schema"]["properties"]["s"]
+    assert scene_array["minItems"] == scene_array["maxItems"] == 1
     payload = json.loads(first["messages"][1]["content"])
     assert all(row["i"].startswith("s") for row in payload["s"])
     assert all(turn["i"].startswith("s") for row in payload["s"] for turn in row["r"])
@@ -203,10 +205,86 @@ def test_strict_prompt_uses_local_aliases_schema_and_one_retry(tmp_path: Path) -
     assert manifest.build_token_usage["reasoning_tokens"] == 0
 
 
+def test_strict_rows_recovers_duplicate_scene_alias_by_position() -> None:
+    distiller = QwenSemanticDistiller.__new__(QwenSemanticDistiller)
+    response = {"finish_reason": "stop", "content": json.dumps({"s": [
+        {"i": "s0", "f": []}, {"i": "s0", "f": []},
+    ]})}
+    rows = distiller._strict_rows(
+        response, {"s0": "scene-a", "s1": "scene-b"}, {})
+    assert [row["i"] for row in rows] == ["scene-a", "scene-b"]
+
+
+def test_strict_rows_salvages_complete_scene_from_truncated_root() -> None:
+    distiller = QwenSemanticDistiller.__new__(QwenSemanticDistiller)
+    content = '{"s":[{"i":"s1","f":[]} , {"i":"s0","f":['
+    rows = distiller._strict_rows(
+        {"finish_reason": "length", "content": content},
+        {"s0": "scene-a", "s1": "scene-b"}, {})
+    assert [row["i"] for row in rows] == ["scene-b"]
+
+
 def test_strict_value_type_is_derived_without_model_tokens() -> None:
     assert QwenSemanticDistiller._infer_value_type("$800") == "currency"
     assert QwenSemanticDistiller._infer_value_type("three options") == "text"
     assert QwenSemanticDistiller._infer_value_type("2024-05-01") == "time"
+
+
+def test_v54_predicate_and_scope_rules_merge_event_variants() -> None:
+    assert GraphBuildPipeline._canonical_predicate("won_tournament", "Valorant final") == "win"
+    assert GraphBuildPipeline._canonical_predicate("won", "international tournament") == "win"
+    assert GraphBuildPipeline._canonical_scope("win", "travel", "international tournament") == "competition"
+    assert GraphBuildPipeline._canonical_predicate("completed_script", "second screenplay") == "write"
+    assert GraphBuildPipeline._canonical_predicate("recommends reading", "to relax") == "recommends reading"
+    assert GraphBuildPipeline._collection_key("write", "second screenplay", "text") == "screenplay"
+    assert GraphBuildPipeline._collection_key("win", "last week", "time") == "tournament"
+    assert GraphBuildPipeline._collection_key("write", "a children's book", "text") == "book"
+    assert GraphBuildPipeline._fact_modality("It is definitely on my to-do list") == "planned"
+    assert GraphBuildPipeline._fact_modality("I visited Chicago last week") == "asserted"
+
+
+class OccurrenceCompletions:
+    def create(self, **request):
+        payload = json.loads(request["messages"][1]["content"])
+        scenes = []
+        for scene_index, scene in enumerate(payload["s"]):
+            turn = next(row for row in scene["r"] if "Paris" in row["t"])
+            scenes.append({"i": scene["i"], "f": [{
+                "o": "Alice", "p": "won_tournament" if scene_index else "won",
+                "v": "Paris tournament", "g": "travel", "n": "positive",
+                "r": [turn["i"]], "q": "Paris",
+            }]})
+        message = SimpleNamespace(content=json.dumps({"s": scenes}), reasoning_content=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")],
+            model="qwen30b", usage=SimpleNamespace(prompt_tokens=80, completion_tokens=20,
+                                                    total_tokens=100))
+
+
+def test_v54_event_instance_collection_keeps_repeated_values(tmp_path: Path) -> None:
+    store = _store(tmp_path / "occurrence.sqlite")
+    config = replace(_strict_config(), scenes=replace(_strict_config().scenes, max_turns=2))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=OccurrenceCompletions()))
+    GraphBuildPipeline(store, dataset_hash="dataset",
+        distiller=QwenSemanticDistiller(store, config, "dataset", client=client)).build("travel", config)
+    collections = [node for node in store.nodes("travel")
+                   if node.node_type == NodeType.COLLECTION_SCOPE
+                   and node.attributes.get("predicate") == "win"]
+    assert len(collections) == 1
+    collection = collections[0]
+    assert collection.attributes["collection_semantics"] == "event_instances"
+    assert collection.attributes["member_count"] == 2
+    member_edges = [edge for edge in store.edges("travel")
+                    if edge.src_id == collection.node_id
+                    and edge.relation == RelationType.COLLECTION_CO_MEMBER]
+    assert len(member_edges) == 2
+    projected_edges = [edge for edge in store.edges("travel")
+                       if edge.relation == RelationType.COLLECTION_CO_MEMBER
+                       and edge.src_id != collection.node_id]
+    assert len(projected_edges) == 1
+    assert any(edge.dst_id == collection.node_id and edge.relation == RelationType.HAS_FACT
+               for edge in store.edges("travel"))
+    assert any(edge.relation == RelationType.PARTICIPATES_IN
+               for edge in store.edges("travel"))
 
 
 def test_g5_lean_graph_has_terminal_facts_and_no_value_nodes(tmp_path: Path) -> None:

@@ -20,7 +20,10 @@ _TIME_PHRASE_RE = re.compile(
     r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
     r"\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|"
     r"(?:about\s+|around\s+)?(?:a|an|one|\d+)\s+(?:day|week|month|year)s?\s+ago|"
-    r"today|yesterday|tomorrow|last\s+(?:week|month|year)|next\s+(?:week|month|year)|"
+    r"(?:for\s+)?(?:(?:just\s+under|almost|nearly|about|around)\s+)?"
+    r"(?:a|an|one|\d+)\s+(?:day|week|month|year)s?(?:\s+now)?|"
+    r"today|yesterday|tomorrow|last\s+(?:week|month|year|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)|"
+    r"next\s+(?:week|month|year|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)|"
     r"Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b", re.I)
 
 
@@ -88,6 +91,15 @@ def normalize_time(raw_text: str, observed_at: str | None,
         elif lowered in _WEEKDAYS:
             delta = (_WEEKDAYS[lowered] - anchor.weekday()) % 7
             start = (anchor + timedelta(days=delta)).replace(hour=0, minute=0, second=0, microsecond=0)
+        elif re.fullmatch(r"(?:last|next)\s+(?:" + "|".join(_WEEKDAYS) + r")", lowered):
+            direction, weekday = lowered.split()
+            target = _WEEKDAYS[weekday]
+            if direction == "last":
+                delta = (anchor.weekday() - target) % 7 or 7
+                start = (anchor - timedelta(days=delta)).replace(hour=0, minute=0, second=0, microsecond=0)
+            else:
+                delta = (target - anchor.weekday()) % 7 or 7
+                start = (anchor + timedelta(days=delta)).replace(hour=0, minute=0, second=0, microsecond=0)
         elif lowered in {"last week", "next week"}:
             monday = (anchor - timedelta(days=anchor.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
             start = monday + timedelta(days=-7 if lowered == "last week" else 7); precision = "week"
@@ -113,6 +125,30 @@ def normalize_time(raw_text: str, observed_at: str | None,
                     start = datetime(month_index // 12, month_index % 12 + 1, 1); precision = "month"
                 else:
                     start = datetime(anchor.year - count, 1, 1); precision = "year"
+            duration = re.fullmatch(
+                r"(?:for\s+)?(?:(just\s+under|almost|nearly|about|around)\s+)?"
+                r"(?:a|an|one|(\d+))\s+(day|week|month|year)s?(?:\s+now)?",
+                lowered)
+            if duration:
+                qualifier = duration.group(1) or ""
+                count = int(duration.group(2) or 1); unit = duration.group(3)
+                if unit == "day":
+                    start = (anchor - timedelta(days=count)).replace(hour=0, minute=0, second=0, microsecond=0)
+                elif unit == "week":
+                    start = (anchor - timedelta(days=7 * count)).replace(hour=0, minute=0, second=0, microsecond=0)
+                    precision = "week"
+                elif unit == "month":
+                    month_index = anchor.year * 12 + anchor.month - 1 - count
+                    start = datetime(month_index // 12, month_index % 12 + 1, 1); precision = "month"
+                else:
+                    # A conversational duration describes an approximate start,
+                    # not a whole calendar year. Month precision avoids turning
+                    # "just under a year" into a false exact date.
+                    months = 12 * count
+                    if qualifier in {"just under", "almost", "nearly"}:
+                        months = max(1, months - 1)
+                    month_index = anchor.year * 12 + anchor.month - 1 - months
+                    start = datetime(month_index // 12, month_index % 12 + 1, 1); precision = "month"
         if start:
             end = (start + timedelta(days=7) - timedelta(microseconds=1)
                    if precision == "week" else _end_for(start, precision))

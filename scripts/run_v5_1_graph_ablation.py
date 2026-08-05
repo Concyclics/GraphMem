@@ -166,6 +166,15 @@ def main() -> None:
             coarsen=replace(base.coarsen, cross_session_merge=False),
             edges=replace(base.edges, graph_variant="g5", temporal_normalization=temporal,
                           cross_session_portals=portals))
+    # V5.4 uses the supplied config verbatim for extraction controls.  Earlier
+    # F3-F5 definitions intentionally freeze the V5.3 three-fact prompt and
+    # therefore must remain unchanged for baseline reproducibility.
+    definitions["v54"] = replace(base, profile="b5",
+        scenes=replace(base.scenes, llm_semantic_extraction=True,
+                       llm_hierarchy_compression=False),
+        coarsen=replace(base.coarsen, cross_session_merge=False),
+        edges=replace(base.edges, graph_variant="g5", temporal_normalization=True,
+                      cross_session_portals=False))
     summary = {}; metric_rows = []; diagnostic_rows = []; trace_rows = []
     navigation_rows = []; manifests = []
     for label in (item.strip() for item in args.profiles.split(",") if item.strip()):
@@ -242,10 +251,12 @@ def main() -> None:
             trace_rows.append({"configuration": label, "question_id": question.question_id,
                                "mode": "oracle_seed", **dataclass_dict(oracle)})
             if label in {"c2", "c3", "c4", "g0", "g1", "g2", "g3", "g4",
-                         "e0", "e1", "e2", "e3", "e4", "f0", "f1", "f2", "f3", "f4", "f5"}:
+                         "e0", "e1", "e2", "e3", "e4", "f0", "f1", "f2", "f3", "f4", "f5",
+                         "v54"}:
                 for relation in (RelationType.SHARED_VALUE, RelationType.SAME_ACTIVITY,
                                  RelationType.HAS_FACT, RelationType.FACT_VALUE,
-                                 RelationType.SCENE_CONTAINS, RelationType.AT_TIME,
+                                 RelationType.SCENE_CONTAINS, RelationType.PARTICIPATES_IN,
+                                 RelationType.AT_TIME,
                                  RelationType.STATE_NEXT, RelationType.TEMPORAL_BEFORE,
                                  RelationType.COLLECTION_CO_MEMBER, RelationType.PORTAL):
                     result = probe.run(question.memory_id, question.query, profile.query_budget,
@@ -287,6 +298,12 @@ def main() -> None:
                 for item in current)),
             "terminal_turn_coverage": sum(float(item.build_diagnostics.get("terminal_turn_coverage", 0))
                 for item in current) / max(1, len(current)),
+            "semantic_terminal_turn_coverage": sum(float(item.build_diagnostics.get(
+                "semantic_terminal_turn_coverage", 0)) for item in current) / max(1, len(current)),
+            "facts_per_scene_mean": sum(float(item.build_diagnostics.get(
+                "facts_per_scene_mean", 0)) for item in current) / max(1, len(current)),
+            "semantic_prompt_hash": (current[0].build_diagnostics.get("semantic_prompt_hash")
+                                     if current else None),
             "config_hash": config_hash(profile)}
     (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     (root / "graph_manifest.json").write_text(json.dumps(manifests, indent=2) + "\n")

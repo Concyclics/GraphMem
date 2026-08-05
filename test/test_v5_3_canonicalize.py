@@ -17,6 +17,17 @@ class FakeEmbeddings:
         return SimpleNamespace(data=data, usage=SimpleNamespace(prompt_tokens=len(input)))
 
 
+class FlakyEmbeddings(FakeEmbeddings):
+    def __init__(self):
+        self.calls = 0
+
+    def create(self, *, model, input):
+        self.calls += 1
+        if self.calls == 1:
+            raise ConnectionError("embedding service restarted")
+        return super().create(model=model, input=input)
+
+
 def test_predicate_clustering_requires_mutual_nearest_and_compatible_slots(tmp_path: Path) -> None:
     store = _store(tmp_path / "canonical.sqlite")
     base = GraphMemV5Config(); config = replace(base, edges=replace(
@@ -41,3 +52,13 @@ def test_predicate_clustering_requires_mutual_nearest_and_compatible_slots(tmp_p
         "SELECT count(*) FROM embedding_calls WHERE model_id LIKE '%predicate-v1'"
     ).fetchone()[0]
     assert before == after == 1
+
+
+def test_predicate_embedding_retries_transient_service_restart(tmp_path: Path) -> None:
+    store = _store(tmp_path / "canonical-retry.sqlite")
+    embeddings = FlakyEmbeddings()
+    canonicalizer = PredicateCanonicalizer(
+        store, GraphMemV5Config(), client=SimpleNamespace(embeddings=embeddings))
+    key = ("alice", "live in", "home", "place", "positive")
+    assert canonicalizer.canonicalize("travel", [key])[key] == "live in"
+    assert embeddings.calls == 2
