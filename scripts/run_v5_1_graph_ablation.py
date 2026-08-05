@@ -138,7 +138,8 @@ def main() -> None:
     f0_models = replace(base.models, semantic_batch_scenes=2, semantic_batch_output_tokens=768,
         semantic_max_facts_per_scene=4, semantic_summary_tokens=32,
         semantic_repair_output_tokens=256, semantic_constrained_json=True,
-        semantic_individual_repair=True)
+        semantic_individual_repair=True, semantic_extraction_mode="legacy_batch",
+        semantic_max_retries=0, semantic_compile_summary=False)
     strict_single = replace(base.models, semantic_extraction_mode="strict_single",
         semantic_batch_scenes=1, semantic_batch_output_tokens=768,
         semantic_max_facts_per_scene=2, semantic_summary_tokens=48,
