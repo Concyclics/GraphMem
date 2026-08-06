@@ -16,8 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=False)
 sys.path.insert(0, str(ROOT / "src"))
 
-from graphmem_demo.clients import OpenAICompatibleClient  # noqa: E402
-from graphmem_demo.mem0_longmemeval_prompts import get_judge_prompt  # noqa: E402
+from graphmem.judging import OpenAICompatibleClient  # noqa: E402
+from graphmem.judging import get_judge_prompt  # noqa: E402
 
 PINNED_COMMIT = "bd063eea04de4f8a19927beea155afa094a01905"
 PROMPT_SOURCE_SHA256 = "ba8cf60d26f1390ecbef0f07b3e950556fe3bc5a37ba4b5343f28217f18c144f"

@@ -12,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from .models import CompressionRecord, DeepSeekCallRecord, EmbeddingCallRecord
+from .records import CompressionRecord, DeepSeekCallRecord, EmbeddingCallRecord
 
 
 _COMPRESSOR_LOAD_LOCK = threading.Lock()

@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=False)
 sys.path.insert(0, str(ROOT / "src"))
 
-from graphmem_demo.clients import OpenAICompatibleClient  # noqa: E402
+from graphmem.judging import OpenAICompatibleClient  # noqa: E402
 
 
 DEFAULT_REPO = Path(

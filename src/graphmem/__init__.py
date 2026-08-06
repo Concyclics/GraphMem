@@ -1,6 +1,6 @@
 """GraphMem 5.0 contracts.
 
-The V5 package intentionally coexists with ``graphmem_demo``.  Gate A exposes
+The V5 package is self-contained.  Gate A exposes
 stable domain/configuration interfaces and a read-only legacy adapter without
 changing the V4/V4.1 execution path.
 """
