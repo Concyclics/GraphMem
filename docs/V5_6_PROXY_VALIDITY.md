@@ -196,3 +196,85 @@ change and should be measured against these numbers before it is adopted.
 
 `content` term matching is adopted meanwhile because it dominates
 `head_action` on every axis.
+
+---
+
+# Addendum 3 — the aggregation unit does not exist
+
+Locating the collection by retrieval instead of by lexicon works, and it works
+by a wide margin. Same 200 questions, same P1 graph:
+
+| strategy | identified | recall | **all-hit** | coverage | manifests |
+|---|---:|---:|---:|---:|---:|
+| `lexical` (question terms) | 0.995 | 0.397 | 0.203 | 0.093 | 38.2 |
+| **`reservoir`** | 1.000 | **0.887** | **0.807** | 0.364 | 151.3 |
+| `bound` | 0.850 | 0.357 | 0.230 | 0.063 | 25.2 |
+| `bound_ranked_1` | 0.850 | 0.058 | 0.032 | 0.002 | 0.8 |
+| `bound_ranked_3` | 0.850 | 0.116 | 0.053 | 0.006 | 2.5 |
+| `bound_ranked_8` | 0.850 | 0.189 | 0.091 | 0.016 | 6.5 |
+
+Admitting a manifest because the reservoir already reached one of its facts
+takes collection all-hit from **20.3% to 80.7%** — a 4× improvement, and the
+first number in the range a certified count would need.
+
+Two clean negatives:
+
+* **Ranking by question terms is actively harmful**, not merely weak.
+  `bound_ranked_1` recalls 5.8%: the manifest that best overlaps the question's
+  words is almost never the right one.
+* **Binding is the lossy step.** `bound` admission recalls 35.7% where the
+  reservoir it is drawn from recalls 88.7%.
+
+## But coverage is 36.4%, and the reason is fatal
+
+The identified collection is a third of the memory, so a count over it would
+still be wrong. The reason is not the selection strategy:
+
+| | value |
+|---|---:|
+| manifests | 51,496 |
+| members per manifest, mean / p50 / p95 / max | **1.06 / 1 / 1 / 9** |
+| **singletons** | **49,477 (96.1%)** |
+| manifests with ≥3 members, corpus-wide | **724** |
+| distinct predicates per memory | **433** for **498 facts** |
+
+**Extraction emits a near-unique predicate per fact** — 433 distinct predicates
+for 498 facts — so the chain key `(owner, predicate, scope, collection_key, …)`
+is almost a primary key and every "collection" is a singleton. There is nothing
+to aggregate over.
+
+Coarsening the key does not rescue it:
+
+| chain key | groups | mean | ≥3 members | singletons |
+|---|---:|---:|---:|---:|
+| `(owner, predicate, scope, collection)` — current | 51,314 | 1.07 | 763 | 95.9% |
+| `(owner, predicate)` | 49,847 | 1.10 | 1,040 | 94.8% |
+| `(owner, predicate_head)` | 32,257 | 1.70 | 3,532 | 78.4% |
+| `(owner, scope)` | 30,402 | 1.80 | 5,404 | 67.4% |
+| `(owner, predicate_head, scope)` | 44,131 | 1.24 | 2,470 | 86.3% |
+
+The loosest key still leaves **67% singletons**. The aggregation unit is absent
+from the extracted data, not merely mis-keyed by the projection.
+
+## What this explains
+
+* why `collection_complete` never worked — there were no multi-member collections to complete;
+* why lexical matching plateaus — predicates are idiosyncratic phrases like *"plans a monthly family game night"*, not relations;
+* why counting is 51.9% — the count has no set to range over;
+* why PR4b's binding discriminant failed twice — with a near-unique predicate per fact there is no dimension to discriminate on.
+
+## Next step
+
+This is a **build-side** problem: the extraction prompt asks for a short verb
+phrase and gets a sentence. `PredicateCanonicalizer` exists and runs, but
+`edges.predicate_embedding_threshold` is **0.92**, strict enough to merge almost
+nothing.
+
+The cheapest test is to lower that threshold (0.92 → 0.80/0.70) and re-measure
+the member distribution; canonicalization is embedding-based, so this costs no
+generation. If clustering cannot produce real families either, the extraction
+schema itself has to constrain the predicate vocabulary, and that is a full
+rebuild.
+
+Until an aggregation unit exists, `COUNT_DISTINCT` cannot be certified on this
+corpus no matter how the collection is selected.
