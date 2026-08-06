@@ -181,6 +181,19 @@ def distinct_by(node: OperatorNode, default: str = "value") -> str:
     return default
 
 
+def ordinal_index(node: OperatorNode, default: int = 0) -> int:
+    """Python index for the first ``Ordinal`` in ``node``.
+
+    ``Ordinal.index`` is 1-based with ``-1`` meaning "the last one", so it
+    cannot be handed to a list directly: index 1 must select element 0, while
+    -1 already means the last element.
+    """
+    for row in walk(node):
+        if isinstance(row, Ordinal):
+            return row.index - 1 if row.index > 0 else row.index
+    return default
+
+
 def requires_exhaustive_scope(node: OperatorNode) -> bool:
     """Operators whose answer is wrong unless the collection is fully enumerated."""
     return any(isinstance(row, (UnionDistinct, IntersectionDistinct, GroupByOwner,

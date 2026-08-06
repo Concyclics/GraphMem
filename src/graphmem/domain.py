@@ -823,6 +823,10 @@ class NavigationResult:
     reached_fact_node_ids: tuple[str, ...] = ()
     bound_fact_node_ids: tuple[str, ...] = ()
     selected_fact_node_ids: tuple[str, ...] = ()
+    # Set only by AST-executing profiles.  The answer stage needs answer members
+    # and their witnesses to emit a closed-form count or list; without this the
+    # composer has nothing to read and fired on 0 of 200 questions.
+    algebra: "AlgebraResult | None" = None
     schema_version: str = SCHEMA_VERSION
 
 

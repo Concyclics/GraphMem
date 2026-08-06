@@ -71,3 +71,67 @@ On `lme_temporal`, packing all the gold turns is worth **nothing** (65% vs 69%, 
 ## Caveat that must travel with these numbers
 
 The judge is **local Qwen3-30B**, while every historical artifact (V3.7's 89.0%/86.2%, V4.1's 72.6%) was judged by **gpt-5.4-mini**. Prompts are byte-identical to mem0's official versions (sha256-enforced on both benchmarks), so judge model is the only changed variable — but a 200-question cross-judge calibration is still required before any of these numbers is placed beside a historical one.
+
+---
+
+# Addendum — why the aggregation fix did not land
+
+Step 1 built the three pieces the aggregation error class needs, and they work
+in isolation:
+
+* **P1 projection**: 51,496 `COLLECTION_MANIFEST` nodes and 54,766 `MEMBER_OF`
+  edges where the frozen graph had **zero**. 49,477 are single-member and
+  **49,641 (96.4%) were invisible** to the build's `>=2 rows and >=2 distinct
+  values` rule — the frozen graph held 1,856 `collection_scope` nodes, which is
+  exactly the remainder.
+* **`ast_algebra.evaluate_ast`**: executes the compiled AST and emits
+  `AnswerMember` rows with witnesses; 24 unit tests.
+* **h10 wiring**: `NavigationResult.algebra` reaches the answer stage.
+
+The end-to-end result is still `closed_form_rate = 0.0`, and that is now the
+**correct** outcome rather than an accident.
+
+## What blocks it
+
+Operand-to-collection identification. For *"How many antique items did I inherit
+from my family members?"* the compiled operand carries:
+
+```
+predicates: ('ask family members about clocks', 'notes that many people share',
+             'plans a monthly family game night')
+scopes:     ('antique clocks', 'family activities')
+owners:     ('i',)
+```
+
+The predicate candidates are **retrieved from the graph by embedding
+similarity, not parsed from the question** — nothing encodes *inherit*. Matching
+manifests by term overlap against them therefore matches nearly every
+collection, and the count ranged over the whole memory: it returned **15
+"antique items"** that were actually `Shutterfly`, `grandmother`, `$70` and
+similar, with `scope_complete = True`. Gold is 5.
+
+Owner does not rescue it: `owners = ('i',)` means "every fact about the memory
+user", which is the whole memory.
+
+## What was changed as a result
+
+A confidently wrong count is worse than no count, so:
+
+* an operand is closed only when a manifest matches it on owner **and**
+  predicate, and the count is then restricted to that manifest's members;
+* owner alone no longer counts as a constraint;
+* `compose()` **withholds an uncertified count entirely** rather than proposing
+  "at least 15". A partial *list* still renders — its members are named rather
+  than inferred from a scope claim — but a partial *count* is withheld.
+
+## What this means for the plan
+
+The aggregation fix is **blocked upstream of both the manifest and the
+algebra**, in query parsing / operand construction. The next step is not more
+algebra: it is making the operand carry the question's own predicate and scope
+(*inherit*, *antique items*) so a collection can be identified at all.
+
+That is a change to `retrieval/slots.py` and `_ast_operands`, and it is the
+precondition for every aggregate operator. Until it lands, `COUNT_DISTINCT`,
+`GROUP_BY_OWNER` and `EXISTS_ALL` cannot be trusted on this corpus regardless of
+how good the manifests are.

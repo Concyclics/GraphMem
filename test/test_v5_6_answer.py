@@ -121,13 +121,18 @@ def test_a_closed_scope_count_answers_exactly() -> None:
     assert draft is not None and draft.text == "3" and draft.certified
 
 
-def test_an_open_scope_count_answers_as_a_lower_bound() -> None:
-    """An unsaturated scope yields a floor; reporting it as exact would be a lie."""
+def test_an_open_scope_count_proposes_nothing_at_all() -> None:
+    """Measured: an uncertified count is noise, not a floor.
+
+    "How many antique items did I inherit" counted 15 members that were
+    unrelated facts, because operand predicate candidates are retrieved from the
+    graph rather than parsed from the question.  Proposing "at least 15" to the
+    answer prompt is worse than proposing nothing.
+    """
     members = tuple(AnswerMember(f"k{i}", f"v{i}", f"v{i}") for i in range(3))
 
-    draft = compose(_algebra(answer_kind="count", members=members, count=3, scope_complete=False))
-
-    assert draft is not None and draft.text == "at least 3" and not draft.certified
+    assert compose(_algebra(answer_kind="count", members=members, count=3,
+                            scope_complete=False)) is None
 
 
 def test_absence_is_not_claimed_from_an_unclosed_scope() -> None:
@@ -169,12 +174,16 @@ def test_latest_state_answers_with_the_current_value() -> None:
 
 
 def test_a_degraded_result_is_never_certified() -> None:
+    """A degradation blocks certification, and an uncertified count is withheld."""
     members = (AnswerMember("k", "v", "v"),)
 
-    draft = compose(_algebra(answer_kind="count", members=members, count=1,
-                             scope_complete=True, degradations=("scope_truncated",)))
-
-    assert draft is not None and not draft.certified
+    assert compose(_algebra(answer_kind="count", members=members, count=1,
+                            scope_complete=True, degradations=("scope_truncated",))) is None
+    # A list still renders its members: they are named, not inferred from a
+    # scope claim, so a partial list is useful where a partial count is not.
+    listed = compose(_algebra(answer_kind="list", members=members,
+                              scope_complete=True, degradations=("scope_truncated",)))
+    assert listed is not None and not listed.certified
 
 
 # --- prompt -------------------------------------------------------------------

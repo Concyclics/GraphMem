@@ -49,10 +49,16 @@ def compose(result: AlgebraResult | None,
     keys = tuple(member.member_key for member in result.members)
 
     if kind == "count":
-        # ``count`` is authoritative only when the scope is closed; otherwise the
-        # distinct members found are a floor and saying so is the honest form.
+        # An uncertified count is not a floor, it is noise.  Measured: "how many
+        # antique items did I inherit" counted 15 members that were unrelated
+        # facts, because the operand's predicate candidates are retrieved from
+        # the graph rather than parsed from the question and match almost any
+        # collection.  Until operand-to-collection identification is precise,
+        # only a certified count may be proposed at all.
+        if not certified:
+            return None
         total = result.count if result.count is not None else len(result.members)
-        text = str(total) if certified else f"at least {total}"
+        text = str(total)
     elif kind == "list":
         text = _members_text(result)
     elif kind == "group":

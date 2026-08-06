@@ -26,6 +26,8 @@ from ..runtime import SQLiteSnapshotRuntime
 from ..storage import SQLiteGraphStore
 from ..tokenization import TokenCounter, resolve_token_counter
 from .algebra import evaluate as evaluate_algebra
+from .ast_algebra import evaluate_ast
+from .operators import requires_exhaustive_scope as ops_requires_scope
 from .bindings import bind_facts, bind_facts_discriminant
 from .certificate import evaluate_certificate
 from .packer import build_proof_units, pack as pack_proof_units
@@ -75,6 +77,11 @@ class HarnessProfile(StrEnum):
     # PR4a: the reservoir principle applied to CanonicalFacts.  The proof funnel
     # showed the fact exists on 68.5% of questions but is reached on 21.0%.
     H9_FACT_RESERVOIR = "h9"
+    # PR5a: executes the compiled operator AST and emits answer members with
+    # their witnesses.  Aggregation questions are 40% of the development set and
+    # its worst category at 51.9%; without members the closed-form composer has
+    # nothing to read and fired on 0 of 200 questions.
+    H10_AST = "h10"
 
 
 VARIANT_RANK = {variant: index for index, variant in enumerate(NavigatorVariant)}
@@ -306,15 +313,20 @@ class GraphNavigator:
         use_postings = profile in {HarnessProfile.H2_POSTINGS, HarnessProfile.H3_MULTI_ANCHOR,
                                    HarnessProfile.H4_SCHEDULER, HarnessProfile.H5_ALGEBRA,
                                    HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
-                                   HarnessProfile.H9_FACT_RESERVOIR}
+                                   HarnessProfile.H9_FACT_RESERVOIR,
+                                   HarnessProfile.H10_AST}
         use_rrf = profile in {HarnessProfile.H3_MULTI_ANCHOR, HarnessProfile.H4_SCHEDULER,
                               HarnessProfile.H5_ALGEBRA, HarnessProfile.H6_PROOF_PACKING,
-                              HarnessProfile.H8_RESERVOIR, HarnessProfile.H9_FACT_RESERVOIR}
+                              HarnessProfile.H8_RESERVOIR, HarnessProfile.H9_FACT_RESERVOIR,
+                              HarnessProfile.H10_AST}
         # H7 is the first profile with the wide reservoir; H2-H6 keep the narrow
         # V5.5 seeding so the ablation ladder stays interpretable.
         wide_reservoir = profile in {HarnessProfile.H8_RESERVOIR,
-                                     HarnessProfile.H9_FACT_RESERVOIR}
-        fact_reservoir_enabled = profile is HarnessProfile.H9_FACT_RESERVOIR
+                                     HarnessProfile.H9_FACT_RESERVOIR,
+                                     HarnessProfile.H10_AST}
+        fact_reservoir_enabled = profile in {HarnessProfile.H9_FACT_RESERVOIR,
+                                             HarnessProfile.H10_AST}
+        execute_ast = profile is HarnessProfile.H10_AST
         tick = time.perf_counter()
         seeded = seed_operands(self.store, view, memory_id, ir, all_turns, dense_search=self.dense_search,
                                use_rrf=use_rrf, use_postings=use_postings,
@@ -412,6 +424,72 @@ class GraphNavigator:
         )
         closure = evaluate_algebra(ir.operator, bindings, (item.operand_id for item in ir.operands),
                                    distinct_by=ir.distinct_by, collection_complete=collection_complete)
+        # H10 runs the AST alongside the legacy closure rather than replacing it:
+        # the packer and certificate still consume ``closure``, so the frozen
+        # ladder's behaviour is untouched and only the answer stage sees members.
+        algebra_result = None
+        if execute_ast and ir.ast is not None:
+            # PR2b compiled the AST in shadow mode with its own operand ids, so
+            # the bindings -- produced against the legacy ir.operands -- carry
+            # labels the AST never mentions.  Left unmapped, every binding is
+            # filtered out and the algebra returns zero members: measured as
+            # closed_form_rate 0.0 with 15 facts bound.  Both operand lists are
+            # built from the same owner rows in the same order, so position is
+            # the correspondence.
+            ast_specs = ir.ast_operands or ir.operands
+            legacy_ids = [item.operand_id for item in ir.operands]
+            ast_ids = [item.operand_id for item in ast_specs]
+            remap = (dict(zip(legacy_ids, ast_ids))
+                     if len(legacy_ids) == len(ast_ids) else {})
+            ast_bindings = tuple(
+                replace(row, operand_id=remap[row.operand_id])
+                if row.operand_id in remap else row
+                for row in bindings)
+            # A count must range over a collection, not over whatever bound.
+            # Counting the raw binding set produced 15 "antique items" that were
+            # actually unrelated facts, reported with scope_complete=True -- a
+            # confidently wrong number, which is worse than declining to answer.
+            # So an operand is only closed when a manifest matches it on owner
+            # *and* predicate, and the count is then restricted to that
+            # manifest's members.
+            closed_by_operand: dict[str, bool] = {}
+            member_scope: set[str] = set()
+            for operand, legacy in zip(ast_specs, legacy_ids + [""] * len(ast_specs)):
+                matched = [
+                    node for node in manifests
+                    if node.node_type == NodeType.COLLECTION_MANIFEST
+                    and bool(node.attributes.get("closed"))
+                    and (not owners.get(legacy)
+                         or str(node.attributes.get("owner_id", "")) in owners[legacy])
+                    and (not operand.predicate_candidates or any(
+                        content_terms(str(candidate))
+                        & content_terms(str(node.attributes.get("predicate", "")))
+                        for candidate in operand.predicate_candidates))
+                ]
+                # An operand with no predicate candidates constrains nothing, so
+                # every manifest "matches" and the count ranges over the whole
+                # memory.  Measured: 15 unrelated facts returned as the answer to
+                # "how many antique items", scope_complete=True.  Without a
+                # constraint the scope is not closed, whatever the manifests say.
+                # Owner alone is not a constraint: "every fact about me" is the
+                # whole memory.  A count needs a predicate to range over.
+                constrained = bool(operand.predicate_candidates)
+                closed_by_operand[operand.operand_id] = bool(matched) and constrained
+                if not constrained:
+                    matched = []
+                for node in matched:
+                    member_scope.update(str(item) for item in
+                                        node.attributes.get("member_ids", ()))
+            if member_scope:
+                ast_bindings = tuple(row for row in ast_bindings
+                                     if row.fact_node_id in member_scope)
+            if any(closed_by_operand.values()) or not ops_requires_scope(ir.ast):
+                algebra_result = evaluate_ast(ir.ast, ast_bindings,
+                                              collection_closed=closed_by_operand)
+            # Otherwise leave algebra unset: an aggregate whose collection is
+            # unidentified has no trustworthy member list, and handing the answer
+            # stage "at least 15" built from unrelated facts is worse than
+            # handing it nothing.
         no_progress = not bindings
         exhausted = any(schedule.exhaustion.values())
         certificate = evaluate_certificate(ir, closure, exhausted=exhausted, no_progress=no_progress)
@@ -557,6 +635,7 @@ class GraphNavigator:
                 if node_id in view.nodes and view.nodes[node_id].node_type == NodeType.CANONICAL_FACT)),
             bound_fact_node_ids=tuple(dict.fromkeys(row.fact_node_id for row in bindings)),
             selected_fact_node_ids=tuple(dict.fromkeys(row.fact_node_id for row in closure.bindings)),
+            algebra=algebra_result,
         )
 
     @staticmethod

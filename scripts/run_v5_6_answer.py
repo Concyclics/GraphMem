@@ -100,8 +100,10 @@ def main() -> None:
     def run(row):
         question, result, _metric = row
         question_date = str(question.raw.get("question_date") or "") or None
+        # result.algebra is populated only by AST-executing profiles; passing it
+        # is what lets the closed-form composer emit a count without an LLM.
         return stage.answer(question.question_id, question.query, result, budget,
-                            question_date=question_date)
+                            question_date=question_date, algebra=result.algebra)
 
     print(f"answering with {args.answer_workers} workers", flush=True)
     with ThreadPoolExecutor(max_workers=max(1, args.answer_workers)) as pool:
