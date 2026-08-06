@@ -118,7 +118,7 @@ start_heartbeat() {
     return 0
   fi
   tmux new-session -d -s graphmem-v5-embed-heartbeat \
-    "cd '${REPO}' && exec /home/chenhan/miniconda3/envs/agent/bin/python scripts/v5_embedding_heartbeat.py --log '${STATE_DIR}/embedding_heartbeat.jsonl'"
+    "cd '${REPO}' && exec /home/chenhan/miniconda3/envs/agent/bin/python scripts/v5_embedding_heartbeat.py --batch-size 512 --batch-jitter 64 --text-words 256 --interval-sec 0.2 --jitter-sec 0.6 --log '${STATE_DIR}/embedding_heartbeat.jsonl'"
 }
 
 start_llm() {
