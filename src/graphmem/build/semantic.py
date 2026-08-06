@@ -35,7 +35,8 @@ EXPLICIT_TIME_RE = re.compile(
 
 
 def strict_scene_schema(max_scenes: int, max_facts: int, *,
-                        quote_evidence: bool = True) -> Mapping[str, Any]:
+                        quote_evidence: bool = True,
+                        predicate_max_chars: int = 0) -> Mapping[str, Any]:
     """Schema for one strict extraction call.
 
     ``quote_evidence`` emits the exact-quote field ``q``.  It is 26% of
@@ -44,7 +45,9 @@ def strict_scene_schema(max_scenes: int, max_facts: int, *,
     budgeted run may drop it.
     """
     properties: dict[str, Any] = {
-        "o": {"type": "string", "minLength": 1}, "p": {"type": "string", "minLength": 1},
+        "o": {"type": "string", "minLength": 1},
+        "p": ({"type": "string", "minLength": 1, "maxLength": predicate_max_chars}
+              if predicate_max_chars else {"type": "string", "minLength": 1}),
         "v": {"type": "string", "minLength": 1},
         "g": {"type": "string", "minLength": 1},
         "n": {"type": "string", "enum": ["positive", "negative"]},
@@ -92,6 +95,14 @@ class QwenSemanticDistiller:
         self.store, self.config, self.dataset_hash = store, config, dataset_hash
         strict_prompt = STRICT_PROMPT + (
             f" Return at most {config.models.semantic_max_facts_per_scene} highest-routing-value facts per scene.")
+        if config.models.semantic_predicate_max_chars:
+            # The schema caps `p` by guided decoding; say so in the prompt too so
+            # the model puts the specifics in `v` rather than getting truncated.
+            strict_prompt += (
+                f" p must be a bare relation of one to three words and at most "
+                f"{config.models.semantic_predicate_max_chars} characters, such as visited, bought, "
+                "recommends, lives in. Never put objects, names, quantities, adjectives or clauses "
+                "in p; those belong in v. Reuse the same p across facts that share a relation.")
         prompt_material = (STRICT_PROMPT_VERSION + strict_prompt if
                            config.models.semantic_extraction_mode != "legacy_batch" else
                            PROMPT_VERSION + SYSTEM_PROMPT + HIERARCHY_PROMPT)
@@ -539,6 +550,8 @@ class QwenSemanticDistiller:
             semantic_settings["degraded_max_facts"] = effective_facts
         if not self.config.models.semantic_quote_evidence:
             semantic_settings["quote_evidence"] = False
+        if self.config.models.semantic_predicate_max_chars:
+            semantic_settings["predicate_max_chars"] = self.config.models.semantic_predicate_max_chars
         semantic_config = hashlib.sha256(canonical_json(semantic_settings).encode()).hexdigest()
         identity = CacheIdentity(self.dataset_hash, self.config.models.llm_model, self.prompt_hash,
                                  self.config.schema_version, semantic_config,
@@ -552,7 +565,8 @@ class QwenSemanticDistiller:
                 "name": "graphmem_scene_facts", "strict": True,
                 "schema": strict_scene_schema(
                     batch_size, effective_facts,
-                    quote_evidence=self.config.models.semantic_quote_evidence)}}
+                    quote_evidence=self.config.models.semantic_quote_evidence,
+                    predicate_max_chars=self.config.models.semantic_predicate_max_chars)}}
         elif self.config.models.semantic_constrained_json:
             request["response_format"] = {"type": "json_object"}
         cached = self.store.cache_get(key); started = time.perf_counter()

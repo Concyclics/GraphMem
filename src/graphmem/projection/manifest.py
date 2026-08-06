@@ -46,11 +46,21 @@ def _attribute(node: GraphNode, key: str) -> str:
     return str(node.attributes.get(key, "") or "")
 
 
-def chain_key(node: GraphNode) -> tuple[str, ...]:
-    return tuple(_attribute(node, key) for key in CHAIN_KEYS)
+def chain_key(node: GraphNode, config: ProjectionConfig | None = None) -> tuple[str, ...]:
+    config = config or ProjectionConfig()
+    values = []
+    for key in CHAIN_KEYS:
+        value = _attribute(node, key)
+        if key == "predicate":
+            value = config.normalize_predicate(value)
+        if key == "scope" and not config.chain_includes_scope:
+            value = ""
+        values.append(value)
+    return tuple(values)
 
 
-def collect_chains(nodes: Iterable[GraphNode]) -> dict[tuple[str, ...], list[GraphNode]]:
+def collect_chains(nodes: Iterable[GraphNode],
+                   config: ProjectionConfig | None = None) -> dict[tuple[str, ...], list[GraphNode]]:
     """Group canonical facts into collection chains, deterministically ordered."""
     chains: dict[tuple[str, ...], list[GraphNode]] = defaultdict(list)
     for node in nodes:
@@ -58,7 +68,7 @@ def collect_chains(nodes: Iterable[GraphNode]) -> dict[tuple[str, ...], list[Gra
             continue
         if not _attribute(node, "owner_id") or not _attribute(node, "predicate"):
             continue
-        chains[chain_key(node)].append(node)
+        chains[chain_key(node, config)].append(node)
     for rows in chains.values():
         # Session/turn order first so a manifest's member list reads in
         # conversation order; node_id breaks ties so the projection is stable.
@@ -81,7 +91,7 @@ def build_manifests(memory_id: str, nodes: Sequence[GraphNode],
     manifest_nodes: list[GraphNode] = []
     edges: list[GraphEdge] = []
     rows: list[ManifestRow] = []
-    for chain, members in sorted(collect_chains(nodes).items()):
+    for chain, members in sorted(collect_chains(nodes, config).items()):
         if len(members) < config.manifest_min_members:
             continue
         owner_id, predicate, scope, collection_key, polarity, modality = chain

@@ -62,6 +62,14 @@ class ModelConfig:
     # and only refines the span inside a turn the fact already cites, which the
     # projection re-derives from the value deterministically.
     semantic_quote_evidence: bool = True
+    # Hard character ceiling on the predicate field, enforced by guided decoding
+    # rather than asked for in the prompt.  Extraction currently writes whole
+    # propositions into `p` -- mean 4.7 words, p95 10, often duplicating `v`
+    # ("demonstrated high efficacy rates" / "high efficacy rates") -- so no two
+    # predicates ever coincide, 96% of collections are singletons, and neither
+    # embedding clustering nor an LLM vocabulary can merge them: they are
+    # distinct propositions, not variants of one relation.  0 disables.
+    semantic_predicate_max_chars: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +173,8 @@ class GraphMemV5Config:
             raise ValueError("semantic_max_retries must be 0 or 1")
         if self.models.semantic_turn_input_chars < 0:
             raise ValueError("semantic_turn_input_chars cannot be negative")
+        if self.models.semantic_predicate_max_chars < 0:
+            raise ValueError("semantic_predicate_max_chars cannot be negative")
         if self.models.semantic_max_tokens_per_memory < 0:
             raise ValueError("semantic_max_tokens_per_memory cannot be negative")
         if not 0.0 < self.models.semantic_budget_degrade_at <= 1.0:

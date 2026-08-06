@@ -95,15 +95,20 @@ class PredicateCanonicalizer:
                 pending.append((predicate, item_id, content_hash))
         if pending:
             started = time.perf_counter()
-            for attempt in range(3):
+            # 3 attempts backed off by 0.25/0.5s survive a dropped packet but not
+            # a server that is briefly busy or restarting, which is what a
+            # multi-hour corpus build actually meets: a sweep died on
+            # APIConnectionError after the endpoint came straight back.
+            attempts = 6
+            for attempt in range(attempts):
                 try:
                     response = self.client.embeddings.create(
                         model=self.model_id, input=[row[0] for row in pending])
                     break
                 except Exception:
-                    if attempt == 2:
+                    if attempt == attempts - 1:
                         raise
-                    time.sleep(0.25 * (2 ** attempt))
+                    time.sleep(min(8.0, 0.5 * (2 ** attempt)))
             latency = (time.perf_counter() - started) * 1000
             ordered = sorted(response.data, key=lambda row: row.index)
             inserts = []

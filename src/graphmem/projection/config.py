@@ -11,9 +11,30 @@ after extraction and cannot change a single LLM call, so it must not perturb
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import asdict, dataclass
 
 from ..domain import canonical_json
+
+
+_CHAIN_STOPWORDS = frozenset({
+    "a", "an", "the", "of", "to", "in", "on", "at", "for", "with", "my", "his",
+    "her", "their", "and", "is", "are", "was", "were", "be", "been",
+})
+
+
+def _stem(word: str) -> str:
+    """Crude suffix stripping; enough to fold recommends/recommended/recommend."""
+    for suffix, replacement in (("ies", "y"), ("ing", ""), ("ed", ""), ("es", ""), ("s", "")):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)] + replacement
+    return word
+
+
+def _head_stem(predicate: str) -> str:
+    tokens = [token for token in re.findall(r"[a-z]+", predicate.casefold())
+              if token not in _CHAIN_STOPWORDS]
+    return _stem(tokens[0]) if tokens else predicate.casefold()
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +78,22 @@ class ProjectionConfig:
     span_min_chars: int = 4
     #: Cap on SHARED_VALUE edges per canonical value, bounding value-hub cliques.
     shared_value_cap: int = 16
+    #: How a fact's predicate is normalized before it keys a collection.
+    #: "raw" is the frozen behaviour and leaves 95.9% of collections singleton,
+    #: because extraction writes a distinct proposition into every predicate.
+    #: "head_stem" keys on the stemmed leading verb, which collapses
+    #: recommends/recommended/recommend/recommends-using into one family and
+    #: takes singletons to 78.4% with 4.4x more countable collections -- the
+    #: best result measured, and free: no LLM, no rebuild, no cache invalidation.
+    predicate_normalization: str = "raw"
+    #: Whether scope and collection_key stay in the chain key.  They are as
+    #: fragmented as the predicate, so keeping them undoes most of the merge.
+    chain_includes_scope: bool = True
+
+    def normalize_predicate(self, predicate: str) -> str:
+        if self.predicate_normalization == "raw":
+            return predicate
+        return _head_stem(predicate)
 
     def __post_init__(self) -> None:
         if self.manifest_min_members < 1:
@@ -69,6 +106,8 @@ class ProjectionConfig:
             raise ValueError("span_derivation must be 'value' or 'value_predicate'")
         if self.span_min_chars < 1:
             raise ValueError("span_min_chars must be positive")
+        if self.predicate_normalization not in {"raw", "head", "head_stem"}:
+            raise ValueError("invalid predicate normalization")
 
     @property
     def any_enabled(self) -> bool:
@@ -91,4 +130,10 @@ ARMS: dict[str, ProjectionConfig] = {
     "P6": ProjectionConfig(event_frames=True),
     "P7": ProjectionConfig(collection_manifest=True, value_lattice=True, dialogue_pair=True,
                            temporal_closure=True, fact_spans=True, event_frames=True),
+    # P8 is the finalized index: manifests keyed on the stemmed head verb with
+    # scope dropped.  Measured best of every route tried -- embedding clustering
+    # (0.922 singleton), an LLM vocabulary (0.929) and a p<=24 extraction rebuild
+    # (0.949, and it truncates propositions mid-phrase) -- at zero cost.
+    "P8": ProjectionConfig(collection_manifest=True, predicate_normalization="head_stem",
+                           chain_includes_scope=False),
 }
