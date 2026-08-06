@@ -51,6 +51,17 @@ class ModelConfig:
     semantic_max_retries: int = 0
     semantic_retry_output_tokens: int = 1024
     semantic_compile_summary: bool = False
+    # Hard per-memory build ceiling, enforced by BuildTokenLedger.  0 disables
+    # enforcement and restores the pre-V5.6 unbounded behaviour.
+    # ``semantic_average_tokens_per_memory`` above has declared 220000 since V5
+    # and never had a consumer; this is the enforced counterpart.
+    semantic_max_tokens_per_memory: int = 0
+    # Fraction of the ceiling that may be spent before the fact cap is reduced.
+    semantic_budget_degrade_at: float = 0.75
+    # Emit the exact-quote evidence field.  It costs ~26% of extraction output
+    # and only refines the span inside a turn the fact already cites, which the
+    # projection re-derives from the value deterministically.
+    semantic_quote_evidence: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,12 +144,17 @@ class GraphMemV5Config:
             raise ValueError("invalid edge refine mode")
         if self.edges.graph_variant not in {"g0", "g1", "g2", "g3", "g4", "g5"}:
             raise ValueError("invalid semantic graph variant")
-        if self.models.semantic_extraction_mode not in {"legacy_batch", "strict_single", "strict_pair"}:
+        if self.models.semantic_extraction_mode not in {
+                "legacy_batch", "strict_single", "strict_pair", "strict_batch"}:
             raise ValueError("invalid semantic extraction mode")
         if self.models.semantic_max_retries not in {0, 1}:
             raise ValueError("semantic_max_retries must be 0 or 1")
         if self.models.semantic_turn_input_chars < 0:
             raise ValueError("semantic_turn_input_chars cannot be negative")
+        if self.models.semantic_max_tokens_per_memory < 0:
+            raise ValueError("semantic_max_tokens_per_memory cannot be negative")
+        if not 0.0 < self.models.semantic_budget_degrade_at <= 1.0:
+            raise ValueError("semantic_budget_degrade_at must be in (0, 1]")
         if not 0.0 <= self.edges.predicate_embedding_threshold <= 1.0:
             raise ValueError("predicate embedding threshold must be in [0, 1]")
         if not 0 <= self.edges.low_threshold < self.edges.high_threshold <= 1:

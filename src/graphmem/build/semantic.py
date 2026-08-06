@@ -11,7 +11,14 @@ from typing import Any, Mapping, Sequence
 from ..config import CacheIdentity, GraphMemV5Config, config_hash
 from ..domain import SourceTurn, canonical_json, stable_id
 from ..storage import SQLiteGraphStore
+from .budget import BuildTokenLedger
 
+
+#: Measured fixed input cost of one extraction call on the frozen V5.4 build:
+#: system prompt + JSON schema + payload scaffold, over 4,000 sampled calls.
+CALL_OVERHEAD_TOKENS = 316
+#: Measured characters per token for this corpus under the Qwen3 vocabulary.
+CHARS_PER_TOKEN = 3.84
 
 PROMPT_VERSION = "graphmem-v5.1-scene-semantic-v1"
 STRICT_PROMPT_VERSION = "graphmem-v5.4-strict-scene-facts-v5"
@@ -24,16 +31,27 @@ EXPLICIT_TIME_RE = re.compile(
     r"october|november|december|today|yesterday|tomorrow|last|next|ago|week|month|year)\b", re.I)
 
 
-def strict_scene_schema(max_scenes: int, max_facts: int) -> Mapping[str, Any]:
+def strict_scene_schema(max_scenes: int, max_facts: int, *,
+                        quote_evidence: bool = True) -> Mapping[str, Any]:
+    """Schema for one strict extraction call.
+
+    ``quote_evidence`` emits the exact-quote field ``q``.  It is 26% of
+    extraction output bytes and only narrows the span inside a turn that ``r``
+    already cites, which the projection re-derives from the fact value, so a
+    budgeted run may drop it.
+    """
+    properties: dict[str, Any] = {
+        "o": {"type": "string", "minLength": 1}, "p": {"type": "string", "minLength": 1},
+        "v": {"type": "string", "minLength": 1},
+        "g": {"type": "string", "minLength": 1},
+        "n": {"type": "string", "enum": ["positive", "negative"]},
+        "r": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "string"}}}
+    required = ["o", "p", "v", "g", "n", "r"]
+    if quote_evidence:
+        properties["q"] = {"type": "string", "minLength": 1, "maxLength": 160}
+        required.append("q")
     fact = {"type": "object", "additionalProperties": False,
-            "required": ["o", "p", "v", "g", "n", "r", "q"], "properties": {
-                "o": {"type": "string", "minLength": 1}, "p": {"type": "string", "minLength": 1},
-                "v": {"type": "string", "minLength": 1},
-                "g": {"type": "string", "minLength": 1},
-                "n": {"type": "string", "enum": ["positive", "negative"]},
-                "r": {"type": "array", "minItems": 1, "maxItems": 2,
-                      "items": {"type": "string"}},
-                "q": {"type": "string", "minLength": 1, "maxLength": 160}}}
+            "required": required, "properties": properties}
     scene = {"type": "object", "additionalProperties": False,
              "required": ["i", "f"], "properties": {
                  "i": {"type": "string"},
@@ -85,6 +103,10 @@ class QwenSemanticDistiller:
         current: list[Any] = []
         estimate = 0
         mode = self.config.models.semantic_extraction_mode
+        # "strict_batch" keeps the strict schema but honours semantic_batch_scenes,
+        # so the measured 316-token fixed cost per call can be amortized over more
+        # scenes.  Larger batches push harder against semantic_batch_output_tokens,
+        # so this is an ablation knob rather than a default.
         batch_limit = {"strict_single": 1, "strict_pair": 2}.get(
             mode, self.config.models.semantic_batch_scenes)
         for scene in scenes:
@@ -96,11 +118,34 @@ class QwenSemanticDistiller:
         if current:
             batches.append(current)
         packets: list[ScenePacket] = []
+        # One ledger per memory, shared by every worker, so the ceiling holds
+        # across the fan-out rather than per call.
+        self.ledger = BuildTokenLedger(
+            memory_id, self.config.models.semantic_max_tokens_per_memory,
+            self.config.models.semantic_budget_degrade_at)
         workers = min(16, self.config.models.max_concurrency, max(1, len(batches)))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             for rows in executor.map(lambda batch: self._extract_batch(memory_id, batch), batches):
                 packets.extend(rows)
         return tuple(packets)
+
+    def _ledger(self) -> BuildTokenLedger:
+        """The current memory's ledger, or an unenforced one for direct calls."""
+        ledger = getattr(self, "ledger", None)
+        if ledger is None:
+            ledger = self.ledger = BuildTokenLedger("", 0)
+        return ledger
+
+    def _batch_estimate(self, batch: Sequence[Any], max_tokens: int) -> int:
+        """Upper bound on what one extraction call will cost.
+
+        Input is the turn text plus the measured 316-token fixed overhead
+        (system prompt, JSON schema, payload scaffold); output is bounded by
+        ``max_tokens``.  Estimating high is the safe direction: it makes the
+        ledger stop early rather than overshoot.
+        """
+        text = sum(len(turn.raw_text) for scene in batch for turn in scene.turns)
+        return int(text / CHARS_PER_TOKEN) + CALL_OVERHEAD_TOKENS + max_tokens
 
     def compress_many(self, memory_id: str, level: int,
                       requests: Sequence[tuple[str, Sequence[Mapping[str, Any]], int]]) -> tuple[Mapping[str, Any], ...]:
@@ -179,9 +224,21 @@ class QwenSemanticDistiller:
 
     def _extract_strict_batch(self, memory_id: str, batch: Sequence[Any]) -> list[ScenePacket]:
         payload, scene_aliases, turn_aliases = self._strict_payload(batch)
+        output_cap = self.config.models.semantic_batch_output_tokens
+        allowed, degrade = self._ledger().reserve(self._batch_estimate(batch, output_cap))
+        if not allowed:
+            # Budget exhausted: keep the scenes in the graph with deterministic
+            # summaries rather than dropping the tail of the conversation.
+            return [self._fallback(scene) for scene in batch]
+        max_facts = self.config.models.semantic_max_facts_per_scene
+        if degrade:
+            max_facts = max(1, max_facts // 2)
         strict_prompt = STRICT_PROMPT + (
-            f" Return at most {self.config.models.semantic_max_facts_per_scene} highest-routing-value facts per scene.")
-        response, _ = self._call(memory_id, "scene_semantic", strict_prompt, payload, len(batch))
+            f" Return at most {max_facts} highest-routing-value facts per scene.")
+        response, usage = self._call(memory_id, "scene_semantic", strict_prompt, payload,
+                                     len(batch), max_facts=max_facts)
+        self._ledger().settle(self._batch_estimate(batch, output_cap),
+                              int(usage.get("total_tokens", 0)))
         rows = self._strict_rows(response, scene_aliases, turn_aliases)
         by_scene = {str(row.get("i")): row for row in rows}
         missing = [scene for scene in batch if scene.scene_id not in by_scene]
@@ -320,12 +377,20 @@ class QwenSemanticDistiller:
                 if quote:
                     start = turn.raw_text.casefold().find(quote.casefold())
                     end = start + len(quote) if start >= 0 else -1
-                else:
+                elif ref.get("a") is not None or ref.get("start") is not None:
                     try:
                         start = int(ref.get("a", ref.get("start")))
                         end = int(ref.get("b", ref.get("end")))
                     except (TypeError, ValueError):
                         continue
+                else:
+                    # Quote-free extraction: locate the value inside the turn the
+                    # fact already cites.  Falling through to the whole-memory
+                    # value scan below would keep the fact but lose the turn it
+                    # was actually grounded in.
+                    value_text = str(item.get("v", item.get("value", ""))).strip()
+                    start = turn.raw_text.casefold().find(value_text.casefold()) if value_text else -1
+                    end = start + len(value_text) if start >= 0 else -1
                 if 0 <= start < end <= len(turn.raw_text):
                     evidence.append((turn.turn_id, start, end))
             owner = str(item.get("o", item.get("owner", ""))).strip()
@@ -406,7 +471,8 @@ class QwenSemanticDistiller:
 
     def _call(self, memory_id: str, stage: str, system: str, payload: Any,
               batch_size: int, max_tokens: int | None = None,
-              retry_count: int = 0) -> tuple[Mapping[str, Any], Mapping[str, int]]:
+              retry_count: int = 0,
+              max_facts: int | None = None) -> tuple[Mapping[str, Any], Mapping[str, int]]:
         serialized = canonical_json(payload)
         semantic_settings = {
             "schema": self.config.schema_version, "model": self.config.models.llm_model,
@@ -435,6 +501,15 @@ class QwenSemanticDistiller:
                 "constrained_json": self.config.models.semantic_constrained_json,
                 "individual_repair": self.config.models.semantic_individual_repair,
             })
+        # A degraded call asks for fewer facts, and a quote-free run emits a
+        # different schema; both must key differently or a throttled answer would
+        # be served from a full-budget cache entry.
+        effective_facts = (self.config.models.semantic_max_facts_per_scene
+                           if max_facts is None else max_facts)
+        if effective_facts != self.config.models.semantic_max_facts_per_scene:
+            semantic_settings["degraded_max_facts"] = effective_facts
+        if not self.config.models.semantic_quote_evidence:
+            semantic_settings["quote_evidence"] = False
         semantic_config = hashlib.sha256(canonical_json(semantic_settings).encode()).hexdigest()
         identity = CacheIdentity(self.dataset_hash, self.config.models.llm_model, self.prompt_hash,
                                  self.config.schema_version, semantic_config,
@@ -446,7 +521,9 @@ class QwenSemanticDistiller:
         if self.config.models.semantic_extraction_mode != "legacy_batch":
             request["response_format"] = {"type": "json_schema", "json_schema": {
                 "name": "graphmem_scene_facts", "strict": True,
-                "schema": strict_scene_schema(batch_size, self.config.models.semantic_max_facts_per_scene)}}
+                "schema": strict_scene_schema(
+                    batch_size, effective_facts,
+                    quote_evidence=self.config.models.semantic_quote_evidence)}}
         elif self.config.models.semantic_constrained_json:
             request["response_format"] = {"type": "json_object"}
         cached = self.store.cache_get(key); started = time.perf_counter()

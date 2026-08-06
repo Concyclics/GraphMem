@@ -1165,6 +1165,10 @@ class GraphBuildPipeline:
             "degree_p95": degree_values[max(0, int(len(degree_values) * 0.95) - 1)] if degree_values else 0,
             "cold_equivalent_stage_tokens": {stage: sum(int(usage.get("total_tokens", 0))
                 for usage in keys.values()) for stage, keys in sorted(stage_usage.items())},
+            # A degraded or truncated extraction must be visible in the manifest:
+            # a silent degradation looks exactly like an unexplained accuracy drop.
+            "build_token_budget": (dict(self.distiller.ledger.snapshot())
+                                   if getattr(self.distiller, "ledger", None) else None),
         }
 
     @staticmethod
