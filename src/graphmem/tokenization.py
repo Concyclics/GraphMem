@@ -139,10 +139,13 @@ def resolve_token_counter(model_id: str, *, require_exact: bool = False) -> Toke
     """
     key = (model_id, os.environ.get(TOKENIZER_ENV, ""))
     cached = _CACHE.get(key)
-    if cached is not None:
-        if require_exact and not cached.exact:
-            raise RuntimeError(f"no exact tokenizer available for {model_id!r}")
+    if cached is not None and (cached.exact or not require_exact):
         return cached
+    # A cached heuristic counter must not be allowed to answer an exact request:
+    # an earlier exploratory caller (the navigator resolves without
+    # ``require_exact``) would otherwise turn "tokenizers is not installed" into
+    # the far less actionable "no exact tokenizer available".  Fall through and
+    # resolve again so the real reason surfaces.
     path = find_tokenizer_file(model_id)
     counter: TokenCounter
     if path is None:

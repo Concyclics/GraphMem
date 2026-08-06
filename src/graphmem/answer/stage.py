@@ -58,8 +58,13 @@ class AnswerStage:
 
     def __init__(self, store: SQLiteGraphStore, config: GraphMemV5Config,
                  dataset_hash: str, *, answer_config: AnswerConfig | None = None,
-                 client: Any | None = None, require_exact_tokenizer: bool = True) -> None:
+                 client: Any | None = None, require_exact_tokenizer: bool = True,
+                 cache_store: SQLiteGraphStore | None = None) -> None:
         self.store = store
+        # Scoring runs open the authority graph read-only, so answers and their
+        # call ledger go to a separate writable sidecar.  Defaulting to ``store``
+        # keeps the single-database case (and the tests) unchanged.
+        self.cache_store = cache_store if cache_store is not None else store
         self.config = config
         self.dataset_hash = dataset_hash
         self.answer_config = answer_config or AnswerConfig()
@@ -192,7 +197,7 @@ class AnswerStage:
         )
         key = identity.key()
         started = time.perf_counter()
-        cached = self.store.cache_get(key)
+        cached = self.cache_store.cache_get(key)
         if cached:
             response, usage, is_cached = cached["response"], dict(cached["usage"]), True
             completion = int(usage.get("output_tokens", 0))
@@ -213,12 +218,12 @@ class AnswerStage:
             usage = {"cached_input_tokens": 0, "uncached_input_tokens": prompt,
                      "output_tokens": completion, "reasoning_tokens": 0,
                      "total_tokens": prompt + completion}
-            self.store.cache_put(key, "answer", request, response, usage, PROMPT_HASH)
+            self.cache_store.cache_put(key, "answer", request, response, usage, PROMPT_HASH)
             is_cached = False
-        occurrence = self.store._read_one(
+        occurrence = self.cache_store._read_one(
             "SELECT count(*) FROM llm_calls WHERE memory_id=? AND cache_key=?",
             (memory_id, key))[0]
-        self.store.log_llm_call(
+        self.cache_store.log_llm_call(
             call_id=stable_id("llm-call", memory_id, key, is_cached, occurrence),
             memory_id=memory_id, stage="answer", cache_key=key, cached=is_cached,
             request=request, response=response, usage=usage,
