@@ -158,10 +158,10 @@ class Qwen30BRefiner:
             self.store.cache_put(cache_key, "selective_refine", request, response_payload, usage, self.prompt_hash)
             is_cached = False
         latency = (time.perf_counter() - started) * 1000
-        occurrence = int(self.store._connection.execute(
+        occurrence = int(self.store._read_one(
             "SELECT count(*) FROM llm_calls WHERE memory_id=? AND cache_key=?",
             (memory_id, cache_key),
-        ).fetchone()[0])
+        )[0])
         call_id = stable_id("llm-call", memory_id, cache_key, is_cached, occurrence)
         self.store.log_llm_call(
             call_id=call_id, memory_id=memory_id, stage="selective_refine",

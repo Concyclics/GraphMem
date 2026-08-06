@@ -65,9 +65,9 @@ class PredicateCanonicalizer:
         for predicate in predicates:
             item_id = stable_id("predicate", memory_id, predicate)
             content_hash = hashlib.sha256(predicate.encode()).hexdigest()
-            row = self.store._connection.execute(
+            row = self.store._read_one(
                 "SELECT dimension,vector,content_hash FROM embeddings WHERE memory_id=? AND model_id=? AND item_id=?",
-                (memory_id, self.index_model_id, item_id)).fetchone()
+                (memory_id, self.index_model_id, item_id))
             if row and row["content_hash"] == content_hash:
                 rows[predicate] = np.frombuffer(row["vector"], dtype=np.float32,
                                                 count=int(row["dimension"])).copy()

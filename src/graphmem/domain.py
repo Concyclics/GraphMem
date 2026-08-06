@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
+from datetime import date
 from enum import StrEnum
 from typing import Any, Iterable, Mapping
 
@@ -358,6 +359,22 @@ class TemporalKey:
             TEMPORAL_KIND_RANK.get(self.kind, len(TEMPORAL_KIND_RANK)),
             -self.confidence,
         )
+
+    def days_between(self, other: "TemporalKey") -> int | None:
+        """Whole days from ``other``'s start to this key's start.
+
+        Returns ``None`` unless both endpoints are resolved to at least day
+        precision: a date difference computed from a year-precision endpoint
+        would be off by up to a year while looking exact.
+        """
+        if not (self.resolved and other.resolved):
+            return None
+        try:
+            left = date.fromisoformat(str(self.start)[:10])
+            right = date.fromisoformat(str(other.start)[:10])
+        except ValueError:
+            return None
+        return (left - right).days
 
     def overlaps(self, other: "TemporalKey") -> bool:
         if not (self.resolved and other.resolved):

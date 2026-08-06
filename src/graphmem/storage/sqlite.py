@@ -53,6 +53,27 @@ class SQLiteGraphStore:
     def close(self) -> None:
         self._connection.close()
 
+    def _read(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
+        """Run a read query under the store lock and materialize the rows.
+
+        One ``sqlite3.Connection`` is shared by every thread (``check_same_thread``
+        is off), and the build fans out to 16 extraction workers while a writer
+        may hold ``BEGIN IMMEDIATE``.  Reading off that connection without the
+        lock is unsynchronized concurrent use, which SQLite reports as
+        ``InterfaceError: bad parameter or other API misuse`` -- intermittently,
+        since it depends on thread interleaving.
+
+        Rows are fetched inside the lock rather than handing back a live cursor:
+        a lazily-consumed cursor would escape the critical section and
+        reintroduce the same race at iteration time.
+        """
+        with self._lock:
+            return self._connection.execute(sql, tuple(params)).fetchall()
+
+    def _read_one(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
+        rows = self._read(sql, params)
+        return rows[0] if rows else None
+
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         if self.read_only:
@@ -224,19 +245,19 @@ class SQLiteGraphStore:
             pass
 
     def conversation(self, memory_id: str) -> Conversation | None:
-        row = self._connection.execute(
+        row = self._read_one(
             "SELECT * FROM conversations WHERE memory_id=?", (memory_id,)
-        ).fetchone()
+        )
         return Conversation(**dict(row)) if row else None
 
     def sessions(self, memory_id: str) -> Sequence[Session]:
-        rows = self._connection.execute(
+        rows = self._read(
             "SELECT * FROM sessions WHERE memory_id=? ORDER BY ordinal,session_id", (memory_id,)
         )
         return [Session(**dict(row)) for row in rows]
 
     def turns(self, memory_id: str) -> Sequence[SourceTurn]:
-        rows = self._connection.execute(
+        rows = self._read(
             "SELECT * FROM source_turns WHERE memory_id=? ORDER BY session_id,turn_index", (memory_id,)
         )
         return [SourceTurn(**dict(row)) for row in rows]
@@ -244,7 +265,7 @@ class SQLiteGraphStore:
     def turns_by_ids(self, turn_ids: Sequence[str]) -> Sequence[SourceTurn]:
         if not turn_ids:
             return []
-        rows = self._connection.execute(
+        rows = self._read(
             f"SELECT * FROM source_turns WHERE turn_id IN ({','.join('?' for _ in turn_ids)})",
             tuple(turn_ids),
         )
@@ -257,7 +278,7 @@ class SQLiteGraphStore:
             return []
         match = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms[:24])
         try:
-            rows = self._connection.execute(
+            rows = self._read(
                 "SELECT turn_id,-bm25(source_turns_fts) AS score FROM source_turns_fts "
                 "WHERE source_turns_fts MATCH ? AND memory_id=? ORDER BY bm25(source_turns_fts) LIMIT ?",
                 (match, memory_id, limit),
@@ -265,7 +286,7 @@ class SQLiteGraphStore:
             return [(row["turn_id"], float(row["score"])) for row in rows]
         except sqlite3.OperationalError:
             pattern = "%" + "%".join(terms[:8]) + "%"
-            rows = self._connection.execute(
+            rows = self._read(
                 "SELECT turn_id,1.0 AS score FROM source_turns WHERE memory_id=? "
                 "AND raw_text LIKE ? LIMIT ?", (memory_id, pattern, limit)
             )
@@ -477,23 +498,23 @@ class SQLiteGraphStore:
         return version
 
     def nodes(self, memory_id: str) -> Sequence[GraphNode]:
-        return [self._node(row) for row in self._connection.execute(
+        return [self._node(row) for row in self._read(
             "SELECT * FROM graph_nodes WHERE memory_id=? ORDER BY node_id", (memory_id,)
         )]
 
     def edges(self, memory_id: str) -> Sequence[GraphEdge]:
-        return [self._edge(row) for row in self._connection.execute(
+        return [self._edge(row) for row in self._read(
             "SELECT * FROM graph_edges WHERE memory_id=? ORDER BY edge_id", (memory_id,)
         )]
 
     def evidence_groups(self, memory_id: str) -> Sequence[EvidenceGroup]:
         result: list[EvidenceGroup] = []
-        for row in self._connection.execute(
+        for row in self._read(
             "SELECT * FROM evidence_groups WHERE memory_id=? ORDER BY evidence_group_id", (memory_id,)
         ):
             members = tuple(EvidenceMember(
                 item["turn_id"], item["span_start"], item["span_end"], item["support_type"]
-            ) for item in self._connection.execute(
+            ) for item in self._read(
                 "SELECT * FROM evidence_members WHERE evidence_group_id=? ORDER BY member_ordinal",
                 (row["evidence_group_id"],),
             ))
@@ -504,14 +525,14 @@ class SQLiteGraphStore:
         return result
 
     def evidence_group(self, evidence_group_id: str) -> EvidenceGroup | None:
-        row = self._connection.execute(
+        row = self._read_one(
             "SELECT * FROM evidence_groups WHERE evidence_group_id=?", (evidence_group_id,)
-        ).fetchone()
+        )
         if not row:
             return None
         members = tuple(EvidenceMember(
             item["turn_id"], item["span_start"], item["span_end"], item["support_type"]
-        ) for item in self._connection.execute(
+        ) for item in self._read(
             "SELECT * FROM evidence_members WHERE evidence_group_id=? ORDER BY member_ordinal",
             (evidence_group_id,),
         ))
@@ -521,21 +542,21 @@ class SQLiteGraphStore:
         )
 
     def graph_version(self, memory_id: str) -> int:
-        row = self._connection.execute(
+        row = self._read_one(
             "SELECT graph_version FROM graph_versions WHERE memory_id=?", (memory_id,)
-        ).fetchone()
+        )
         return int(row[0]) if row else 0
 
     def graph_checksum(self, memory_id: str) -> str:
-        row = self._connection.execute(
+        row = self._read_one(
             "SELECT graph_checksum FROM graph_versions WHERE memory_id=?", (memory_id,)
-        ).fetchone()
+        )
         return str(row[0]) if row else ""
 
     def cache_get(self, cache_key: str) -> Mapping[str, Any] | None:
-        row = self._connection.execute(
+        row = self._read_one(
             "SELECT response_json,usage_json FROM llm_cache WHERE cache_key=?", (cache_key,)
-        ).fetchone()
+        )
         return ({"response": json.loads(row[0]), "usage": json.loads(row[1])} if row else None)
 
     def cache_put(self, cache_key: str, stage: str, request: Any, response: Any,
@@ -575,7 +596,7 @@ class SQLiteGraphStore:
         return len(rows)
 
     def embedding_hashes(self, memory_id: str, model_id: str) -> dict[str, str]:
-        return {row["item_id"]: row["content_hash"] for row in self._connection.execute(
+        return {row["item_id"]: row["content_hash"] for row in self._read(
             "SELECT item_id,content_hash FROM embeddings WHERE memory_id=? AND model_id=?",
             (memory_id, model_id),
         )}
@@ -585,7 +606,7 @@ class SQLiteGraphStore:
         query = array("f", (float(value) for value in query_vector))
         query_norm = math.sqrt(sum(value * value for value in query)) or 1.0
         scores: list[tuple[str, float]] = []
-        for row in self._connection.execute(
+        for row in self._read(
             "SELECT item_id,dimension,vector FROM embeddings WHERE memory_id=? AND model_id=?",
             (memory_id, model_id),
         ):

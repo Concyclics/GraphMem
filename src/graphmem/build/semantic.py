@@ -468,8 +468,8 @@ class QwenSemanticDistiller:
             usage = {"cached_input_tokens": 0, "uncached_input_tokens": prompt,
                      "output_tokens": output, "reasoning_tokens": 0, "total_tokens": prompt + output}
             self.store.cache_put(key, stage, request, response, usage, self.prompt_hash); is_cached = False
-        occurrence = self.store._connection.execute(
-            "SELECT count(*) FROM llm_calls WHERE memory_id=? AND cache_key=?", (memory_id, key)).fetchone()[0]
+        occurrence = self.store._read_one(
+            "SELECT count(*) FROM llm_calls WHERE memory_id=? AND cache_key=?", (memory_id, key))[0]
         self.store.log_llm_call(call_id=stable_id("llm-call", memory_id, key, is_cached, occurrence),
             memory_id=memory_id, stage=stage, cache_key=key, cached=is_cached, request=request,
             response=response, usage=usage, latency_ms=(time.perf_counter()-started)*1000,
