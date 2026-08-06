@@ -8,7 +8,7 @@
     "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
     "embedding_base_url": "http://127.0.0.1:8001/v1",
     "thinking_enabled": false,
-    "max_concurrency": 128,
+    "max_concurrency": 384,
     "semantic_batch_scenes": 1,
     "semantic_batch_input_tokens": 12000,
     "semantic_scene_input_tokens": 16000,

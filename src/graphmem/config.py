@@ -32,7 +32,7 @@ class ModelConfig:
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     embedding_base_url: str = "http://127.0.0.1:8001/v1"
     thinking_enabled: bool = False
-    max_concurrency: int = 128
+    max_concurrency: int = 384
     refine_input_tokens_per_endpoint: int = 96
     refine_output_tokens: int = 256
     bridge_refine_output_tokens: int = 512

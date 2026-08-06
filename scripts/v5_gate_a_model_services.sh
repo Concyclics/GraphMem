@@ -13,6 +13,7 @@ EMBED_GPU="${EMBED_GPU:-1}"
 LLM_GPUS="${LLM_GPUS:-2,3}"
 LLM_TP_SIZE="${LLM_TP_SIZE:-2}"
 LLM_MAX_MODEL_LEN="${LLM_MAX_MODEL_LEN:-65536}"
+LLM_MAX_NUM_SEQS="${LLM_MAX_NUM_SEQS:-384}"
 
 mkdir -p "${STATE_DIR}"
 
@@ -60,7 +61,7 @@ run_llm_supervisor() {
       "${VLLM_BIN}" serve "${LLM_MODEL_PATH}" \
       --served-model-name "${LLM_SERVED_NAME}" --host 127.0.0.1 --port 8002 \
       --tensor-parallel-size "${LLM_TP_SIZE}" --max-model-len "${LLM_MAX_MODEL_LEN}" \
-      --gpu-memory-utilization 0.88 --max-num-seqs 128 \
+      --gpu-memory-utilization 0.88 --max-num-seqs "${LLM_MAX_NUM_SEQS}" \
       --max-num-batched-tokens 65536 --trust-remote-code \
       >>"${STATE_DIR}/llm.log" 2>&1
     local exit_code=$?
