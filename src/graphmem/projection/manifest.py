@@ -52,7 +52,7 @@ def chain_key(node: GraphNode, config: ProjectionConfig | None = None) -> tuple[
     for key in CHAIN_KEYS:
         value = _attribute(node, key)
         if key == "predicate":
-            value = config.normalize_predicate(value)
+            value = "" if not config.chain_includes_predicate else config.normalize_predicate(value)
         if key == "scope" and not config.chain_includes_scope:
             value = ""
         values.append(value)
@@ -104,7 +104,10 @@ def build_manifests(memory_id: str, nodes: Sequence[GraphNode],
         manifest_id = stable_id("node", memory_id, "collection-manifest", *chain)
         summary = " ".join(filter(None, [
             owner_id, "not" if polarity == "negative" else "",
-            modality if modality and modality != "asserted" else "", predicate,
+            modality if modality and modality != "asserted" else "",
+            # collection_key carries the class name once the predicate is out of
+            # the chain, and it is the field a question's noun actually matches.
+            predicate or collection_key,
             ", ".join(str(row.attributes.get("value", "")) for row in members[:8]),
         ]))
         manifest_nodes.append(GraphNode(

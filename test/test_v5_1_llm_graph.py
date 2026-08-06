@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from graphmem.build import GraphBuildPipeline, QwenSemanticDistiller
+from graphmem.build.semantic import SemanticFact
 from graphmem.config import GraphMemV5Config
 from graphmem.domain import NodeType, QueryBudget, RelationType
 from graphmem.retrieval import GraphDiagnosticProbe
@@ -163,11 +164,14 @@ class StrictCompletions:
         else:
             scenes = []
             for scene in payload["s"]:
-                turn = next(row for row in scene["r"] if "Paris" in row["t"])
+                index, turn = next((i, row) for i, row in enumerate(scene["r"]) if "Paris" in row["t"])
                 start = turn["t"].index("Paris")
-                scenes.append({"i": scene["i"], "f": [{"o": "Alice", "p": "travel to",
+                # `p` is the bare relation the prompt asks for -- the build no
+                # longer rewrites "travel to" into "visit" through a verb list.
+                scenes.append({"i": scene["i"], "f": [{"o": "Alice", "p": "visit",
                     "v": "Paris", "y": "place", "g": "travel", "n": "positive",
-                    "t": None, "r": [turn["i"]], "q": "Paris"}]})
+                    "t": None, "r": [index], "q": "Paris",
+                    }]})
             content = json.dumps({"s": scenes})
         message = SimpleNamespace(content=content, reasoning_content=None)
         return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")],
@@ -180,13 +184,14 @@ def _strict_config(*, variant="g5", retries=1, temporal=True):
     return replace(base, models=replace(base.models, semantic_extraction_mode="strict_single",
         semantic_batch_scenes=1, semantic_batch_output_tokens=768,
         semantic_max_facts_per_scene=4, semantic_max_retries=retries,
-        semantic_retry_output_tokens=1024, semantic_compile_summary=True),
+        semantic_retry_output_tokens=1024, semantic_compile_summary=True,
+),
         scenes=replace(base.scenes, llm_hierarchy_compression=False),
         edges=replace(base.edges, graph_variant=variant, temporal_normalization=temporal),
         coarsen=replace(base.coarsen, cross_session_merge=False))
 
 
-def test_strict_prompt_uses_local_aliases_schema_and_one_retry(tmp_path: Path) -> None:
+def test_strict_prompt_exposes_only_role_time_text_and_one_retry(tmp_path: Path) -> None:
     store = _store(tmp_path / "strict.sqlite"); completions = StrictCompletions(fail_first=True)
     config = _strict_config(); client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     manifest = GraphBuildPipeline(store, dataset_hash="dataset",
@@ -199,8 +204,10 @@ def test_strict_prompt_uses_local_aliases_schema_and_one_retry(tmp_path: Path) -
     scene_array = first["response_format"]["json_schema"]["schema"]["properties"]["s"]
     assert scene_array["minItems"] == scene_array["maxItems"] == 1
     payload = json.loads(first["messages"][1]["content"])
-    assert all(row["i"].startswith("s") for row in payload["s"])
-    assert all(turn["i"].startswith("s") for row in payload["s"] for turn in row["r"])
+    # Scene ids are array positions now, not "s0"-style labels the model could copy.
+    assert [row["i"] for row in payload["s"]] == [str(i) for i in range(len(payload["s"]))]
+    # A turn shows the model only who spoke, when, and what was said.
+    assert all(set(turn) == {"s", "d", "t"} for row in payload["s"] for turn in row["r"])
     assert manifest.build_diagnostics["extraction_retry_calls"] >= 1
     assert manifest.build_token_usage["reasoning_tokens"] == 0
 
@@ -230,61 +237,118 @@ def test_strict_value_type_is_derived_without_model_tokens() -> None:
     assert QwenSemanticDistiller._infer_value_type("2024-05-01") == "time"
 
 
-def test_v54_predicate_and_scope_rules_merge_event_variants() -> None:
-    assert GraphBuildPipeline._canonical_predicate("won_tournament", "Valorant final") == "win"
-    assert GraphBuildPipeline._canonical_predicate("won", "international tournament") == "win"
-    assert GraphBuildPipeline._canonical_scope("win", "travel", "international tournament") == "competition"
-    assert GraphBuildPipeline._canonical_predicate("completed_script", "second screenplay") == "write"
-    assert GraphBuildPipeline._canonical_predicate("recommends reading", "to relax") == "recommends reading"
-    assert GraphBuildPipeline._collection_key("write", "second screenplay", "text") == "screenplay"
-    assert GraphBuildPipeline._collection_key("win", "last week", "time") == "tournament"
-    assert GraphBuildPipeline._collection_key("write", "a children's book", "text") == "book"
+def _semantic_fact(**overrides):
+    fields = {"owner": "user", "predicate": "won_tournament", "value": "Valorant final",
+              "value_type": "text", "scope": "competition", "polarity": "positive",
+              "time": None, "confidence": 1.0, "evidence": ()}
+    fields.update(overrides)
+    return SemanticFact(**fields)
+
+
+def test_v58_scene_summary_and_entities_enter_the_schema() -> None:
+    from graphmem.build.semantic import strict_scene_schema
+
+    off = strict_scene_schema(1, 4)["properties"]["s"]["items"]
+    on = strict_scene_schema(1, 4, scene_summary_chars=160, scene_entities=True)
+    scene = on["properties"]["s"]["items"]
+
+    assert "m" not in off["properties"] and "e" not in off["properties"]
+    assert scene["properties"]["m"]["maxLength"] == 160
+    assert "m" in scene["required"] and "e" in scene["required"]
+    assert scene["properties"]["e"]["items"]["maxLength"] == 40
+
+
+def test_v58_a_real_summary_survives_compile_summary() -> None:
+    """The sentence must not be overwritten by the fact-triple concatenation.
+
+    `semantic_compile_summary` replaced the model's summary with
+    "owner predicate value owner predicate value ...", which is what routing
+    cards were built from and why they read as duplicated term soup.
+    """
+    from graphmem.build.semantic import QwenSemanticDistiller
+
+    base = _strict_config()
+    config = replace(base, models=replace(
+        base.models, semantic_compile_summary=True, semantic_scene_summary_chars=160))
+    distiller = QwenSemanticDistiller.__new__(QwenSemanticDistiller)
+    distiller.config = config
+    scene = SimpleNamespace(scene_id="s0", summary="fallback", turns=[])
+    row = {"i": "s0", "f": [], "m": "Alice visited Paris in July and stayed near the Louvre.",
+           "e": ["Alice", "Paris", "Louvre", "Alice"]}
+
+    packet = distiller._validate_scene(scene, row)
+
+    assert packet.summary == "Alice visited Paris in July and stayed near the Louvre."
+    # Deduplicated, order preserved -- the same entity string must recur across
+    # scenes for cross-session routing to join them.
+    assert packet.entities == ("Alice", "Paris", "Louvre")
+
+
+def test_v58_scene_and_turn_labels_never_survive_into_free_text() -> None:
+    """The input protocol's own labels must not come back as content.
+
+    Measured on a 20-memory build without this guard: 68.5% of scene summaries
+    were the bare string "s1", and the six most frequent "entities" across the
+    corpus were s1t1, s1t0, s1t2, s1t3, s0t1, s0t0 -- which recur in every
+    session by construction and so faked a cross-session entity link.  `scope`
+    has been filtered since V5.4 and the V5.7 category field leaked the same
+    labels at 2.9%; this is the third occurrence, so it is pinned here.
+    """
+    from graphmem.build.semantic import QwenSemanticDistiller, strip_aliases
+
+    for label in ("s1", "s10", "s1t0", "S0T12", "  s1  "):
+        assert strip_aliases(label) == ""
+    for real in ("Trello", "Patti Smith", "s1 is where Alice went"):
+        assert strip_aliases(real) == " ".join(real.split())
+
+    base = _strict_config()
+    config = replace(base, models=replace(
+        base.models, semantic_scene_summary_chars=160, semantic_scene_entities=True))
+    distiller = QwenSemanticDistiller.__new__(QwenSemanticDistiller)
+    distiller.config = config
+    scene = SimpleNamespace(scene_id="s0", summary="fallback", turns=[])
+
+    packet = distiller._validate_scene(
+        scene, {"i": "s0", "f": [], "m": "s1", "e": ["s1t0", "Trello", "s0", "Patti Smith"]})
+
+    assert packet.summary == "fallback", "an echoed label must fall through to the scene text"
+    assert packet.entities == ("Trello", "Patti Smith")
+
+
+def test_v58_compiled_summary_still_used_when_the_field_is_off() -> None:
+    from graphmem.build.semantic import QwenSemanticDistiller
+
+    base = _strict_config()
+    config = replace(base, models=replace(
+        base.models, semantic_compile_summary=True, semantic_scene_summary_chars=0))
+    distiller = QwenSemanticDistiller.__new__(QwenSemanticDistiller)
+    distiller.config = config
+    scene = SimpleNamespace(scene_id="s0", summary="fallback", turns=[])
+
+    packet = distiller._validate_scene(scene, {"i": "s0", "f": [], "m": "ignored"})
+
+    assert packet.summary == "fallback" and packet.entities == ()
+
+
+def test_v57_predicate_and_scope_come_from_extraction_not_regex_ladders() -> None:
+    # The predicate is normalized, not rewritten: no verb list decides that
+    # "won_tournament" means "win".  Extraction supplies the relation itself.
+    assert GraphBuildPipeline._predicate_key(_semantic_fact()) == "won tournament"
+    assert GraphBuildPipeline._predicate_key(
+        _semantic_fact(predicate="recommends reading")) == "recommends reading"
+    assert GraphBuildPipeline._scope_key(_semantic_fact(scope="Travel")) == "travel"
+    assert GraphBuildPipeline._scope_key(_semantic_fact(scope="")) == "general"
+    # collection_key falls back to value_type: the seven regex families it used
+    # to consult matched none of model kit, fitness class or film festival, and
+    # the extraction-supplied category that replaced them measured 390 distinct
+    # values per memory at 6.3% reuse, so that route is closed.
+    assert GraphBuildPipeline._collection_key(_semantic_fact(value_type="time")) == "time"
+    assert GraphBuildPipeline._collection_key(_semantic_fact(value_type="")) == "value"
+
+
+def test_v54_modality_rules_survive_the_ladder_removal() -> None:
     assert GraphBuildPipeline._fact_modality("It is definitely on my to-do list") == "planned"
     assert GraphBuildPipeline._fact_modality("I visited Chicago last week") == "asserted"
-
-
-class OccurrenceCompletions:
-    def create(self, **request):
-        payload = json.loads(request["messages"][1]["content"])
-        scenes = []
-        for scene_index, scene in enumerate(payload["s"]):
-            turn = next(row for row in scene["r"] if "Paris" in row["t"])
-            scenes.append({"i": scene["i"], "f": [{
-                "o": "Alice", "p": "won_tournament" if scene_index else "won",
-                "v": "Paris tournament", "g": "travel", "n": "positive",
-                "r": [turn["i"]], "q": "Paris",
-            }]})
-        message = SimpleNamespace(content=json.dumps({"s": scenes}), reasoning_content=None)
-        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")],
-            model="qwen30b", usage=SimpleNamespace(prompt_tokens=80, completion_tokens=20,
-                                                    total_tokens=100))
-
-
-def test_v54_event_instance_collection_keeps_repeated_values(tmp_path: Path) -> None:
-    store = _store(tmp_path / "occurrence.sqlite")
-    config = replace(_strict_config(), scenes=replace(_strict_config().scenes, max_turns=2))
-    client = SimpleNamespace(chat=SimpleNamespace(completions=OccurrenceCompletions()))
-    GraphBuildPipeline(store, dataset_hash="dataset",
-        distiller=QwenSemanticDistiller(store, config, "dataset", client=client)).build("travel", config)
-    collections = [node for node in store.nodes("travel")
-                   if node.node_type == NodeType.COLLECTION_SCOPE
-                   and node.attributes.get("predicate") == "win"]
-    assert len(collections) == 1
-    collection = collections[0]
-    assert collection.attributes["collection_semantics"] == "event_instances"
-    assert collection.attributes["member_count"] == 2
-    member_edges = [edge for edge in store.edges("travel")
-                    if edge.src_id == collection.node_id
-                    and edge.relation == RelationType.COLLECTION_CO_MEMBER]
-    assert len(member_edges) == 2
-    projected_edges = [edge for edge in store.edges("travel")
-                       if edge.relation == RelationType.COLLECTION_CO_MEMBER
-                       and edge.src_id != collection.node_id]
-    assert len(projected_edges) == 1
-    assert any(edge.dst_id == collection.node_id and edge.relation == RelationType.HAS_FACT
-               for edge in store.edges("travel"))
-    assert any(edge.relation == RelationType.PARTICIPATES_IN
-               for edge in store.edges("travel"))
 
 
 def test_g5_lean_graph_has_terminal_facts_and_no_value_nodes(tmp_path: Path) -> None:

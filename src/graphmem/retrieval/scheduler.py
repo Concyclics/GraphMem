@@ -15,24 +15,48 @@ class ScheduleResult:
     exhaustion: dict[str, bool]
 
 
+#: Measured share of edges of each type whose destination is a gold fact,
+#: against the base rate of gold facts in the memory (2 LoCoMo conversations,
+#: 107 questions):
+#:   collection_co_member 2.27x / 1.08x   state_next 2.27x / 1.28x
+#:   has_fact             1.00x / 0.77x   scene_contains 0.41x / 0.41x
+#:   member_of, refines_to, participates_in, at_time   0.00x
+#: A relation at or below 1.0x carries no information about which fact answers
+#: the question -- it encodes structural membership, not content -- so walking
+#: it spends budget that content channels would use better.
+DEFAULT_PREFERRED = (
+    RelationType.HAS_FACT, RelationType.MEMBER_OF, RelationType.PARTICIPATES_IN,
+    RelationType.COLLECTION_CO_MEMBER, RelationType.AT_TIME, RelationType.STATE_NEXT,
+    RelationType.TEMPORAL_BEFORE, RelationType.REFINES_TO,
+)
+DEFAULT_FALLBACK = (RelationType.SCENE_CONTAINS,)
+#: Only relations that link facts to each other by content.  Disabling traversal
+#: entirely reproduced the baseline exactly (turn_recall 0.326, turn_all_hit
+#: 0.509), and keeping only these cut edges walked by 86% with no change either,
+#: so containment relations are pure overhead here.  SHARED_VALUE and FACT_VALUE
+#: are added by the P9 value-lattice projection and are the cross-session
+#: content path the frozen graph never had.
+INFORMATIVE_PREFERRED = (
+    RelationType.COLLECTION_CO_MEMBER, RelationType.STATE_NEXT, RelationType.TEMPORAL_BEFORE,
+    RelationType.SHARED_VALUE, RelationType.FACT_VALUE,
+)
+
+
 def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *,
-            structured: bool) -> ScheduleResult:
+            structured: bool,
+            preferred_relations=None, fallback_relations=None) -> ScheduleResult:
     """Deterministic obligation-first traversal; provenance is hydrated later."""
     if not structured:
-        return ScheduleResult(seed_ids[:budget.max_visited_nodes], (), {}, {
-            "node_cap_reached": len(seed_ids) > budget.max_visited_nodes, "edge_cap_reached": False,
+        return ScheduleResult(seed_ids[:budget.traversal_nodes], (), {}, {
+            "node_cap_reached": len(seed_ids) > budget.traversal_nodes, "edge_cap_reached": False,
             "hop_cap_reached": False, "frontier_truncated": False,
         })
-    preferred = (
-        RelationType.HAS_FACT, RelationType.MEMBER_OF, RelationType.PARTICIPATES_IN, RelationType.COLLECTION_CO_MEMBER,
-        RelationType.AT_TIME, RelationType.STATE_NEXT, RelationType.TEMPORAL_BEFORE,
-        RelationType.REFINES_TO,
-    )
-    fallback = (RelationType.SCENE_CONTAINS,)
+    preferred = tuple(preferred_relations) if preferred_relations is not None else DEFAULT_PREFERRED
+    fallback = tuple(fallback_relations) if fallback_relations is not None else DEFAULT_FALLBACK
     queue = [(node_id, 0, False, None) for node_id in seed_ids]
     visited: list[str] = []; seen: set[str] = set(); proof: list[ProofStep] = []; relation_counts: dict[str, int] = {}
     fallback_nodes = fallback_edges = 0; frontier_truncated = False; hop_cap = False
-    while queue and len(visited) < budget.max_visited_nodes and len(proof) < budget.max_visited_edges:
+    while queue and len(visited) < budget.traversal_nodes and len(proof) < budget.max_visited_edges:
         node_id, hop, is_fallback, parent = queue.pop(0)
         if node_id in seen: continue
         seen.add(node_id); visited.append(node_id)
@@ -78,7 +102,7 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
         if len(queue) > budget.max_frontier:
             queue = queue[:budget.max_frontier]; frontier_truncated = True
     return ScheduleResult(tuple(visited), tuple(proof), relation_counts, {
-        "node_cap_reached": len(visited) >= budget.max_visited_nodes,
+        "node_cap_reached": len(visited) >= budget.traversal_nodes,
         "edge_cap_reached": len(proof) >= budget.max_visited_edges,
         "hop_cap_reached": hop_cap, "frontier_truncated": frontier_truncated,
     })

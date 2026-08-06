@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from graphmem.domain import NodeType  # noqa: E402
-from graphmem.projection import ARMS, ProjectionConfig, build_manifests, manifest_stats  # noqa: E402
+from graphmem.projection import (ARMS, ProjectionConfig, build_manifests,  # noqa: E402
+                                 build_value_lattice, lattice_stats, manifest_stats)
 from graphmem.storage import SQLiteGraphStore  # noqa: E402
 
 
@@ -72,6 +73,9 @@ def main() -> None:
         edges = list(store.edges(memory_id))
         before = len(nodes)
         manifest_nodes, manifest_edges, rows = build_manifests(memory_id, nodes, config)
+        value_nodes, value_edges, value_rows = build_value_lattice(memory_id, nodes, config)
+        manifest_nodes = manifest_nodes + value_nodes
+        manifest_edges = manifest_edges + value_edges
         if manifest_nodes or manifest_edges:
             # Evidence groups are passed through unchanged: the projection cites
             # existing provenance and never mints a new group, so re-writing them
@@ -79,6 +83,7 @@ def main() -> None:
             store.replace_graph(memory_id, nodes + manifest_nodes, edges + manifest_edges,
                                 list(store.evidence_groups(memory_id)))
         stats = dict(manifest_stats(rows))
+        stats.update({f"value_{key}": value for key, value in lattice_stats(value_rows).items()})
         stats.update({"memory_id": memory_id, "nodes_before": before,
                       "nodes_after": before + len(manifest_nodes),
                       "facts": sum(1 for node in nodes if node.node_type == NodeType.CANONICAL_FACT)})

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 from .config import ARMS, ProjectionConfig
 from .manifest import ManifestRow, build_manifests, chain_key, collect_chains, manifest_stats
+from .value_lattice import ValueLatticeRow, build_value_lattice, collect_values, lattice_stats
 
 __all__ = [
     "ARMS", "ManifestRow", "ProjectionConfig", "build_manifests", "chain_key",
-    "collect_chains", "manifest_stats",
+    "collect_chains", "manifest_stats", "ValueLatticeRow", "build_value_lattice",
+    "collect_values", "lattice_stats",
 ]

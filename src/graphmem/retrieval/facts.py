@@ -17,7 +17,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
-from ..domain import NodeType, OperandSpec
+from ..domain import NodeType, OperandSpec, RelationType
 from ..text import content_terms, normalize_key
 
 
@@ -35,7 +35,16 @@ ACTIVE_SHARED_BRIDGE = 16
 ACTIVE_GLOBAL_FALLBACK = 16
 ACTIVE_TOTAL = 96
 
-CHANNELS = ("source_projection", "structured", "routing", "lexical", "dense")
+#: Channels enabled by default.  "routing" is deliberately absent: the channel
+#: was broken (it filtered Scene ids to CANONICAL_FACT and returned nothing on
+#: every question ever run) and fixing it made retrieval *worse* -- on 100 LoCoMo
+#: questions turn_recall fell 0.520 -> 0.486 and turn_all_hit 0.410 -> 0.390,
+#: because its 58 facts per question displace better source-projection and
+#: lexical candidates inside the reservoir's soft limit.  The fix is kept so the
+#: channel works when the routing keys are worth reading; today they are not.
+#: Re-measure this A/B before enabling it.
+CHANNELS = ("source_projection", "structured", "lexical", "dense")
+ALL_CHANNELS = ("source_projection", "structured", "routing", "lexical", "dense")
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,9 +191,29 @@ def build_fact_reservoir(view, ir, seeded, groups_by_turn, *, core_fact_ids: Seq
                 contributions["structured"] += len(found)
         if "routing" in enabled:
             keys = (*operand.owner_aliases, *operand.predicate_candidates, *sorted(query_terms))
-            found = [node_id for node_id in view.route_children(keys, limit=routing_limit * 2)
-                     if node_id in view.nodes
-                     and view.nodes[node_id].node_type == NodeType.CANONICAL_FACT][:routing_limit]
+            # Routing postings never contain facts.  A level-1 card's
+            # ``child_postings`` maps a term to *Scene* ids (pipeline
+            # ``_packet_record`` sets ``child_id = packet.scene_id``), and level
+            # 2/3 cards map to routing-card ids.  Filtering the result to
+            # CANONICAL_FACT therefore matched nothing and this channel returned
+            # zero rows on every question ever run.  Descend one hop instead:
+            # the facts hang off the scene by SCENE_CONTAINS / HAS_FACT.
+            found: list[str] = []
+            for node_id in view.route_children(keys, limit=routing_limit * 2):
+                node = view.nodes.get(node_id)
+                if node is None:
+                    continue
+                if node.node_type == NodeType.CANONICAL_FACT:
+                    found.append(node_id)
+                    continue
+                for row in view.neighbors(node_id, (RelationType.SCENE_CONTAINS,
+                                                    RelationType.HAS_FACT,
+                                                    RelationType.REFINES_TO),
+                                          semantic_only=True):
+                    child = view.nodes.get(row.next_node_id)
+                    if child is not None and child.node_type == NodeType.CANONICAL_FACT:
+                        found.append(row.next_node_id)
+            found = list(dict.fromkeys(found))[:routing_limit]
             if found:
                 rows["routing"] = found
                 contributions["routing"] += len(found)

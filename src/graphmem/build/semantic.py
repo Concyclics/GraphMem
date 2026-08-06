@@ -24,10 +24,24 @@ CHARS_PER_TOKEN = 3.84
 ESTIMATE_SAFETY = 1.10
 
 PROMPT_VERSION = "graphmem-v5.1-scene-semantic-v1"
-STRICT_PROMPT_VERSION = "graphmem-v5.4-strict-scene-facts-v5"
+STRICT_PROMPT_VERSION = "graphmem-v5.8-strict-scene-facts-v7"
 SYSTEM_PROMPT = """Extract grounded memory facts. Return compact JSON {"s":[{"i":scene_id,"m":summary,"f":[{"o":owner,"p":predicate,"v":value,"y":value_type,"g":scope,"n":"positive|negative","t":time_or_null,"c":confidence,"e":[{"i":turn_id,"a":start,"b":end}]}],"u":[]}]}. Every fact must cite exact supplied offsets. No invention, markdown, explanations, or reasoning. Summary <=64 tokens. Omit empty optional fields."""
-STRICT_PROMPT = """Extract durable facts that help route later questions to exact source turns. Return only schema JSON and copy local aliases exactly. Fact keys: o=owner entity; p=short canonical verb phrase; v=the concrete value including names and ordinals; g=short domain; n=positive or negative; r=one or two cited turn aliases; q=one exact quote containing the value and any explicit time. Cover every informative turn before adding a second fact from any turn. Highest priority: quantities and ordinals, named people/places/books/pets, acquisitions and state changes, participation or wins, preferences, explicit or relative time, and factual media-caption details. Preserve words such as first/second/third and numeric caption facts. Never emit generic facts such as shared/showed/sent a photo when the caption supports a more concrete fact. Omit greetings, acknowledgements, emotions without a durable state, advice, and filler. Input d is observation metadata and may only anchor relative time; never copy it as event time. Do not invent, explain, reason, summarize, or create aliases."""
+STRICT_PROMPT = """Extract durable facts that help route later questions to exact source turns. Return only schema JSON. Each scene supplies its turns in order, and every turn shows only who spoke, when, and what was said. Fact keys: o=owner entity; p=short canonical verb phrase; v=the concrete value including names and ordinals; g=short domain; n=positive or negative; r=one or two 0-based positions of the cited turns within this scene's turn array; q=one exact quote containing the value and any explicit time. Cover every informative turn before adding a second fact from any turn. Highest priority: quantities and ordinals, named people/places/books/pets, acquisitions and state changes, participation or wins, preferences, explicit or relative time, and factual media-caption details. Preserve words such as first/second/third and numeric caption facts. Never emit generic facts such as shared/showed/sent a photo when the caption supports a more concrete fact. Omit greetings, acknowledgements, emotions without a durable state, advice, and filler. Input d is observation metadata and may only anchor relative time; never copy it as event time. Do not invent, explain, reason, summarize, or create aliases."""
 HIERARCHY_PROMPT = """Compress supplied child semantic records for routing. Return compact JSON with summary, owners, predicates, values, scopes, times, child_postings mapping keys to child ID arrays, and aliases as arrays of equivalent value strings found in the children. Only copy supported values and IDs. Never put IDs in scopes or aliases. No markdown or reasoning."""
+#: The input protocol labels scenes `s1` and turns `s1t0`, and the model copies
+#: those labels into any free-text field it is given.  `scope` has been filtered
+#: for this since V5.4; the V5.7 category field `k` leaked them at 2.9%, and the
+#: V5.8 scene summary and entity list leaked them at 68.5% and across the entire
+#: top of the entity frequency table.  Every new free-text field needs this guard.
+ALIAS_RE = re.compile(r"s?\d+(?:t\d+)?", re.I)
+
+
+def strip_aliases(text: str) -> str:
+    """Empty when the model echoed a scene or turn label instead of writing prose."""
+    cleaned = " ".join(str(text).split())
+    return "" if ALIAS_RE.fullmatch(cleaned) else cleaned
+
+
 EXPLICIT_TIME_RE = re.compile(
     r"\b(?:\d{1,4}[:/\-]\d{1,2}|\d{4}|monday|tuesday|wednesday|thursday|friday|"
     r"saturday|sunday|january|february|march|april|may|june|july|august|september|"
@@ -36,13 +50,16 @@ EXPLICIT_TIME_RE = re.compile(
 
 def strict_scene_schema(max_scenes: int, max_facts: int, *,
                         quote_evidence: bool = True,
-                        predicate_max_chars: int = 0) -> Mapping[str, Any]:
+                        predicate_max_chars: int = 0,
+                        scene_summary_chars: int = 0,
+                        scene_entities: bool = False) -> Mapping[str, Any]:
     """Schema for one strict extraction call.
 
     ``quote_evidence`` emits the exact-quote field ``q``.  It is 26% of
     extraction output bytes and only narrows the span inside a turn that ``r``
     already cites, which the projection re-derives from the fact value, so a
     budgeted run may drop it.
+
     """
     properties: dict[str, Any] = {
         "o": {"type": "string", "minLength": 1},
@@ -51,17 +68,37 @@ def strict_scene_schema(max_scenes: int, max_facts: int, *,
         "v": {"type": "string", "minLength": 1},
         "g": {"type": "string", "minLength": 1},
         "n": {"type": "string", "enum": ["positive", "negative"]},
-        "r": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "string"}}}
+        # A 0-based position in the scene's turn array, not a copyable label.
+        "r": {"type": "array", "minItems": 1, "maxItems": 2,
+              "items": {"type": "integer", "minimum": 0}}}
     required = ["o", "p", "v", "g", "n", "r"]
     if quote_evidence:
         properties["q"] = {"type": "string", "minLength": 1, "maxLength": 160}
         required.append("q")
     fact = {"type": "object", "additionalProperties": False,
             "required": required, "properties": properties}
+    scene_properties: dict[str, Any] = {
+        "i": {"type": "string"},
+        "f": {"type": "array", "maxItems": max_facts, "items": fact}}
+    scene_required = ["i", "f"]
+    if scene_summary_chars:
+        # A readable standalone sentence, not the concatenation of fact triples
+        # the build compiles today ("Obsess has website URL https://obsessvr.com/
+        # Vertebrae has website URL ...").  Both mem0's FACT_RETRIEVAL_PROMPT and
+        # LightMem's METADATA_GENERATE_PROMPT return standalone sentences, and a
+        # sentence is what a question embedding can match against.
+        scene_properties["m"] = {"type": "string", "minLength": 1,
+                                 "maxLength": scene_summary_chars}
+        scene_required.append("m")
+    if scene_entities:
+        # Named entities carry a multi-session question across sessions: LoCoMo
+        # cat1 ("What did Caroline research?") spreads its evidence over 2.68
+        # sessions and is the worst-routed category at session_all_hit 0.592.
+        scene_properties["e"] = {"type": "array", "maxItems": 8,
+                                 "items": {"type": "string", "minLength": 1, "maxLength": 40}}
+        scene_required.append("e")
     scene = {"type": "object", "additionalProperties": False,
-             "required": ["i", "f"], "properties": {
-                 "i": {"type": "string"},
-                 "f": {"type": "array", "maxItems": max_facts, "items": fact}}}
+             "required": scene_required, "properties": scene_properties}
     return {"type": "object", "additionalProperties": False, "required": ["s"],
             "properties": {"s": {"type": "array", "minItems": max_scenes, "maxItems": max_scenes,
                                      "items": scene}}}
@@ -87,6 +124,9 @@ class ScenePacket:
     facts: tuple[SemanticFact, ...]
     unresolved: tuple[str, ...]
     fallback: bool = False
+    #: Named entities the scene mentions.  Empty when the config does not ask for
+    #: `e`, which is what every graph before V5.8 carries.
+    entities: tuple[str, ...] = ()
 
 
 class QwenSemanticDistiller:
@@ -103,6 +143,27 @@ class QwenSemanticDistiller:
                 f"{config.models.semantic_predicate_max_chars} characters, such as visited, bought, "
                 "recommends, lives in. Never put objects, names, quantities, adjectives or clauses "
                 "in p; those belong in v. Reuse the same p across facts that share a relation.")
+        if config.models.semantic_scene_summary_chars:
+            # Phrased after mem0's FACT_RETRIEVAL_PROMPT and LightMem's
+            # METADATA_GENERATE_PROMPT, both of which return standalone sentences
+            # that read without the surrounding turns.  The summary is what a
+            # question is matched against, so it has to carry the specifics --
+            # LightMem's LoCoMo prompt is explicit that names, places and
+            # quantities must survive into the fact text.
+            strict_prompt += (
+                " m is one standalone sentence stating what this scene is about, readable without "
+                "the conversation. Name the people, places, objects, organizations and quantities "
+                "involved rather than referring to them as he, she, it or they. State it as prose, "
+                "never as a list of subject-predicate-object fragments. Never write a scene or turn "
+                "label such as s1 or s1t0 into m, and never copy a turn verbatim: write your own "
+                "sentence about what happened.")
+        if config.models.semantic_scene_entities:
+            strict_prompt += (
+                " e lists the named entities the scene mentions -- people, places, organizations, "
+                "products, works and events -- each written the same way every time it appears "
+                "anywhere in the input, so the same entity in two sessions yields the same string. "
+                "Scene and turn labels such as s1 or s1t0 are not entities and must never appear "
+                "in e.")
         prompt_material = (STRICT_PROMPT_VERSION + strict_prompt if
                            config.models.semantic_extraction_mode != "legacy_batch" else
                            PROMPT_VERSION + SYSTEM_PROMPT + HIERARCHY_PROMPT)
@@ -300,13 +361,22 @@ class QwenSemanticDistiller:
         scene_aliases: dict[str, str] = {}
         turn_aliases: dict[str, str] = {}
         rows = []
+        # A turn shows the model three things: who spoke, when, and what was said.
+        # Everything else is our plumbing, and plumbing that is shaped like prose
+        # gets copied into prose: string aliases ("s0", "s0t1") were echoed back
+        # as 68.5% of scene summaries and as the six most frequent "entities" in
+        # the corpus.  Citations are therefore positions in the arrays we already
+        # send -- an integer cannot be mistaken for a summary or an entity name,
+        # and it costs fewer output tokens than "s0t1".
         for scene_index, scene in enumerate(batch):
-            scene_alias = f"s{scene_index}"; scene_aliases[scene_alias] = scene.scene_id
+            scene_alias = str(scene_index); scene_aliases[scene_alias] = scene.scene_id
             turns = []
-            for turn_index, turn in enumerate(scene.turns):
-                alias = f"s{scene_index}t{turn_index}"; turn_aliases[alias] = turn.turn_id
-                turns.append({"i": alias, "s": turn.speaker, "d": turn.timestamp,
+            for turn in scene.turns:
+                turns.append({"s": turn.speaker, "d": turn.timestamp,
                               "t": self._compact_turn(turn.raw_text)})
+            # Citations resolve against this scene's own turn order, so the model
+            # never needs -- and never sees -- an identifier it could copy.
+            turn_aliases[scene_alias] = tuple(turn.turn_id for turn in scene.turns)
             rows.append({"i": scene_alias, "r": turns})
         return {"s": rows}, scene_aliases, turn_aliases
 
@@ -330,8 +400,6 @@ class QwenSemanticDistiller:
             if not isinstance(source, dict):
                 continue
             alias = str(source.get("i"))
-            if alias not in scene_aliases and alias in turn_aliases:
-                alias = alias.split("t", 1)[0]
             # Guided JSON guarantees the array shape but cannot express that each
             # scene alias is unique. Qwen occasionally emits s0 twice for a
             # two-scene batch while preserving row order. Recover that row
@@ -350,11 +418,18 @@ class QwenSemanticDistiller:
                     continue
                 fact = dict(source_fact); refs = []
                 quote = " ".join(str(source_fact.get("q", "")).split())
-                for alias in source_fact.get("r", ()) if isinstance(source_fact.get("r"), list) else ():
-                    turn_id = turn_aliases.get(str(alias))
-                    if not turn_id:
+                # `r` is a 0-based position in this scene's turn array.  A model
+                # that answers with a 1-based index or a stray string simply
+                # fails to resolve, exactly as an unknown alias used to.
+                scene_turns = turn_aliases.get(alias, ())
+                for cited in source_fact.get("r", ()) if isinstance(source_fact.get("r"), list) else ():
+                    try:
+                        index = int(cited)
+                    except (TypeError, ValueError):
                         continue
-                    refs.append({"i": turn_id, "q": quote})
+                    if not 0 <= index < len(scene_turns):
+                        continue
+                    refs.append({"i": scene_turns[index], "q": quote})
                 fact["e"] = refs; facts.append(fact)
             row["f"] = facts; result.append(row)
         return result
@@ -460,15 +535,26 @@ class QwenSemanticDistiller:
                                       scope,
                                       str(item.get("n", item.get("polarity", "positive"))),
                                       raw_time,
-                                      min(1.0, max(0.0, float(item.get("c", item.get("confidence", 0.5))))), tuple(evidence)))
-        summary = " ".join(str(row.get("m", row.get("summary", ""))).split()[
+                                      min(1.0, max(0.0, float(item.get("c", item.get("confidence", 0.5))))),
+                                      tuple(evidence)))
+        summary = " ".join(strip_aliases(row.get("m", row.get("summary", ""))).split()[
             :self.config.models.semantic_summary_tokens])
-        if self.config.models.semantic_compile_summary:
+        # `semantic_compile_summary` replaces the model's sentence with a
+        # concatenation of fact triples.  That is what routing cards are built
+        # from today, and it is why they read as duplicated term soup
+        # ("user track spending on luxury items vs. budget-friendly ones luxury
+        # items vs. budget-friendly ones").  When the model is asked for a real
+        # summary, keep it.
+        if self.config.models.semantic_compile_summary and not (
+                self.config.models.semantic_scene_summary_chars and summary):
             summary = self._compiled_summary(facts)
         if not summary:
             summary = " ".join(scene.summary.split()[:96])
+        entities = tuple(dict.fromkeys(
+            filter(None, (strip_aliases(item) for item in (row.get("e") or ())))))[:8]
         return ScenePacket(scene.scene_id, summary, tuple(facts),
-                           self._strings(row.get("u", row.get("unresolved"))), False)
+                           self._strings(row.get("u", row.get("unresolved"))), False,
+                           entities)
 
     @staticmethod
     def _compiled_summary(facts: Sequence[SemanticFact]) -> str:
@@ -566,7 +652,9 @@ class QwenSemanticDistiller:
                 "schema": strict_scene_schema(
                     batch_size, effective_facts,
                     quote_evidence=self.config.models.semantic_quote_evidence,
-                    predicate_max_chars=self.config.models.semantic_predicate_max_chars)}}
+                    predicate_max_chars=self.config.models.semantic_predicate_max_chars,
+                    scene_summary_chars=self.config.models.semantic_scene_summary_chars,
+                    scene_entities=self.config.models.semantic_scene_entities)}}
         elif self.config.models.semantic_constrained_json:
             request["response_format"] = {"type": "json_object"}
         cached = self.store.cache_get(key); started = time.perf_counter()

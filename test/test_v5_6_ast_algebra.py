@@ -82,6 +82,46 @@ def test_distinct_chains_do_not_merge() -> None:
     assert len(nodes) == 2
 
 
+#: R1: group by the class of thing, not by the verb.
+BY_CATEGORY = ProjectionConfig(collection_manifest=True, chain_includes_scope=False,
+                               chain_includes_predicate=False)
+
+
+def test_one_class_reached_by_different_verbs_is_one_collection() -> None:
+    """The defect this arm exists to fix.
+
+    Measured over 149 gold-annotated aggregation questions: 91.5% of a question's
+    gold facts land in different chains.  "How many model kits have I worked on
+    or bought" has gold facts whose predicates are just/start/finish -- three
+    chains, so a count has no set to range over and the answer stage faithfully
+    counts whatever subset survived ranking.
+    """
+    facts = [_fact("B-29 bomber kit", predicate="just got", collection="model kit"),
+             _fact("diorama kit", predicate="started working on", collection="model kit", turn=1),
+             _fact("Revell F-15 kit", predicate="finished", collection="model kit", turn=2)]
+
+    split = build_manifests("m", facts, ON)[0]
+    merged = build_manifests("m", facts, BY_CATEGORY)[0]
+
+    assert len(split) == 3, "the verb-keyed chain splits one collection three ways"
+    assert len(merged) == 1
+    assert merged[0].attributes["member_count"] == 3
+    assert merged[0].attributes["collection_key"] == "model kit"
+    # The class name has to survive into the summary, because that and
+    # collection_key are what a question's noun is matched against once the
+    # predicate has left the chain key.
+    assert "model kit" in merged[0].summary
+
+
+def test_different_classes_still_do_not_merge_without_the_predicate() -> None:
+    facts = [_fact("B-29 kit", predicate="bought", collection="model kit"),
+             _fact("kyoto", predicate="bought", collection="trip", turn=1)]
+
+    nodes, _edges, _rows = build_manifests("m", facts, BY_CATEGORY)
+
+    assert len(nodes) == 2
+
+
 def test_repeated_occurrences_stay_separate_members() -> None:
     """Counting occurrences must not deduplicate two rides into one."""
     facts = [_fact("rollercoaster", turn=0, event="e1"),

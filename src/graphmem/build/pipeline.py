@@ -59,9 +59,6 @@ VERB_RE = re.compile(r"\b([A-Za-z]+(?:ed|ing|s)|went|go|got|made|took|had|has|is
 
 PROFILE_LEVEL = {f"b{index}": index for index in range(7)}
 
-OCCURRENCE_PREDICATES = frozenset({
-    "win", "participate", "receive", "write", "visit", "read", "buy", "get", "attend",
-})
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,11 +200,17 @@ class GraphBuildPipeline:
         if level >= 1:
             for scene in scenes:
                 evidence_ids = tuple(group_by_turn[turn.turn_id].evidence_group_id for turn in scene.turns)
+                packet = packet_by_scene.get(
+                    scene.scene_id, ScenePacket(scene.scene_id, scene.summary, (), ()))
                 scene_node = GraphNode(
                     scene.scene_id, memory_id, NodeType.SCENE, 0,
-                    packet_by_scene.get(scene.scene_id, ScenePacket(scene.scene_id, scene.summary, (), ())).summary,
+                    packet.summary,
                     evidence_ids[0], evidence_ids[1:],
                     attributes={"session_id": scene.session_id, "turn_ids": tuple(x.turn_id for x in scene.turns),
+                                # Entities are what join the 2.68 sessions a LoCoMo
+                                # cat1 question needs; they are only useful if the
+                                # same name recurs verbatim in another session.
+                                **({"entities": packet.entities} if packet.entities else {}),
                                 "roles": ("scene", "route") if lean_graph else ("scene",),
                                 **({"provenance_scope": "route"} if lean_graph else {})},
                 )
@@ -605,8 +608,8 @@ class GraphBuildPipeline:
                 if not self._keep_lean_fact(fact):
                     continue
                 owner_key = self._normal(fact.owner)
-                predicate_key = self._canonical_predicate(fact.predicate, fact.value)
-                scope_key = self._canonical_scope(predicate_key, fact.scope, fact.value)
+                predicate_key = self._predicate_key(fact)
+                scope_key = self._scope_key(fact)
                 predicate_keys.append((owner_key, predicate_key, scope_key,
                                        self._normal(fact.value_type), fact.polarity))
         predicate_map = (self.predicate_canonicalizer.canonicalize(memory_id, predicate_keys)
@@ -623,9 +626,9 @@ class GraphBuildPipeline:
                                              for turn_id, _, _ in refs))
                 source_turn = turn_map[refs[0][0]]
                 owner_key = self._normal(fact.owner)
-                raw_predicate = self._canonical_predicate(fact.predicate, fact.value)
+                raw_predicate = self._predicate_key(fact)
                 value_key = self._normal(fact.value)
-                scope_key = self._canonical_scope(raw_predicate, fact.scope, fact.value)
+                scope_key = self._scope_key(fact)
                 predicate_key = predicate_map[(owner_key, raw_predicate, scope_key,
                                                self._normal(fact.value_type), fact.polarity)]
                 owner_id = stable_id("node", memory_id, "semantic-owner", owner_key)
@@ -658,9 +661,6 @@ class GraphBuildPipeline:
                          "provenance_scope": "terminal",
                          "observed_at": dataclass_dict(observed) if observed else None,
                          "time_interval": dataclass_dict(interval) if interval else None}
-                if predicate_key in OCCURRENCE_PREDICATES:
-                    attrs["event_instance_id"] = stable_id(
-                        "event-instance", memory_id, predicate_key, tuple(refs))
                 fact_node = GraphNode(
                     fact_id, memory_id, NodeType.CANONICAL_FACT, 0,
                     f"{fact.owner} " + (f"{modality} " if modality != "asserted" else "") +
@@ -691,8 +691,7 @@ class GraphBuildPipeline:
                                     "provenance_scope": "terminal"}))
                     edges.append(self._edge(memory_id, fact_node, RelationType.AT_TIME,
                                             nodes[time_id], "normalized_temporal"))
-                collection_key = self._collection_key(predicate_key, fact.value,
-                                                      fact.value_type)
+                collection_key = self._collection_key(fact)
                 attrs["collection_key"] = collection_key
                 # attrs changed after GraphNode creation; preserve the value on
                 # the immutable node used by downstream chain compilation.
@@ -704,7 +703,10 @@ class GraphBuildPipeline:
 
         for (owner_id, predicate, scope, collection_key, polarity, modality), rows in sorted(chains.items()):
             values = {str(row[0].attributes["value_key"]) for row in rows}
-            occurrence_collection = predicate in OCCURRENCE_PREDICATES
+            # Read the aspect back off the members rather than carrying it in the
+            # chain key, so this matches projection/manifest.py exactly -- it
+            # derives occurrence the same way.
+            occurrence_collection = any(row[0].attributes.get("event_instance_id") for row in rows)
             if len(rows) < 2 or (len(values) < 2 and not occurrence_collection):
                 continue
             ordered = sorted(rows, key=lambda row: (
@@ -852,73 +854,32 @@ class GraphBuildPipeline:
     def _normal(value):
         return " ".join(re.findall(r"[\w'-]+", value.casefold()))
 
-    @classmethod
-    def _canonical_predicate(cls, predicate, value):
-        raw = cls._normal(str(predicate).replace("_", " "))
-        context = f"{raw} {cls._normal(value)}"
-        if re.search(r"\b(?:won|win|wins|winning)\b", raw):
-            return "win"
-        if re.search(r"\b(?:participat\w*|compet\w*|entered?)\b", raw):
-            return "participate"
-        if (re.search(r"\b(?:write|writes|wrote|written|writing|complete\w*|finish\w*)\b", raw)
-                and re.search(r"\b(?:screenplay|script|story|book|novel|letter|poem)\b", context)):
-            return "write"
-        if (re.search(r"\b(?:receive\w*|got|get)\b", raw)
-                and re.search(r"\b(?:letter|message|email|note)\b", context)):
-            return "receive"
-        if re.search(r"\b(?:visit\w*|travel(?:led|ed)? to|went to)\b", raw):
-            return "visit"
-        if (re.search(r"\b(?:read|reads|reading|reread\w*)\b", raw)
-                and not re.search(r"\b(?:recommend\w*|suggest\w*|advise\w*)\b", raw)):
-            return "read"
-        if re.search(r"\b(?:attend\w*|went to event)\b", raw):
-            return "attend"
-        if re.search(r"\b(?:buy|buys|bought|purchase\w*)\b", raw):
-            return "buy"
-        return raw
+    # The three ladders that used to live here -- _canonical_predicate (win /
+    # participate / write / receive / visit / read / attend / buy),
+    # _canonical_scope (competition / writing / travel / reading / acquisition)
+    # and _collection_key (tournament / game / screenplay / letter / book / poem
+    # / pet) -- were regexes hand-fitted to a handful of LongMemEval questions.
+    # They are gone for two reasons.  They are dataset constants sitting in
+    # general build config, and they did not generalize: _collection_key matched
+    # none of model kit, fitness class, film festival, health device or delivery
+    # service, so it fell through to value_type (4.4 distinct per memory) and
+    # left the collection chain keyed on the predicate instead -- 369.3 distinct
+    # per memory, which is why 91.5% of an aggregation question's gold facts land
+    # in different chains and a count has no set to range over.  Extraction now
+    # supplies all three as fields, uniformly for every memory.
 
     @classmethod
-    def _canonical_scope(cls, predicate, scope, value):
-        context = f"{predicate} {cls._normal(scope)} {cls._normal(value)}"
-        if predicate in {"win", "participate"}:
-            return "competition"
-        if predicate == "write":
-            return "writing"
-        if predicate == "receive" and re.search(r"\b(?:letter|message|email|note)\b", context):
-            return "correspondence"
-        if predicate == "visit":
-            return "travel"
-        if predicate == "read":
-            return "reading"
-        if predicate in {"buy", "get"}:
-            return "acquisition"
-        normalized = cls._normal(scope)
-        return normalized if normalized else "general"
+    def _predicate_key(cls, fact):
+        return cls._normal(str(fact.predicate).replace("_", " "))
 
     @classmethod
-    def _collection_key(cls, predicate, value, value_type):
-        text = cls._normal(value)
-        if predicate in {"win", "participate"}:
-            # Extraction occasionally puts only the temporal adjunct in value
-            # ("last week"). Predicate semantics still identify the event family.
-            return "tournament"
-        families = (
-            ("tournament", r"\b(?:tournament|tourney|championship|valorant final)\b"),
-            ("game", r"\b(?:game|match)\b"),
-            ("screenplay", r"\b(?:screenplay|script)\b"),
-            ("letter", r"\b(?:letter|email|message|note)\b"),
-            ("book", r"\b(?:book|novel)\b"),
-            ("poem", r"\b(?:poem|poetry)\b"),
-            ("pet", r"\b(?:pet|dog|cat|turtle|puppy|kitten)\b"),
-        )
-        for label, pattern in families:
-            if re.search(pattern, text):
-                return label
-        if predicate == "read":
-            return "reading_item"
-        if predicate == "visit":
-            return "location"
-        return cls._normal(value_type) or "value"
+    def _scope_key(cls, fact):
+        return cls._normal(fact.scope) or "general"
+
+    @classmethod
+    def _collection_key(cls, fact):
+        """The class of thing this fact is about -- the key a count ranges over."""
+        return cls._normal(fact.value_type) or "value"
 
     @classmethod
     def _keep_lean_fact(cls, fact):
@@ -927,8 +888,7 @@ class GraphBuildPipeline:
         if re.search(r"\b(?:shared|showed|sent)\b.*\b(?:media|photo|picture|image|caption)\b",
                      predicate):
             return False
-        canonical = cls._canonical_predicate(predicate, value)
-        if canonical in OCCURRENCE_PREDICATES and value in {"yes", "true", "it", "that"}:
+        if value in {"yes", "true", "it", "that"} and len(predicate.split()) <= 2:
             return False
         return True
 
@@ -948,7 +908,8 @@ class GraphBuildPipeline:
     @staticmethod
     def _packet_record(packet):
         return {"child_id": packet.scene_id, "summary": " ".join(packet.summary.split()[:48]),
-                "owners": tuple(dict.fromkeys(fact.owner for fact in packet.facts)),
+                "owners": tuple(dict.fromkeys(
+                    tuple(fact.owner for fact in packet.facts) + tuple(packet.entities))),
                 "predicates": tuple(dict.fromkeys(fact.predicate for fact in packet.facts)),
                 "values": tuple(dict.fromkeys(fact.value for fact in packet.facts)),
                 "scopes": tuple(dict.fromkeys(fact.scope for fact in packet.facts)),
@@ -969,7 +930,16 @@ class GraphBuildPipeline:
                     keys = {self._normal(text), *self._terms(text)} - {""}
                     for key in keys:
                         postings[key].append(child_id)
-            summary_parts.extend(str(child.get("summary", "")).split())
+            # Index the summary too.  Postings were built only from the fact
+            # fields, so a question word that appears in a child's summary but in
+            # none of its predicate/value strings could not reach that child at
+            # all -- which is most question words once the summary is a sentence
+            # rather than a concatenation of those same fields.
+            child_summary = str(child.get("summary", ""))
+            for key in self._terms(child_summary):
+                if key:
+                    postings[key].append(child_id)
+            summary_parts.extend(child_summary.split())
         if not summary_parts:
             for field in fields:
                 summary_parts.extend(collected[field])

@@ -89,6 +89,17 @@ class ProjectionConfig:
     #: Whether scope and collection_key stay in the chain key.  They are as
     #: fragmented as the predicate, so keeping them undoes most of the merge.
     chain_includes_scope: bool = True
+    #: Whether the predicate stays in the chain key at all.  Measured over 149
+    #: gold-annotated aggregation questions: 91.5% of a question's gold facts
+    #: land in *different* chains, because the chain keys on the verb while the
+    #: question keys on the object class -- "how many model kits" has gold facts
+    #: whose predicates are just/start/finish, "how many movie festivals" has
+    #: participate/attend/volunteer/has/express.  Dropping the predicate leaves
+    #: (owner_id, collection_key, polarity, modality): the class of thing, per
+    #: owner.  Only meaningful on a graph built with `semantic_category_field`,
+    #: since otherwise collection_key degenerates to value_type (4.4 distinct
+    #: per memory) and this over-merges.
+    chain_includes_predicate: bool = True
 
     def normalize_predicate(self, predicate: str) -> str:
         if self.predicate_normalization == "raw":
@@ -136,4 +147,23 @@ ARMS: dict[str, ProjectionConfig] = {
     # (0.949, and it truncates propositions mid-phrase) -- at zero cost.
     "P8": ProjectionConfig(collection_manifest=True, predicate_normalization="head_stem",
                            chain_includes_scope=False),
+    # P9 adds the content layer.  Containment relations measured 0.00-1.00x lift
+    # while the two content relations measured 2.27x, and traversal over the
+    # containment graph contributes exactly nothing, so this is the arm that
+    # tests whether *content* edges behave differently.
+    "P9": ProjectionConfig(collection_manifest=True, predicate_normalization="head_stem",
+                           chain_includes_scope=False, value_lattice=True),
+    # The R series runs on a V5.7 graph, whose facts carry an extraction-supplied
+    # `collection_key` (the class of thing) instead of one of seven regex
+    # families.  R0 is the control: same chain key as P8, so it isolates what the
+    # rebuild alone changed.  R1 is the point of the rebuild -- group by class,
+    # not by verb.  R2 is R1; the difference is on the retrieval side, where the
+    # navigator matches manifests on collection_key and packs their members as
+    # mandatory, so it shares R1's projection and is selected by profile.
+    "R0": ProjectionConfig(collection_manifest=True, predicate_normalization="head_stem",
+                           chain_includes_scope=False),
+    "R1": ProjectionConfig(collection_manifest=True, chain_includes_scope=False,
+                           chain_includes_predicate=False),
+    "R2": ProjectionConfig(collection_manifest=True, chain_includes_scope=False,
+                           chain_includes_predicate=False),
 }

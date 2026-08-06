@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Callable, Iterable, Mapping
 
 from ..domain import CandidateScore, EvidenceUnit, FactBinding, SourceTurn, stable_id
@@ -24,8 +23,10 @@ def build_proof_units(bindings: Iterable[FactBinding], group_turns: Mapping[str,
 def pack(units: Iterable[EvidenceUnit], candidates: Iterable[CandidateScore], turns: Mapping[str, SourceTurn], *,
          max_turns: int, max_tokens: int,
          token_cost: Callable[[SourceTurn], int] | None = None,
+         rank_mandatory: bool = False,
          ) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, bool]]:
     cost_of = token_cost or (lambda turn: estimate_tokens(turn.raw_text))
+    candidates = list(candidates)
     packed: list[str] = []; used = 0
     # Mandatory turns must keep the order their proof units declare them in.
     # Collecting them into a set and iterating it made both the packed order and,
@@ -35,7 +36,20 @@ def pack(units: Iterable[EvidenceUnit], candidates: Iterable[CandidateScore], tu
         for turn_id in unit.source_turn_ids:
             if turn_id not in seen:
                 seen.add(turn_id); mandatory.append(turn_id)
-    ordered = mandatory + [row.turn_id for row in candidates if row.turn_id not in seen]
+    if rank_mandatory:
+        # Declaration order is binding order, which says nothing about relevance.
+        # That is harmless when the mandatory set fits the budget, and it is the
+        # entire selection when it does not: a LoCoMo question produces 95-104
+        # mandatory turns against a 16-32 turn budget, so the pack is 100%
+        # mandatory and `rest` -- the lexical and dense ranking -- never gets a
+        # single seat.  Ordering by the score the candidate pool already computed
+        # turns an arbitrary truncation into a ranked one.  turn_id breaks ties so
+        # the result stays stable across PYTHONHASHSEED, which is what the
+        # declaration order was protecting in the first place.
+        score_of = {row.turn_id: row.fused_score for row in candidates}
+        mandatory.sort(key=lambda turn_id: (-score_of.get(turn_id, 0.0), turn_id))
+    rest = [row.turn_id for row in candidates if row.turn_id not in seen]
+    ordered = mandatory + rest
     turn_cap = token_cap = False
     for turn_id in ordered:
         turn = turns.get(turn_id)

@@ -49,6 +49,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--span-window", type=int, default=-1,
                         help="-1 renders whole turns; >=0 renders cited spans widened by N chars")
     parser.add_argument("--no-closed-form", action="store_true")
+    parser.add_argument("--rank-mandatory", action="store_true",
+                        help="order mandatory proof-unit turns by candidate score before the "
+                             "turn cap truncates them; measured +16.0pp turn_all_hit on "
+                             "locomo_cat4 and +17.4pp on cat2, no effect on LongMemEval")
+    parser.add_argument("--manifest-mandatory", action="store_true",
+                        help="pack every member of a matched collection manifest, "
+                             "instead of ranking them against unrelated candidates (R2 arm)")
     parser.add_argument("--embedding", action="store_true")
     parser.add_argument("--max-questions", type=int)
     parser.add_argument("--answer-workers", type=int, default=32)
@@ -56,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--full", action="store_true",
                         help="score LongMemEval 500 + LoCoMo Cat 1-4 (2,040) instead of the "
                              "frozen 200-question development set")
+    parser.add_argument("--shard", type=int, default=0,
+                        help="this process handles memories where hash(memory) %% shards == shard")
+    parser.add_argument("--shards", type=int, default=1,
+                        help="split by MEMORY, not by question: navigation builds one graph view "
+                             "per memory and sharding by question would rebuild it in every process")
     parser.add_argument("--navigate-workers", type=int, default=1,
                         help="navigation is CPU-bound and holds the store lock; >1 helps only "
                              "when the dense channel dominates")
@@ -66,7 +78,8 @@ def main() -> None:
     args = parse_args()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     label = args.label or args.profile
-    root = args.output_root / f"v5_6_answer_{label}_{stamp}"
+    root = args.output_root / (f"v5_6_answer_{label}_{stamp}"
+                              + (f"_shard{args.shard}" if args.shards > 1 else ""))
     root.mkdir(parents=True)
 
     # The authority graph is opened read-only; answers are cached in a separate
@@ -86,6 +99,16 @@ def main() -> None:
     else:
         questions = load_dev_questions(args.lme, args.locomo, gold)
         flags = {}
+    if args.shards > 1:
+        # Shard on memory_id so each process touches a disjoint set of graphs and
+        # builds each view exactly once; sharding on question_id would make every
+        # process load every memory.
+        import hashlib as _hashlib
+        def _bucket(memory_id: str) -> int:
+            return int(_hashlib.sha256(memory_id.encode()).hexdigest()[:8], 16) % args.shards
+        questions = [row for row in questions if _bucket(row.memory_id) == args.shard]
+        print(f"shard {args.shard}/{args.shards}: {len(questions)} questions, "
+              f"{len({row.memory_id for row in questions})} memories", flush=True)
     if args.max_questions:
         questions = questions[:args.max_questions]
 
@@ -98,7 +121,9 @@ def main() -> None:
 
     embedding = QwenEmbeddingIndex(store, config, record_usage=False) if args.embedding else None
     navigator = GraphNavigator(store, dense_search=embedding.search if embedding else None,
-                               harness_profile=HarnessProfile(args.profile))
+                               harness_profile=HarnessProfile(args.profile),
+                               manifest_mandatory=args.manifest_mandatory,
+                               rank_mandatory=args.rank_mandatory)
 
     # Navigation is single-threaded and in-process; answering is IO-bound on the
     # backbone, so only that stage fans out.

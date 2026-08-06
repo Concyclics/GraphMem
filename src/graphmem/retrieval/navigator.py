@@ -13,6 +13,7 @@ from typing import Callable, Mapping, Sequence
 from ..domain import (
     CandidateScore,
     EvidenceCertificate,
+    EvidenceUnit,
     NavigationResult,
     NodeType,
     ProofStep,
@@ -131,8 +132,16 @@ class GraphNavigator:
         token_counter: TokenCounter | None = None,
         fact_channels: Sequence[str] | None = None,
         binding_discriminant: bool = False,
+        skip_traversal_on_certificate: bool = True,
+        preferred_relations=None,
+        fallback_relations=None,
+        rank_mandatory: bool = False,
     ) -> None:
         self.store = store
+        self.skip_traversal_on_certificate = skip_traversal_on_certificate
+        self.rank_mandatory = rank_mandatory
+        self.preferred_relations = preferred_relations
+        self.fallback_relations = fallback_relations
         self.runtime = SQLiteSnapshotRuntime(store)
         self.variant = NavigatorVariant(variant)
         self.dense_search = dense_search
@@ -332,17 +341,20 @@ class GraphNavigator:
                                use_rrf=use_rrf, use_postings=use_postings,
                                reservoir_limit=budget.max_candidate_reservoir,
                                max_views_per_operand=budget.max_query_views_per_operand,
-                               node_budget=budget.max_visited_nodes,
+                               node_budget=budget.seed_nodes,
                                wide_reservoir=wide_reservoir)
         stage_times["seed_fusion"] = (time.perf_counter() - tick) * 1000
         route_closure = (self._route_terminal_closure(view, seeded.semantic_node_ids)
                          if profile in {HarnessProfile.H2_POSTINGS, HarnessProfile.H3_MULTI_ANCHOR} else ())
-        semantic_seeds = tuple(dict.fromkeys((*seeded.semantic_node_ids, *route_closure)))[:budget.max_visited_nodes]
+        # Capped at the seed budget, not the traversal budget: handing the
+        # scheduler max_visited_nodes seeds left it no room to expand.
+        semantic_seeds = tuple(dict.fromkeys((*seeded.semantic_node_ids, *route_closure)))[:budget.seed_nodes]
         direct_owner_terminals = self._owner_terminal_postings(
             view, semantic_seeds, seeded.raw_scores, query
         ) if profile in {HarnessProfile.H4_SCHEDULER, HarnessProfile.H5_ALGEBRA,
                          HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
-                         HarnessProfile.H9_FACT_RESERVOIR} else ()
+                         HarnessProfile.H9_FACT_RESERVOIR,
+                         HarnessProfile.H10_AST} else ()
         owners = {
             operand.operand_id: set().union(*(set(view.owner_alias_index.get(alias.casefold(), ()))
                                                for alias in operand.owner_aliases))
@@ -353,20 +365,30 @@ class GraphNavigator:
                                            distinct_by=ir.distinct_by, collection_complete=False)
         initial_certificate = evaluate_certificate(ir, initial_closure, no_progress=not initial_bindings)
         tick = time.perf_counter()
-        if profile in {HarnessProfile.H5_ALGEBRA, HarnessProfile.H6_PROOF_PACKING,
-                       HarnessProfile.H8_RESERVOIR,
-                       HarnessProfile.H9_FACT_RESERVOIR} and initial_certificate.complete:
+        # The shortcut below skips graph traversal whenever the *initial*
+        # certificate already claims completeness.  That certificate is a pre-pack
+        # flag over "the operand has at least one binding" and was measured not to
+        # predict correctness at all (rho=+0.103, CI [-0.04,+0.25]), so it is a
+        # weak signal being used to switch off the graph.  Settable for ablation.
+        if (self.skip_traversal_on_certificate
+                and profile in {HarnessProfile.H5_ALGEBRA, HarnessProfile.H6_PROOF_PACKING,
+                                HarnessProfile.H8_RESERVOIR,
+                                HarnessProfile.H9_FACT_RESERVOIR}
+                and initial_certificate.complete):
             schedule = ScheduleResult(semantic_seeds, (), {}, {
                 "node_cap_reached": False, "edge_cap_reached": False,
                 "hop_cap_reached": False, "frontier_truncated": False,
             })
         else:
             schedule = schedule_relations(view, ir, semantic_seeds, budget,
+                                          preferred_relations=self.preferred_relations,
+                                          fallback_relations=self.fallback_relations,
                                           structured=profile in {HarnessProfile.H4_SCHEDULER,
                                                                  HarnessProfile.H5_ALGEBRA,
                                                                  HarnessProfile.H6_PROOF_PACKING,
                                                                  HarnessProfile.H8_RESERVOIR,
-                                                                 HarnessProfile.H9_FACT_RESERVOIR})
+                                                                 HarnessProfile.H9_FACT_RESERVOIR,
+                                                                 HarnessProfile.H10_AST})
         stage_times["graph_read_view"] = (time.perf_counter() - tick) * 1000
         fact_ids = set(semantic_seeds) | set(schedule.visited_node_ids) | set(direct_owner_terminals)
         fact_reservoir = None
@@ -428,6 +450,9 @@ class GraphNavigator:
         # the packer and certificate still consume ``closure``, so the frozen
         # ladder's behaviour is untouched and only the answer stage sees members.
         algebra_result = None
+        # Set by the AST branch when a manifest is matched; read again below by
+        # the mandatory-packing step, so it must exist on every path.
+        member_scope: set[str] = set()
         if execute_ast and ir.ast is not None:
             # PR2b compiled the AST in shadow mode with its own operand ids, so
             # the bindings -- produced against the legacy ir.operands -- carry
@@ -453,7 +478,6 @@ class GraphNavigator:
             # *and* predicate, and the count is then restricted to that
             # manifest's members.
             closed_by_operand: dict[str, bool] = {}
-            member_scope: set[str] = set()
             for operand, legacy in zip(ast_specs, legacy_ids + [""] * len(ast_specs)):
                 # Match on the *question's* words, not on the operand's
                 # predicate candidates: those are retrieved from the graph by
@@ -472,6 +496,12 @@ class GraphNavigator:
                          or str(node.attributes.get("owner_id", "")) in owners[legacy])
                     and question and (
                         (question & content_terms(str(node.attributes.get("predicate", ""))))
+                        # collection_key is the class of thing the manifest
+                        # collects, which is the noun an aggregation question
+                        # actually names ("how many *model kits*").  Once the
+                        # predicate leaves the chain key it is also the only
+                        # field that identifies the manifest at all.
+                        or (question & content_terms(str(node.attributes.get("collection_key", ""))))
                         or any(question & content_terms(str(value))
                                for value in node.attributes.get("value_keys", ())))
                 ]
@@ -569,12 +599,23 @@ class GraphNavigator:
                                        mandatory=turn_id in mandatory,
                                        proof_unit_ids=tuple(unit.unit_id for unit in units if turn_id in unit.source_turn_ids)))
         rows.sort(key=lambda row: (-row.mandatory, -row.fused_score, row.turn_id))
+        # H10 is deliberately not in this set.  `rows` above is already sorted
+        # mandatory-first and then by fused_score, so `_rank_pack` packs the
+        # mandatory turns in relevance order.  `pack_proof_units` instead keeps
+        # the order the proof units declare, which is binding order and carries
+        # no relevance signal -- harmless when the mandatory set fits the budget,
+        # but a LoCoMo question produces 95-104 mandatory turns against a 32-turn
+        # budget, so it becomes the entire selection.  Adding H10 here as a
+        # "missing profile" fix cost 11pp of LoCoMo accuracy (0.823 -> 0.714);
+        # `rank_mandatory=True` recovers 0.808 by restoring exactly the ordering
+        # `_rank_pack` already had.
         if profile in {HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
                        HarnessProfile.H9_FACT_RESERVOIR}:
             packed, dropped, pack_exhaustion = pack_proof_units(units, rows, by_id,
                                                                  max_turns=budget.max_evidence_turns,
                                                                  max_tokens=budget.max_evidence_tokens,
-                                                                 token_cost=self._turn_tokens)
+                                                                 token_cost=self._turn_tokens,
+                                                                 rank_mandatory=self.rank_mandatory)
         else:
             packed, dropped, _ = self._rank_pack(rows, by_id, budget)
             pack_exhaustion = {"turn_cap_reached": len(packed) >= budget.max_evidence_turns,
@@ -667,11 +708,18 @@ class GraphNavigator:
             candidates = []
             for row in view.neighbors(node_id, (RelationType.HAS_FACT,), semantic_only=True):
                 target = view.nodes.get(row.next_node_id)
-                if not target or target.node_type != NodeType.EVIDENCE_GROUP_REF:
+                # The build never emits Entity --HAS_FACT--> EvidenceGroupRef;
+                # HAS_FACT from an entity reaches CanonicalFact, CollectionScope
+                # and StateHead, while evidence refs hang off a Scene by
+                # SCENE_CONTAINS.  Requiring EVIDENCE_GROUP_REF here meant this
+                # rescue returned nothing on every question ever run.  Facts are
+                # terminal and carry their own evidence groups, so they serve the
+                # same purpose.
+                if not target or target.node_type != NodeType.CANONICAL_FACT:
                     continue
-                turn_id = str(target.attributes.get("turn_id", ""))
-                score = sum(float(value) for value in raw_scores.get(turn_id, {}).values())
-                score += len(query_terms & content_terms(target.summary)) / max(1, len(query_terms))
+                score = len(query_terms & content_terms(target.summary)) / max(1, len(query_terms))
+                for group_id in target.all_evidence_group_ids:
+                    score += 0.01 * len(raw_scores.get(group_id, {}))
                 candidates.append((score, target.node_id))
             result.extend(node_id for _, node_id in sorted(candidates, key=lambda item: (-item[0], item[1]))[:per_owner_limit])
         return tuple(dict.fromkeys(result))

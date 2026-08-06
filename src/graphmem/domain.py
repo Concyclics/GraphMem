@@ -572,13 +572,41 @@ class QueryBudget:
     # The fact reservoir is id-only and wide; only this many facts reach binding.
     max_active_facts: int = 96
     max_active_facts_per_operand: int = 32
+    # Seeding and traversal used to share ``max_visited_nodes``: seeding filled
+    # it, the scheduler popped those seeds until the same cap was reached, and
+    # expanded nothing.  These split the cap.  Both are read through the
+    # ``seed_nodes`` / ``traversal_nodes`` properties below, where 0 means
+    # "inherit max_visited_nodes" -- so grepping the field names alone makes them
+    # look dead when they are not.
+    max_seed_nodes: int = 64
+    max_traversal_nodes: int = 0
+
+    #: Fields where 0 is meaningful rather than invalid: no reranks, or "inherit
+    #: max_visited_nodes" for the budgets split out of it.
+    _ZERO_ALLOWED = ("max_llm_reranks", "max_traversal_nodes", "max_seed_nodes")
+
+    @property
+    def traversal_nodes(self) -> int:
+        """Node cap for graph traversal, independent of how many seeds there are."""
+        return self.max_traversal_nodes or self.max_visited_nodes
+
+    @property
+    def seed_nodes(self) -> int:
+        """Node cap for seeding, so a full seed list cannot starve traversal."""
+        return self.max_seed_nodes or self.max_visited_nodes
 
     def __post_init__(self) -> None:
         for name, value in asdict(self).items():
-            if value < 0 or (name != "max_llm_reranks" and value == 0):
+            if value < 0 or (name not in self._ZERO_ALLOWED and value == 0):
                 raise ValueError(f"{name} must be positive")
         if self.max_answer_tokens_hard < self.max_answer_tokens:
             raise ValueError("max_answer_tokens_hard cannot be below max_answer_tokens")
+        # No guard on seed_nodes >= traversal_nodes: it was measured not to
+        # matter.  Seeding returns 15-64 nodes in practice, so the shared cap
+        # rarely bound, and widening the traversal budget to 160 actually
+        # *reduced* edges walked (37.7 vs 44.0 per query) because traversal is
+        # seed-bound, not budget-bound.  The split is kept for correctness --
+        # the two stages should not compete -- not as a performance fix.
 
 
 @dataclass(frozen=True, slots=True)

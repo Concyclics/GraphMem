@@ -70,6 +70,15 @@ class ModelConfig:
     # embedding clustering nor an LLM vocabulary can merge them: they are
     # distinct propositions, not variants of one relation.  0 disables.
     semantic_predicate_max_chars: int = 0
+    # Character ceiling on the per-scene summary sentence, enforced by guided
+    # decoding.  0 keeps the pre-V5.8 behaviour, where `semantic_compile_summary`
+    # concatenates fact triples and the routing cards built from them read as
+    # duplicated term soup.  A sentence is what a question embedding can match.
+    semantic_scene_summary_chars: int = 0
+    # Ask extraction for the named entities each scene mentions.  LoCoMo cat1
+    # spreads its evidence over 2.68 sessions and is the worst-routed category
+    # (session_all_hit 0.592); an entity is what links those sessions.
+    semantic_scene_entities: bool = False
 
 
 @dataclass(frozen=True, slots=True)

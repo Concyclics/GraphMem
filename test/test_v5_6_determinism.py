@@ -43,11 +43,11 @@ class _CityCompletions:
         scenes = []
         for scene in payload["s"]:
             facts = []
-            for turn in scene["r"]:
+            for index, turn in enumerate(scene["r"]):
                 city = next((name for name in CITIES if name in turn["t"]), None)
                 if city:
                     facts.append({"o": "Alice", "p": "visit", "v": city, "g": "travel",
-                                  "n": "positive", "r": [turn["i"]], "q": city})
+                                  "n": "positive", "r": [index], "q": city})
             scenes.append({"i": scene["i"], "f": facts})
         message = SimpleNamespace(content=json.dumps({"s": scenes}), reasoning_content=None)
         return SimpleNamespace(
