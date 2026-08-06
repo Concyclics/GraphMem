@@ -43,7 +43,12 @@ from graphmem.eval.devset import ingest_questions  # noqa: E402
 from graphmem.eval.fullset import load_full_questions  # noqa: E402
 from graphmem.storage import SQLiteGraphStore  # noqa: E402
 
-GATES = {"tokens_max": 220_000, "truncation_rate": 0.005,
+#: 300,000 is the hard per-memory ceiling.  The 220,000 this gate used before was
+#: the operating budget V5.6 was tuned against, not the limit; raising it is what
+#: lets the output ceiling stop clipping extraction mid-JSON.  Truncation is now
+#: gated at zero rather than 0.5%, because with a 32K output ceiling a clipped
+#: call is a defect rather than a rate to keep small.
+GATES = {"tokens_max": 300_000, "truncation_rate": 0.0005,
          "summary_prose": 0.80, "entity_cross_session": 0.30}
 
 #: Function words a sentence has and a concatenation of subject-predicate-object

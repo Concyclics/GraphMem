@@ -99,6 +99,11 @@ class GraphBuildPipeline:
         packets = (self.distiller.extract(memory_id, scenes)
                    if profile.scenes.llm_semantic_extraction and self.distiller else ())
         packet_by_scene = {packet.scene_id: packet for packet in packets}
+        # Computed once over every scene in the memory, before any card is
+        # compiled: this is the one point in the build that sees the whole
+        # vocabulary at once, which is precisely what a per-scene extraction
+        # call cannot do.
+        merge_aliases = self._merge_aliases(scenes, packet_by_scene, profile)
         nodes: list[GraphNode] = []
         edges: list[GraphEdge] = []
         scene_nodes: dict[str, GraphNode] = {}
@@ -132,7 +137,7 @@ class GraphBuildPipeline:
                 children = [self._packet_record(packet_by_scene[scene.scene_id])
                             for scene in scenes if scene.session_id == session.session_id
                             and scene.scene_id in packet_by_scene]
-                compiled = self._compile_routing(children, 80)
+                compiled = self._compile_routing(children, 80, merge_aliases)
                 card_summary = compiled["summary"]; card_attrs.update(compiled)
             if session.session_id in session_compressed:
                 compressed = session_compressed[session.session_id]
@@ -171,7 +176,8 @@ class GraphBuildPipeline:
                         [self._node_record(child) for child in children], 160)
                     l2_summary = str(compressed["summary"]); l2_attrs.update(compressed)
                 elif lean_graph:
-                    compiled = self._compile_routing([self._node_record(child) for child in children], 120)
+                    compiled = self._compile_routing(
+                        [self._node_record(child) for child in children], 120, merge_aliases)
                     l2_summary = compiled["summary"]; l2_attrs.update(compiled)
                 l2_cards.append(GraphNode(
                     l2_id,
@@ -191,7 +197,8 @@ class GraphBuildPipeline:
                                                   [self._node_record(x) for x in memory_children], 192)
             memory_summary = str(compressed["summary"]); memory_attrs.update(compressed)
         elif lean_graph:
-            compiled = self._compile_routing([self._node_record(x) for x in memory_children], 160)
+            compiled = self._compile_routing(
+                [self._node_record(x) for x in memory_children], 160, merge_aliases)
             memory_summary = compiled["summary"]; memory_attrs.update(compiled)
         memory_card = GraphNode(memory_card_id, memory_id, NodeType.ROUTING_CARD, 3,
             memory_summary, memory_evidence[0], memory_evidence[1:], attributes=memory_attrs)
@@ -915,10 +922,12 @@ class GraphBuildPipeline:
                 "scopes": tuple(dict.fromkeys(fact.scope for fact in packet.facts)),
                 "times": tuple(dict.fromkeys(fact.time for fact in packet.facts if fact.time))}
 
-    def _compile_routing(self, children, limit):
+    def _compile_routing(self, children, limit, aliases=None):
         fields = ("owners", "predicates", "values", "scopes", "times")
+        aliases = aliases or {}
         collected = {field: [] for field in fields}; postings: dict[str, list[str]] = defaultdict(list)
-        summary_parts = []
+        summary_parts: list[str] = []
+        seen_summaries: set[str] = set()
         for child in children:
             child_id = str(child["child_id"])
             for field in fields:
@@ -928,6 +937,11 @@ class GraphBuildPipeline:
                         continue
                     collected[field].append(text)
                     keys = {self._normal(text), *self._terms(text)} - {""}
+                    # A merged surface also indexes under its siblings, so a
+                    # query naming the referent one way reaches the children that
+                    # named it another -- which, since the merge only keeps keys
+                    # spanning two or more sessions, is a cross-session hop.
+                    keys |= {alias for key in tuple(keys) for alias in aliases.get(key, ())}
                     for key in keys:
                         postings[key].append(child_id)
             # Index the summary too.  Postings were built only from the fact
@@ -939,6 +953,15 @@ class GraphBuildPipeline:
             for key in self._terms(child_summary):
                 if key:
                     postings[key].append(child_id)
+            # Sibling children restate each other -- adjacent scenes in a session
+            # carry overlapping facts -- and the card is truncated to `limit`
+            # words, so a repeated sentence displaces a distinct one.  Skip a
+            # child summary already contributed verbatim; postings above are
+            # unaffected, since every child still indexes its own terms.
+            normalized = " ".join(child_summary.split()).casefold()
+            if normalized and normalized in seen_summaries:
+                continue
+            seen_summaries.add(normalized)
             summary_parts.extend(child_summary.split())
         if not summary_parts:
             for field in fields:
@@ -1148,6 +1171,79 @@ class GraphBuildPipeline:
     @staticmethod
     def _terms(text):
         return {token.casefold() for token in WORD_RE.findall(text) if len(token) > 2}
+
+    @staticmethod
+    def _merge_surface(text: str) -> str:
+        """Fold the spelling variations that split one referent into many keys.
+
+        Extraction runs per scene, so the same referent arrives as "the dance
+        studio", "Dance Studio", "dance studios" and "dance studio's" from four
+        different calls with no shared vocabulary.  Folding is deliberately
+        shallow -- case, articles, possessives, a trailing plural -- because
+        anything more aggressive merges referents that are genuinely distinct,
+        and a key that merges too much routes nowhere.
+        """
+        words = re.findall(r"[\w'-]+", text.casefold())
+        if words and words[0] in {"the", "a", "an", "my", "his", "her", "their", "our"}:
+            words = words[1:]
+        folded = []
+        for word in words:
+            word = word.removesuffix("'s").removesuffix("s'")
+            if len(word) > 4 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
+                word = word[:-1]
+            if word:
+                folded.append(word)
+        return " ".join(folded)
+
+    def _merge_aliases(self, scenes, packet_by_scene, profile):
+        """Surface -> the sibling surfaces that name the same thing elsewhere.
+
+        The graph audit measured 124 of 21,117 edges (0.59%) leaving their
+        session, and of 1,305 entity names only 60 reached two sessions -- the
+        eight widest of those being speaker names, which are constant within a
+        memory and so discriminate nothing.  Nothing in the graph joined two
+        sessions.  This is the second pass that gives it one: it reads the whole
+        memory at once, which no single extraction call can do, and it costs no
+        LLM call because every string it folds is already in the packets.
+
+        The result is consumed by `_compile_routing`, not by traversal.  The
+        routing channel keys postings on *query* terms, so the merge pays off by
+        making any surface of a referent reach every child that mentions any
+        other surface of it -- across sessions, which is the whole point.
+        """
+        merge = getattr(profile.coarsen, "entity_merge", False)
+        if not merge:
+            return {}
+        sessions_by_surface: dict[str, set[str]] = defaultdict(set)
+        forms_by_key: dict[str, set[str]] = defaultdict(set)
+        speakers = {turn.speaker.casefold() for scene in scenes for turn in scene.turns}
+        for scene in scenes:
+            packet = packet_by_scene.get(scene.scene_id)
+            if packet is None:
+                continue
+            surfaces = {fact.value for fact in packet.facts}
+            surfaces |= {fact.owner for fact in packet.facts}
+            for surface in surfaces:
+                key = self._merge_surface(str(surface))
+                if len(key) < profile.coarsen.entity_merge_min_chars or key in speakers:
+                    continue
+                sessions_by_surface[key].add(scene.session_id)
+                forms_by_key[key].add(self._normal(str(surface)))
+        total = len({scene.session_id for scene in scenes}) or 1
+        ceiling = max(profile.coarsen.entity_merge_min_sessions,
+                      int(total * profile.coarsen.entity_merge_max_session_share))
+        aliases: dict[str, set[str]] = defaultdict(set)
+        for key, sessions in sessions_by_surface.items():
+            # Both ends are cut: a key inside one session joins nothing, and a
+            # key spanning most of the memory routes nowhere.
+            if not profile.coarsen.entity_merge_min_sessions <= len(sessions) <= ceiling:
+                continue
+            forms = {form for form in forms_by_key[key] if form}
+            if len(forms) < 2:
+                continue
+            for form in forms:
+                aliases[form] |= forms - {form}
+        return {form: tuple(sorted(others)) for form, others in aliases.items() if others}
 
     @staticmethod
     def _names(text):

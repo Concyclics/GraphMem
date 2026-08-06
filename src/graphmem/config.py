@@ -113,6 +113,24 @@ class CoarsenConfig:
     max_levels: int = 3
     summary_tokens: int = 320
     cross_session_merge: bool = True
+    #: Second pass over the whole memory that merges mention strings into keys
+    #: spanning more than one session.  Extraction runs per scene and cannot see
+    #: another scene's vocabulary, which is why the entity layer measured 1,305
+    #: names of which only 60 reach two sessions -- and the eight widest of those
+    #: are speaker names, constant within a memory and so discriminating nothing.
+    #: Off by default: this is an arm until it is measured, not a default.
+    entity_merge: bool = False
+    #: A key that reaches one session joins nothing; a key that reaches most of
+    #: them routes nowhere.  Both ends are cut.  The upper bound is a share
+    #: rather than a count so it does not encode any dataset's session count.
+    entity_merge_min_sessions: int = 2
+    entity_merge_max_session_share: float = 0.25
+    #: Surfaces shorter than this are ambient words rather than referents.
+    entity_merge_min_chars: int = 4
+    #: 0 disables the dense step, leaving normalisation-only merging.  Above 0,
+    #: two surfaces whose Qwen3-Embedding vectors exceed this cosine are merged;
+    #: no new model is introduced, and no generative call is made.
+    entity_merge_embedding_threshold: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +224,12 @@ class GraphMemV5Config:
             raise ValueError("predicate embedding threshold must be in [0, 1]")
         if not 0 <= self.edges.low_threshold < self.edges.high_threshold <= 1:
             raise ValueError("edge thresholds must satisfy 0 <= low < high <= 1")
+        if not 0 < self.coarsen.entity_merge_max_session_share <= 1:
+            raise ValueError("entity merge session share must be in (0, 1]")
+        if not 0 <= self.coarsen.entity_merge_embedding_threshold <= 1:
+            raise ValueError("entity merge embedding threshold must be in [0, 1]")
+        if self.coarsen.entity_merge_min_sessions < 2:
+            raise ValueError("an entity merge key must span at least two sessions")
         positive = {
             "fanout": self.coarsen.fanout,
             "max_levels": self.coarsen.max_levels,
