@@ -228,6 +228,12 @@ class SQLiteGraphStore:
             "turn_id,memory_id,session_id,turn_index,speaker,listener,role,timestamp,"
             "raw_text,content_hash,schema_version"
         )
+        # Probed BEFORE the insert below: afterwards every turn is present and the
+        # FTS cleanup would degrade back to deleting all of them.
+        present: set[str] = set()
+        for memory_id in sorted({item.memory_id for item in turns}):
+            present.update(row[0] for row in db.execute(
+                "SELECT turn_id FROM source_turns WHERE memory_id=?", (memory_id,)))
         db.executemany(
             f"INSERT INTO source_turns({columns}) VALUES({','.join('?' for _ in range(11))}) "
             "ON CONFLICT(turn_id) DO UPDATE SET raw_text=excluded.raw_text,"
@@ -236,7 +242,15 @@ class SQLiteGraphStore:
             [tuple(asdict(item).values()) for item in turns],
         )
         try:
-            db.executemany("DELETE FROM source_turns_fts WHERE turn_id=?", [(x.turn_id,) for x in turns])
+            # turn_id is not indexed on the FTS5 table, so each delete scans it.
+            # Deleting unconditionally made ingest O(n^2): 0.15s per memory on an
+            # empty database and 20s per memory once 55k turns were present --
+            # about 2 hours of pure CPU before the first GPU call on a 510-memory
+            # corpus.  Only rows that already exist need clearing, and memory_id
+            # IS indexed, so one indexed read replaces N full scans.
+            stale = [(x.turn_id,) for x in turns if x.turn_id in present]
+            if stale:
+                db.executemany("DELETE FROM source_turns_fts WHERE turn_id=?", stale)
             db.executemany(
                 "INSERT INTO source_turns_fts(turn_id,memory_id,session_id,raw_text) VALUES(?,?,?,?)",
                 [(x.turn_id, x.memory_id, x.session_id, x.raw_text) for x in turns],

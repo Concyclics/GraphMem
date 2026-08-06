@@ -29,6 +29,7 @@ from graphmem.config import config_hash, load_config  # noqa: E402
 from graphmem.domain import dataclass_dict  # noqa: E402
 from graphmem.embedding import QwenEmbeddingIndex  # noqa: E402
 from graphmem.eval import load_dev_questions, load_gold_turns  # noqa: E402
+from graphmem.eval.fullset import load_full_questions  # noqa: E402
 from graphmem.eval.metrics import navigation_metrics  # noqa: E402
 from graphmem.retrieval import GraphNavigator, HarnessProfile  # noqa: E402
 from graphmem.storage import SQLiteGraphStore  # noqa: E402
@@ -52,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-questions", type=int)
     parser.add_argument("--answer-workers", type=int, default=32)
     parser.add_argument("--label", default="")
+    parser.add_argument("--full", action="store_true",
+                        help="score LongMemEval 500 + LoCoMo Cat 1-4 (2,040) instead of the "
+                             "frozen 200-question development set")
+    parser.add_argument("--navigate-workers", type=int, default=1,
+                        help="navigation is CPU-bound and holds the store lock; >1 helps only "
+                             "when the dense channel dominates")
     return parser.parse_args()
 
 
@@ -69,7 +76,16 @@ def main() -> None:
     cache_store = SQLiteGraphStore(cache_db)
 
     config = load_config(args.config)
-    questions = load_dev_questions(args.lme, args.locomo, load_gold_turns(args.gold))
+    gold = load_gold_turns(args.gold)
+    if args.full:
+        # FullQuestion proxies attribute access to its DevQuestion, so everything
+        # downstream keeps working; the extra flags ride along for the metrics.
+        full_rows = load_full_questions(args.lme, args.locomo, gold)
+        questions = [row.question for row in full_rows]
+        flags = {row.question.question_id: row for row in full_rows}
+    else:
+        questions = load_dev_questions(args.lme, args.locomo, gold)
+        flags = {}
     if args.max_questions:
         questions = questions[:args.max_questions]
 
@@ -124,8 +140,13 @@ def main() -> None:
             "benchmark": question.benchmark,
             "stratum": question.stratum,
         })
+        row_flags = flags.get(question.question_id)
         retrieval_rows.append({
             "dev_question_id": question.question_id, "stratum": question.stratum,
+            # turn_all_hit is vacuously true where no gold turns are annotated,
+            # so the full-set report must be able to exclude those rows.
+            "has_turn_gold": bool(row_flags.has_turn_gold) if row_flags else True,
+            "is_abstention": bool(row_flags.is_abstention) if row_flags else False,
             "benchmark": question.benchmark, "configuration": label,
             "prompt_tokens": answer.prompt_tokens, "evidence_tokens": answer.evidence_tokens,
             "completion_tokens": answer.completion_tokens,

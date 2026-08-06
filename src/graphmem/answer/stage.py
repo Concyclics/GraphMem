@@ -17,6 +17,7 @@ Contracts this stage holds:
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
@@ -74,26 +75,39 @@ class AnswerStage:
             from openai import OpenAI
             client = OpenAI(base_url=config.models.llm_base_url, api_key="local")
         self.client = client
-        self._turn_cache: dict[str, dict[str, SourceTurn]] = {}
-        self._session_order: dict[str, dict[str, int]] = {}
+        self._turn_cache: dict[str, tuple[dict[str, SourceTurn], dict[str, int]]] = {}
+        self._cache_lock = threading.Lock()
 
     # -- evidence ---------------------------------------------------------
 
-    def _turns(self, memory_id: str) -> dict[str, SourceTurn]:
-        cached = self._turn_cache.get(memory_id)
-        if cached is None:
-            cached = {turn.turn_id: turn for turn in self.store.turns(memory_id)}
-            # Single-memory cache: navigation walks memories in order and a full
-            # corpus of turn text will not fit in memory at 510 graphs.
-            self._turn_cache = {memory_id: cached}
-            self._session_order = {memory_id: {
-                session.session_id: session.ordinal
-                for session in self.store.sessions(memory_id)}}
-        return cached
+    def _turns(self, memory_id: str) -> tuple[dict[str, SourceTurn], dict[str, int]]:
+        """Turn map and session order for one memory, safely under concurrency.
+
+        The previous single-entry cache replaced the whole dict on every miss.
+        With answers rendered by 32 workers across different memories, one thread
+        could hold memory A's turn map while another had already swapped
+        ``_session_order`` to memory B, so A's turns were ordered by B's sessions
+        -- or by nothing, when the lookup missed.  Both are returned together now
+        and the cache is keyed and bounded rather than overwritten.
+        """
+        with self._cache_lock:
+            entry = self._turn_cache.get(memory_id)
+            if entry is None:
+                entry = (
+                    {turn.turn_id: turn for turn in self.store.turns(memory_id)},
+                    {session.session_id: session.ordinal
+                     for session in self.store.sessions(memory_id)},
+                )
+                # A full corpus of turn text will not fit at 510 graphs, so keep
+                # a small working set rather than one entry or everything.
+                if len(self._turn_cache) >= 8:
+                    self._turn_cache.pop(next(iter(self._turn_cache)))
+                self._turn_cache[memory_id] = entry
+            return entry
 
     def render(self, result: NavigationResult, budget: QueryBudget,
                max_tokens: int | None = None) -> RenderedEvidence:
-        turn_map = self._turns(result.memory_id)
+        turn_map, session_order = self._turns(result.memory_id)
         packed = result.packed_turn_ids or result.retrieved_turn_ids
         spans = {
             unit_span.turn_id: tuple(
@@ -108,7 +122,7 @@ class AnswerStage:
             [turn_map[turn_id] for turn_id in packed if turn_id in turn_map],
             config=self.answer_config, counter=self.counter,
             max_tokens=max_tokens if max_tokens is not None else budget.max_answer_tokens,
-            session_order=self._session_order.get(result.memory_id),
+            session_order=session_order,
             spans_by_turn=spans, mandatory_turn_ids=mandatory,
         )
 
