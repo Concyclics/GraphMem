@@ -70,8 +70,22 @@ class ModelConfig:
     # embedding clustering nor an LLM vocabulary can merge them: they are
     # distinct propositions, not variants of one relation.  0 disables.
     semantic_predicate_max_chars: int = 0
+    # Basis for the ledger's per-call output reservation.  0 keeps the old
+    # behaviour of reserving `semantic_batch_output_tokens`, which makes the
+    # output ceiling and the build budget the same knob: raising the ceiling to
+    # 32768 to stop truncation reserved 32768 per call, exhausted the 220,000
+    # per-memory budget in about seven calls, and drove extraction into fallback
+    # on 100 scenes with 0.28 facts per scene.  Setting an expected value
+    # decouples them -- the ceiling becomes a runaway guard, the budget is spent
+    # against what calls actually cost.  Measured output on this corpus is
+    # ~600 tokens per call.
+    semantic_expected_output_tokens: int = 0
+    # When a call costs more than its reservation, whether the ledger degrades
+    # subsequent calls.  Off means the ceiling is advisory for a single call and
+    # only the running total governs.
+    semantic_fallback_on_overrun: bool = True
     # Character ceiling on the per-scene summary sentence, enforced by guided
-    # decoding.  0 keeps the pre-V5.8 behaviour, where `semantic_compile_summary`
+    # decoding.  0 restores the pre-V5.8 behaviour, where `semantic_compile_summary`
     # concatenates fact triples and the routing cards built from them read as
     # duplicated term soup.  A sentence is what a question embedding can match.
     semantic_scene_summary_chars: int = 0

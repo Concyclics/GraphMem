@@ -49,13 +49,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--span-window", type=int, default=-1,
                         help="-1 renders whole turns; >=0 renders cited spans widened by N chars")
     parser.add_argument("--no-closed-form", action="store_true")
+    parser.add_argument("--no-h10-owner-rescue", action="store_true")
+    parser.add_argument("--no-h10-traversal", action="store_true")
+    parser.add_argument("--no-manifest-collection-key", action="store_true")
     parser.add_argument("--rank-mandatory", action="store_true",
                         help="order mandatory proof-unit turns by candidate score before the "
                              "turn cap truncates them; measured +16.0pp turn_all_hit on "
                              "locomo_cat4 and +17.4pp on cat2, no effect on LongMemEval")
-    parser.add_argument("--manifest-mandatory", action="store_true",
-                        help="pack every member of a matched collection manifest, "
-                             "instead of ranking them against unrelated candidates (R2 arm)")
     parser.add_argument("--embedding", action="store_true")
     parser.add_argument("--max-questions", type=int)
     parser.add_argument("--answer-workers", type=int, default=32)
@@ -122,8 +122,10 @@ def main() -> None:
     embedding = QwenEmbeddingIndex(store, config, record_usage=False) if args.embedding else None
     navigator = GraphNavigator(store, dense_search=embedding.search if embedding else None,
                                harness_profile=HarnessProfile(args.profile),
-                               manifest_mandatory=args.manifest_mandatory,
-                               rank_mandatory=args.rank_mandatory)
+                               rank_mandatory=args.rank_mandatory,
+                               h10_owner_rescue=not args.no_h10_owner_rescue,
+                               h10_traversal=not args.no_h10_traversal,
+                               manifest_collection_key=not args.no_manifest_collection_key)
 
     # Navigation is single-threaded and in-process; answering is IO-bound on the
     # backbone, so only that stage fans out.

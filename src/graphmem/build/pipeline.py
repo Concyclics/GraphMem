@@ -1067,9 +1067,13 @@ class GraphBuildPipeline:
         return [edge for rows in by_relation.values() for edge in rows]
 
     def _usage(self, memory_id):
-        rows = self.store._connection.execute(
-            "SELECT usage_json,cached FROM llm_calls WHERE memory_id=?", (memory_id,)
-        )
+        # Through ``_read`` so the store lock is held.  Going at
+        # ``_connection.execute`` directly races the other memory workers and
+        # raises "bad parameter or other API misuse" intermittently -- the same
+        # defect already fixed in the storage read helpers, missed here because
+        # this is the one caller that reaches past them.
+        rows = self.store._read(
+            "SELECT usage_json,cached FROM llm_calls WHERE memory_id=?", (memory_id,))
         totals = {"cached_input_tokens": 0, "uncached_input_tokens": 0,
                   "output_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0}
         import json
@@ -1109,14 +1113,14 @@ class GraphBuildPipeline:
         source_turn_count = max(1, len(self.store.turns(memory_id)))
         facts_per_scene = sorted(len(packet.facts) for packet in packets)
         stage_usage: dict[str, dict[str, Mapping[str, Any]]] = defaultdict(dict)
-        for row in self.store._connection.execute(
+        for row in self.store._read(
             "SELECT c.stage,c.cache_key,k.usage_json FROM llm_calls c JOIN llm_cache k "
             "ON k.cache_key=c.cache_key WHERE c.memory_id=?", (memory_id,)):
             stage_usage[str(row["stage"])][str(row["cache_key"])] = json.loads(row["usage_json"])
         degree_values = sorted(degrees.values())
-        retries = self.store._connection.execute(
+        retries = self.store._read(
             "SELECT count(*) FROM llm_calls WHERE memory_id=? AND stage='scene_semantic_retry'",
-            (memory_id,)).fetchone()[0]
+            (memory_id,))[0][0]
         return {
             "extraction_scenes": len(packets),
             "extraction_success_scenes": sum(bool(packet.facts) and not packet.fallback for packet in packets),

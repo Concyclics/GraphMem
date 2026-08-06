@@ -37,6 +37,11 @@ class BuildTokenLedger:
     memory_id: str
     ceiling: int
     degrade_at: float = 0.75
+    #: Whether a call that costs more than it reserved degrades the calls after
+    #: it.  With reservations based on an expected output rather than the output
+    #: ceiling, individual overruns are normal and should not cascade; the
+    #: running total still governs.
+    fallback_on_overrun: bool = True
     spent: int = 0
     reserved: int = 0
     degraded_calls: int = 0
@@ -65,8 +70,15 @@ class BuildTokenLedger:
         with self._lock:
             committed = self.spent + self.reserved
             if committed + estimate > self.ceiling:
-                self.skipped_scenes += 1
-                return False, False
+                # Refusing the call is the only hard stop.  With
+                # ``fallback_on_overrun`` off the ceiling still bounds the memory
+                # -- what changes is that a single call costing more than it
+                # reserved no longer forces the rest into fallback, which matters
+                # once reservations are an expected value rather than the output
+                # ceiling and overruns are routine.
+                if self.fallback_on_overrun or committed >= self.ceiling:
+                    self.skipped_scenes += 1
+                    return False, False
             self.reserved += estimate
             degrade = committed >= self.degrade_threshold
             if degrade:

@@ -115,8 +115,15 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=max(1, args.memory_workers)) as pool:
         for memory_id, manifest, seconds in pool.map(build, selected):
             total = int(dict(manifest.build_token_usage).get("total_tokens", 0))
+            diagnostics = dict(manifest.build_diagnostics)
             rows.append({"memory_id": memory_id, "total_tokens": total,
-                         "seconds": round(seconds, 1)})
+                         "seconds": round(seconds, 1),
+                         # Coverage is the quality axis that costs nothing to read
+                         # and carries no judge noise, so a token ablation can be
+                         # scored without spending a benchmark run on it.
+                         "coverage": diagnostics.get("semantic_terminal_turn_coverage"),
+                         "facts_per_scene": diagnostics.get("facts_per_scene_mean"),
+                         "fallback_scenes": diagnostics.get("extraction_fallback_scenes")})
             print(f"  {memory_id}: {total:,} tokens in {seconds:.0f}s", flush=True)
 
     truncated = store._read(
@@ -154,6 +161,9 @@ def main() -> None:
         "summary_chars_mean": statistics.mean(lengths) if lengths else 0.0,
         "entity_cross_session": statistics.mean(cross) if cross else 0.0,
         "entities_per_memory": statistics.mean(per_memory_entities) if per_memory_entities else 0.0,
+        "coverage": statistics.mean(float(row["coverage"] or 0) for row in rows),
+        "facts_per_scene": statistics.mean(float(row["facts_per_scene"] or 0) for row in rows),
+        "seconds_per_memory": statistics.mean(row["seconds"] for row in rows),
     }
     verdict = {
         "A_tokens": measured["tokens_max"] <= GATES["tokens_max"],

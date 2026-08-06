@@ -28,9 +28,7 @@
     "semantic_budget_degrade_at": 0.75,
     "semantic_quote_evidence": true,
     "semantic_scene_summary_chars": 160,
-    "semantic_scene_entities": true,
-    "semantic_category_field": false,
-    "semantic_aspect_field": false
+    "semantic_scene_entities": true
   },
   "scenes": {
     "min_turns": 2,

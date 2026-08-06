@@ -136,10 +136,20 @@ class GraphNavigator:
         preferred_relations=None,
         fallback_relations=None,
         rank_mandatory: bool = False,
+        h10_owner_rescue: bool = True,
+        h10_traversal: bool = True,
+        manifest_collection_key: bool = True,
     ) -> None:
         self.store = store
         self.skip_traversal_on_certificate = skip_traversal_on_certificate
         self.rank_mandatory = rank_mandatory
+        # H10 was added to the owner-rescue, traversal and proof-packing sets in
+        # one batch.  The packing one measured -11pp on LoCoMo and is reverted;
+        # these two and the manifest collection_key match were never measured
+        # alone, and together they are the residual against the V5.6 baseline.
+        self.h10_owner_rescue = h10_owner_rescue
+        self.h10_traversal = h10_traversal
+        self.manifest_collection_key = manifest_collection_key
         self.preferred_relations = preferred_relations
         self.fallback_relations = fallback_relations
         self.runtime = SQLiteSnapshotRuntime(store)
@@ -354,7 +364,7 @@ class GraphNavigator:
         ) if profile in {HarnessProfile.H4_SCHEDULER, HarnessProfile.H5_ALGEBRA,
                          HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
                          HarnessProfile.H9_FACT_RESERVOIR,
-                         HarnessProfile.H10_AST} else ()
+                         *((HarnessProfile.H10_AST,) if self.h10_owner_rescue else ())} else ()
         owners = {
             operand.operand_id: set().union(*(set(view.owner_alias_index.get(alias.casefold(), ()))
                                                for alias in operand.owner_aliases))
@@ -388,7 +398,8 @@ class GraphNavigator:
                                                                  HarnessProfile.H6_PROOF_PACKING,
                                                                  HarnessProfile.H8_RESERVOIR,
                                                                  HarnessProfile.H9_FACT_RESERVOIR,
-                                                                 HarnessProfile.H10_AST})
+                                                                 *((HarnessProfile.H10_AST,)
+                                                                   if self.h10_traversal else ())})
         stage_times["graph_read_view"] = (time.perf_counter() - tick) * 1000
         fact_ids = set(semantic_seeds) | set(schedule.visited_node_ids) | set(direct_owner_terminals)
         fact_reservoir = None
@@ -501,7 +512,8 @@ class GraphNavigator:
                         # actually names ("how many *model kits*").  Once the
                         # predicate leaves the chain key it is also the only
                         # field that identifies the manifest at all.
-                        or (question & content_terms(str(node.attributes.get("collection_key", ""))))
+                        or (self.manifest_collection_key
+                            and (question & content_terms(str(node.attributes.get("collection_key", "")))))
                         or any(question & content_terms(str(value))
                                for value in node.attributes.get("value_keys", ())))
                 ]

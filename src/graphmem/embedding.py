@@ -53,7 +53,7 @@ class QwenEmbeddingIndex:
     def import_memory(self, memory_id: str, source: SQLiteGraphStore) -> int:
         expected = {turn.turn_id: turn.content_hash for turn in self.store.turns(memory_id)}
         rows = []
-        for row in source._connection.execute(
+        for row in source._read(
             "SELECT item_id,content_hash,dimension,vector FROM embeddings "
             "WHERE memory_id=? AND model_id=?", (memory_id, self.model_id),
         ):
@@ -82,7 +82,7 @@ class QwenEmbeddingIndex:
                 )
         if memory_id not in self._memory_cache:
             ids, vectors = [], []
-            for row in self.store._connection.execute(
+            for row in self.store._read(
                 "SELECT item_id,dimension,vector FROM embeddings WHERE memory_id=? AND model_id=? ORDER BY item_id",
                 (memory_id, self.model_id),
             ):

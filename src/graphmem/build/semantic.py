@@ -52,7 +52,8 @@ def strict_scene_schema(max_scenes: int, max_facts: int, *,
                         quote_evidence: bool = True,
                         predicate_max_chars: int = 0,
                         scene_summary_chars: int = 0,
-                        scene_entities: bool = False) -> Mapping[str, Any]:
+                        scene_entities: bool = False,
+                        max_turn_index: int = 63) -> Mapping[str, Any]:
     """Schema for one strict extraction call.
 
     ``quote_evidence`` emits the exact-quote field ``q``.  It is 26% of
@@ -69,8 +70,13 @@ def strict_scene_schema(max_scenes: int, max_facts: int, *,
         "g": {"type": "string", "minLength": 1},
         "n": {"type": "string", "enum": ["positive", "negative"]},
         # A 0-based position in the scene's turn array, not a copyable label.
+        # The maximum is load-bearing, not decoration: an unbounded integer let
+        # guided decoding emit a 32,727-digit number that consumed the whole
+        # output budget and failed JSON parsing outright.  Scenes hold
+        # `scenes.max_turns` turns, so any index past this bound is already
+        # unresolvable.
         "r": {"type": "array", "minItems": 1, "maxItems": 2,
-              "items": {"type": "integer", "minimum": 0}}}
+              "items": {"type": "integer", "minimum": 0, "maximum": max_turn_index}}}
     required = ["o", "p", "v", "g", "n", "r"]
     if quote_evidence:
         properties["q"] = {"type": "string", "minLength": 1, "maxLength": 160}
@@ -197,7 +203,8 @@ class QwenSemanticDistiller:
         # across the fan-out rather than per call.
         self.ledger = BuildTokenLedger(
             memory_id, self.config.models.semantic_max_tokens_per_memory,
-            self.config.models.semantic_budget_degrade_at)
+            self.config.models.semantic_budget_degrade_at,
+            fallback_on_overrun=self.config.models.semantic_fallback_on_overrun)
         workers = min(16, self.config.models.max_concurrency, max(1, len(batches)))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             for rows in executor.map(lambda batch: self._extract_batch(memory_id, batch), batches):
@@ -220,7 +227,12 @@ class QwenSemanticDistiller:
         ledger stop early rather than overshoot.
         """
         text = sum(len(turn.raw_text) for scene in batch for turn in scene.turns)
-        estimate = int(text / CHARS_PER_TOKEN) + CALL_OVERHEAD_TOKENS + max_tokens
+        # Reserve what the call is expected to cost, not what it is allowed to
+        # cost.  Those were the same number until the output ceiling was raised
+        # to stop truncation, at which point the ceiling silently became the
+        # budget and starved extraction.
+        expected = self.config.models.semantic_expected_output_tokens or max_tokens
+        estimate = int(text / CHARS_PER_TOKEN) + CALL_OVERHEAD_TOKENS + expected
         # CHARS_PER_TOKEN is a corpus mean, so individual calls tokenize both
         # better and worse than it.  A call that costs more than its estimate
         # pushes ``spent`` past the ceiling with no way to take it back, so the
@@ -654,7 +666,8 @@ class QwenSemanticDistiller:
                     quote_evidence=self.config.models.semantic_quote_evidence,
                     predicate_max_chars=self.config.models.semantic_predicate_max_chars,
                     scene_summary_chars=self.config.models.semantic_scene_summary_chars,
-                    scene_entities=self.config.models.semantic_scene_entities)}}
+                    scene_entities=self.config.models.semantic_scene_entities,
+                    max_turn_index=max(0, self.config.scenes.max_turns - 1))}}
         elif self.config.models.semantic_constrained_json:
             request["response_format"] = {"type": "json_object"}
         cached = self.store.cache_get(key); started = time.perf_counter()
