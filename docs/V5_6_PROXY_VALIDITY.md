@@ -135,3 +135,64 @@ That is a change to `retrieval/slots.py` and `_ast_operands`, and it is the
 precondition for every aggregate operator. Until it lands, `COUNT_DISTINCT`,
 `GROUP_BY_OWNER` and `EXISTS_ALL` cannot be trusted on this corpus regardless of
 how good the manifests are.
+
+---
+
+# Addendum 2 — operand construction, measured
+
+Step 1 blamed operand construction: predicate candidates are retrieved from the
+graph by embedding similarity and contain none of the question's own words.
+`parse_slots` now also parses the question, adding `content_terms`,
+`head_terms` (the noun phrase after "how many") and `action_terms`, by a purely
+lexical rule -- no POS tagger, no model call.  Manifest matching uses those
+instead of the retrieved candidates.
+
+## Result on the 200-question development set
+
+| | before | after (`head_action`) | after (`content`) |
+|---|---:|---:|---:|
+| identification rate | ~100% (vacuous) | 98.0% | **98.5%** |
+| coverage of memory | ~100% | 7.3% | **8.1%** |
+| **collection recall** | — | 33.7% | **38.2%** |
+| collection all-hit | — | 16.0% | **19.3%** |
+
+The constraint is now real: the identified collection covers **8%** of the
+memory instead of all of it, and 36 of an average 443 manifests are selected.
+
+**But recall is 38.2% and all-hit is 19.3%, which cannot certify a count.**
+Four fifths of aggregation questions would count over a collection missing some
+of their members.
+
+## Lexical matching is exhausted
+
+Widening the term set from head+action to *every* question content word -- a far
+more permissive filter -- moves recall by only **+4.5pp** (33.7% → 38.2%) and
+coverage by +0.8pp. The bottleneck is not vocabulary breadth; it is that lexical
+overlap selects the wrong collection.
+
+On the questions that need it most it is worst:
+
+| aggregation only (n=152) | recall | all-hit |
+|---|---:|---:|
+| `head_action` | 0.288 | 0.113 |
+| `content` | 0.339 | 0.148 |
+
+By stratum, LoCoMo multi-hop is the floor: recall 0.112 at coverage 0.120 --
+plenty of members selected, the wrong ones.
+
+## Why, and what follows
+
+A collection is keyed by `(owner, predicate, scope, collection_key, ...)`. A
+question names its **values** -- "antique items", "rollercoasters" -- while the
+key carries the **predicate**, "inherit", "ride". The graph's predicate
+vocabulary is generated per memory and does not lexically coincide with the
+question's verb, so term overlap cannot bridge the two.
+
+The next attempt should therefore **locate the collection by retrieval, not by
+lexicon**: the fact reservoir already reaches every gold turn for 200/200
+questions, so admit manifests that contain an already-reached fact and use the
+question terms only to *rank* them, never as a hard filter. That is a larger
+change and should be measured against these numbers before it is adopted.
+
+`content` term matching is adopted meanwhile because it dominates
+`head_action` on every axis.

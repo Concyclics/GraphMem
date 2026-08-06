@@ -68,6 +68,28 @@ PLURAL_HINTS = {
 }
 
 
+
+# Words that carry no discriminating content for matching a question against a
+# collection.  Question frames, auxiliaries, pronouns and determiners all appear
+# in nearly every question, so leaving them in makes every manifest "match".
+QUESTION_STOPWORDS = frozenset({
+    "how", "many", "much", "what", "which", "who", "whom", "whose", "when", "where",
+    "why", "did", "does", "do", "done", "was", "were", "is", "are", "am", "be", "been",
+    "being", "has", "have", "had", "can", "could", "will", "would", "shall", "should",
+    "may", "might", "must", "the", "a", "an", "of", "in", "on", "at", "to", "for",
+    "from", "with", "by", "about", "into", "over", "and", "or", "but", "if", "than",
+    "then", "that", "this", "these", "those", "there", "here", "it", "its", "i", "me",
+    "my", "mine", "we", "us", "our", "you", "your", "he", "him", "his", "she", "her",
+    "they", "them", "their", "total", "number", "count", "times", "time", "ever",
+    "also", "just", "still", "any", "all", "some", "so", "as", "up", "out", "get",
+    "got", "go", "went", "make", "made", "take", "took", "say", "said", "tell", "know",
+    "please", "list", "name", "give", "show", "far", "long", "old", "now", "currently",
+})
+# Verb-ish suffixes used to split question content into "what happened" and
+# "what it happened to", without a POS tagger or any model call.
+_VERB_SUFFIXES = ("ed", "ing", "ies", "es", "s")
+
+
 @dataclass(frozen=True, slots=True)
 class QuerySlots:
     """Everything the composer needs, parsed once from the question."""
@@ -92,6 +114,16 @@ class QuerySlots:
     expects_multiple: bool = False
     indirect: bool = False
     temporal_key: object | None = None
+    # Terms taken from the *question*, which is what a collection has to be
+    # identified by.  Operand predicate candidates are retrieved from the graph
+    # by embedding similarity, so they contain none of the question's own words:
+    # "how many antique items did I inherit" produced candidates like "plans a
+    # monthly family game night", which match nearly every manifest.
+    content_terms: tuple[str, ...] = ()
+    #: The head noun phrase being asked about ("antique items", "rollercoasters").
+    head_terms: tuple[str, ...] = ()
+    #: Content terms that look like the question's verb ("inherit", "spent").
+    action_terms: tuple[str, ...] = ()
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -113,6 +145,37 @@ def _strip_frames(query: str) -> tuple[str, bool]:
 def _has(tokens: frozenset[str], words) -> bool:
     """Whole-token membership, so 'now' never matches inside 'know'."""
     return bool(tokens & set(words))
+
+
+def _question_terms(row: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Split a question's own words into content, head-noun and action terms.
+
+    Purely lexical and deterministic: no POS tagger, no model call.  The head is
+    what follows the counting phrase ("how many *antique items*"), which is the
+    collection being asked about; action terms are the residue that looks verbal
+    ("inherit", "spent").  Both are needed because a collection is keyed by
+    (owner, predicate, ...) and the question names the predicate, while the
+    manifest's members carry the values.
+    """
+    content = tuple(dict.fromkeys(
+        token for token in row
+        if token not in QUESTION_STOPWORDS and len(token) > 2))
+    head: list[str] = []
+    for index, token in enumerate(row):
+        if token in {"many", "much"} and index + 1 < len(row):
+            # Take the noun phrase until an auxiliary or pronoun closes it.
+            for candidate in row[index + 1:]:
+                if candidate in QUESTION_STOPWORDS:
+                    break
+                head.append(candidate)
+            break
+    if not head:
+        head = [token for token in content[:3]]
+    actions = tuple(token for token in content
+                    if token not in set(head) and token.endswith(_VERB_SUFFIXES))
+    if not actions:
+        actions = tuple(token for token in content if token not in set(head))
+    return content, tuple(dict.fromkeys(head)), actions
 
 
 def parse_slots(query: str) -> QuerySlots:
@@ -182,6 +245,7 @@ def parse_slots(query: str) -> QuerySlots:
         temporal_key = TemporalKey.from_attribute(
             normalize_time(temporal_phrase, None, "query"))
     possessive = "'s" in lowered or "'" in lowered
+    content_terms, head_terms, action_terms = _question_terms(row)
 
     if is_count and is_existence:
         warnings.append("count_and_existence_both_detected")
@@ -197,5 +261,6 @@ def parse_slots(query: str) -> QuerySlots:
         is_duration=is_duration, is_latest=is_latest, is_list=is_list,
         possessive=possessive, expects_multiple=expects_multiple, indirect=indirect,
         temporal_key=temporal_key,
+        content_terms=content_terms, head_terms=head_terms, action_terms=action_terms,
         warnings=tuple(warnings),
     )
