@@ -49,11 +49,33 @@ Switching degradation off recovers **nothing** (0.5237 vs 0.5265, indistinguisha
 * **the fact-cap ladder is effectively free** — it saves ~4,000 tokens/memory at no measurable coverage cost;
 * **dropping `q` is what costs the ~3pp of coverage.** Without the quote, some facts fail to locate their value in the cited turn and are discarded.
 
-That points at a cheaper configuration than either arm tested here: the control only needs a **4%** cut, so **keeping `q` and letting the ledger alone trim the tail** should land under 220K while preserving coverage. That is the next configuration to measure, and it should be measured before the full rebuild commits to a quote-free corpus.
+### The leak that measurement exposed
+
+Testing "keep `q`, let the ledger trim" first produced a memory at **221,305 tokens against a 220,000 ceiling**. The enforcement had three holes:
+
+1. **`scene_semantic_retry` was never reserved.** ~11 calls per memory spent entirely outside the budget — the main leak.
+2. **`legacy_batch` extraction and its repair calls were unledgered**, so the ceiling silently did not apply in that mode at all.
+3. **Reservations used a mean chars-per-token**, so a call tokenizing worse than average was spent before it could be clawed back. Reservations now carry `ESTIMATE_SAFETY = 1.10`.
+
+The earlier `0/4 over ceiling` results were true but *lucky*: those configs left enough headroom that unreserved retries never pushed them over. On a 400-memory rebuild the leak would have surfaced.
+
+### The recommended configuration
+
+With the leak closed, `configs/v5/v5_6_budget220k_quoted.json` — quotes kept, ceiling 220,000, `degrade_at = 0.75`:
+
+| config | mean | max | over 220K | fact coverage |
+|---|---:|---:|---:|---:|
+| control (no ceiling) | 229,038 | 237,008 | 4/4 | 0.5560 |
+| quote-free, `degrade_at=0.75` | 196,605 | 201,138 | 0/4 | 0.5265 |
+| quote-free, `degrade_at=0.95` | 200,869 | 206,000 | 0/4 | 0.5237 |
+| quotes-on, before the fix | 214,496 | **221,305** | **1/4** | 0.5458 |
+| **quotes-on, after the fix** | **206,224** | **210,801** | **0/4** | **0.5588** |
+
+Every memory lands under the ceiling with **coverage indistinguishable from the unbudgeted control** (0.5588 vs 0.5560). Dropping `q` is unnecessary: the fact-cap ladder alone pays the required 4%.
 
 ### Still unmeasured
 
-Coverage is a proxy. Whether a 3pp coverage drop changes judged answer accuracy is unknown until a budgeted graph is run through the answer stage and the mem0 judges. Given the finding that all gold turns are already reachable for 200/200 questions, a small coverage loss may cost nothing — but that is a hypothesis, not a result.
+Coverage is a proxy, and this arm emitted 49 fallback scenes and skipped 0–12 scenes per memory while coverage stayed flat — which suggests the throttled scenes were low-yield, but at n=4 that is an observation, not a result. Whether any of these configurations changes judged answer accuracy is unknown until a budgeted graph is run through the answer stage and the mem0 judges.
 
 Stage split (per LME memory, shipped config):
 

@@ -19,6 +19,9 @@ from .budget import BuildTokenLedger
 CALL_OVERHEAD_TOKENS = 316
 #: Measured characters per token for this corpus under the Qwen3 vocabulary.
 CHARS_PER_TOKEN = 3.84
+#: Margin applied to every reservation so a call that costs more than its
+#: estimate cannot carry the memory past its ceiling.
+ESTIMATE_SAFETY = 1.10
 
 PROMPT_VERSION = "graphmem-v5.1-scene-semantic-v1"
 STRICT_PROMPT_VERSION = "graphmem-v5.4-strict-scene-facts-v5"
@@ -145,7 +148,13 @@ class QwenSemanticDistiller:
         ledger stop early rather than overshoot.
         """
         text = sum(len(turn.raw_text) for scene in batch for turn in scene.turns)
-        return int(text / CHARS_PER_TOKEN) + CALL_OVERHEAD_TOKENS + max_tokens
+        estimate = int(text / CHARS_PER_TOKEN) + CALL_OVERHEAD_TOKENS + max_tokens
+        # CHARS_PER_TOKEN is a corpus mean, so individual calls tokenize both
+        # better and worse than it.  A call that costs more than its estimate
+        # pushes ``spent`` past the ceiling with no way to take it back, so the
+        # reservation carries a margin: overshooting the estimate is recoverable,
+        # overshooting the budget is not.
+        return int(estimate * ESTIMATE_SAFETY)
 
     def compress_many(self, memory_id: str, level: int,
                       requests: Sequence[tuple[str, Sequence[Mapping[str, Any]], int]]) -> tuple[Mapping[str, Any], ...]:
@@ -187,12 +196,19 @@ class QwenSemanticDistiller:
     def _extract_batch(self, memory_id: str, batch: Sequence[Any]) -> list[ScenePacket]:
         if self.config.models.semantic_extraction_mode != "legacy_batch":
             return self._extract_strict_batch(memory_id, batch)
+        # The ceiling must hold in every extraction mode; a budget that silently
+        # does not apply to one path is worse than no budget at all.
+        output_cap = self.config.models.semantic_batch_output_tokens
+        estimate = self._batch_estimate(batch, output_cap)
+        if not self._ledger().reserve(estimate)[0]:
+            return [self._fallback(scene) for scene in batch]
         payload = {"s": [{"i": scene.scene_id, "r": [
             {"i": turn.turn_id, "s": turn.speaker, "d": turn.timestamp, "l": len(turn.raw_text),
              "t": turn.raw_text}
             for turn in scene.turns]} for scene in batch]}
         system = self._scene_prompt()
-        response, _ = self._call(memory_id, "scene_semantic", system, payload, len(batch))
+        response, usage = self._call(memory_id, "scene_semantic", system, payload, len(batch))
+        self._ledger().settle(estimate, int(usage.get("total_tokens", 0)))
         objects = self._parse_objects(str(response.get("content", "")))
         root = objects[0] if objects else {}
         rows = root.get("s", root.get("scenes", [])) if isinstance(root, dict) else []
@@ -202,15 +218,20 @@ class QwenSemanticDistiller:
         missing = [scene for scene in batch if scene.scene_id not in by_scene]
         if missing:
             repair_batches = [[scene] for scene in missing] if self.config.models.semantic_individual_repair else [missing]
+            repair_cap = self.config.models.semantic_repair_output_tokens
             for repair_batch in repair_batches:
+                repair_estimate = self._batch_estimate(repair_batch, repair_cap)
+                if not self._ledger().reserve(repair_estimate)[0]:
+                    continue
                 repair_payload = {"repair": "Return complete valid JSON for only these missing scenes.",
                 "s": [{"i": scene.scene_id, "r": [
                     {"i": turn.turn_id, "s": turn.speaker, "d": turn.timestamp,
                      "l": len(turn.raw_text), "t": turn.raw_text}
                     for turn in scene.turns]} for scene in repair_batch]}
-                repaired, _ = self._call(memory_id, "scene_semantic_repair", system,
-                    repair_payload, len(repair_batch),
-                    max_tokens=self.config.models.semantic_repair_output_tokens)
+                repaired, repair_usage = self._call(memory_id, "scene_semantic_repair", system,
+                    repair_payload, len(repair_batch), max_tokens=repair_cap)
+                self._ledger().settle(repair_estimate,
+                                      int(repair_usage.get("total_tokens", 0)))
                 repaired_objects = self._parse_objects(str(repaired.get("content", "")))
                 repaired_root = repaired_objects[0] if repaired_objects else {}
                 for item in repaired_root.get("s", repaired_root.get("scenes", ())) if isinstance(repaired_root, dict) else ():
@@ -243,11 +264,19 @@ class QwenSemanticDistiller:
         by_scene = {str(row.get("i")): row for row in rows}
         missing = [scene for scene in batch if scene.scene_id not in by_scene]
         if missing and self.config.models.semantic_max_retries:
+            retry_cap = self.config.models.semantic_retry_output_tokens
             for scene in missing:
+                # Retries must be ledgered too.  Leaving them out let a memory
+                # finish at 221,305 tokens against a 220,000 ceiling: ~11 retry
+                # calls per memory were spending outside the budget entirely.
+                retry_estimate = self._batch_estimate((scene,), retry_cap)
+                if not self._ledger().reserve(retry_estimate)[0]:
+                    continue
                 retry_payload, retry_scenes, retry_turns = self._strict_payload((scene,))
-                repaired, _ = self._call(
+                repaired, retry_usage = self._call(
                     memory_id, "scene_semantic_retry", strict_prompt, retry_payload, 1,
-                    max_tokens=self.config.models.semantic_retry_output_tokens, retry_count=1)
+                    max_tokens=retry_cap, retry_count=1)
+                self._ledger().settle(retry_estimate, int(retry_usage.get("total_tokens", 0)))
                 for row in self._strict_rows(repaired, retry_scenes, retry_turns):
                     by_scene[str(row.get("i"))] = row
         result = []

@@ -129,3 +129,27 @@ def test_enabling_the_budget_changes_the_config_hash() -> None:
     budgeted = GraphMemV5Config(models=ModelConfig(semantic_max_tokens_per_memory=220_000))
 
     assert config_hash(base) != config_hash(budgeted)
+
+
+def test_a_call_costing_more_than_its_estimate_cannot_breach_the_ceiling() -> None:
+    """Measured regression: a memory finished at 221,305 against a 220,000 cap.
+
+    Reservations are estimates, and an estimate that comes in low is spent
+    before anyone can take it back.  The margin has to absorb that.
+    """
+    from graphmem.build.semantic import ESTIMATE_SAFETY
+
+    ledger = BuildTokenLedger("m", 1000, degrade_at=1.0)
+    estimate = 500
+    spent_per_call = int(estimate / ESTIMATE_SAFETY * 1.05)  # 5% worse than predicted
+
+    while ledger.reserve(estimate)[0]:
+        ledger.settle(estimate, spent_per_call)
+
+    assert ledger.snapshot()["within_budget"], ledger.snapshot()
+
+
+def test_the_estimate_carries_a_safety_margin() -> None:
+    from graphmem.build.semantic import ESTIMATE_SAFETY
+
+    assert ESTIMATE_SAFETY > 1.0
