@@ -34,7 +34,26 @@ With the ceiling on, every memory lands under 220K with **no scenes skipped and 
 
 The cost is quality: semantic terminal turn coverage falls from 0.5560 to 0.5265, a **5.3% relative drop**. Whether that costs answer accuracy is **not yet measured** — it needs an answer + judge run against a budgeted graph, and until that exists the budgeted config should not be assumed free.
 
-The 196,605 mean also shows the configuration overshoots: only a 4% cut was needed and it took 14%. `semantic_budget_degrade_at` is the dial — raising it toward 0.95 spends more of the ceiling before degrading and should recover most of the lost coverage while still landing under 220K.
+### Which lever actually costs the coverage
+
+Re-running with `semantic_budget_degrade_at = 0.95`, so the fact cap almost never engages, separates the two effects:
+
+| variant | mean | max | over 220K | degraded calls | fact coverage |
+|---|---:|---:|---:|---:|---:|
+| control (quotes on, no ceiling) | 229,038 | 237,008 | 4/4 | — | 0.5560 |
+| quote-free, `degrade_at=0.75` | 196,605 | 201,138 | 0/4 | 24–29 | 0.5265 |
+| quote-free, `degrade_at=0.95` | 200,869 | 206,000 | 0/4 | **0–3** | 0.5237 |
+
+Switching degradation off recovers **nothing** (0.5237 vs 0.5265, indistinguishable at n=4). So:
+
+* **the fact-cap ladder is effectively free** — it saves ~4,000 tokens/memory at no measurable coverage cost;
+* **dropping `q` is what costs the ~3pp of coverage.** Without the quote, some facts fail to locate their value in the cited turn and are discarded.
+
+That points at a cheaper configuration than either arm tested here: the control only needs a **4%** cut, so **keeping `q` and letting the ledger alone trim the tail** should land under 220K while preserving coverage. That is the next configuration to measure, and it should be measured before the full rebuild commits to a quote-free corpus.
+
+### Still unmeasured
+
+Coverage is a proxy. Whether a 3pp coverage drop changes judged answer accuracy is unknown until a budgeted graph is run through the answer stage and the mem0 judges. Given the finding that all gold turns are already reachable for 200/200 questions, a small coverage loss may cost nothing — but that is a hypothesis, not a result.
 
 Stage split (per LME memory, shipped config):
 
