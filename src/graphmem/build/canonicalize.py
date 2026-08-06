@@ -31,24 +31,44 @@ class PredicateCanonicalizer:
     def canonicalize(self, memory_id: str, keys: Sequence[PredicateKey]) -> dict[PredicateKey, str]:
         unique = tuple(sorted(set(keys))); predicates = tuple(sorted({key[1] for key in unique}))
         vectors = self._vectors(memory_id, predicates)
-        groups: dict[tuple[str, str, str, str], list[PredicateKey]] = defaultdict(list)
+        scope = self.config.edges.predicate_cluster_scope
+        groups: dict[tuple[str, ...], list[PredicateKey]] = defaultdict(list)
         for key in unique:
-            groups[(key[0], key[2], key[3], key[4])].append(key)
+            if scope == "memory":
+                slot: tuple[str, ...] = ()
+            elif scope == "owner":
+                # (owner, polarity).  The V5.4 slot also pinned scope and
+                # value_type, which left 51% of predicates in singleton groups
+                # that the clusterer skips outright.
+                slot = (key[0], key[4])
+            else:
+                slot = (key[0], key[2], key[3], key[4])
+            groups[slot].append(key)
         result = {key: key[1] for key in unique}; threshold = self.config.edges.predicate_embedding_threshold
+        agglomerative = self.config.edges.predicate_cluster_mode == "agglomerative"
         for compatible in groups.values():
             labels = sorted({key[1] for key in compatible})
             if len(labels) < 2:
                 continue
-            nearest = {}
-            for left in labels:
-                choices = [(float(np.dot(vectors[left], vectors[right])), right)
-                           for right in labels if right != left]
-                nearest[left] = max(choices, key=lambda row: (row[0], row[1]))
             pairs = []
-            for left in labels:
-                score, right = nearest[left]
-                if score >= threshold and nearest.get(right, (0.0, ""))[1] == left:
-                    pairs.append(tuple(sorted((left, right))))
+            if agglomerative:
+                # Every above-threshold pair, then transitive closure below, so a
+                # family of five predicates collapses to one representative
+                # instead of at most two.
+                for index, left in enumerate(labels):
+                    for right in labels[index + 1:]:
+                        if float(np.dot(vectors[left], vectors[right])) >= threshold:
+                            pairs.append((left, right))
+            else:
+                nearest = {}
+                for left in labels:
+                    choices = [(float(np.dot(vectors[left], vectors[right])), right)
+                               for right in labels if right != left]
+                    nearest[left] = max(choices, key=lambda row: (row[0], row[1]))
+                for left in labels:
+                    score, right = nearest[left]
+                    if score >= threshold and nearest.get(right, (0.0, ""))[1] == left:
+                        pairs.append(tuple(sorted((left, right))))
             representative = {label: label for label in labels}
             for left, right in sorted(set(pairs)):
                 winner = min(representative[left], representative[right])

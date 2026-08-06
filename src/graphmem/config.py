@@ -98,6 +98,16 @@ class EdgeConfig:
     temporal_normalization: bool = False
     cross_session_portals: bool = False
     predicate_embedding_threshold: float = 0.92
+    # Predicates only ever merge inside one of these slots.  "slot" is the V5.4
+    # behaviour, (owner, scope, value_type, polarity), which leaves 51% of
+    # predicates structurally ineligible before the threshold is consulted;
+    # "owner" widens to (owner, polarity), making 78.6% eligible.
+    predicate_cluster_scope: str = "slot"
+    # "mutual_pair" is the V5.4 rule: merge only when two labels are each
+    # other's nearest neighbour, so a family of five similar predicates yields
+    # at most a couple of merges.  "agglomerative" takes the transitive closure
+    # of every above-threshold pair.
+    predicate_cluster_mode: str = "mutual_pair"
     portal_degree_cap: int = 2
     relation_degree_caps: Mapping[str, int] = field(default_factory=lambda: {
         "same_event": 4, "same_activity": 8, "state_next": 4,
@@ -144,6 +154,10 @@ class GraphMemV5Config:
             raise ValueError("invalid edge refine mode")
         if self.edges.graph_variant not in {"g0", "g1", "g2", "g3", "g4", "g5"}:
             raise ValueError("invalid semantic graph variant")
+        if self.edges.predicate_cluster_scope not in {"slot", "owner", "memory"}:
+            raise ValueError("invalid predicate cluster scope")
+        if self.edges.predicate_cluster_mode not in {"mutual_pair", "agglomerative"}:
+            raise ValueError("invalid predicate cluster mode")
         if self.models.semantic_extraction_mode not in {
                 "legacy_batch", "strict_single", "strict_pair", "strict_batch"}:
             raise ValueError("invalid semantic extraction mode")
