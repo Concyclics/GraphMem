@@ -45,6 +45,8 @@ def parse_args() -> argparse.Namespace:
         "--runtime-config", type=Path,
         default=ROOT / "configs/v5/runtime_v5_11_balanced.json")
     parser.add_argument("--compiled-cache-dir", type=Path, required=True)
+    parser.add_argument("--dense-sidecar-dir", type=Path)
+    parser.add_argument("--query-embedding-cache", type=Path)
     parser.add_argument("--workers", type=int, required=True)
     parser.add_argument("--clients", default=",".join(map(str, CLIENT_LEVELS)))
     parser.add_argument("--duration", type=float, default=10.0)
@@ -57,6 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-mib", type=int, default=256)
     parser.add_argument("--cpu-ids", default="")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--warm-all-affinity", action="store_true",
+                        help="prewarm every workload memory on each affinity replica")
     return parser.parse_args()
 
 
@@ -85,6 +89,19 @@ def main() -> None:
         "metadata_cache_memories": args.cache_memories,
         "snapshot_cache_bytes": args.cache_mib * 1024 * 1024,
     }
+    dense_sidecar_dir = args.dense_sidecar_dir
+    if dense_sidecar_dir is None and runtime_config.retrieval.dense_sidecar_dir:
+        configured = Path(runtime_config.retrieval.dense_sidecar_dir)
+        dense_sidecar_dir = configured if configured.is_absolute() else ROOT / configured
+    query_embedding_cache = args.query_embedding_cache
+    if (query_embedding_cache is None
+            and runtime_config.retrieval.query_embedding_cache_path):
+        configured = Path(runtime_config.retrieval.query_embedding_cache_path)
+        query_embedding_cache = configured if configured.is_absolute() else ROOT / configured
+    embedding_options = runtime_config.retrieval.embedding_options(
+        dense_sidecar_dir=dense_sidecar_dir,
+        query_embedding_cache_path=query_embedding_cache,
+    )
     affinity_replicas = min(runtime_config.serving.affinity_replicas, args.workers)
     max_clients = max(clients_levels)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -94,6 +111,7 @@ def main() -> None:
         args.db,
         workers=args.workers,
         navigator_options=navigator_options,
+        embedding_options=embedding_options,
         start_method=runtime_config.serving.start_method,
         max_queued=max(0, max_clients - args.workers),
         per_tenant_outstanding=1,
@@ -103,19 +121,35 @@ def main() -> None:
     ) as pool:
         readiness_started = time.monotonic()
         readiness_rounds = []
-        for _round in range(2):
-            rows = pool.warm(
-                memories[0],
-                (by_memory[memories[0]][0]["query"],),
-                budget,
-            )
-            readiness_rounds.append([{
-                "pid": row.pid,
-                "memory_id": row.memory_id,
-                "cached_views": row.cached_views,
-                "compiled_hits": row.compiled_hits,
-                "compiled_hydrations": row.compiled_hydrations,
-            } for row in rows])
+        if args.warm_all_affinity:
+            workloads = {
+                memory_id: (by_memory[memory_id][0]["query"],)
+                for memory_id in memories
+            }
+            for _round in range(2):
+                rows = pool.warm_affinity(
+                    workloads, budget, replicas=affinity_replicas)
+                readiness_rounds.append([{
+                    "pid": row.pid,
+                    "memory_id": row.memory_id,
+                    "cached_views": row.cached_views,
+                    "compiled_hits": row.compiled_hits,
+                    "compiled_hydrations": row.compiled_hydrations,
+                } for row in rows])
+        else:
+            for _round in range(2):
+                rows = pool.warm(
+                    memories[0],
+                    (by_memory[memories[0]][0]["query"],),
+                    budget,
+                )
+                readiness_rounds.append([{
+                    "pid": row.pid,
+                    "memory_id": row.memory_id,
+                    "cached_views": row.cached_views,
+                    "compiled_hits": row.compiled_hits,
+                    "compiled_hydrations": row.compiled_hydrations,
+                } for row in rows])
         worker_readiness = {
             "rounds": readiness_rounds,
             "elapsed_ms": (time.monotonic() - readiness_started) * 1000,
@@ -243,7 +277,9 @@ def main() -> None:
         "system": {
             "name": "GraphMem V5.11",
             "mode": "QueryIR + hierarchical graph + compiled immutable views",
-            "query_embedding": False,
+            "query_embedding": runtime_config.retrieval.dense_search_enabled,
+            "dense_backend": (runtime_config.retrieval.dense_backend
+                              if runtime_config.retrieval.dense_search_enabled else None),
         },
         "protocol": manifest["protocol"],
         "workload_sha256": manifest["source"]["turn_payload_sha256"],
@@ -257,7 +293,12 @@ def main() -> None:
         "cache_memories_per_worker": args.cache_memories,
         "cache_mib_per_worker": args.cache_mib,
         "compiled_cache_dir": str(args.compiled_cache_dir.resolve()),
+        "dense_sidecar_dir": (str(dense_sidecar_dir.resolve())
+                              if dense_sidecar_dir else None),
+        "query_embedding_cache": (str(query_embedding_cache.resolve())
+                                  if query_embedding_cache else None),
         "worker_readiness": worker_readiness,
+        "warm_all_affinity": args.warm_all_affinity,
         "duration_sec": args.duration,
         "warmup_sec": args.warmup,
         "repetitions": args.repetitions,

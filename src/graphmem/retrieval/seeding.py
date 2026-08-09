@@ -26,6 +26,10 @@ from .query_ir import QueryIR
 
 
 DenseSearch = Callable[[str, str, int], Sequence[tuple[str, float]]]
+DenseSearchMany = Callable[
+    [str, Sequence[tuple[str, int]]],
+    Sequence[Sequence[tuple[str, float]]],
+]
 
 # Depths that reproduce the legacy navigator's reach.
 LEGACY_BM25_DEPTH = 96
@@ -272,10 +276,12 @@ class _ChannelRunner:
 
     def __init__(self, store, memory_id: str, turns: Sequence[SourceTurn],
                  turn_terms: Mapping[str, frozenset[str]], dense_search: DenseSearch | None,
+                 dense_search_many: DenseSearchMany | None = None,
                  turn_index: TurnSearchIndex | None = None,
                  native_bm25: bool = False) -> None:
         self.store, self.memory_id, self.turns = store, memory_id, turns
         self.turn_terms, self.dense_search = turn_terms, dense_search
+        self.dense_search_many = dense_search_many
         self.turn_index = turn_index
         self.native_bm25 = native_bm25
 
@@ -309,6 +315,18 @@ class _ChannelRunner:
             return []
         return [(turn_id, float(score)) for turn_id, score in
                 self.dense_search(self.memory_id, text, limit)]
+
+    def dense_many(self, requests: Sequence[tuple[str, int]]) -> tuple[
+            list[tuple[str, float]], ...]:
+        if not requests:
+            return ()
+        if self.dense_search_many is not None:
+            rows = self.dense_search_many(self.memory_id, requests)
+            if len(rows) != len(requests):
+                raise RuntimeError("dense batch response cardinality mismatch")
+            return tuple([(turn_id, float(score)) for turn_id, score in result]
+                         for result in rows)
+        return tuple(self.dense(text, limit=limit) for text, limit in requests)
 
 
 def _operand_owner_ids(view, operand) -> tuple[str, ...]:
@@ -449,6 +467,7 @@ def _seed_narrow(store, view, memory_id: str, ir: QueryIR, turns: Sequence[Sourc
 
 def seed_operands(store, view, memory_id: str, ir: QueryIR, turns: Sequence[SourceTurn], *,
                   dense_search: DenseSearch | None, use_rrf: bool, use_postings: bool,
+                  dense_search_many: DenseSearchMany | None = None,
                   reservoir_limit: int = 576, max_views_per_operand: int = 6,
                   node_budget: int = 96, wide_reservoir: bool = True,
                   session_fanout: int = 0,
@@ -468,7 +487,7 @@ def seed_operands(store, view, memory_id: str, ir: QueryIR, turns: Sequence[Sour
     turn_terms = turn_index.turn_terms
     query_terms = content_terms(ir.query)
     runner = _ChannelRunner(
-        store, memory_id, turns, turn_terms, dense_search, turn_index,
+        store, memory_id, turns, turn_terms, dense_search, dense_search_many, turn_index,
         native_bm25=native_bm25)
     hierarchy = None
     hierarchy_latency_ms = 0.0
@@ -494,12 +513,20 @@ def seed_operands(store, view, memory_id: str, ir: QueryIR, turns: Sequence[Sour
     # silently drop the tail of each channel.
     channel_hits: set[str] = set()
     per_view_ranked: dict[str, dict[str, list[str]]] = defaultdict(dict)
+    dense_views = [row for row in views if row.dense]
+    dense_requests = [
+        (row.text, LEGACY_DENSE_DEPTH if row.operand_id is None else VIEW_DENSE_DEPTH)
+        for row in dense_views
+    ]
+    dense_results = runner.dense_many(dense_requests)
+    dense_by_view = {
+        row.view_id: result for row, result in zip(dense_views, dense_results)
+    }
     for row in views:
         is_full = row.operand_id is None
         exact = runner.exact(row.text, limit=None if is_full else VIEW_BM25_DEPTH)
         bm25 = runner.bm25(row.text, limit=LEGACY_BM25_DEPTH if is_full else VIEW_BM25_DEPTH)
-        dense = (runner.dense(row.text, limit=LEGACY_DENSE_DEPTH if is_full else VIEW_DENSE_DEPTH)
-                 if row.dense else [])
+        dense = dense_by_view.get(row.view_id, [])
         for channel, rows in (("exact", exact), ("bm25", bm25), ("dense", dense)):
             if not rows:
                 continue

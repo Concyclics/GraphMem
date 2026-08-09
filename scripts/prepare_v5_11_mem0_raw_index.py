@@ -13,6 +13,8 @@ import time
 import uuid
 from pathlib import Path
 
+import numpy as np
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE = ROOT.parent
@@ -30,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-url", default="http://127.0.0.1:8001/v1")
     parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
     parser.add_argument("--embedding-dims", type=int, default=1024)
+    parser.add_argument("--embedding-db", type=Path,
+                        help="reuse existing turn vectors instead of calling the embedding API")
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--reuse", action="store_true")
     parser.add_argument(
@@ -63,7 +67,8 @@ def memory_config(args: argparse.Namespace, collection: str) -> dict:
 def main() -> None:
     args = parse_args()
     workload, _ = load_workload(args.workload)
-    collection = "graphmem_v511_raw110_" + workload["source"]["turn_payload_sha256"][:12]
+    collection = (f"graphmem_pareto_raw{workload['memory_count']}_"
+                  + workload["source"]["turn_payload_sha256"][:12])
     expected = {
         "schema_version": "mem0-raw-turn-batched-v2",
         "collection": collection,
@@ -72,6 +77,8 @@ def main() -> None:
         "turn_counts": workload["turn_counts"],
         "embedding_model": args.embedding_model,
         "embedding_dims": args.embedding_dims,
+        "embedding_source": (str(args.embedding_db.resolve())
+                             if args.embedding_db else "online_api"),
         "infer": False,
         "payload_contract": "Mem0 infer=False raw message",
     }
@@ -97,6 +104,8 @@ def main() -> None:
 
     memory = Memory.from_config(memory_config(args, collection))
     con = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+    embedding_con = (sqlite3.connect(
+        f"file:{args.embedding_db}?mode=ro", uri=True) if args.embedding_db else None)
     total_rows = 0
     total_embedding_ms = 0.0
     total_insert_ms = 0.0
@@ -167,7 +176,26 @@ def main() -> None:
                         "turn_index": int(turn_index),
                     })
                 embed_started = time.monotonic()
-                vectors = memory.embedding_model.embed_batch(texts, "add")
+                if embedding_con is not None:
+                    turn_ids = [str(row[0]) for row in batch]
+                    placeholders = ",".join("?" for _ in turn_ids)
+                    vector_rows = embedding_con.execute(
+                        f"SELECT item_id,dimension,vector FROM embeddings "
+                        f"WHERE model_id=? AND item_id IN ({placeholders})",
+                        (args.embedding_model, *turn_ids),
+                    ).fetchall()
+                    by_id = {
+                        str(item_id): np.frombuffer(blob, dtype=np.float32,
+                                                    count=int(dimension)).tolist()
+                        for item_id, dimension, blob in vector_rows
+                    }
+                    missing = [turn_id for turn_id in turn_ids if turn_id not in by_id]
+                    if missing:
+                        raise RuntimeError(
+                            f"missing {len(missing)} cached embeddings for {memory_id}")
+                    vectors = [by_id[turn_id] for turn_id in turn_ids]
+                else:
+                    vectors = memory.embedding_model.embed_batch(texts, "add")
                 total_embedding_ms += (time.monotonic() - embed_started) * 1000
                 insert_started = time.monotonic()
                 memory.vector_store.insert(vectors=vectors, ids=ids, payloads=payloads)
@@ -182,6 +210,8 @@ def main() -> None:
             }, ensure_ascii=False), flush=True)
     finally:
         con.close()
+        if embedding_con is not None:
+            embedding_con.close()
         memory.vector_store.client.close()
     elapsed = time.monotonic() - started_all
     if total_rows != workload["turn_count"]:

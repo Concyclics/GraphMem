@@ -78,6 +78,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding", action="store_true")
     parser.add_argument("--embedding-db", type=Path,
                         help="read turn vectors from a separate immutable SQLite sidecar")
+    parser.add_argument("--dense-sidecar-dir", type=Path,
+                        help="versioned per-memory FAISS/NumPy turn-vector indexes")
+    parser.add_argument("--dense-backend",
+                        choices=("auto", "numpy_exact", "faiss_flat"), default="auto")
+    parser.add_argument("--query-embedding-cache", type=Path,
+                        help="persistent WAL cache; defaults to the run directory")
     parser.add_argument("--max-questions", type=int)
     parser.add_argument("--question-id", action="append", default=[],
                         help="run one or more exact question ids; may be repeated")
@@ -177,13 +183,21 @@ def main() -> None:
         sampling_seed=args.sampling_seed)
 
     embedding_store = None
+    embedding_options = {
+        "record_usage": False,
+        "query_cache_path": (args.query_embedding_cache
+                             or root / "query_embedding_cache.sqlite"),
+        "dense_sidecar_dir": args.dense_sidecar_dir,
+        "dense_backend": args.dense_backend,
+    }
     if args.embedding_db:
         embedding_store = SQLiteGraphStore(args.embedding_db, read_only=True)
-        embedding = QwenEmbeddingIndex(embedding_store, config, record_usage=False)
+        embedding = QwenEmbeddingIndex(embedding_store, config, **embedding_options)
     else:
         embedding = QwenEmbeddingIndex(
-            store, config, record_usage=False) if args.embedding else None
+            store, config, **embedding_options) if args.embedding else None
     navigator = GraphNavigator(store, dense_search=embedding.search if embedding else None,
+                               dense_search_many=(embedding.search_many if embedding else None),
                                harness_profile=HarnessProfile(args.profile),
                                rank_mandatory=args.rank_mandatory,
                                h10_owner_rescue=not args.no_h10_owner_rescue,

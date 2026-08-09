@@ -50,7 +50,7 @@ from .query_ir import compile_query
 from .scheduler import ScheduleResult, execute as schedule_relations
 from .facts import (CHANNELS as FACT_CHANNELS, build_fact_reservoir,
                     select_active_facts)
-from .seeding import TurnSearchIndex, seed_operands
+from .seeding import DenseSearchMany, TurnSearchIndex, seed_operands
 
 
 DEFAULT_BACKBONE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
@@ -158,6 +158,7 @@ class GraphNavigator:
         *,
         variant: NavigatorVariant | str = NavigatorVariant.N5_SET_COVER,
         dense_search: DenseSearch | None = None,
+        dense_search_many: DenseSearchMany | None = None,
         harness_profile: HarnessProfile | str | None = None,
         token_counter: TokenCounter | None = None,
         fact_channels: Sequence[str] | None = None,
@@ -278,6 +279,7 @@ class GraphNavigator:
             max_cache_bytes=snapshot_cache_bytes)
         self.variant = NavigatorVariant(variant)
         self.dense_search = dense_search
+        self.dense_search_many = dense_search_many
         self.harness_profile = HarnessProfile(harness_profile) if harness_profile else None
         # Evidence budgets are only meaningful against the backbone's own
         # vocabulary.  The word-count estimate stays available as a labelled
@@ -767,11 +769,13 @@ class GraphNavigator:
     def _navigate_harness(self, memory_id: str, query: str, budget: QueryBudget) -> NavigationResult:
         """V5.5 query-only Graph Harness over an immutable V5.4 graph."""
         started = time.perf_counter(); stage_times: dict[str, float] = {}
+        tick = time.perf_counter()
         compiled_view = self._hydrate_compiled_memory(memory_id)
         view = compiled_view or self.runtime.view(memory_id)
         all_turns, by_id, by_session_index = self._turn_bundle(
             memory_id, view.graph_version)
         turn_index = self._turn_search_index(memory_id, all_turns)
+        stage_times["memory_hydrate"] = (time.perf_counter() - tick) * 1000
         tick = time.perf_counter()
         registry = self._principals(memory_id, view)
         compiled_ir = compile_query(query, view, registry=registry)
@@ -805,6 +809,7 @@ class GraphNavigator:
         execute_ast = profile in ast_profiles
         tick = time.perf_counter()
         seeded = seed_operands(self.store, view, memory_id, ir, all_turns, dense_search=self.dense_search,
+                               dense_search_many=self.dense_search_many,
                                use_rrf=use_rrf, use_postings=use_postings,
                                reservoir_limit=budget.max_candidate_reservoir,
                                max_views_per_operand=budget.max_query_views_per_operand,
@@ -820,6 +825,7 @@ class GraphNavigator:
         if seeded.stats.get("hierarchical_route_ms"):
             stage_times["hierarchical_route"] = float(
                 seeded.stats["hierarchical_route_ms"])
+        tick = time.perf_counter()
         route_closure = (self._route_terminal_closure(view, seeded.semantic_node_ids)
                          if profile in {HarnessProfile.H2_POSTINGS, HarnessProfile.H3_MULTI_ANCHOR} else ())
         # Capped at the seed budget, not the traversal budget: handing the
@@ -840,6 +846,7 @@ class GraphNavigator:
         initial_closure = evaluate_algebra(ir.operator, initial_bindings, (item.operand_id for item in ir.operands),
                                            distinct_by=ir.distinct_by, collection_complete=False)
         initial_certificate = evaluate_certificate(ir, initial_closure, no_progress=not initial_bindings)
+        stage_times["seed_binding"] = (time.perf_counter() - tick) * 1000
         tick = time.perf_counter()
         # The shortcut below skips graph traversal whenever the *initial*
         # certificate already claims completeness.  That certificate is a pre-pack
@@ -894,6 +901,7 @@ class GraphNavigator:
                 total=budget.max_active_facts)
             fact_ids |= set(fact_reservoir.active)
             stage_times["fact_reservoir"] = (time.perf_counter() - tick) * 1000
+        tick = time.perf_counter()
         paths: dict[str, tuple[str, ...]] = {}
         for step in schedule.proof:
             paths.setdefault(step.dst_id, (step.edge_id,))
@@ -1019,6 +1027,7 @@ class GraphNavigator:
         no_progress = not bindings
         exhausted = any(schedule.exhaustion.values())
         certificate = evaluate_certificate(ir, closure, exhausted=exhausted, no_progress=no_progress)
+        stage_times["algebra_binding"] = (time.perf_counter() - tick) * 1000
         tick = time.perf_counter()
         _groups_by_turn, all_group_turns, all_group_members = (
             self._evidence_indexes(memory_id, view.graph_version))
@@ -1232,10 +1241,12 @@ class GraphNavigator:
             pack_exhaustion = {"turn_cap_reached": len(packed) >= budget.max_evidence_turns,
                                "token_cap_reached": sum(self._turn_tokens(by_id[item]) for item in packed) >= budget.max_evidence_tokens}
         stage_times["evidence_pack"] = (time.perf_counter() - tick) * 1000
+        tick = time.perf_counter()
         if algebra_result is not None:
             certificate = finalize_ast_certificate(
                 ir, algebra_result, algebra_bindings, group_turns, packed,
                 units=units, exhausted=exhausted or any(pack_exhaustion.values()))
+        stage_times["certificate_finalize"] = (time.perf_counter() - tick) * 1000
         stage_times["total"] = (time.perf_counter() - started) * 1000
         graph_id = stable_id(
             "graph-artifact", memory_id, view.graph_version, view.graph_checksum)

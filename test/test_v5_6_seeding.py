@@ -75,6 +75,32 @@ def test_build_views_gives_each_operand_its_own_angles() -> None:
     assert views == build_views(ir, max_per_operand=6)
 
 
+def test_dense_views_use_one_batch_without_changing_per_view_results() -> None:
+    turns = [_turn("s1", index, f"unrelated evidence number {index}")
+             for index in range(4)]
+    ir = _ir("Where did Alice volunteer?", [_operand("only", "alice", "volunteer")])
+    requests = []
+
+    def dense_many(memory_id, rows):
+        requests.append((memory_id, tuple(rows)))
+        return tuple(
+            [(turns[index % len(turns)].turn_id, 1.0)]
+            for index, _request in enumerate(rows)
+        )
+
+    result = seed_operands(
+        _StubStore(), _StubView(), "m", ir, turns,
+        dense_search=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("batch path must replace individual dense calls")),
+        dense_search_many=dense_many,
+        use_rrf=True, use_postings=False, wide_reservoir=True,
+    )
+
+    assert len(requests) == 1
+    assert len(requests[0][1]) == result.stats["dense_views"] == 2
+    assert {turns[0].turn_id, turns[1].turn_id} <= set(result.source_turn_ids)
+
+
 def test_turn_search_index_uses_postings_and_preserves_exact_ranking() -> None:
     turns = [_turn("s1", 0, "Alice visited Kyoto in spring"),
              _turn("s1", 1, "Alice visited Osaka"),

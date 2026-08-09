@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 from graphmem.build import GraphBuildPipeline
 from graphmem.config import GraphMemV5Config
+from graphmem.embedding import QwenEmbeddingIndex
 from graphmem.domain import QueryBudget, stable_id
 from graphmem.retrieval import HarnessProfile
 from graphmem.retrieval import GraphNavigator
+from graphmem.retrieval.dense_sidecar import DenseIndexSidecar
 from graphmem.serving import ProcessShardedNavigator
 from graphmem.serving import AdmissionRejected, BoundedAdmissionController
 from graphmem.storage import SQLiteGraphStore
@@ -52,6 +55,67 @@ def test_process_shards_share_a_versioned_read_plane(tmp_path) -> None:
     assert len(results) == 8
     assert all(row.graph_artifact_id == expected_artifact for row in results)
     assert all(row.memory_id == "m" for row in results)
+
+
+def test_process_worker_reuses_persistent_queries_and_dense_sidecar(tmp_path) -> None:
+    path = tmp_path / "graph.sqlite"
+    dense_dir = tmp_path / "dense"
+    query_cache = tmp_path / "query-cache.sqlite"
+    store = _store(path)
+    config = GraphMemV5Config(profile="b5")
+    GraphBuildPipeline(store, dataset_hash="dataset").build("m", config)
+    turns = tuple(store.turns("m"))
+    store.upsert_embeddings("m", config.models.embedding_model, [
+        (turn.turn_id, turn.content_hash,
+         [1.0, float(index % 2), float(index % 3)])
+        for index, turn in enumerate(turns)
+    ])
+    DenseIndexSidecar(dense_dir, backend="numpy_exact").build(
+        store, "m", config.models.embedding_model)
+
+    class Embeddings:
+        def create(self, *, model, input):
+            return SimpleNamespace(
+                data=[SimpleNamespace(index=index, embedding=[1.0, 0.0, 0.0])
+                      for index, _text in enumerate(input)],
+                usage=SimpleNamespace(prompt_tokens=len(input)),
+            )
+
+    embedding = QwenEmbeddingIndex(
+        store, config,
+        client=SimpleNamespace(embeddings=Embeddings()),
+        query_cache_path=query_cache,
+        dense_sidecar_dir=dense_dir,
+        dense_backend="numpy_exact",
+        record_usage=False,
+    )
+    query = "What project did Alice discuss?"
+    budget = QueryBudget(max_evidence_turns=8, max_evidence_tokens=1000)
+    expected = GraphNavigator(
+        store,
+        harness_profile=HarnessProfile.H10_AST,
+        dense_search=embedding.search,
+        dense_search_many=embedding.search_many,
+    ).navigate("m", query, budget)
+    store.close()
+
+    with ProcessShardedNavigator(
+        path, workers=1,
+        navigator_options={"harness_profile": HarnessProfile.H10_AST},
+        embedding_options={
+            "model_id": config.models.embedding_model,
+            "base_url": "http://127.0.0.1:1/v1",
+            "query_cache_path": str(query_cache),
+            "dense_sidecar_dir": str(dense_dir),
+            "dense_backend": "numpy_exact",
+        },
+    ) as pool:
+        actual = pool.submit("m", query, budget).result(timeout=15)
+        stats = pool.worker_cache_stats()[0].stats["embedding"]
+
+    assert actual.retrieved_turn_ids == expected.retrieved_turn_ids
+    assert stats["query_persistent_hits"] >= 1
+    assert stats["dense_sidecar"]["entries"] == 1
 
 
 def test_admission_controller_bounds_each_tenant_and_releases_capacity() -> None:

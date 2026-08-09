@@ -23,8 +23,18 @@
     "snapshot_cache_bytes": 268435456,
     "snapshot_cache_memories": 8,
     "metadata_cache_memories": 8,
-    "compiled_cache_dir": "artifacts/v5_11/compiled_memory_views",
-    "compiled_cache_admission": true
+    "compiled_cache_dir": "../artifacts/report/v5_18/compiled_memory_views",
+    "compiled_cache_admission": true,
+    "dense_search_enabled": true,
+    "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+    "embedding_base_url": "http://127.0.0.1:8001/v1",
+    "query_embedding_cache_path": "../artifacts/report/v5_18/query_embedding_cache.sqlite",
+    "query_embedding_cache_entries": 8192,
+    "dense_sidecar_dir": "../artifacts/report/v5_18/dense_indexes",
+    "dense_backend": "auto",
+    "dense_cache_bytes": 268435456,
+    "dense_cache_memories": 32,
+    "memory_matrix_cache_memories": 16
   },
   "serving": {
     "workers": 8,

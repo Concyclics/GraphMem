@@ -53,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-url", default="http://127.0.0.1:8001/v1")
     parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
     parser.add_argument("--embedding-dims", type=int, default=1024)
+    parser.add_argument("--query-vector-cache", type=Path,
+                        help="precomputed query vectors for a warm data-plane-only comparison")
     parser.add_argument("--cpu-ids", default="")
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -68,7 +70,8 @@ def _close_worker() -> None:
     _MEMORY = None
 
 
-def _initialize_worker(config: dict, state_dir: str, cpu_id: int) -> None:
+def _initialize_worker(config: dict, state_dir: str, cpu_id: int,
+                       query_vector_cache: str | None) -> None:
     global _MEMORY
     os.sched_setaffinity(0, {cpu_id})
     os.environ["MEM0_DIR"] = state_dir
@@ -76,6 +79,17 @@ def _initialize_worker(config: dict, state_dir: str, cpu_id: int) -> None:
     os.environ["OPENAI_API_KEY"] = "local-benchmark"
     from mem0 import Memory
     _MEMORY = Memory.from_config(config)
+    if query_vector_cache:
+        vectors = json.loads(Path(query_vector_cache).read_text(encoding="utf-8"))
+
+        def cached_embed(text: str, *_args, **_kwargs):
+            try:
+                return vectors[text]
+            except KeyError as error:
+                raise RuntimeError(
+                    "query is absent from the precomputed Mem0 vector cache") from error
+
+        _MEMORY.embedding_model.embed = cached_embed
     atexit.register(_close_worker)
 
 
@@ -148,7 +162,9 @@ class Mem0ShardedPool:
                 max_workers=1,
                 mp_context=self._context,
                 initializer=_initialize_worker,
-                initargs=(config, str(state_dir), cpu_ids[shard]),
+                initargs=(config, str(state_dir), cpu_ids[shard],
+                          str(args.query_vector_cache)
+                          if args.query_vector_cache else None),
             ))
 
     def submit(self, memory_id: str, query: str, top_k: int) -> Future:
@@ -326,8 +342,12 @@ def main() -> None:
         "system": {
             "name": "Mem0 OSS",
             "version": "2.0.17",
-            "mode": "infer=False raw turns + Qwen query embedding + Qdrant dense search",
-            "query_embedding": True,
+            "mode": ("infer=False raw turns + cached query vector + Qdrant dense search"
+                     if args.query_vector_cache else
+                     "infer=False raw turns + Qwen query embedding + Qdrant dense search"),
+            "query_embedding": not bool(args.query_vector_cache),
+            "query_vector_cache": (str(args.query_vector_cache)
+                                   if args.query_vector_cache else None),
             "reranker": False,
             "bm25": False,
         },

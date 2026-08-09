@@ -316,6 +316,20 @@ class RetrievalRuntimeConfig:
     metadata_cache_memories: int = 8
     compiled_cache_dir: str = "artifacts/v5_11/compiled_memory_views"
     compiled_cache_admission: bool = True
+    # Dense retrieval is an online concern and therefore lives outside the
+    # immutable graph-build identity.  Off preserves the measured V5.11
+    # lexical-only Pareto baseline.  When enabled, QueryIR dense views are
+    # embedded as one batch and searched against a versioned per-memory index.
+    dense_search_enabled: bool = False
+    embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
+    embedding_base_url: str = "http://127.0.0.1:8001/v1"
+    query_embedding_cache_path: str = ""
+    query_embedding_cache_entries: int = 8_192
+    dense_sidecar_dir: str = ""
+    dense_backend: str = "auto"
+    dense_cache_bytes: int = 256 * 1024 * 1024
+    dense_cache_memories: int = 32
+    memory_matrix_cache_memories: int = 16
 
     def __post_init__(self) -> None:
         if self.harness_profile not in {
@@ -333,6 +347,10 @@ class RetrievalRuntimeConfig:
             "snapshot_cache_bytes": self.snapshot_cache_bytes,
             "snapshot_cache_memories": self.snapshot_cache_memories,
             "metadata_cache_memories": self.metadata_cache_memories,
+            "query_embedding_cache_entries": self.query_embedding_cache_entries,
+            "dense_cache_bytes": self.dense_cache_bytes,
+            "dense_cache_memories": self.dense_cache_memories,
+            "memory_matrix_cache_memories": self.memory_matrix_cache_memories,
         }
         if any(value <= 0 for value in positive.values()):
             raise ValueError(f"positive retrieval runtime values required: {positive}")
@@ -346,6 +364,11 @@ class RetrievalRuntimeConfig:
             raise ValueError("fusion weights cannot be negative")
         if not 0.0 <= self.queryir_soft_fallback_threshold <= 1.0:
             raise ValueError("queryir_soft_fallback_threshold must be in [0, 1]")
+        if self.dense_backend not in {"auto", "numpy_exact", "faiss_flat"}:
+            raise ValueError("dense_backend must be auto, numpy_exact or faiss_flat")
+        if self.dense_search_enabled:
+            if not self.embedding_model.strip() or not self.embedding_base_url.strip():
+                raise ValueError("dense retrieval requires an embedding model and base URL")
 
     def navigator_options(
         self, *, compiled_cache_dir: str | Path | None = None,
@@ -385,6 +408,32 @@ class RetrievalRuntimeConfig:
         if cache_dir:
             options["compiled_cache_dir"] = cache_dir
         return options
+
+    def embedding_options(
+        self,
+        *,
+        dense_sidecar_dir: str | Path | None = None,
+        query_embedding_cache_path: str | Path | None = None,
+    ) -> dict[str, Any] | None:
+        """Translate dense runtime settings into process-worker primitives."""
+        if not self.dense_search_enabled:
+            return None
+        sidecar = (self.dense_sidecar_dir if dense_sidecar_dir is None
+                   else str(dense_sidecar_dir))
+        query_cache = (self.query_embedding_cache_path
+                       if query_embedding_cache_path is None
+                       else str(query_embedding_cache_path))
+        return {
+            "model_id": self.embedding_model,
+            "base_url": self.embedding_base_url,
+            "query_cache_path": query_cache or None,
+            "query_cache_entries": self.query_embedding_cache_entries,
+            "memory_cache_memories": self.memory_matrix_cache_memories,
+            "dense_sidecar_dir": sidecar or None,
+            "dense_backend": self.dense_backend,
+            "dense_cache_bytes": self.dense_cache_bytes,
+            "dense_cache_memories": self.dense_cache_memories,
+        }
 
 
 @dataclass(frozen=True, slots=True)

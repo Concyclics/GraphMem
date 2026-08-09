@@ -13,12 +13,15 @@ import time
 from typing import Iterable, Mapping, Sequence
 
 from ..domain import NavigationResult, QueryBudget
+from ..config import GraphMemV5Config
+from ..embedding import QwenEmbeddingIndex
 from ..retrieval import GraphNavigator
 from ..storage import SQLiteGraphStore
 
 
 _WORKER_STORE: SQLiteGraphStore | None = None
 _WORKER_NAVIGATOR: GraphNavigator | None = None
+_WORKER_EMBEDDING: QwenEmbeddingIndex | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,19 +53,21 @@ class WorkerCacheSnapshot:
 
 
 def _close_worker() -> None:
-    global _WORKER_STORE, _WORKER_NAVIGATOR
+    global _WORKER_STORE, _WORKER_NAVIGATOR, _WORKER_EMBEDDING
     if _WORKER_STORE is not None:
         _WORKER_STORE.close()
     _WORKER_STORE = None
     _WORKER_NAVIGATOR = None
+    _WORKER_EMBEDDING = None
 
 
 def _initialize_worker(
     db_path: str,
     navigator_options: Mapping[str, object],
+    embedding_options: Mapping[str, object] | None,
     cpu_id: int | None,
 ) -> None:
-    global _WORKER_STORE, _WORKER_NAVIGATOR
+    global _WORKER_STORE, _WORKER_NAVIGATOR, _WORKER_EMBEDDING
     if cpu_id is not None:
         try:
             os.sched_setaffinity(0, {cpu_id})
@@ -74,6 +79,15 @@ def _initialize_worker(
     # process; parallelism comes from the process shards themselves.
     options = dict(navigator_options)
     options.setdefault("read_pool_size", 1)
+    if embedding_options:
+        _WORKER_EMBEDDING = QwenEmbeddingIndex(
+            _WORKER_STORE,
+            GraphMemV5Config(),
+            record_usage=False,
+            **dict(embedding_options),
+        )
+        options["dense_search"] = _WORKER_EMBEDDING.search
+        options["dense_search_many"] = _WORKER_EMBEDDING.search_many
     _WORKER_NAVIGATOR = GraphNavigator(_WORKER_STORE, **options)
     atexit.register(_close_worker)
 
@@ -212,6 +226,8 @@ def _cache_snapshot_worker() -> WorkerCacheSnapshot:
     except AttributeError:  # pragma: no cover - Linux serving path
         cpu_affinity = ()
     stats["process"] = {"cpu_affinity": cpu_affinity}
+    if _WORKER_EMBEDDING is not None:
+        stats["embedding"] = dict(_WORKER_EMBEDDING.stats)
     return WorkerCacheSnapshot(os.getpid(), stats)
 
 
@@ -232,6 +248,7 @@ class ProcessShardedNavigator:
         *,
         workers: int = 4,
         navigator_options: Mapping[str, object] | None = None,
+        embedding_options: Mapping[str, object] | None = None,
         start_method: str = "spawn",
         max_queued: int = 32,
         per_tenant_outstanding: int = 8,
@@ -246,6 +263,8 @@ class ProcessShardedNavigator:
         self.db_path = Path(db_path)
         self.workers = workers
         self.navigator_options = dict(navigator_options or {})
+        self.embedding_options = (
+            dict(embedding_options) if embedding_options is not None else None)
         if max_queued < 0:
             raise ValueError("max_queued cannot be negative")
         if not 1 <= affinity_replicas <= workers:
@@ -284,7 +303,7 @@ class ProcessShardedNavigator:
         return ProcessPoolExecutor(
             max_workers=1, mp_context=self._context,
             initializer=_initialize_worker,
-            initargs=(str(self.db_path), self.navigator_options,
+            initargs=(str(self.db_path), self.navigator_options, self.embedding_options,
                       self.worker_cpu_ids[shard]))
 
     def _restart_shard(self, shard: int, failed_generation: int) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import replace
+from functools import lru_cache
 from typing import Callable, Iterable, Mapping, Sequence
 
 from ..domain import (
@@ -118,6 +119,31 @@ def _sentences(text: str) -> tuple[tuple[int, int, str], ...]:
     return rows or ((0, len(text), text),)
 
 
+@lru_cache(maxsize=131_072)
+def _sentence_features(text: str) -> tuple[
+        tuple[int, int, frozenset[str], bool, bool, bool, bool], ...]:
+    """Cache query-independent sentence parsing for immutable source turns.
+
+    The 64-turn accuracy profile calls ``salient_spans`` once for every packed
+    turn.  Sentence splitting, tokenization and four regex scans do not depend
+    on the question; repeating them consumed ~58 ms/query in the warm W8 path.
+    Keeping the compact immutable features makes only the lexical overlap
+    query-dependent and preserves byte-identical span selection.
+    """
+    return tuple(
+        (
+            start,
+            end,
+            content_terms(sentence),
+            bool(_NUMBER_RE.search(sentence)),
+            bool(_TIME_RE.search(sentence)),
+            bool(_NEGATION_RE.search(sentence)),
+            bool(_STATUS_RE.search(sentence)),
+        )
+        for start, end, sentence in _sentences(text)
+    )
+
+
 def salient_spans(
     turn: SourceTurn,
     query: str,
@@ -137,14 +163,14 @@ def salient_spans(
     temporal = answer_kind in {"temporal", "duration", "date_difference", "ordering"}
     aggregate = answer_kind in {"count", "list", "count_distinct", "union_distinct"}
     stateful = answer_kind in {"state_change", "latest_state"}
-    for start, end, text in _sentences(turn.raw_text):
-        terms = content_terms(text)
+    for start, end, terms, number, time_, negative, status in _sentence_features(
+            turn.raw_text):
         lexical = len(query_terms & terms) / max(1, len(query_terms))
         critical = {
-            "number": bool(_NUMBER_RE.search(text)),
-            "time": bool(_TIME_RE.search(text)),
-            "negative": bool(_NEGATION_RE.search(text)),
-            "status": bool(_STATUS_RE.search(text)),
+            "number": number,
+            "time": time_,
+            "negative": negative,
+            "status": status,
         }
         score = lexical * 8.0
         score += 2.0 * critical["negative"]

@@ -4,6 +4,7 @@ from .compiled_lifecycle import (
     CompiledSidecarMaintainer,
     sync_compiled_sidecars,
 )
+from .dense_lifecycle import DenseSidecarMaintainer, sync_dense_sidecars
 
 from .process_pool import (
     AdmissionRejected,
@@ -23,9 +24,11 @@ from .replication import (
 __all__ = [
     "AdmissionRejected", "BoundedAdmissionController",
     "CompiledSidecarMaintainer",
+    "DenseSidecarMaintainer",
     "ProcessShardedNavigator", "RequestDeadlineExceeded", "WorkerSnapshot",
     "WorkerCacheSnapshot",
     "ReplicaCorruptionError", "ReplicaStaleError", "SQLiteSnapshotReplicator",
     "SnapshotReplicaManifest",
     "sync_compiled_sidecars",
+    "sync_dense_sidecars",
 ]

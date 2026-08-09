@@ -1,32 +1,119 @@
 from __future__ import annotations
 
 import hashlib
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from pathlib import Path
+import threading
 import time
+import sqlite3
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
 from .config import GraphMemV5Config
 from .domain import SourceTurn, stable_id
+from .query_embedding_cache import QueryEmbeddingCache
+from .retrieval.dense_sidecar import DenseIndexCache, DenseIndexSidecar
 from .storage import SQLiteGraphStore
+
+
+QUERY_INSTRUCTION_REVISION = "graphmem-turn-evidence-v1"
+QUERY_INSTRUCTION = (
+    "Instruct: Retrieve conversation turns that provide all evidence needed to answer "
+    "the memory question.\nQuery: "
+)
+
+
+@dataclass(slots=True)
+class _EmbeddingFlight:
+    event: threading.Event = field(default_factory=threading.Event)
+    error: BaseException | None = None
 
 
 class QwenEmbeddingIndex:
     """Turn-level Qwen embedding index; usage is logged outside backbone tokens."""
 
     def __init__(self, store: SQLiteGraphStore, config: GraphMemV5Config,
-                 client: Any | None = None, batch_size: int = 64, record_usage: bool = True) -> None:
+                 client: Any | None = None, batch_size: int = 64, record_usage: bool = True,
+                 query_cache_path: str | Path | None = None,
+                 query_cache_entries: int = 8_192,
+                 memory_cache_memories: int = 16,
+                 dense_sidecar_dir: str | Path | None = None,
+                 dense_backend: str = "auto",
+                 dense_cache_bytes: int = 256 * 1024 * 1024,
+                 dense_cache_memories: int = 32,
+                 model_id: str | None = None,
+                 base_url: str | None = None) -> None:
         self.store = store
         self.config = config
-        self.model_id = config.models.embedding_model
+        self.model_id = model_id or config.models.embedding_model
         self.batch_size = batch_size
-        self._query_cache: dict[str, list[float]] = {}
-        self._memory_cache: dict[str, tuple[list[str], np.ndarray]] = {}
+        self._query_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._query_cache_entries = max(1, int(query_cache_entries))
+        self._persistent_query_cache = (
+            QueryEmbeddingCache(query_cache_path) if query_cache_path else None)
+        self._query_lock = threading.RLock()
+        self._query_flights: dict[str, _EmbeddingFlight] = {}
+        self._memory_cache: OrderedDict[str, tuple[list[str], np.ndarray]] = OrderedDict()
+        self._memory_cache_memories = max(1, int(memory_cache_memories))
+        self._memory_lock = threading.RLock()
+        self._dense_cache = (
+            DenseIndexCache(
+                DenseIndexSidecar(dense_sidecar_dir, backend=dense_backend),
+                max_bytes=dense_cache_bytes,
+                max_memories=dense_cache_memories,
+            ) if dense_sidecar_dir else None
+        )
+        self._stats = {
+            "query_memory_hits": 0,
+            "query_persistent_hits": 0,
+            "query_misses": 0,
+            "query_batches": 0,
+            "query_singleflight_waits": 0,
+            "query_embedded_views": 0,
+            "query_api_ms": 0.0,
+            "query_api_tokens": 0,
+            "query_cache_errors": 0,
+        }
         self.record_usage = record_usage
         if client is None:
             from openai import OpenAI
-            client = OpenAI(base_url=config.models.embedding_base_url, api_key="local")
+            client = OpenAI(
+                base_url=base_url or config.models.embedding_base_url,
+                api_key="local",
+            )
         self.client = client
+
+    @property
+    def stats(self) -> Mapping[str, Any]:
+        with self._query_lock:
+            values: dict[str, Any] = {
+                **self._stats,
+                "query_memory_entries": len(self._query_cache),
+            }
+        with self._memory_lock:
+            values["memory_matrix_entries"] = len(self._memory_cache)
+        if self._dense_cache is not None:
+            values["dense_sidecar"] = self._dense_cache.stats()
+        return values
+
+    def _put_query_memory(self, cache_key: str, vector: Sequence[float] | np.ndarray) -> None:
+        normalized = np.asarray(vector, dtype=np.float32).reshape(-1)
+        norm = float(np.linalg.norm(normalized))
+        if not normalized.size or not np.isfinite(normalized).all() or norm <= 1e-12:
+            raise ValueError("embedding service returned an invalid query vector")
+        normalized = np.ascontiguousarray(normalized / norm, dtype=np.float32)
+        self._query_cache[cache_key] = normalized
+        self._query_cache.move_to_end(cache_key)
+        while len(self._query_cache) > self._query_cache_entries:
+            self._query_cache.popitem(last=False)
+
+    def _get_query_memory(self, cache_key: str) -> np.ndarray | None:
+        vector = self._query_cache.get(cache_key)
+        if vector is not None:
+            self._query_cache.move_to_end(cache_key)
+        return vector
 
     def index_memory(self, memory_id: str) -> int:
         turns = list(self.store.turns(memory_id))
@@ -47,7 +134,8 @@ class QwenEmbeddingIndex:
             )
             indexed += len(batch)
         if indexed:
-            self._memory_cache.pop(memory_id, None)
+            with self._memory_lock:
+                self._memory_cache.pop(memory_id, None)
         return indexed
 
     def import_memory(self, memory_id: str, source: SQLiteGraphStore) -> int:
@@ -63,7 +151,8 @@ class QwenEmbeddingIndex:
             rows.append((row["item_id"], row["content_hash"], vector))
         if rows:
             self.store.upsert_embeddings(memory_id, self.model_id, rows)
-            self._memory_cache.pop(memory_id, None)
+            with self._memory_lock:
+                self._memory_cache.pop(memory_id, None)
         return len(rows)
 
     def embed_graph_nodes(self, memory_id: str, nodes: Sequence[Any]) -> Mapping[
@@ -107,42 +196,177 @@ class QwenEmbeddingIndex:
                     count=int(row["dimension"])).copy()
         return result
 
-    def search(self, memory_id: str, query: str, limit: int) -> Sequence[tuple[str, float]]:
-        query_text = (
-            "Instruct: Retrieve conversation turns that provide all evidence needed to answer "
-            "the memory question.\nQuery: " + query
-        )
-        cache_key = hashlib.sha256((self.model_id + "\n" + query_text).encode()).hexdigest()
-        if cache_key not in self._query_cache:
-            vectors, tokens, latency = self._embed([query_text])
-            self._query_cache[cache_key] = vectors[0]
-            if self.record_usage:
-                self.store.log_embedding_call(
-                    stable_id("embedding-call", memory_id, "query", cache_key), memory_id,
-                    self.model_id, 1, tokens, latency,
-                )
-        if memory_id not in self._memory_cache:
+    def _query_vectors(self, memory_id: str, queries: Sequence[str]) -> list[np.ndarray]:
+        query_texts = [QUERY_INSTRUCTION + query for query in queries]
+        keys = [hashlib.sha256((
+            self.model_id + "\n" + QUERY_INSTRUCTION_REVISION + "\n" + text
+        ).encode()).hexdigest() for text in query_texts]
+
+        unresolved: list[str] = []
+        with self._query_lock:
+            for cache_key in dict.fromkeys(keys):
+                if self._get_query_memory(cache_key) is None:
+                    unresolved.append(cache_key)
+                else:
+                    self._stats["query_memory_hits"] += 1
+
+        if unresolved and self._persistent_query_cache is not None:
+            try:
+                persisted = self._persistent_query_cache.get_many(unresolved)
+            except (OSError, sqlite3.Error, ValueError):
+                persisted = {}
+                with self._query_lock:
+                    self._stats["query_cache_errors"] += 1
+            with self._query_lock:
+                for cache_key, vector in persisted.items():
+                    self._put_query_memory(cache_key, vector)
+                    self._stats["query_persistent_hits"] += 1
+            unresolved = [key for key in unresolved if key not in persisted]
+
+        owned: list[tuple[str, str, _EmbeddingFlight]] = []
+        waiting: list[_EmbeddingFlight] = []
+        text_by_key = dict(zip(keys, query_texts))
+        with self._query_lock:
+            for cache_key in unresolved:
+                if self._get_query_memory(cache_key) is not None:
+                    continue
+                flight = self._query_flights.get(cache_key)
+                if flight is None:
+                    flight = _EmbeddingFlight()
+                    self._query_flights[cache_key] = flight
+                    owned.append((cache_key, text_by_key[cache_key], flight))
+                    self._stats["query_misses"] += 1
+                else:
+                    waiting.append(flight)
+                    self._stats["query_singleflight_waits"] += 1
+
+        if owned:
+            owned_keys = [row[0] for row in owned]
+            try:
+                vectors, tokens, latency = self._embed([row[1] for row in owned])
+                if len(vectors) != len(owned):
+                    raise RuntimeError("embedding response cardinality mismatch")
+                persisted = dict(zip(owned_keys, vectors))
+                if self._persistent_query_cache is not None:
+                    try:
+                        self._persistent_query_cache.put_many(persisted)
+                    except (OSError, sqlite3.Error, ValueError):
+                        # This sidecar is a disposable optimization.  A full or
+                        # temporarily locked cache must not fail retrieval after
+                        # the authoritative embedding service has succeeded.
+                        with self._query_lock:
+                            self._stats["query_cache_errors"] += 1
+                with self._query_lock:
+                    for cache_key, vector in persisted.items():
+                        self._put_query_memory(cache_key, vector)
+                    self._stats["query_batches"] += 1
+                    self._stats["query_embedded_views"] += len(owned)
+                    self._stats["query_api_ms"] += latency
+                    self._stats["query_api_tokens"] += tokens
+                if self.record_usage:
+                    self.store.log_embedding_call(
+                        stable_id("embedding-call", memory_id, "query-batch", *owned_keys),
+                        memory_id, self.model_id, len(owned), tokens, latency,
+                    )
+            except BaseException as error:
+                for _cache_key, _text, flight in owned:
+                    flight.error = error
+                raise
+            finally:
+                with self._query_lock:
+                    for cache_key, _text, flight in owned:
+                        self._query_flights.pop(cache_key, None)
+                        flight.event.set()
+
+        for flight in waiting:
+            flight.event.wait()
+            if flight.error is not None:
+                raise RuntimeError("concurrent query embedding failed") from flight.error
+
+        with self._query_lock:
+            result = []
+            for cache_key in keys:
+                vector = self._get_query_memory(cache_key)
+                if vector is None:  # pragma: no cover - defensive invariant
+                    raise RuntimeError("query embedding cache fill failed")
+                result.append(vector)
+            return result
+
+    def _memory_matrix(self, memory_id: str) -> tuple[list[str], np.ndarray]:
+        with self._memory_lock:
+            cached = self._memory_cache.get(memory_id)
+            if cached is not None:
+                self._memory_cache.move_to_end(memory_id)
+                return cached
+            expected = {turn.turn_id for turn in self.store.turns(memory_id)}
             ids, vectors = [], []
-            for row in self.store._read(
-                "SELECT item_id,dimension,vector FROM embeddings WHERE memory_id=? AND model_id=? ORDER BY item_id",
-                (memory_id, self.model_id),
-            ):
-                ids.append(str(row["item_id"]))
-                vectors.append(np.frombuffer(row["vector"], dtype=np.float32, count=int(row["dimension"])))
+            if expected:
+                for row in self.store._read(
+                    "SELECT item_id,dimension,vector FROM embeddings WHERE memory_id=? AND model_id=? ORDER BY item_id",
+                    (memory_id, self.model_id),
+                ):
+                    item_id = str(row["item_id"])
+                    if item_id not in expected:
+                        continue
+                    ids.append(item_id)
+                    vectors.append(np.frombuffer(
+                        row["vector"], dtype=np.float32,
+                        count=int(row["dimension"])))
             matrix = np.stack(vectors) if vectors else np.empty((0, 0), dtype=np.float32)
             if matrix.size:
-                matrix /= np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
+                matrix /= np.maximum(
+                    np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
             self._memory_cache[memory_id] = (ids, matrix)
-        ids, matrix = self._memory_cache[memory_id]
+            self._memory_cache.move_to_end(memory_id)
+            while len(self._memory_cache) > self._memory_cache_memories:
+                self._memory_cache.popitem(last=False)
+            return ids, matrix
+
+    def _search_vector(self, memory_id: str, query_vector: np.ndarray,
+                       limit: int) -> Sequence[tuple[str, float]]:
+        return self._search_vectors(memory_id, ((query_vector, limit),))[0]
+
+    def _search_vectors(
+        self,
+        memory_id: str,
+        requests: Sequence[tuple[np.ndarray, int]],
+    ) -> tuple[Sequence[tuple[str, float]], ...]:
+        if not requests:
+            return ()
+        if self._dense_cache is not None:
+            handle = self._dense_cache.get(self.store, memory_id, self.model_id)
+            if handle is not None:
+                return tuple(handle.search(vector, limit) for vector, limit in requests)
+        ids, matrix = self._memory_matrix(memory_id)
         if not ids:
-            return []
-        query_vector = np.asarray(self._query_cache[cache_key], dtype=np.float32)
-        query_vector /= max(float(np.linalg.norm(query_vector)), 1e-12)
-        scores = matrix @ query_vector
-        count = min(limit, len(ids))
-        indices = np.argpartition(-scores, count - 1)[:count]
-        indices = sorted(indices, key=lambda index: (-float(scores[index]), ids[index]))
-        return [(ids[index], float(scores[index])) for index in indices]
+            return tuple(() for _request in requests)
+        results: list[Sequence[tuple[str, float]]] = []
+        for query_vector, limit in requests:
+            scores = matrix @ query_vector
+            count = min(limit, len(ids))
+            if count <= 0:
+                results.append(())
+                continue
+            indices = np.argpartition(-scores, count - 1)[:count]
+            indices = sorted(
+                indices, key=lambda index: (-float(scores[index]), ids[index]))
+            results.append([(ids[index], float(scores[index])) for index in indices])
+        return tuple(results)
+
+    def search_many(self, memory_id: str,
+                    requests: Sequence[tuple[str, int]]) -> tuple[
+                        Sequence[tuple[str, float]], ...]:
+        if not requests:
+            return ()
+        vectors = self._query_vectors(memory_id, [query for query, _limit in requests])
+        return self._search_vectors(
+            memory_id,
+            tuple((vector, int(limit))
+                  for vector, (_query, limit) in zip(vectors, requests)),
+        )
+
+    def search(self, memory_id: str, query: str, limit: int) -> Sequence[tuple[str, float]]:
+        return self.search_many(memory_id, ((query, limit),))[0]
 
     def _embed(self, texts: Sequence[str]) -> tuple[list[list[float]], int, float]:
         started = time.perf_counter()

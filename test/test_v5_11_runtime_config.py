@@ -57,6 +57,11 @@ def test_v5_17_accuracy_profile_keeps_wider_evidence_budget() -> None:
     assert options["precision_aware_packing"] is False
     assert options["rare_lexical_relations"] is True
     assert options["queryir_soft_fallback"] is True
+    assert config.retrieval.dense_search_enabled is True
+    embedding = config.retrieval.embedding_options()
+    assert embedding is not None
+    assert embedding["dense_backend"] == "auto"
+    assert embedding["query_cache_entries"] == 8192
 
 
 def test_runtime_profile_matches_report_pareto_worker_configuration() -> None:

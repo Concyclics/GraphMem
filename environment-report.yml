@@ -19,6 +19,7 @@ dependencies:
   - networkx
   - rank-bm25
   - hnswlib
+  - faiss-cpu>=1.8
   - pip:
       - openai>=1.0
       - tokenizers>=0.20
