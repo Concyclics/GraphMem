@@ -114,6 +114,41 @@ def test_typed_region_arrival_descends_to_fact_on_second_hop() -> None:
     assert result.proof[-1].relation == RelationType.SCENE_CONTAINS
 
 
+def test_rare_lexical_bridge_is_conditioned_on_multifact_plan_and_descends() -> None:
+    nodes = (
+        GraphNode("seed", "m", NodeType.SCENE, 0, "anchor", "g:0"),
+        GraphNode("rare-region", "m", NodeType.SCENE, 0,
+                  "related region", "g:1"),
+        GraphNode("semantic-region", "m", NodeType.SCENE, 0, "nearby region", "g:2"),
+        _node("fact", "second required value"),
+    )
+    edges = (
+        GraphEdge("e-rare", "m", "seed", RelationType.COARSE_RELATED,
+                  "rare-region", "g:0", False, 0.9,
+                  "relation_mask:lexical_rare"),
+        GraphEdge("e-scene", "m", "seed", RelationType.COARSE_RELATED,
+                  "semantic-region", "g:0", False, 0.9,
+                  "relation_mask:scene_similar"),
+        GraphEdge("e-fact", "m", "rare-region", RelationType.SCENE_CONTAINS,
+                  "fact", "g:1", True, 1.0, "structural"),
+    )
+    view = GraphReadView(nodes, edges)
+    ir = QueryIR(
+        "What were the two recorded values?", QueryOperator.UNION_DISTINCT,
+        (OperandSpec("o1"), OperandSpec("o2")),
+        (ProofObligation("need-collection", None, "collection"),))
+    budget = QueryBudget(
+        max_hops=2, max_visited_nodes=3, max_visited_edges=2,
+        max_frontier=4, max_seed_nodes=1)
+
+    result = execute(
+        view, ir, ("seed",), budget, structured=True, expansion_beam=1,
+        preferred_relations=(RelationType.COARSE_RELATED,))
+
+    assert result.visited_node_ids == ("seed", "rare-region", "fact")
+    assert result.proof[0].edge_id == "e-rare"
+
+
 def test_typed_executor_requires_post_pack_proof_and_reports_units() -> None:
     algebra = AlgebraResult(
         QueryOperator.DATE_DIFFERENCE, (), ("b1", "b2"),

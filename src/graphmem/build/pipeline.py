@@ -29,6 +29,7 @@ from .coarsen import (
     RecursiveHierarchy,
     admit_llm_refined_relation,
     build_parent_gated_relations,
+    build_rare_lexical_node_terms,
     build_recursive_hierarchy,
 )
 from .refine import Qwen30BRefiner, RefineCandidate
@@ -342,6 +343,7 @@ class GraphBuildPipeline:
 
         gated_plan: GatedRelationPlan | None = None
         relation_semantic_vector_count = 0
+        rare_lexical_terms: Mapping[str, frozenset[str]] = {}
         if (recursive_hierarchy is not None
                 and profile.edges.parent_gated_relations and level >= 3):
             node_map = {node.node_id: node for node in nodes}
@@ -372,6 +374,11 @@ class GraphBuildPipeline:
                 semantic_vectors = self.relation_vector_provider(
                     memory_id, relation_vector_nodes)
                 relation_semantic_vector_count = len(semantic_vectors)
+            if (profile.edges.relation_mask_propagation
+                    and profile.edges.rare_lexical_relation):
+                rare_lexical_terms = build_rare_lexical_node_terms(
+                    tuple(node_map.values()), turns,
+                    df_share=profile.edges.rare_lexical_df_share)
             gated_plan = build_parent_gated_relations(
                 memory_id, recursive_hierarchy, node_map, child_map,
                 embedding_k=profile.edges.embedding_k,
@@ -398,6 +405,9 @@ class GraphBuildPipeline:
                 atomic_relation_multiview=(
                     profile.edges.atomic_relation_multiview),
                 relation_view_quotas=profile.edges.relation_view_quotas,
+                lexical_rare_terms=rare_lexical_terms,
+                rare_lexical_min_shared=(
+                    profile.edges.rare_lexical_min_shared),
             )
             for left_id, right_id, score, _gate_level in gated_plan.accepted_pairs:
                 left, right = node_map[left_id], node_map[right_id]
@@ -500,6 +510,7 @@ class GraphBuildPipeline:
                 "relation_mask_pairs": gated_plan.relation_mask_pairs,
                 "relation_mask_counts": dict(
                     gated_plan.relation_mask_counts),
+                "rare_lexical_feature_nodes": len(rare_lexical_terms),
                 "atomic_candidate_source_counts": dict(
                     gated_plan.atomic_candidate_source_counts),
                 "levels_with_relations": gated_plan.levels_with_relations,

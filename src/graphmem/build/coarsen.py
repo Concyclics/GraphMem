@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -12,7 +12,9 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from ..domain import GraphNode, NodeType, RelationType, canonical_json, stable_id
+from ..domain import (
+    GraphNode, NodeType, RelationType, SourceTurn, canonical_json, stable_id,
+)
 from ..text import content_terms, normalize_key
 from .refine import RefineCandidate
 
@@ -69,6 +71,7 @@ class RelationSignal(StrEnum):
     TEMPORAL_NEAR = "temporal_near"
     STATE_COMPATIBLE = "state_compatible"
     COLLECTION_RELATED = "collection_related"
+    LEXICAL_RARE = "lexical_rare"
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +84,7 @@ class RelationFeatures:
     collection_keys: frozenset[str] = frozenset()
     values: frozenset[str] = frozenset()
     time_points: tuple[float, ...] = ()
+    lexical_rare_terms: frozenset[str] = frozenset()
 
 
 ATOMIC_RELATION_NODE_TYPES = frozenset({
@@ -726,6 +730,76 @@ GENERIC_ENTITY_KEYS = frozenset({
     "friend", "friends", "family", "they", "them", "i", "me", "you",
 })
 
+# These are conversational scaffolding rather than referents.  The core text
+# stoplist is intentionally small because it also serves ordinary retrieval;
+# relation construction needs a stricter vocabulary so greetings and generic
+# discourse markers cannot become cross-session hubs.
+RARE_LEXICAL_STOPWORDS = frozenset({
+    "also", "awesome", "because", "been", "being", "can", "cool", "could",
+    "day", "days", "didn't", "doesn't", "don't", "going", "good", "got",
+    "great", "hey", "just", "know", "let's", "like", "made", "make", "many",
+    "month", "months", "more", "most", "much", "need", "nice", "okay", "one",
+    "other", "out", "over", "really", "said", "some", "sure", "thanks",
+    "than", "then", "there", "thing", "things", "think", "time", "today",
+    "tomorrow", "very", "want", "week", "weeks", "well", "would", "wow",
+    "yeah", "year", "years", "yesterday",
+})
+
+
+def build_rare_lexical_node_terms(
+    nodes: Sequence[GraphNode],
+    turns: Sequence[SourceTurn],
+    *,
+    df_share: float = 0.05,
+) -> dict[str, frozenset[str]]:
+    """Derive connectable low-session-DF terms from lossless source text.
+
+    Rarity is measured over sessions, not turns.  Terms occurring in only one
+    session are discarded because they cannot form an edge; terms occurring in
+    too many sessions are topic/dialogue hubs.  The result is attached only to
+    session routing cards and scenes, then propagated bottom-up by
+    :func:`build_relation_features`.  It never changes query lexical seeding.
+    """
+
+    if not 0.0 < df_share <= 1.0:
+        raise ValueError("df_share must be in (0, 1]")
+    terms_by_turn: dict[str, frozenset[str]] = {}
+    terms_by_session: dict[str, set[str]] = defaultdict(set)
+    for turn in turns:
+        terms = frozenset(
+            term for term in content_terms(turn.raw_text)
+            if len(term) > 2 and any(character.isalpha() for character in term)
+            and term not in RARE_LEXICAL_STOPWORDS)
+        terms_by_turn[turn.turn_id] = terms
+        terms_by_session[turn.session_id].update(terms)
+    session_df: Counter[str] = Counter()
+    for terms in terms_by_session.values():
+        session_df.update(terms)
+    ceiling = max(2.0, len(terms_by_session) * df_share)
+    connectable = frozenset(
+        term for term, count in session_df.items()
+        if 2 <= count <= ceiling)
+    if not connectable:
+        return {}
+
+    result: dict[str, frozenset[str]] = {}
+    for node in nodes:
+        node_terms: set[str] = set()
+        if node.node_type == NodeType.ROUTING_CARD:
+            session_id = str(node.attributes.get("session_id", ""))
+            if session_id:
+                node_terms.update(terms_by_session.get(session_id, ()))
+        elif node.node_type == NodeType.SCENE:
+            turn_ids = node.attributes.get("turn_ids", ())
+            if isinstance(turn_ids, (str, bytes)):
+                turn_ids = (str(turn_ids),)
+            for turn_id in turn_ids or ():
+                node_terms.update(terms_by_turn.get(str(turn_id), ()))
+        selected = frozenset(node_terms & connectable)
+        if selected:
+            result[node.node_id] = selected
+    return result
+
 
 def _attribute_terms(node: GraphNode, *keys: str) -> frozenset[str]:
     phrases = _attribute_phrases(node, *keys)
@@ -769,7 +843,10 @@ def _time_scalars(value: object) -> tuple[float, ...]:
         return ()
 
 
-def _direct_relation_features(node: GraphNode) -> RelationFeatures:
+def _direct_relation_features(
+    node: GraphNode,
+    lexical_rare_terms: Mapping[str, frozenset[str]] | None = None,
+) -> RelationFeatures:
     attrs = node.attributes
     time_values: list[float] = []
     for key in ("observed_at", "observation_time_range", "time_interval",
@@ -791,6 +868,8 @@ def _direct_relation_features(node: GraphNode) -> RelationFeatures:
         collection_keys=_attribute_phrases(node, "collection_key"),
         values=_attribute_terms(node, "value", "values", "value_key"),
         time_points=tuple(sorted(set(time_values)))[:32],
+        lexical_rare_terms=(lexical_rare_terms or {}).get(
+            node.node_id, frozenset()),
     )
 
 
@@ -799,6 +878,8 @@ def build_relation_features(
     child_map: Mapping[str, Sequence[str]],
     *,
     max_values_per_field: int = 128,
+    lexical_rare_terms: Mapping[str, frozenset[str]] | None = None,
+    max_rare_terms_per_region: int = 512,
 ) -> dict[str, RelationFeatures]:
     """Aggregate typed routing features bottom-up through the coarse DAG.
 
@@ -819,14 +900,15 @@ def build_relation_features(
         if node_id in active:
             # The expected graph is a DAG.  A malformed structural cycle must
             # not recurse forever; retaining direct fields is the safe fallback.
-            return _direct_relation_features(node)
+            return _direct_relation_features(node, lexical_rare_terms)
         active.add(node_id)
-        direct = _direct_relation_features(node)
+        direct = _direct_relation_features(node, lexical_rare_terms)
         entities = set(direct.entities); predicates = set(direct.predicates)
         predicate_phrases = set(direct.predicate_phrases)
         scopes = set(direct.scopes); scope_phrases = set(direct.scope_phrases)
         collection_keys = set(direct.collection_keys); values = set(direct.values)
         times = set(direct.time_points)
+        rare_terms = set(direct.lexical_rare_terms)
         for child_id in child_map.get(node_id, ()):
             if child_id not in nodes:
                 continue
@@ -837,6 +919,7 @@ def build_relation_features(
             collection_keys.update(child.collection_keys)
             values.update(child.values)
             times.update(child.time_points)
+            rare_terms.update(child.lexical_rare_terms)
         active.remove(node_id)
         cached[node_id] = RelationFeatures(
             entities=frozenset(sorted(entities)[:max_values_per_field]),
@@ -850,6 +933,8 @@ def build_relation_features(
                 collection_keys)[:max_values_per_field]),
             values=frozenset(sorted(values)[:max_values_per_field]),
             time_points=tuple(sorted(times))[:max_values_per_field],
+            lexical_rare_terms=frozenset(sorted(
+                rare_terms)[:max_rare_terms_per_region]),
         )
         return cached[node_id]
 
@@ -883,6 +968,7 @@ def relation_signal_scores(
     *,
     semantic_similarity: float,
     eligible_entities: frozenset[str] | None = None,
+    rare_lexical_min_shared: int = 3,
 ) -> dict[RelationSignal, float]:
     """Relation-specific compatibility scores used for routing only."""
 
@@ -903,6 +989,19 @@ def relation_signal_scores(
         scores[RelationSignal.SHARED_ENTITY] = min(
             1.0, len(shared_entities) / max(
                 1, min(len(left_entities), len(right_entities))))
+
+    shared_rare = (left_features.lexical_rare_terms
+                   & right_features.lexical_rare_terms)
+    left_sessions = _node_sessions(left); right_sessions = _node_sessions(right)
+    if (rare_lexical_min_shared > 0
+            and len(shared_rare) >= rare_lexical_min_shared
+            and left_sessions and right_sessions
+            and left_sessions.isdisjoint(right_sessions)):
+        # K>=3 was the measured high-recall operating point on LongMemEval.
+        # Preserve overlap magnitude for ranking instead of turning every
+        # qualifying pair into the same binary score.
+        scores[RelationSignal.LEXICAL_RARE] = min(
+            1.0, len(shared_rare) / (2.0 * rare_lexical_min_shared))
 
     predicate_overlap = len(left_features.predicates & right_features.predicates) / max(
         1, min(len(left_features.predicates), len(right_features.predicates)))
@@ -954,6 +1053,7 @@ def relation_mask(
         RelationSignal.STATE_COMPATIBLE: 0.45,
         RelationSignal.COLLECTION_RELATED: 0.45,
         RelationSignal.TEMPORAL_NEAR: math.exp(-2.0),
+        RelationSignal.LEXICAL_RARE: 0.50,
     }
     return frozenset(signal for signal, score in scores.items()
                      if score >= thresholds[signal])
@@ -968,6 +1068,11 @@ def _signal_gate_confidence(signal: RelationSignal, value: float) -> float:
         return 0.82 + 0.16 * value
     if signal == RelationSignal.STATE_COMPATIBLE:
         return 0.80 + 0.18 * value
+    if signal == RelationSignal.LEXICAL_RARE:
+        # This is a relation filter between two long text regions, not a
+        # query-to-document rank.  K>=3 earns an online edge; degree caps still
+        # bound how many such bridges a region may retain.
+        return 0.82 + 0.16 * value
     if signal == RelationSignal.COLLECTION_RELATED:
         # Collection compatibility is useful for descent, while closed-world
         # membership is already represented by deterministic collection edges.
@@ -995,8 +1100,9 @@ def bounded_relation_view_pairs(
     quotas: Mapping[str, int],
     max_candidates: int,
     cross_session_only: bool,
+    rare_lexical_min_shared: int = 3,
 ) -> tuple[list[tuple[str, str, float, RelationSignal]], int]:
-    """Propose a bounded union of entity/state/time/collection neighbours."""
+    """Propose a bounded union of typed and rare-lexical neighbours."""
 
     ordered = tuple(sorted(nodes, key=lambda row: row.node_id))
     by_id = {node.node_id: node for node in ordered}
@@ -1006,6 +1112,7 @@ def bounded_relation_view_pairs(
             RelationSignal.STATE_COMPATIBLE,
             RelationSignal.TEMPORAL_NEAR,
             RelationSignal.COLLECTION_RELATED,
+            RelationSignal.LEXICAL_RARE,
         )
     }
 
@@ -1035,6 +1142,7 @@ def bounded_relation_view_pairs(
     entity_postings: dict[str, list[str]] = defaultdict(list)
     state_postings: dict[tuple[str, str], list[str]] = defaultdict(list)
     collection_postings: dict[tuple[str, str], list[str]] = defaultdict(list)
+    rare_lexical_postings: dict[str, list[str]] = defaultdict(list)
     for node in ordered:
         row = features[node.node_id]
         for entity in row.entities & eligible_entities:
@@ -1049,9 +1157,34 @@ def bounded_relation_view_pairs(
         for scope in sorted(collection_scopes)[:16]:
             for predicate in sorted(row.predicate_phrases)[:16]:
                 collection_postings[(scope, predicate)].append(node.node_id)
+        for term in row.lexical_rare_terms:
+            rare_lexical_postings[term].append(node.node_id)
     add_posting_candidates(RelationSignal.SHARED_ENTITY, entity_postings)
     add_posting_candidates(RelationSignal.STATE_COMPATIBLE, state_postings)
     add_posting_candidates(RelationSignal.COLLECTION_RELATED, collection_postings)
+
+    # One rare term is insufficient: the useful historical signal was the
+    # intersection size between two long documents.  Accumulate overlap through
+    # postings first, then keep each endpoint's strongest bounded partners.
+    lexical_pair_counts: Counter[tuple[str, str]] = Counter()
+    lexical_posting_cap = max(8, max_candidates * 4)
+    for _term, ids in sorted(rare_lexical_postings.items()):
+        unique = tuple(dict.fromkeys(sorted(ids)))
+        if len(unique) < 2 or len(unique) > lexical_posting_cap:
+            continue
+        for left_index, left_id in enumerate(unique):
+            for right_id in unique[left_index + 1:]:
+                lexical_pair_counts[(left_id, right_id)] += 1
+    lexical_ranked: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    for (left_id, right_id), count in lexical_pair_counts.items():
+        if count < rare_lexical_min_shared:
+            continue
+        lexical_ranked[left_id].append((count, right_id))
+        lexical_ranked[right_id].append((count, left_id))
+    for left_id, rows in lexical_ranked.items():
+        candidates[RelationSignal.LEXICAL_RARE][left_id].update(
+            right_id for _count, right_id in sorted(
+                rows, key=lambda row: (-row[0], row[1]))[:max_candidates])
 
     timed = sorted((min(features[node.node_id].time_points), node.node_id)
                    for node in ordered if features[node.node_id].time_points)
@@ -1067,6 +1200,7 @@ def bounded_relation_view_pairs(
         RelationSignal.STATE_COMPATIBLE: "state",
         RelationSignal.TEMPORAL_NEAR: "temporal",
         RelationSignal.COLLECTION_RELATED: "collection",
+        RelationSignal.LEXICAL_RARE: "rare_lexical",
     }
     result: dict[tuple[str, str, RelationSignal], tuple[
         str, str, float, RelationSignal]] = {}
@@ -1089,7 +1223,8 @@ def bounded_relation_view_pairs(
                 comparisons += 1
                 scores = relation_signal_scores(
                     left, right, features, semantic_similarity=0.0,
-                    eligible_entities=eligible_entities)
+                    eligible_entities=eligible_entities,
+                    rare_lexical_min_shared=rare_lexical_min_shared)
                 score = scores.get(signal, 0.0)
                 if signal in relation_mask(scores, semantic_threshold=1.1):
                     scored.append((score, right_id))
@@ -1190,6 +1325,8 @@ def build_parent_gated_relations(
     relation_mask_propagation: bool = False,
     atomic_relation_multiview: bool = False,
     relation_view_quotas: Mapping[str, int] | None = None,
+    lexical_rare_terms: Mapping[str, frozenset[str]] | None = None,
+    rare_lexical_min_shared: int = 3,
 ) -> GatedRelationPlan:
     """Generate fine candidates only below a surviving coarse candidate edge.
 
@@ -1205,9 +1342,12 @@ def build_parent_gated_relations(
     if max_refine_candidates_per_1000_nodes < 0:
         raise ValueError(
             "max_refine_candidates_per_1000_nodes cannot be negative")
+    if rare_lexical_min_shared < 1:
+        raise ValueError("rare_lexical_min_shared must be positive")
     all_nodes = tuple(nodes.values())
     view_quotas = dict(relation_view_quotas or {})
-    relation_features = (build_relation_features(nodes, child_map)
+    relation_features = (build_relation_features(
+        nodes, child_map, lexical_rare_terms=lexical_rare_terms)
                          if relation_mask_propagation else {})
     eligible_entities = (_eligible_entity_keys(all_nodes, relation_features)
                          if relation_mask_propagation else frozenset())
@@ -1252,7 +1392,8 @@ def build_parent_gated_relations(
                 scores = relation_signal_scores(
                     nodes[pair[0]], nodes[pair[1]], relation_features,
                     semantic_similarity=score,
-                    eligible_entities=eligible_entities)
+                    eligible_entities=eligible_entities,
+                    rare_lexical_min_shared=rare_lexical_min_shared)
                 mask = set(relation_mask(
                     scores, semantic_threshold=low_threshold))
                 if not mask:
@@ -1272,7 +1413,8 @@ def build_parent_gated_relations(
                 siblings, relation_features,
                 eligible_entities=eligible_entities, quotas=view_quotas,
                 max_candidates=max_candidates_per_node,
-                cross_session_only=False)
+                cross_session_only=False,
+                rare_lexical_min_shared=rare_lexical_min_shared)
             comparisons += view_comparisons
             for left, right, _view_score, signal in view_pairs:
                 pair = (left, right)
@@ -1281,7 +1423,8 @@ def build_parent_gated_relations(
                 scores = relation_signal_scores(
                     nodes[left], nodes[right], relation_features,
                     semantic_similarity=semantic_score,
-                    eligible_entities=eligible_entities)
+                    eligible_entities=eligible_entities,
+                    rare_lexical_min_shared=rare_lexical_min_shared)
                 mask = set(relation_mask(
                     scores, semantic_threshold=low_threshold))
                 mask.add(signal)
@@ -1350,7 +1493,8 @@ def build_parent_gated_relations(
                     local_scores = relation_signal_scores(
                         left, right, relation_features,
                         semantic_similarity=local_semantic,
-                        eligible_entities=eligible_entities)
+                        eligible_entities=eligible_entities,
+                        rare_lexical_min_shared=rare_lexical_min_shared)
                     accepted_signals[pair].update(
                         str(signal) for signal in gate_mask
                         if _signal_gate_confidence(
@@ -1440,7 +1584,8 @@ def build_parent_gated_relations(
                         scores = relation_signal_scores(
                             left_child, right_child, relation_features,
                             semantic_similarity=semantic_score,
-                            eligible_entities=eligible_entities)
+                            eligible_entities=eligible_entities,
+                            rare_lexical_min_shared=rare_lexical_min_shared)
                         local_mask = relation_mask(
                             scores, semantic_threshold=low_threshold)
                         child_mask = frozenset(
@@ -1543,13 +1688,15 @@ def build_parent_gated_relations(
                 atomic_nodes, relation_features,
                 eligible_entities=eligible_entities, quotas=view_quotas,
                 max_candidates=max_candidates_per_node,
-                cross_session_only=True)
+                cross_session_only=True,
+                rare_lexical_min_shared=rare_lexical_min_shared)
             comparisons += view_comparisons
             source_by_signal = {
                 RelationSignal.SHARED_ENTITY: "entity",
                 RelationSignal.STATE_COMPATIBLE: "state",
                 RelationSignal.TEMPORAL_NEAR: "temporal",
                 RelationSignal.COLLECTION_RELATED: "collection",
+                RelationSignal.LEXICAL_RARE: "rare_lexical",
             }
             for left_id, right_id, score, signal in view_pairs:
                 pair = (left_id, right_id)

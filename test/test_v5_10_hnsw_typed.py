@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from graphmem.build.coarsen import (
     admit_llm_refined_relation,
     bounded_relation_view_pairs,
+    build_rare_lexical_node_terms,
     build_relation_features,
     build_parent_gated_relations,
     build_recursive_hierarchy,
@@ -14,7 +15,9 @@ from graphmem.build.coarsen import (
     RelationSignal,
 )
 from graphmem.build.pipeline import GraphBuildPipeline
-from graphmem.domain import GraphEdge, GraphNode, NodeType, RelationType
+from graphmem.domain import (
+    GraphEdge, GraphNode, NodeType, RelationType, SourceTurn,
+)
 
 
 def _card(index: int, *, topic: int | None = None, negated: bool = False) -> GraphNode:
@@ -363,6 +366,56 @@ def test_multiview_candidates_are_independently_bounded() -> None:
     # cannot grow with N for a fixed per-view quota.
     assert max(per_signal_degree.values(), default=0) <= 4
     assert comparisons < len(nodes) * 8 * 8
+
+
+def test_rare_lexical_relation_is_one_multi_attribute_edge() -> None:
+    left = replace(
+        _card(1), summary="restored a classic roadster",
+        attributes={**_card(1).attributes,
+                    "entities": ("ethereal-dreams",)})
+    right = replace(
+        _card(2), summary="moved a framed painting",
+        attributes={**_card(2).attributes,
+                    "entities": ("ethereal-dreams",)})
+    turns = (
+        SourceTurn("t:1", "m", "s:1", 0, "Alice", "Bob", "user", None,
+                   "Ethereal Dreams sapphire canvas bedroom", "h:1"),
+        SourceTurn("t:2", "m", "s:2", 0, "Alice", "Bob", "user", None,
+                   "Ethereal Dreams sapphire canvas hallway", "h:2"),
+        SourceTurn("t:3", "m", "s:3", 0, "Alice", "Bob", "user", None,
+                   "ordinary conversation unrelated topic", "h:3"),
+    )
+    lexical = build_rare_lexical_node_terms((left, right), turns)
+    assert {"ethereal", "dreams", "sapphire", "canvas"} <= lexical[left.node_id]
+
+    hierarchy = build_recursive_hierarchy(
+        "m", (left, right), fanout=2, max_levels=3, summary_words=24,
+        max_candidates=4, assignment_method="bounded_semantic_partition")
+    left_fact = replace(
+        left, node_id="fact:left", node_type=NodeType.CANONICAL_FACT,
+        attributes={"session_id": "s:1", "owner_id": "ethereal-dreams",
+                    "predicate": "display location"})
+    right_fact = replace(
+        right, node_id="fact:right", node_type=NodeType.CANONICAL_FACT,
+        attributes={"session_id": "s:2", "owner_id": "ethereal-dreams",
+                    "predicate": "display location"})
+    nodes = {node.node_id: node for node in (
+        left, right, left_fact, right_fact, *hierarchy.parent_cards)}
+    children = {key: list(value) for key, value in hierarchy.children.items()}
+    children[left.node_id] = [left_fact.node_id]
+    children[right.node_id] = [right_fact.node_id]
+    plan = build_parent_gated_relations(
+        "m", hierarchy, nodes, children,
+        embedding_k=2, max_candidates_per_node=4,
+        low_threshold=0.35, high_threshold=0.78,
+        refine_mode="ambiguous_only", relation_mask_propagation=True,
+        lexical_rare_terms=lexical, rare_lexical_min_shared=3,
+        relation_view_quotas={"entity": 2, "rare_lexical": 2})
+
+    pair = tuple(sorted((left.node_id, right.node_id)))
+    assert sum(row[:2] == pair for row in plan.accepted_pairs) == 1
+    assert {"lexical_rare", "shared_entity"} <= set(
+        plan.accepted_pair_signals[pair])
 
 
 def test_undirected_degree_cap_applies_to_both_endpoints() -> None:

@@ -190,7 +190,7 @@ class EdgeConfig:
     typed_relation_restoration: bool = False
     typed_relation_min_confidence: float = 0.82
     # V5.14 experimental path.  Coarse candidate edges carry a relation-signal
-    # mask (semantic/entity/time/state) into their child scopes instead of
+    # mask (semantic/entity/time/state/rare-lexical) into their child scopes instead of
     # propagating one untyped cosine.  Disabled by default so frozen V5.13
     # snapshots and config hashes retain their historical behaviour.
     relation_mask_propagation: bool = False
@@ -199,6 +199,15 @@ class EdgeConfig:
     # recall by only 0.053pp and changed no all-hit decision.  Keep it as a
     # separate research arm; parent-mask routing does not require it.
     atomic_relation_multiview: bool = False
+    # Rare lexical terms are measured by session document frequency over raw
+    # source text.  They are a long-document relation feature, not a replacement
+    # for query BM25.  Requiring three shared terms reproduces the high-recall,
+    # bounded LongMemEval operating point while rejecting one-word coincidences.
+    # The full V5.15 gate raised session-pair all-hit from 63% to 93% but changed
+    # neither 32-turn nor 48-turn packed accuracy, so promotion remains opt-in.
+    rare_lexical_relation: bool = False
+    rare_lexical_df_share: float = 0.05
+    rare_lexical_min_shared: int = 3
     # Independent quotas are intentionally combined by union.  A shared total
     # top-k made dense/lexical similarity crowd out sparse entity, temporal and
     # state signals on the hard multi-hop development set.
@@ -209,6 +218,7 @@ class EdgeConfig:
         "state": 4,
         "temporal": 2,
         "collection": 2,
+        "rare_lexical": 6,
     })
     predicate_embedding_threshold: float = 0.92
     # Predicates only ever merge inside one of these slots.  "slot" is the V5.4

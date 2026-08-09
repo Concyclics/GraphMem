@@ -19,6 +19,7 @@ from graphmem.build.coarsen import (  # noqa: E402
     ATOMIC_RELATION_NODE_TYPES,
     admit_llm_refined_relation,
     build_parent_gated_relations,
+    build_rare_lexical_node_terms,
     build_recursive_hierarchy,
 )
 from graphmem.build.refine import Qwen30BRefiner  # noqa: E402
@@ -70,6 +71,10 @@ def parse_args() -> argparse.Namespace:
         "--atomic-relation-multiview", action="store_true",
         help=("V5.14 ablation: also add entity/state/time/collection atomic "
               "candidates; disabled after the full candidate audit"))
+    parser.add_argument(
+        "--rare-lexical-relation", action="store_true",
+        help=("V5.15 ablation: use shared low-session-DF source terms as a "
+              "bounded coarse-edge attribute; disabled after the packed-accuracy gate"))
     parser.add_argument("--cross-session-quota", type=int, default=2)
     parser.add_argument("--embedding-model",
                         default="Qwen/Qwen3-Embedding-0.6B")
@@ -231,7 +236,10 @@ def recoarsen(memory_id: str, source: SQLiteGraphStore,
               typed_min_confidence: float = 0.82,
               relation_mask_propagation: bool = False,
               atomic_relation_multiview: bool = False,
-              relation_view_quotas=None) -> dict:
+              relation_view_quotas=None,
+              rare_lexical_relation: bool = False,
+              rare_lexical_df_share: float = 0.05,
+              rare_lexical_min_shared: int = 3) -> dict:
     nodes = list(source.nodes(memory_id))
     edges = list(source.edges(memory_id))
     groups = source.evidence_groups(memory_id)
@@ -293,6 +301,10 @@ def recoarsen(memory_id: str, source: SQLiteGraphStore,
     for edge in kept_edges:
         if edge.relation in {RelationType.REFINES_TO, RelationType.SCENE_CONTAINS}:
             child_map.setdefault(edge.src_id, []).append(edge.dst_id)
+    rare_lexical_terms = (build_rare_lexical_node_terms(
+        tuple(node_map.values()), source.turns(memory_id),
+        df_share=rare_lexical_df_share)
+        if relation_mask_propagation and rare_lexical_relation else {})
     relation_plan = build_parent_gated_relations(
         memory_id, hierarchy, node_map, child_map,
         embedding_k=8, max_candidates_per_node=24,
@@ -308,7 +320,9 @@ def recoarsen(memory_id: str, source: SQLiteGraphStore,
                                 if atomic_summary_vectors else ()),
         relation_mask_propagation=relation_mask_propagation,
         atomic_relation_multiview=atomic_relation_multiview,
-        relation_view_quotas=relation_view_quotas)
+        relation_view_quotas=relation_view_quotas,
+        lexical_rare_terms=rare_lexical_terms,
+        rare_lexical_min_shared=rare_lexical_min_shared)
     new_relation_edges = []
     for left_id, right_id, score, _level in relation_plan.accepted_pairs:
         signals = relation_plan.accepted_pair_signals.get(
@@ -400,6 +414,7 @@ def recoarsen(memory_id: str, source: SQLiteGraphStore,
             relation_plan.atomic_relation_pairs_proposed),
         "relation_mask_pairs": relation_plan.relation_mask_pairs,
         "relation_mask_counts": dict(relation_plan.relation_mask_counts),
+        "rare_lexical_feature_nodes": len(rare_lexical_terms),
         "atomic_candidate_source_counts": dict(
             relation_plan.atomic_candidate_source_counts),
     }
@@ -481,7 +496,10 @@ def main() -> None:
             typed_min_confidence=config.edges.typed_relation_min_confidence,
             relation_mask_propagation=args.relation_mask_propagation,
             atomic_relation_multiview=args.atomic_relation_multiview,
-            relation_view_quotas=config.edges.relation_view_quotas)
+            relation_view_quotas=config.edges.relation_view_quotas,
+            rare_lexical_relation=args.rare_lexical_relation,
+            rare_lexical_df_share=config.edges.rare_lexical_df_share,
+            rare_lexical_min_shared=config.edges.rare_lexical_min_shared)
         rows.append(row)
         with checkpoint_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -503,7 +521,10 @@ def main() -> None:
         "typed_restoration": args.typed_restoration,
         "relation_mask_propagation": args.relation_mask_propagation,
         "atomic_relation_multiview": args.atomic_relation_multiview,
+        "rare_lexical_relation": args.rare_lexical_relation,
         "relation_view_quotas": dict(config.edges.relation_view_quotas),
+        "rare_lexical_df_share": config.edges.rare_lexical_df_share,
+        "rare_lexical_min_shared": config.edges.rare_lexical_min_shared,
         "cross_session_quota": args.cross_session_quota,
         "embedding_model": args.embedding_model,
         "relation_vector_mode": args.relation_vector_mode,

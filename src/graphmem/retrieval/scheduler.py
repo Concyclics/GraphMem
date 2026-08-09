@@ -131,6 +131,14 @@ def _coarse_signal_bonus(ir: QueryIR, source: str) -> float:
         score += 1.5
     if "shared_entity" in signals and len(ir.operands) > 1:
         score += 1.0
+    if "lexical_rare" in signals and (
+            len(ir.operands) > 1 or kinds & {
+                "state_history", "time_endpoint", "ordering", "collection"}):
+        # Rare overlap is strong for long-region -> long-region linkage but was
+        # measured to be a weak short-query router.  Give it only a modest
+        # cross-region bonus when the compiled plan actually needs multiple
+        # facts/endpoints; ordinary lookup still relies on lexical seed scoring.
+        score += 0.75
     # A semantic-only mask remains a normal coarse edge.  Its relation-specific
     # siblings should win ties, but it receives no extra proof authority.
     return score
@@ -189,7 +197,7 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
                            else frozenset())
         typed_region_arrival = bool(arrived_signals & {
             "shared_entity", "state_compatible", "temporal_near",
-            "collection_related",
+            "collection_related", "lexical_rare",
         })
         if typed_region_arrival:
             # A typed coarse edge locates a related region; its value is lost if
