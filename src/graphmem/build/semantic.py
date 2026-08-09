@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -189,8 +190,17 @@ class ScenePacket:
 
 class QwenSemanticDistiller:
     def __init__(self, store: SQLiteGraphStore, config: GraphMemV5Config,
-                 dataset_hash: str, client: Any | None = None) -> None:
+                 dataset_hash: str, client: Any | None = None, *,
+                 request_gate: threading.BoundedSemaphore | None = None,
+                 worker_limit: int = 16) -> None:
         self.store, self.config, self.dataset_hash = store, config, dataset_hash
+        if worker_limit < 1:
+            raise ValueError("worker_limit must be positive")
+        # A full build creates one distiller per Memory.  Without a process-wide
+        # gate, ``memory_workers * 16`` requests can reach vLLM even though
+        # ModelConfig.max_concurrency is meant to be the global service limit.
+        self.request_gate = request_gate
+        self.worker_limit = worker_limit
         strict_prompt = STRICT_PROMPT + (
             f" Return at most {config.models.semantic_max_facts_per_scene} highest-routing-value facts per scene.")
         if config.models.semantic_predicate_max_chars:
@@ -282,7 +292,8 @@ class QwenSemanticDistiller:
             memory_id, self.config.models.semantic_max_tokens_per_memory,
             self.config.models.semantic_budget_degrade_at,
             fallback_on_overrun=self.config.models.semantic_fallback_on_overrun)
-        workers = min(16, self.config.models.max_concurrency, max(1, len(batches)))
+        workers = min(self.worker_limit, self.config.models.max_concurrency,
+                      max(1, len(batches)))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             for rows in executor.map(lambda batch: self._extract_batch(memory_id, batch), batches):
                 packets.extend(rows)
@@ -319,7 +330,8 @@ class QwenSemanticDistiller:
 
     def compress_many(self, memory_id: str, level: int,
                       requests: Sequence[tuple[str, Sequence[Mapping[str, Any]], int]]) -> tuple[Mapping[str, Any], ...]:
-        workers = min(16, self.config.models.max_concurrency, max(1, len(requests)))
+        workers = min(self.worker_limit, self.config.models.max_concurrency,
+                      max(1, len(requests)))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             return tuple(executor.map(
                 lambda row: self.compress(memory_id, level, row[0], row[1], row[2]), requests
@@ -1028,7 +1040,14 @@ class QwenSemanticDistiller:
                      "total_tokens": int(old.get("uncached_input_tokens", 0))}
             is_cached = True
         else:
-            result = self.client.chat.completions.create(**request); message = result.choices[0].message
+            if self.request_gate is not None:
+                self.request_gate.acquire()
+            try:
+                result = self.client.chat.completions.create(**request)
+            finally:
+                if self.request_gate is not None:
+                    self.request_gate.release()
+            message = result.choices[0].message
             if getattr(message, "reasoning_content", None):
                 raise RuntimeError("semantic distillation returned reasoning content")
             choice = result.choices[0]

@@ -17,6 +17,7 @@ import json
 import shutil
 import statistics
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -114,9 +115,22 @@ def main() -> None:
     started = time.perf_counter()
     results: list[dict] = []
     failures: list[dict] = []
+    global_llm_limit = max(1, config.models.max_concurrency)
+    memory_workers = max(1, args.memory_workers)
+    per_memory_llm_workers = max(1, min(
+        16, global_llm_limit // memory_workers))
+    request_gate = threading.BoundedSemaphore(global_llm_limit)
+    print(
+        "LLM concurrency: "
+        f"{memory_workers} memory workers x {per_memory_llm_workers} inner workers, "
+        f"global cap {global_llm_limit}",
+        flush=True,
+    )
 
     def build(memory_id: str) -> dict:
-        distiller = QwenSemanticDistiller(store, config, "v5.6-full")
+        distiller = QwenSemanticDistiller(
+            store, config, "v5.6-full", request_gate=request_gate,
+            worker_limit=per_memory_llm_workers)
         if args.embedding:
             QwenEmbeddingIndex(store, config, batch_size=128).index_memory(
                 memory_id)
@@ -137,7 +151,7 @@ def main() -> None:
                 "seconds": round(time.perf_counter() - tick, 1),
                 "nodes": manifest.node_count, "edges": manifest.edge_count}
 
-    with ThreadPoolExecutor(max_workers=max(1, args.memory_workers)) as pool:
+    with ThreadPoolExecutor(max_workers=memory_workers) as pool:
         futures = {pool.submit(build, item): item for item in pending}
         for index, future in enumerate(as_completed(futures), 1):
             memory_id = futures[future]
@@ -170,7 +184,9 @@ def main() -> None:
             if args.relation_embedding_db else None),
         "relation_mask_propagation": config.edges.relation_mask_propagation,
         "rare_lexical_relation": config.edges.rare_lexical_relation,
-        "memory_workers": args.memory_workers, "max_concurrency": config.models.max_concurrency,
+        "memory_workers": memory_workers,
+        "llm_workers_per_memory": per_memory_llm_workers,
+        "max_concurrency": global_llm_limit,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps({"summary": report, "rows": results}, indent=2) + "\n",

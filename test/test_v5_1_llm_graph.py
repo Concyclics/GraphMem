@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +17,63 @@ from graphmem.storage import SQLiteGraphStore
 from graphmem.runtime import GraphReadView
 
 from test_v5_gate_b_core import _store
+
+
+class _NoopCallStore:
+    def cache_get(self, _key):
+        return None
+
+    def cache_put(self, *_args, **_kwargs):
+        return None
+
+    def _read_one(self, *_args, **_kwargs):
+        return (0,)
+
+    def log_llm_call(self, **_kwargs):
+        return None
+
+
+class _ConcurrencyProbeCompletions:
+    def __init__(self) -> None:
+        self.active = 0
+        self.max_active = 0
+        self.lock = threading.Lock()
+
+    def create(self, **_request):
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(0.02)
+        with self.lock:
+            self.active -= 1
+        message = SimpleNamespace(content='{"s": []}', reasoning_content=None)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason="stop")],
+            model="qwen30b",
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2),
+        )
+
+
+def test_process_wide_request_gate_caps_multiple_distillers() -> None:
+    gate = threading.BoundedSemaphore(2)
+    completions = _ConcurrencyProbeCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    config = GraphMemV5Config()
+    distillers = [
+        QwenSemanticDistiller(
+            _NoopCallStore(), config, "dataset", client=client,
+            request_gate=gate, worker_limit=1)
+        for _ in range(8)
+    ]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(
+            lambda row: row[1]._call(
+                f"memory-{row[0]}", "probe", "system", {"i": row[0]}, 1),
+            enumerate(distillers),
+        ))
+
+    assert completions.max_active == 2
 
 
 class FakeCompletions:
