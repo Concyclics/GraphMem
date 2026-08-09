@@ -129,6 +129,30 @@ def scan_information_units(turns: Sequence[Any]) -> tuple[InformationUnit, ...]:
         for kind, pattern in patterns:
             for match in pattern.finditer(text):
                 value = " ".join(match.group(0).split())
+                if kind == "number_unit":
+                    # Numbered assistant lists ("1. ...", "2) ...") made up a
+                    # large fraction of failed atomic obligations.  They encode
+                    # document layout, not a durable quantity.
+                    line_start = text.rfind("\n", 0, match.start()) + 1
+                    prefix = text[line_start:match.start()]
+                    suffix = text[match.end():]
+                    if (not prefix.strip()
+                            and re.match(r"^[.)\-:]\s+", suffix)
+                            and not re.search(r"[$£€¥%]", value)):
+                        continue
+                if kind == "date" and value.casefold() == "may":
+                    # The case-insensitive month regex also matched the modal
+                    # verb in "may want".  Keep unambiguous month contexts.
+                    before = text[max(0, match.start() - 20):match.start()]
+                    after = text[match.end():match.end() + 12]
+                    month_context = (
+                        re.search(r"\b(?:in|during|since|until|by|from|through)\s*$",
+                                  before, re.I)
+                        or re.match(r"\s+(?:\d{1,2}(?:st|nd|rd|th)?|\d{4})\b",
+                                    after, re.I)
+                    )
+                    if not month_context:
+                        continue
                 candidates.append((turn_position, kind, turn_id, match.start(), match.end(), value))
         for match in _ENTITY.finditer(text):
             value = " ".join(match.group(0).split()).strip(".,!?;:'")
@@ -148,9 +172,17 @@ def scan_information_units(turns: Sequence[Any]) -> tuple[InformationUnit, ...]:
                 continue
             # A capitalised sentence opener is weak evidence unless it contains
             # another capitalised token or recognizable entity punctuation.
-            if (match.start() == 0 and " " not in value
-                    and not re.search(r"[.&'-]", value)):
-                continue
+            prefix = text[:entity_start]
+            sentence_opener = (
+                not prefix.strip()
+                or bool(re.search(
+                    r"(?:^|[.!?。！？]\s+|\n)\s*(?:\d+[.)\-:]\s+)?$", prefix))
+            )
+            if sentence_opener:
+                first_token = value.casefold().split()[0]
+                if ((" " not in value and not re.search(r"[.&'-]", value))
+                        or first_token in _ENTITY_STOP):
+                    continue
             candidates.append((turn_position, "entity", turn_id,
                                entity_start, entity_start + len(value), value))
         for match in _QUOTED_ITEM.finditer(text):

@@ -8,7 +8,7 @@ from graphmem.build.atomic_extractor import (
     scan_information_units,
     sentence_chunks,
 )
-from graphmem.build.semantic import QwenSemanticDistiller, strict_scene_schema
+from graphmem.build.semantic import QwenSemanticDistiller, ScenePacket, strict_scene_schema
 from graphmem.config import GraphMemV5Config
 
 
@@ -51,6 +51,23 @@ def test_information_unit_scan_preserves_fragile_semantics() -> None:
     ).raw_text[unit.start:unit.end] for unit in units)
 
 
+def test_information_unit_scan_ignores_layout_and_ambiguous_openers() -> None:
+    units = scan_information_units([_turn(
+        "1. Remember the source.\n2) Consider alternatives. May I add one? "
+        "We met in May and again May 2025. Later we left. I met Alice there.")])
+    surfaces = [(unit.kind, unit.text) for unit in units]
+
+    assert ("number_unit", "1") not in surfaces
+    assert ("number_unit", "2") not in surfaces
+    assert ("date", "May") in surfaces
+    assert ("date", "May 2025") in surfaces
+    assert sum(kind == "date" and text == "May" for kind, text in surfaces) == 1
+    assert ("entity", "Remember") not in surfaces
+    assert ("entity", "Consider") not in surfaces
+    assert ("entity", "Later") not in surfaces
+    assert ("entity", "Alice") in surfaces
+
+
 def test_sentence_chunking_is_lossless_and_keeps_middle_content() -> None:
     text = "First fact. " + "middle evidence " * 12 + "Final fact."
     chunks = sentence_chunks("turn:1", text, 40)
@@ -87,6 +104,16 @@ def test_atomic_schema_requires_confidence_unit_links_and_rejections() -> None:
     assert fact["properties"]["r"]["items"]["maximum"] == 4
     assert "u" in scene["required"]
     assert scene["properties"]["u"]["maxItems"] == 7
+
+
+def test_atomic_schema_can_emit_compact_unresolved_ids() -> None:
+    schema = strict_scene_schema(
+        1, 4, atomic_coverage=True, compact_unresolved_units=True,
+        max_information_units=5, max_turn_index=2)
+    unresolved = schema["properties"]["s"]["items"]["properties"]["u"]
+
+    assert unresolved["items"] == {
+        "type": "integer", "minimum": 0, "maximum": 4}
 
 
 def test_atomic_payload_chunks_without_dropping_units() -> None:
@@ -153,3 +180,38 @@ def test_atomic_validation_accepts_only_grounded_unit_links() -> None:
     assert set(packet.covered_unit_ids) == set(grounded_ids)
     assert set(packet.unresolved_unit_ids) == set(unresolved_ids)
     assert packet.missing_unit_ids == () and packet.unit_coverage == 1.0
+
+
+def test_atomic_validation_accepts_compact_unresolved_ids() -> None:
+    scene = _scene("Alice may buy 3 books in Paris next year.")
+    units = scan_information_units(scene.turns)
+    distiller = _atomic_distiller()
+    row = {"i": scene.scene_id, "f": [],
+           "u": [unit.unit_id for unit in units]}
+
+    packet = distiller._validate_scene(scene, row, units=units, fact_cap=4)
+
+    assert set(packet.unresolved_unit_ids) == {unit.unit_id for unit in units}
+    assert packet.missing_unit_ids == ()
+    assert packet.unit_coverage == 1.0
+
+
+def test_retry_cannot_game_coverage_by_relabelling_missing_as_unresolved() -> None:
+    distiller = _atomic_distiller()
+    distiller.config = replace(
+        distiller.config,
+        models=replace(
+            distiller.config.models,
+            semantic_retry_require_covered_gain=True))
+    previous = ScenePacket(
+        "scene:1", "summary", (), (), information_units=(),
+        covered_unit_ids=(0,), missing_unit_ids=(1, 2))
+    relabelled = ScenePacket(
+        "scene:1", "summary", (), (), information_units=(),
+        covered_unit_ids=(0,), unresolved_unit_ids=(1, 2), missing_unit_ids=())
+    grounded = ScenePacket(
+        "scene:1", "summary", (), (), information_units=(),
+        covered_unit_ids=(0, 1), unresolved_unit_ids=(2,), missing_unit_ids=())
+
+    assert not distiller._prefer_retry(previous, relabelled)
+    assert distiller._prefer_retry(previous, grounded)

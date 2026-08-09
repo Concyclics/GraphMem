@@ -63,6 +63,7 @@ def strict_scene_schema(max_scenes: int, max_facts: int, *,
                         scene_summary_chars: int = 0,
                         scene_entities: bool = False,
                         atomic_coverage: bool = False,
+                        compact_unresolved_units: bool = False,
                         max_information_units: int = 0,
                         max_turn_index: int = 63) -> Mapping[str, Any]:
     """Schema for one strict extraction call.
@@ -130,7 +131,7 @@ def strict_scene_schema(max_scenes: int, max_facts: int, *,
     if atomic_coverage:
         scene_properties["u"] = {
             "type": "array", "maxItems": max(0, max_information_units),
-            "items": {
+            "items": ({
                 "type": "object", "additionalProperties": False,
                 "required": ["i", "r"],
                 "properties": {
@@ -138,7 +139,10 @@ def strict_scene_schema(max_scenes: int, max_facts: int, *,
                           "maximum": max(0, max_information_units - 1)},
                     "r": {"type": "string", "minLength": 1, "maxLength": 80},
                 },
-            },
+            } if not compact_unresolved_units else {
+                "type": "integer", "minimum": 0,
+                "maximum": max(0, max_information_units - 1),
+            }),
         }
         scene_required.append("u")
     scene = {"type": "object", "additionalProperties": False,
@@ -233,11 +237,15 @@ class QwenSemanticDistiller:
                 "Scene and turn labels such as s1 or s1t0 are not entities and must never appear "
                 "in e.")
         if config.models.semantic_atomic_coverage:
+            unresolved_contract = (
+                "or put its integer id in scene-level u"
+                if config.models.semantic_compact_unresolved_units else
+                "or put {i:unit_id,r:short_reason} in scene-level u")
             strict_prompt += (
                 " Each input scene provides k, its fact budget, and compact information-unit entries "
                 "u=[unit_id,type,verbatim_surface] beside the source chunk that contains them. Every "
                 "unit must be accounted for exactly: put its integer id in z on at least one fact "
-                "grounded in that same source turn, or put {i:unit_id,r:short_reason} in scene-level u "
+                f"grounded in that same source turn, {unresolved_contract} "
                 "when the surface cannot support a durable fact. A fact may cover several units. "
                 "c is calibrated confidence in [0,1]: use high confidence only when owner, relation, "
                 "value, polarity and citation are explicit. Never mark a unit covered merely because "
@@ -328,6 +336,30 @@ class QwenSemanticDistiller:
         # overshooting the budget is not.
         return int(estimate * ESTIMATE_SAFETY)
 
+    def _strict_request_estimate(
+        self, system: str, payload: Mapping[str, Any], max_tokens: int,
+    ) -> int:
+        """Conservative reservation for a fully materialised strict request.
+
+        The old estimator saw only raw turn text.  Atomic unit annotations and
+        the longer system contract were therefore invisible, while its
+        900-token expected output was much smaller than observed generations.
+        Under concurrent fan-out all calls could be admitted on those low
+        reservations before any one of them settled.  Hard mode prices the
+        exact serialized input and the complete output allowance up front.
+        """
+        input_chars = len(system) + len(canonical_json(payload))
+        estimate = int(input_chars / CHARS_PER_TOKEN) + 64 + max_tokens
+        return int(estimate * self.config.models.semantic_request_reservation_safety)
+
+    def _strict_estimate(
+        self, batch: Sequence[Any], system: str,
+        payload: Mapping[str, Any], max_tokens: int,
+    ) -> int:
+        if self.config.models.semantic_hard_request_reservation:
+            return self._strict_request_estimate(system, payload, max_tokens)
+        return self._batch_estimate(batch, max_tokens)
+
     def compress_many(self, memory_id: str, level: int,
                       requests: Sequence[tuple[str, Sequence[Mapping[str, Any]], int]]) -> tuple[Mapping[str, Any], ...]:
         workers = min(self.worker_limit, self.config.models.max_concurrency,
@@ -417,9 +449,21 @@ class QwenSemanticDistiller:
         return result
 
     def _extract_strict_batch(self, memory_id: str, batch: Sequence[Any]) -> list[ScenePacket]:
+        allowed_kinds = set(self.config.models.semantic_atomic_unit_kinds)
+
+        def selected_units(scene: Any) -> tuple[InformationUnit, ...]:
+            if not self.config.models.semantic_atomic_coverage:
+                return ()
+            scanned = scan_information_units(scene.turns)
+            if allowed_kinds:
+                scanned = tuple(unit for unit in scanned if unit.kind in allowed_kinds)
+            # The schema uses dense integer IDs bounded by the number of units.
+            # Filtering must therefore renumber rather than leave gaps.
+            return tuple(replace(unit, unit_id=index)
+                         for index, unit in enumerate(scanned))
+
         units_by_scene = {
-            scene.scene_id: (scan_information_units(scene.turns)
-                             if self.config.models.semantic_atomic_coverage else ())
+            scene.scene_id: selected_units(scene)
             for scene in batch
         }
         fact_caps = {scene.scene_id: self._scene_fact_cap(units_by_scene[scene.scene_id])
@@ -427,22 +471,25 @@ class QwenSemanticDistiller:
         payload, scene_aliases, turn_aliases = self._strict_payload(
             batch, units_by_scene, fact_caps)
         output_cap = self.config.models.semantic_batch_output_tokens
-        allowed, degrade = self._ledger().reserve(self._batch_estimate(batch, output_cap))
+        max_facts = max(fact_caps.values(), default=self.config.models.semantic_max_facts_per_scene)
+        strict_base = (self.strict_prompt if self.config.models.semantic_atomic_coverage
+                       else STRICT_PROMPT)
+        strict_prompt = strict_base + (
+            f" This call's schema permits at most {max_facts} facts per scene; obey each scene's k.")
+        estimate = self._strict_estimate(batch, strict_prompt, payload, output_cap)
+        allowed, degrade = self._ledger().reserve(estimate)
         if not allowed:
             # Budget exhausted: keep the scenes in the graph with deterministic
             # summaries rather than dropping the tail of the conversation.
             return [self._fallback(scene, units_by_scene[scene.scene_id],
                                    fact_caps[scene.scene_id]) for scene in batch]
-        max_facts = max(fact_caps.values(), default=self.config.models.semantic_max_facts_per_scene)
         if degrade:
             fact_caps = {key: max(1, value // 2) for key, value in fact_caps.items()}
             max_facts = max(fact_caps.values())
             payload, scene_aliases, turn_aliases = self._strict_payload(
                 batch, units_by_scene, fact_caps)
-        strict_base = (self.strict_prompt if self.config.models.semantic_atomic_coverage
-                       else STRICT_PROMPT)
-        strict_prompt = strict_base + (
-            f" This call's schema permits at most {max_facts} facts per scene; obey each scene's k.")
+            strict_prompt = strict_base + (
+                f" This call's schema permits at most {max_facts} facts per scene; obey each scene's k.")
         response, usage = self._call(
             memory_id, "scene_semantic", strict_prompt, payload, len(batch),
             max_facts=max_facts,
@@ -450,8 +497,7 @@ class QwenSemanticDistiller:
                 (len(value) for value in units_by_scene.values()), default=0),
             max_turn_index=max(
                 (len(value) for value in turn_aliases.values()), default=1) - 1)
-        self._ledger().settle(self._batch_estimate(batch, output_cap),
-                              int(usage.get("total_tokens", 0)))
+        self._ledger().settle(estimate, int(usage.get("total_tokens", 0)))
         rows = self._strict_rows(response, scene_aliases, turn_aliases)
         by_scene = {str(row.get("i")): row for row in rows}
         packets = {
@@ -465,22 +511,29 @@ class QwenSemanticDistiller:
                                fact_caps[scene.scene_id]))
             for scene in batch
         }
-        retry_scenes = [
-            scene for scene in batch
-            if (scene.scene_id not in by_scene
-                or (self.config.models.semantic_atomic_coverage
-                    and packets[scene.scene_id].unit_coverage
-                    < self.config.models.semantic_min_unit_coverage))
-        ]
+        retry_kinds = set(self.config.models.semantic_retry_unit_kinds)
+
+        def needs_retry(scene: Any) -> bool:
+            if scene.scene_id not in by_scene:
+                return True
+            packet = packets[scene.scene_id]
+            if (not self.config.models.semantic_atomic_coverage
+                    or packet.unit_coverage
+                    >= self.config.models.semantic_min_unit_coverage):
+                return False
+            if not retry_kinds:
+                return True
+            units = {unit.unit_id: unit for unit in units_by_scene[scene.scene_id]}
+            return any(units[unit_id].kind in retry_kinds
+                       for unit_id in packet.missing_unit_ids if unit_id in units)
+
+        retry_scenes = [scene for scene in batch if needs_retry(scene)]
         if retry_scenes and self.config.models.semantic_max_retries:
             retry_cap = self.config.models.semantic_retry_output_tokens
             for scene in retry_scenes:
                 # Retries must be ledgered too.  Leaving them out let a memory
                 # finish at 221,305 tokens against a 220,000 ceiling: ~11 retry
                 # calls per memory were spending outside the budget entirely.
-                retry_estimate = self._batch_estimate((scene,), retry_cap)
-                if not self._ledger().reserve(retry_estimate)[0]:
-                    continue
                 retry_payload, retry_aliases, retry_turns = self._strict_payload(
                     (scene,), units_by_scene,
                     {scene.scene_id: fact_caps[scene.scene_id]})
@@ -491,6 +544,10 @@ class QwenSemanticDistiller:
                         "instruction": "Return one complete replacement scene; cover or reject every unit.",
                         "missing_unit_ids": list(current.missing_unit_ids),
                     }
+                retry_estimate = self._strict_estimate(
+                    (scene,), strict_prompt, retry_payload, retry_cap)
+                if not self._ledger().reserve(retry_estimate)[0]:
+                    continue
                 repaired, retry_usage = self._call(
                     memory_id, "scene_semantic_retry", strict_prompt, retry_payload, 1,
                     max_tokens=retry_cap, retry_count=1,
@@ -503,15 +560,30 @@ class QwenSemanticDistiller:
                         scene, row, units=units_by_scene[scene.scene_id],
                         fact_cap=fact_caps[scene.scene_id])
                     previous = packets[scene.scene_id]
-                    candidate_score = (
-                        -len(candidate.missing_unit_ids), len(candidate.covered_unit_ids),
-                        len(candidate.facts))
-                    previous_score = (
-                        -len(previous.missing_unit_ids), len(previous.covered_unit_ids),
-                        len(previous.facts))
-                    if candidate_score >= previous_score:
+                    if self._prefer_retry(previous, candidate):
                         packets[scene.scene_id] = candidate
         return [packets[scene.scene_id] for scene in batch]
+
+    def _prefer_retry(self, previous: ScenePacket, candidate: ScenePacket) -> bool:
+        """Accept a repair only when it adds useful grounded information.
+
+        Missing-first scoring rewarded a model for relabelling missing units as
+        unresolved.  That improved the contract metric without creating any
+        fact the graph could navigate.  Grounded coverage is therefore the
+        leading term, and hard-budget profiles can require a strict gain.
+        """
+        grounded_gain = len(
+            set(candidate.covered_unit_ids) - set(previous.covered_unit_ids))
+        if (self.config.models.semantic_retry_require_covered_gain
+                and grounded_gain <= 0):
+            return False
+        candidate_score = (
+            len(candidate.covered_unit_ids), len(candidate.facts),
+            -len(candidate.missing_unit_ids), -len(candidate.unresolved_unit_ids))
+        previous_score = (
+            len(previous.covered_unit_ids), len(previous.facts),
+            -len(previous.missing_unit_ids), -len(previous.unresolved_unit_ids))
+        return candidate_score > previous_score
 
     def _scene_fact_cap(self, units: Sequence[InformationUnit]) -> int:
         base = self.config.models.semantic_max_facts_per_scene
@@ -806,6 +878,9 @@ class QwenSemanticDistiller:
                         unresolved.append(f"{unit_id}:{reason}")
                 elif str(item).strip():
                     unresolved.append(str(item).strip())
+                    if isinstance(item, int) and item in valid_unit_ids:
+                        if item not in unresolved_ids:
+                            unresolved_ids.append(item)
 
         units_by_id = {unit.unit_id: unit for unit in units}
         covered: list[int] = []
@@ -983,6 +1058,16 @@ class QwenSemanticDistiller:
                 ),
                 "min_unit_coverage": self.config.models.semantic_min_unit_coverage,
                 "sentence_chunking": self.config.models.semantic_sentence_chunking,
+                "atomic_unit_kinds": self.config.models.semantic_atomic_unit_kinds,
+                "retry_unit_kinds": self.config.models.semantic_retry_unit_kinds,
+                "retry_require_covered_gain": (
+                    self.config.models.semantic_retry_require_covered_gain),
+                "compact_unresolved_units": (
+                    self.config.models.semantic_compact_unresolved_units),
+                "hard_request_reservation": (
+                    self.config.models.semantic_hard_request_reservation),
+                "request_reservation_safety": (
+                    self.config.models.semantic_request_reservation_safety),
                 "max_information_units": max_information_units,
                 "max_turn_index": max_turn_index,
             })
@@ -1027,6 +1112,8 @@ class QwenSemanticDistiller:
                     scene_summary_chars=self.config.models.semantic_scene_summary_chars,
                     scene_entities=self.config.models.semantic_scene_entities,
                     atomic_coverage=self.config.models.semantic_atomic_coverage,
+                    compact_unresolved_units=(
+                        self.config.models.semantic_compact_unresolved_units),
                     max_information_units=max_information_units,
                     max_turn_index=(max(0, self.config.scenes.max_turns - 1)
                                     if max_turn_index is None else max(0, max_turn_index)))}}

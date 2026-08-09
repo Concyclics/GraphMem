@@ -112,6 +112,28 @@ class ModelConfig:
     # as a raw-source fallback rather than silently certified as complete.
     semantic_min_unit_coverage: float = 0.95
     semantic_raw_fallback_on_low_coverage: bool = True
+    # Empty preserves the original contract over every scanner kind.  A
+    # non-empty allow-list keeps the atomic verifier focused on fragile values
+    # instead of paying prompt/output tokens for broad capitalised-word hits.
+    semantic_atomic_unit_kinds: tuple[str, ...] = ()
+    # Empty retries any missing unit, matching V5.10.  Otherwise a low-coverage
+    # scene is retried only when at least one missing unit has a listed kind.
+    semantic_retry_unit_kinds: tuple[str, ...] = ()
+    # A retry may account for a missing unit by merely moving it to unresolved.
+    # Require a new source-grounded unit link before accepting the replacement.
+    semantic_retry_require_covered_gain: bool = False
+    # Emit unresolved unit IDs directly instead of repeating a free-text reason
+    # for each one.  The ID is sufficient for coverage certification and raw
+    # source fallback retains the evidence turn.
+    semantic_compact_unresolved_units: bool = False
+    # Reserve the complete serialized request and maximum output allowance
+    # before dispatch.  This is the strict hard-budget mode for concurrent
+    # builds; it is opt-in so frozen profiles keep their historical scheduling.
+    semantic_hard_request_reservation: bool = False
+    # Safety multiplier for the complete-request estimate.  Hard reservation
+    # already uses the maximum generation allowance, so calibrated profiles can
+    # use a smaller margin than the historical raw-text/expected-output path.
+    semantic_request_reservation_safety: float = 1.10
     # Losslessly split overlong turns into sentence-aligned source spans.  This
     # uses ``semantic_turn_input_chars`` as the chunk size; no middle text is
     # replaced by a truncation marker.
@@ -491,8 +513,18 @@ class GraphMemV5Config:
             raise ValueError("semantic fact-cap coefficients cannot be negative")
         if not 0.0 <= self.models.semantic_min_unit_coverage <= 1.0:
             raise ValueError("semantic_min_unit_coverage must be in [0, 1]")
+        atomic_kinds = {
+            "date", "duration", "number_unit", "negation", "modality",
+            "state_change", "entity", "item",
+        }
+        if not set(self.models.semantic_atomic_unit_kinds) <= atomic_kinds:
+            raise ValueError("semantic_atomic_unit_kinds contains an unknown kind")
+        if not set(self.models.semantic_retry_unit_kinds) <= atomic_kinds:
+            raise ValueError("semantic_retry_unit_kinds contains an unknown kind")
         if not 0.0 < self.models.semantic_budget_degrade_at <= 1.0:
             raise ValueError("semantic_budget_degrade_at must be in (0, 1]")
+        if not 1.0 <= self.models.semantic_request_reservation_safety <= 2.0:
+            raise ValueError("semantic_request_reservation_safety must be in [1, 2]")
         if not 0.0 <= self.edges.predicate_embedding_threshold <= 1.0:
             raise ValueError("predicate embedding threshold must be in [0, 1]")
         if not 0 <= self.edges.low_threshold < self.edges.high_threshold <= 1:
