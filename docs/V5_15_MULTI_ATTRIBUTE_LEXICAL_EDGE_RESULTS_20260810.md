@@ -121,6 +121,10 @@ Fact。下一步应先实现：
    `anchor region -> lexical bridge -> matching child -> source turn`；
 4. 以 `new packed gold / added edge` 和 precision 为 gate，再比较 K=3/5、quota=4/6。
 
+关系 hop 与层级深度的解耦、逐层 rerank 下探及新一轮 200 题结果已经在
+`V5_16_LAYERED_TOP_DOWN_RETRIEVAL_20260810.md` 中完成。该结果确认下探机制已能使用
+lexical edge，但也进一步定位到 shared anchor 缺失仍是主要瓶颈。
+
 ## 6. 实物
 
 - 图：`../artifacts/report/v5_15/relation_mask_lexical_dev200/report_graph.sqlite`

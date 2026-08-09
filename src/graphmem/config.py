@@ -273,6 +273,7 @@ class RetrievalRuntimeConfig:
     hierarchical_routing: bool = True
     hierarchy_root_beam: int = 2
     hierarchy_child_beam: int = 4
+    hierarchy_descent_beam: int = 1
     hierarchy_operator_aware: bool = True
     obligation_aware_packing: bool = True
     precision_aware_packing: bool = False
@@ -304,6 +305,7 @@ class RetrievalRuntimeConfig:
             "expansion_beam": self.expansion_beam,
             "hierarchy_root_beam": self.hierarchy_root_beam,
             "hierarchy_child_beam": self.hierarchy_child_beam,
+            "hierarchy_descent_beam": self.hierarchy_descent_beam,
             "read_pool_size": self.read_pool_size,
             "snapshot_cache_bytes": self.snapshot_cache_bytes,
             "snapshot_cache_memories": self.snapshot_cache_memories,
@@ -338,6 +340,7 @@ class RetrievalRuntimeConfig:
             "hierarchical_routing": self.hierarchical_routing,
             "hierarchy_root_beam": self.hierarchy_root_beam,
             "hierarchy_child_beam": self.hierarchy_child_beam,
+            "hierarchy_descent_beam": self.hierarchy_descent_beam,
             "hierarchy_operator_aware": self.hierarchy_operator_aware,
             "obligation_aware_packing": self.obligation_aware_packing,
             "precision_aware_packing": self.precision_aware_packing,

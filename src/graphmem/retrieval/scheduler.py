@@ -144,20 +144,17 @@ def _coarse_signal_bonus(ir: QueryIR, source: str) -> float:
     return score
 
 
-def _relation_mask_signals(source: str) -> frozenset[str]:
-    prefix = "relation_mask:"
-    return (frozenset(source[len(prefix):].split(","))
-            if source.startswith(prefix) else frozenset())
-
-
 def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *,
             structured: bool,
             preferred_relations=None, fallback_relations=None,
             expansion_beam: int = 0,
+            hierarchy_descent_beam: int = 1,
             obligation_aware_relations: bool = False) -> ScheduleResult:
     """Deterministic obligation-first traversal; provenance is hydrated later.
 
-    ``expansion_beam`` keeps only the best N neighbours of each expanded node.
+    ``expansion_beam`` keeps the best N relation neighbours.  The independent
+    ``hierarchy_descent_beam`` retains structural children at every level of a
+    relation-induced top-down corridor.
     0 restores the unpruned behaviour, where every neighbour of every visited
     node was queued and the only limit was ``queue[:max_frontier]`` -- a global
     truncation of the *oldest* entries, which does not bound how much a single
@@ -170,17 +167,24 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
             "node_cap_reached": len(seed_ids) > budget.traversal_nodes, "edge_cap_reached": False,
             "hop_cap_reached": False, "frontier_truncated": False,
         }, {node_id: 0 for node_id in seed_ids[:budget.traversal_nodes]})
+    if hierarchy_descent_beam < 1:
+        raise ValueError("hierarchy_descent_beam must be positive")
     preferred = tuple(preferred_relations) if preferred_relations is not None else DEFAULT_PREFERRED
     if obligation_aware_relations:
         preferred = tuple(dict.fromkeys((*_TYPED_RELATIONS, *preferred)))
     fallback = tuple(fallback_relations) if fallback_relations is not None else DEFAULT_FALLBACK
-    queue = [(node_id, 0, False, None) for node_id in seed_ids]
+    # ``relation_hop`` and structural descent are deliberately independent.
+    # max_hops bounds semantic/cross-region reasoning; it must not strand a
+    # selected routing card above Scene/Fact merely because the hierarchy has
+    # more levels.  Every structural edge still consumes node/edge/frontier
+    # budget, and every level is reranked before its child beam is admitted.
+    queue = [(node_id, 0, False, None, False) for node_id in seed_ids]
     query_terms = content_terms(ir.query)
     visited: list[str] = []; seen: set[str] = set(); proof: list[ProofStep] = []; relation_counts: dict[str, int] = {}
     node_hops: dict[str, int] = {}
     fallback_nodes = fallback_edges = 0; frontier_truncated = False; hop_cap = False
     while queue and len(visited) < budget.traversal_nodes and len(proof) < budget.max_visited_edges:
-        node_id, hop, is_fallback, parent = queue.pop(0)
+        node_id, hop, is_fallback, parent, descending = queue.pop(0)
         if node_id in seen: continue
         seen.add(node_id); visited.append(node_id); node_hops[node_id] = hop
         if parent is not None:
@@ -188,28 +192,8 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
                                    parent.edge.dst_id, parent.edge.evidence_group_id,
                                    inverse=parent.inverse))
             relation_counts[str(parent.edge.relation)] = relation_counts.get(str(parent.edge.relation), 0) + 1
-        if hop >= budget.max_hops:
-            hop_cap = hop_cap or bool(view.neighbors(node_id, semantic_only=True)); continue
         allowed = fallback if is_fallback else preferred
-        arrived_signals = (_relation_mask_signals(parent.edge.source)
-                           if parent is not None
-                           and parent.edge.relation == RelationType.COARSE_RELATED
-                           else frozenset())
-        typed_region_arrival = bool(arrived_signals & {
-            "shared_entity", "state_compatible", "temporal_near",
-            "collection_related", "lexical_rare",
-        })
-        if typed_region_arrival:
-            # A typed coarse edge locates a related region; its value is lost if
-            # the next beam keeps following region edges and never hydrates the
-            # region's evidence.  Admit structural descent in the normal beam
-            # for this one expansion only.  Fact destinations then win via the
-            # existing fact bonus, while pure scene-similar edges retain the old
-            # conservative fallback behaviour.
-            allowed = tuple(dict.fromkeys((
-                *allowed, RelationType.SCENE_CONTAINS,
-                RelationType.REFINES_TO)))
-        def destination_priority(row):
+        def destination_priority(row, *, structural: bool = False):
             node = view.nodes.get(row.next_node_id)
             if not node:
                 return (0.0, row.edge.edge_id)
@@ -230,31 +214,84 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
                 ir, row.edge.relation, inverse=row.inverse)
                               if obligation_aware_relations else 0.0)
             signal_bonus = _coarse_signal_bonus(ir, row.edge.source)
+            posting_bonus = 0.0
+            if structural:
+                parent_node = view.nodes.get(node_id)
+                postings = ((parent_node.attributes.get("child_postings", {})
+                             if parent_node is not None else {}) or {})
+                if isinstance(postings, dict):
+                    posting_bonus = 2.0 * sum(
+                        row.next_node_id in tuple(postings.get(term, ()))
+                        for term in query_terms)
             return (collection_bonus + lexical + fact_bonus + relation_bonus
-                    + signal_bonus,
+                    + signal_bonus + posting_bonus,
                     row.edge.edge_id)
 
-        # Score each neighbour once; the previous key lambda called
-        # destination_priority twice per comparison.
-        scored = [(destination_priority(row), row) for row in
-                  view.neighbors(node_id, allowed, semantic_only=True)]
-        ordered = sorted(scored, key=lambda item: (-item[0][0], item[0][1]))
-        # Prune per expansion, before anything is queued: a node that scores
-        # below its siblings is not going to be rescued by the frontier cap,
-        # which drops the oldest entries rather than the weakest ones.
-        admitted = 0
-        for _, row in ordered:
-            if row.next_node_id in seen: continue
-            fallback_edge = row.edge.relation == RelationType.SCENE_CONTAINS
-            if fallback_edge and (fallback_nodes >= 16 or fallback_edges >= 32): continue
-            if expansion_beam and admitted >= expansion_beam: break
-            queue.append((row.next_node_id, hop + 1, fallback_edge, row))
-            admitted += 1
-            if fallback_edge: fallback_edges += 1
+        structural_relations = (
+            RelationType.REFINES_TO, RelationType.SCENE_CONTAINS)
+        arrived_by_relation = bool(
+            parent is not None
+            and parent.edge.relation not in structural_relations)
+        # Initial roots have already been routed top-down by ``route_hierarchy``
+        # during seed fusion.  Re-descending every RoutingCard seed duplicates
+        # that work and crowds relation arrivals out of the global node budget.
+        # Start a fresh structural corridor only after a semantic/cross-region
+        # edge lands in a new region; once started, carry it to a terminal.
+        descending = bool(descending or arrived_by_relation)
+        # One best child per level guarantees a leaf path while keeping enough
+        # global budget for the independent relation beam.  Wider structural
+        # beams are a separate accuracy/cost knob, not coupled to relation beam.
+        structural_queue = []
+        structural_rows = (view.neighbors(
+            node_id, structural_relations, include_inverse=False,
+            semantic_only=True) if descending else ())
+        if structural_rows:
+            structural_scored = sorted(
+                ((destination_priority(row, structural=True), row)
+                 for row in structural_rows),
+                key=lambda item: (-item[0][0], item[0][1]))
+            for _priority, row in structural_scored:
+                if row.next_node_id in seen:
+                    continue
+                if len(structural_queue) >= hierarchy_descent_beam:
+                    break
+                structural_queue.append((
+                    row.next_node_id, hop, False, row, True))
+
+        # Same-level/content relations receive their own beam instead of
+        # competing with descent.  A top-down branch is inserted at the front,
+        # so one bounded path reaches a leaf before unrelated frontier work can
+        # consume the global node budget.
+        relation_allowed = tuple(
+            relation for relation in allowed
+            if relation not in structural_relations)
+        relation_queue = []
+        if hop < budget.max_hops:
+            scored = [(destination_priority(row), row) for row in
+                      view.neighbors(
+                          node_id, relation_allowed, semantic_only=True)]
+            ordered = sorted(
+                scored, key=lambda item: (-item[0][0], item[0][1]))
+            for _priority, row in ordered:
+                if row.next_node_id in seen:
+                    continue
+                if expansion_beam and len(relation_queue) >= expansion_beam:
+                    break
+                relation_queue.append((
+                    row.next_node_id, hop + 1, False, row, False))
+        else:
+            hop_cap = hop_cap or bool(view.neighbors(
+                node_id, relation_allowed, semantic_only=True))
+        if structural_queue:
+            queue[0:0] = structural_queue
+        queue.extend(relation_queue)
         if not queue and hop < budget.max_hops:
             for row in view.neighbors(node_id, fallback, semantic_only=True):
-                if row.next_node_id not in seen and fallback_nodes < 16:
-                    queue.append((row.next_node_id, hop + 1, True, row)); fallback_nodes += 1
+                if (row.next_node_id not in seen and fallback_nodes < 16
+                        and fallback_edges < 32):
+                    queue.append((
+                        row.next_node_id, hop + 1, True, row, False))
+                    fallback_nodes += 1; fallback_edges += 1
         if len(queue) > budget.max_frontier:
             queue = queue[:budget.max_frontier]; frontier_truncated = True
     return ScheduleResult(tuple(visited), tuple(proof), relation_counts, {

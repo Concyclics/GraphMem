@@ -149,6 +149,107 @@ def test_rare_lexical_bridge_is_conditioned_on_multifact_plan_and_descends() -> 
     assert result.proof[0].edge_id == "e-rare"
 
 
+def test_layered_search_reranks_each_level_and_reaches_leaf_at_hop_cap() -> None:
+    nodes = (
+        GraphNode("seed", "m", NodeType.SCENE, 0, "query anchor", "g:0"),
+        GraphNode(
+            "route", "m", NodeType.ROUTING_CARD, 2, "candidate region", "g:1",
+            attributes={"child_postings": {"sapphire": ("card-good",)}}),
+        GraphNode(
+            "card-good", "m", NodeType.ROUTING_CARD, 1, "selected session", "g:1",
+            attributes={"child_postings": {"sapphire": ("scene-good",)}}),
+        GraphNode("card-bad", "m", NodeType.ROUTING_CARD, 1,
+                  "unrelated session", "g:2"),
+        GraphNode("scene-good", "m", NodeType.SCENE, 0,
+                  "selected scene", "g:1"),
+        GraphNode("scene-bad", "m", NodeType.SCENE, 0,
+                  "unrelated scene", "g:2"),
+        _node("fact-good", "sapphire project reached the final stage"),
+        _node("fact-bad", "ordinary unrelated detail"),
+    )
+    edges = (
+        GraphEdge("e-cross", "m", "seed", RelationType.COARSE_RELATED,
+                  "route", "g:0", False, 0.9,
+                  "relation_mask:lexical_rare"),
+        GraphEdge("e-card-good", "m", "route", RelationType.REFINES_TO,
+                  "card-good", "g:1", True, 1.0, "structural"),
+        GraphEdge("e-card-bad", "m", "route", RelationType.REFINES_TO,
+                  "card-bad", "g:2", True, 1.0, "structural"),
+        GraphEdge("e-scene-good", "m", "card-good", RelationType.REFINES_TO,
+                  "scene-good", "g:1", True, 1.0, "structural"),
+        GraphEdge("e-scene-bad", "m", "card-bad", RelationType.REFINES_TO,
+                  "scene-bad", "g:2", True, 1.0, "structural"),
+        GraphEdge("e-fact-good", "m", "scene-good", RelationType.SCENE_CONTAINS,
+                  "fact-good", "g:1", True, 1.0, "structural"),
+        GraphEdge("e-fact-bad", "m", "scene-bad", RelationType.SCENE_CONTAINS,
+                  "fact-bad", "g:2", True, 1.0, "structural"),
+    )
+    view = GraphReadView(nodes, edges)
+    ir = QueryIR(
+        "What happened to the sapphire project?", QueryOperator.LOOKUP,
+        (OperandSpec("o1"),), (ProofObligation("need-value", "o1", "value"),))
+    budget = QueryBudget(
+        max_hops=1, max_visited_nodes=5, max_visited_edges=4,
+        max_frontier=4, max_seed_nodes=1)
+
+    result = execute(
+        view, ir, ("seed",), budget, structured=True, expansion_beam=1,
+        preferred_relations=(RelationType.COARSE_RELATED,
+                             RelationType.REFINES_TO))
+
+    assert result.visited_node_ids == (
+        "seed", "route", "card-good", "scene-good", "fact-good")
+    assert result.node_hops["route"] == 1
+    assert result.node_hops["fact-good"] == 1
+    assert "card-bad" not in result.visited_node_ids
+
+
+def test_layered_search_separates_relation_hops_from_structural_depth() -> None:
+    nodes = (
+        GraphNode("seed", "m", NodeType.SCENE, 0, "anchor", "g:0"),
+        GraphNode("route-a", "m", NodeType.ROUTING_CARD, 2,
+                  "first related region", "g:1"),
+        GraphNode("card-a", "m", NodeType.ROUTING_CARD, 1,
+                  "first session", "g:1"),
+        GraphNode("route-b", "m", NodeType.ROUTING_CARD, 1,
+                  "second related region", "g:2"),
+        GraphNode("scene-b", "m", NodeType.SCENE, 0,
+                  "target scene", "g:2"),
+        _node("fact-b", "the target evidence"),
+    )
+    edges = (
+        GraphEdge("e-rel-1", "m", "seed", RelationType.COARSE_RELATED,
+                  "route-a", "g:0", False, 0.9,
+                  "relation_mask:shared_entity"),
+        GraphEdge("e-down-a", "m", "route-a", RelationType.REFINES_TO,
+                  "card-a", "g:1", True, 1.0, "structural"),
+        GraphEdge("e-rel-2", "m", "card-a", RelationType.COARSE_RELATED,
+                  "route-b", "g:1", False, 0.9,
+                  "relation_mask:temporal_near"),
+        GraphEdge("e-down-b", "m", "route-b", RelationType.REFINES_TO,
+                  "scene-b", "g:2", True, 1.0, "structural"),
+        GraphEdge("e-fact-b", "m", "scene-b", RelationType.SCENE_CONTAINS,
+                  "fact-b", "g:2", True, 1.0, "structural"),
+    )
+    budget = QueryBudget(
+        max_hops=2, max_visited_nodes=6, max_visited_edges=5,
+        max_frontier=4, max_seed_nodes=1)
+
+    result = execute(
+        GraphReadView(nodes, edges),
+        QueryIR("target evidence", QueryOperator.LOOKUP, (OperandSpec("o1"),),
+                (ProofObligation("need-value", "o1", "value"),)),
+        ("seed",), budget, structured=True, expansion_beam=1,
+        preferred_relations=(RelationType.COARSE_RELATED,))
+
+    assert result.visited_node_ids == (
+        "seed", "route-a", "card-a", "route-b", "scene-b", "fact-b")
+    assert result.node_hops["route-a"] == 1
+    assert result.node_hops["card-a"] == 1
+    assert result.node_hops["route-b"] == 2
+    assert result.node_hops["fact-b"] == 2
+
+
 def test_typed_executor_requires_post_pack_proof_and_reports_units() -> None:
     algebra = AlgebraResult(
         QueryOperator.DATE_DIFFERENCE, (), ("b1", "b2"),

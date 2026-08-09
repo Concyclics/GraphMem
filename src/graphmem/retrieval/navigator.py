@@ -208,6 +208,10 @@ class GraphNavigator:
         hierarchical_routing: bool = True,
         hierarchy_root_beam: int = 2,
         hierarchy_child_beam: int = 4,
+        #: Structural fanout at each level after a relation lands in a new
+        #: region.  It is intentionally independent of ``expansion_beam``:
+        #: relation hops and hierarchy depth are separate search dimensions.
+        hierarchy_descent_beam: int = 1,
         hierarchy_operator_aware: bool = True,
         read_pool_size: int = 4,
         snapshot_cache_bytes: int = 512 * 1024 * 1024,
@@ -257,6 +261,7 @@ class GraphNavigator:
         self.hierarchical_routing = hierarchical_routing
         self.hierarchy_root_beam = max(1, hierarchy_root_beam)
         self.hierarchy_child_beam = max(1, hierarchy_child_beam)
+        self.hierarchy_descent_beam = max(1, hierarchy_descent_beam)
         self.hierarchy_operator_aware = hierarchy_operator_aware
         self.h10_owner_rescue = h10_owner_rescue
         self.h10_traversal = h10_traversal
@@ -851,6 +856,8 @@ class GraphNavigator:
                                           preferred_relations=self.preferred_relations,
                                           fallback_relations=self.fallback_relations,
                                           expansion_beam=self.expansion_beam,
+                                          hierarchy_descent_beam=(
+                                              self.hierarchy_descent_beam),
                                           obligation_aware_relations=(
                                               self.obligation_aware_relations),
                                           structured=profile in {HarnessProfile.H4_SCHEDULER,

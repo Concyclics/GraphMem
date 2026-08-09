@@ -37,6 +37,7 @@ def test_runtime_profiles_load_and_translate_to_online_options(name: str) -> Non
     assert navigator["harness_profile"] == "h11"
     assert navigator["obligation_aware_packing"] is True
     assert navigator["native_seed_fusion"] is True
+    assert navigator["hierarchy_descent_beam"] == 1
     assert navigator["compiled_cache_admission"] is True
     assert pool["workers"] == config.serving.workers
     assert pool["affinity_replicas"] == config.serving.affinity_replicas
