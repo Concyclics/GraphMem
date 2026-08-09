@@ -168,6 +168,102 @@ def save_figure(fig, base: Path, *, fixed_canvas: bool = False) -> None:
                     facecolor="white")
 
 
+def place_concurrency_labels(fig, axis, points: list[dict[str, Any]]) -> None:
+    """Greedily place concurrency labels without covering peers or markers."""
+    from matplotlib import patheffects
+    from matplotlib.font_manager import FontProperties
+    from matplotlib.transforms import Bbox
+
+    renderer = fig.canvas.get_renderer()
+    font = FontProperties(size=7.4)
+    pixels_per_point = fig.dpi / 72.0
+    axis_box = axis.get_window_extent(renderer)
+    axis_box = Bbox.from_extents(
+        axis_box.x0 + 2, axis_box.y0 + 2,
+        axis_box.x1 - 2, axis_box.y1 - 2,
+    )
+    display_points = [axis.transData.transform((row["x"], row["y"]))
+                      for row in points]
+    marker_boxes = [Bbox.from_extents(x - 5, y - 5, x + 5, y + 5)
+                    for x, y in display_points]
+    densities = []
+    for index, (x, y) in enumerate(display_points):
+        density = sum(
+            int(other != index and abs(x - ox) < 48 and abs(y - oy) < 24)
+            for other, (ox, oy) in enumerate(display_points)
+        )
+        densities.append(density)
+    order = sorted(range(len(points)),
+                   key=lambda index: (-densities[index],
+                                      -points[index]["y"],
+                                      points[index]["x"]))
+    placed: list[Bbox] = []
+    fallback_offsets = [
+        (0, 9), (0, -9), (8, 7), (-8, 7), (8, -7), (-8, -7),
+        (12, 0), (-12, 0), (0, 15), (0, -15),
+        (14, 9), (-14, 9), (14, -9), (-14, -9),
+        (19, 0), (-19, 0), (0, 21), (0, -21),
+    ]
+
+    for index in order:
+        point = points[index]
+        px, py = display_points[index]
+        width, height, _ = renderer.get_text_width_height_descent(
+            point["label"], font, ismath=False)
+        candidates = [point["preferred"], *fallback_offsets]
+        # Preserve candidate order while dropping duplicates.
+        candidates = list(dict.fromkeys(candidates))
+        selected = candidates[0]
+        selected_alignment = ("center", "center")
+        selected_box = None
+        for dx, dy in candidates:
+            ha = "left" if dx > 1 else "right" if dx < -1 else "center"
+            va = "bottom" if dy > 1 else "top" if dy < -1 else "center"
+            anchor_x = px + dx * pixels_per_point
+            anchor_y = py + dy * pixels_per_point
+            x0 = (anchor_x if ha == "left" else
+                  anchor_x - width if ha == "right" else
+                  anchor_x - width / 2)
+            y0 = (anchor_y if va == "bottom" else
+                  anchor_y - height if va == "top" else
+                  anchor_y - height / 2)
+            candidate_box = Bbox.from_extents(
+                x0 - 2.2, y0 - 2.2,
+                x0 + width + 2.2, y0 + height + 2.2,
+            )
+            if not (axis_box.contains(candidate_box.x0, candidate_box.y0)
+                    and axis_box.contains(candidate_box.x1, candidate_box.y1)):
+                continue
+            if any(candidate_box.overlaps(box) for box in placed):
+                continue
+            if any(candidate_box.overlaps(box) for other, box in enumerate(marker_boxes)
+                   if other != index):
+                continue
+            selected = (dx, dy)
+            selected_alignment = (ha, va)
+            selected_box = candidate_box
+            break
+        if selected_box is None:
+            dx, dy = selected
+            selected_alignment = (
+                "left" if dx > 1 else "right" if dx < -1 else "center",
+                "bottom" if dy > 1 else "top" if dy < -1 else "center",
+            )
+        else:
+            placed.append(selected_box)
+        annotation = axis.annotate(
+            point["label"], (point["x"], point["y"]),
+            xytext=selected, textcoords="offset points",
+            fontsize=7.4, color=point["color"],
+            ha=selected_alignment[0], va=selected_alignment[1],
+            clip_on=True, zorder=5,
+        )
+        annotation.set_path_effects([
+            patheffects.withStroke(linewidth=2.8, foreground="white"),
+            patheffects.Normal(),
+        ])
+
+
 def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
     plt = configure_plotting()
     from matplotlib.lines import Line2D
@@ -178,7 +274,9 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
         ("latency_p99_ms", "(c) p99"),
     )
     fig, axes = plt.subplots(1, 3, figsize=PAPER_FIGSIZE, sharey=True)
+    labels_by_axis: list[list[dict[str, Any]]] = []
     for axis, (metric_key, panel_title) in zip(axes, metrics):
+        point_labels: list[dict[str, Any]] = []
         for system in ("Mem0 OSS", "GraphMem"):
             for workers in (1, 4, 8):
                 group = sorted((row for row in rows
@@ -199,22 +297,16 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
                     zorder=2,
                 )
                 for row in group:
-                    # Keep every requested concurrency label, while nudging the
-                    # two systems and three core counts into distinct lanes.
-                    dx, dy = {
+                    preferred = {
                         "GraphMem": {1: (4, -10), 4: (4, 6), 8: (4, 5)},
                         "Mem0 OSS": {1: (-4, 11), 4: (-4, -12), 8: (-4, 7)},
                     }[system][workers]
-                    ha = "left" if dx > 0 else "right"
-                    if row["clients"] == 256:
-                        dx, ha = -5, "right"
-                    axis.annotate(
-                        str(row["clients"]),
-                        (row[metric_key], row["qps"]),
-                        xytext=(dx, dy), textcoords="offset points",
-                        fontsize=7.4, color=SYSTEM_COLORS[system], ha=ha,
-                        va="center", clip_on=True,
-                    )
+                    point_labels.append({
+                        "x": row[metric_key], "y": row["qps"],
+                        "label": str(row["clients"]),
+                        "color": SYSTEM_COLORS[system],
+                        "preferred": preferred,
+                    })
         axis.set_xscale("log")
         axis.set_yscale("log")
         axis.set_ylim(1.3, 100.0)
@@ -223,15 +315,8 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
         axis.grid(True, which="both", linestyle="--", linewidth=0.65)
         axis.set_title(panel_title, fontweight="bold")
         axis.set_xlabel("端到端延迟（ms，对数轴）")
+        labels_by_axis.append(point_labels)
     axes[0].set_ylabel("吞吐（QPS，对数轴）")
-    axes[0].annotate(
-        "左上更优",
-        xy=(0.055, 0.91), xytext=(0.28, 0.72),
-        xycoords="axes fraction", textcoords="axes fraction",
-        arrowprops={"arrowstyle": "-|>", "color": "#475569",
-                    "linewidth": 1.3},
-        fontsize=8.5, color="#475569", ha="center", va="center",
-    )
     method_handles = [
         Line2D([0], [0], color=SYSTEM_COLORS[system], linewidth=2.6,
                label=system)
@@ -248,13 +333,18 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
                bbox_to_anchor=(0.5, 0.91), frameon=False,
                handlelength=2.4, columnspacing=1.5)
     fig.suptitle(
-        "GraphMem vs. Mem0：吞吐–延迟并发对比",
+        "GraphMem vs. Mem0：吞吐–延迟并发对比（左上更优）",
         y=0.985, fontsize=14, fontweight="bold",
     )
     fig.text(0.995, 0.018, "点旁数字 = 并发用户数", ha="right",
              fontsize=8.5, color="#64748B")
+    fig.text(0.005, 0.018, "完整在线检索路径；不含回答模型生成",
+             ha="left", fontsize=8.5, color="#64748B")
     fig.subplots_adjust(left=0.055, right=0.992, bottom=0.17, top=0.77,
                         wspace=0.19)
+    fig.canvas.draw()
+    for axis, point_labels in zip(axes, labels_by_axis):
+        place_concurrency_labels(fig, axis, point_labels)
     save_figure(fig, base, fixed_canvas=True)
     plt.close(fig)
 
@@ -299,10 +389,24 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
             pair_top = max(graph_bars[index].get_height(),
                            mem0_bars[index].get_height())
             axis.text(
-                x[index], pair_top + ymax * 0.018,
+                x[index], pair_top + ymax * 0.055,
                 f"节省 {ratio:.1f}×",
                 ha="center", va="bottom", fontsize=8.2,
                 color="#334155", fontweight="bold",
+            )
+            axis.text(
+                graph_bars[index].get_x() + graph_bars[index].get_width() / 2,
+                graph_bars[index].get_height() + ymax * 0.010,
+                f"{graph_values[index]:.2f}",
+                ha="center", va="bottom", fontsize=8.0,
+                color="#1E40AF", fontweight="bold",
+            )
+            axis.text(
+                mem0_bars[index].get_x() + mem0_bars[index].get_width() / 2,
+                mem0_bars[index].get_height() + ymax * 0.010,
+                f"{mem0_values[index]:.2f}",
+                ha="center", va="bottom", fontsize=8.0,
+                color="#9A3412", fontweight="bold",
             )
         axis.set_xticks(x, [str(client) for client in clients])
         axis.set_ylim(0, ymax)
@@ -316,6 +420,9 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
                handlelength=2.4, columnspacing=1.8)
     fig.suptitle("GraphMem vs. Mem0：8-core 常驻内存开支",
                  y=0.985, fontsize=14, fontweight="bold")
+    fig.text(0.005, 0.018,
+             "柱内/柱顶数字单位为 GiB；仅统计检索 worker，不含回答模型与外部 Embedding 服务",
+             ha="left", fontsize=8.5, color="#64748B")
     fig.subplots_adjust(left=0.06, right=0.992, bottom=0.17, top=0.77,
                         wspace=0.18)
     save_figure(fig, base, fixed_canvas=True)
