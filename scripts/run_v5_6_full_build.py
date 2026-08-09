@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from graphmem.build import GraphBuildPipeline, QwenSemanticDistiller  # noqa: E402
 from graphmem.build.canonicalize import PredicateCanonicalizer  # noqa: E402
 from graphmem.config import config_hash, load_config  # noqa: E402
+from graphmem.embedding import QwenEmbeddingIndex  # noqa: E402
 from graphmem.eval import load_gold_turns  # noqa: E402
 from graphmem.eval.devset import ingest_questions  # noqa: E402
 from graphmem.eval.fullset import load_full_questions  # noqa: E402
@@ -42,6 +43,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--locomo", type=Path, required=True)
     parser.add_argument("--gold", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--profile", help="override the build profile, e.g. b5")
+    parser.add_argument("--relation-mask-propagation", action="store_true")
+    parser.add_argument("--rare-lexical-relation", action="store_true")
+    parser.add_argument(
+        "--embedding", action="store_true",
+        help="index every source turn with the configured embedding model")
+    parser.add_argument(
+        "--relation-embedding-db", type=Path,
+        help=("separate cache for RoutingCard and atomic-summary vectors; "
+              "keeps online turn search free of graph-node embeddings"))
     parser.add_argument("--memory-workers", type=int, default=16)
     parser.add_argument("--max-concurrency", type=int, default=256)
     parser.add_argument("--max-memories", type=int)
@@ -54,6 +65,17 @@ def main() -> None:
     config = load_config(args.config)
     if args.max_concurrency:
         config = replace(config, models=replace(config.models, max_concurrency=args.max_concurrency))
+    if args.profile:
+        config = replace(config, profile=args.profile)
+    if args.relation_mask_propagation or args.rare_lexical_relation:
+        config = replace(config, edges=replace(
+            config.edges,
+            relation_mask_propagation=(
+                args.relation_mask_propagation
+                or config.edges.relation_mask_propagation),
+            rare_lexical_relation=(
+                args.rare_lexical_relation
+                or config.edges.rare_lexical_relation)))
 
     args.target_db.parent.mkdir(parents=True, exist_ok=True)
     if args.seed_db and not args.target_db.exists():
@@ -62,6 +84,8 @@ def main() -> None:
 
     questions = load_full_questions(args.lme, args.locomo, load_gold_turns(args.gold))
     store = SQLiteGraphStore(args.target_db)
+    relation_store = (SQLiteGraphStore(args.relation_embedding_db)
+                      if args.relation_embedding_db else None)
 
     # Ingest only memories the database does not already hold.  Re-ingesting a
     # present memory rewrites every one of its turns, and each rewrite clears the
@@ -93,9 +117,19 @@ def main() -> None:
 
     def build(memory_id: str) -> dict:
         distiller = QwenSemanticDistiller(store, config, "v5.6-full")
+        if args.embedding:
+            QwenEmbeddingIndex(store, config, batch_size=128).index_memory(
+                memory_id)
+        relation_index = (QwenEmbeddingIndex(
+            relation_store, config, batch_size=128)
+                          if relation_store is not None else None)
         pipeline = GraphBuildPipeline(
             store, dataset_hash="v5.6-full", distiller=distiller,
-            predicate_canonicalizer=PredicateCanonicalizer(store, config))
+            predicate_canonicalizer=PredicateCanonicalizer(store, config),
+            coarsen_vector_provider=(
+                relation_index.embed_graph_nodes if relation_index else None),
+            relation_vector_provider=(
+                relation_index.embed_graph_nodes if relation_index else None))
         tick = time.perf_counter()
         manifest = pipeline.build(memory_id, config)
         usage = dict(manifest.build_token_usage)
@@ -130,6 +164,12 @@ def main() -> None:
             "mean": statistics.mean(tokens), "p50": statistics.median(tokens),
             "p95": tokens[max(0, int(0.95 * len(tokens)) - 1)], "max": max(tokens)},
         "tokens_total": sum(tokens),
+        "embedding": args.embedding,
+        "relation_embedding_db": (
+            str(args.relation_embedding_db)
+            if args.relation_embedding_db else None),
+        "relation_mask_propagation": config.edges.relation_mask_propagation,
+        "rare_lexical_relation": config.edges.rare_lexical_relation,
         "memory_workers": args.memory_workers, "max_concurrency": config.models.max_concurrency,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
@@ -137,6 +177,8 @@ def main() -> None:
                            encoding="utf-8")
     print(json.dumps(report, indent=2)[:2000])
     store.close()
+    if relation_store is not None:
+        relation_store.close()
     if failures:
         raise SystemExit(f"{len(failures)} memories failed; rerun to resume")
 

@@ -9,6 +9,7 @@
     "hierarchy_root_beam": 2,
     "hierarchy_child_beam": 4,
     "hierarchy_descent_beam": 1,
+    "rare_lexical_relations": false,
     "hierarchy_operator_aware": true,
     "obligation_aware_packing": true,
     "span_pack_window": 96,

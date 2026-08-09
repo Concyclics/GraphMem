@@ -39,6 +39,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=ROOT /
                         "configs/v5/v5_10_report.json")
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument(
+        "--all-memories", action="store_true",
+        help="embed every memory in the source graph for the full benchmark")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -53,10 +56,14 @@ def main() -> None:
     source = SQLiteGraphStore(args.source_db, read_only=True)
     target = SQLiteGraphStore(args.output_db)
     index = QwenEmbeddingIndex(target, config, batch_size=args.batch_size)
-    questions = list(load_dev_questions(
-        args.lme, args.locomo, load_gold_turns(args.gold)))
-    memory_ids = tuple(dict.fromkeys(sorted(
-        question.memory_id for question in questions)))
+    if args.all_memories:
+        memory_ids = tuple(str(row["memory_id"]) for row in source._read(
+            "SELECT memory_id FROM conversations ORDER BY memory_id"))
+    else:
+        questions = list(load_dev_questions(
+            args.lme, args.locomo, load_gold_turns(args.gold)))
+        memory_ids = tuple(dict.fromkeys(sorted(
+            question.memory_id for question in questions)))
     started = time.perf_counter()
     rows = []
     for ordinal, memory_id in enumerate(memory_ids, 1):
@@ -83,6 +90,7 @@ def main() -> None:
     manifest = {
         "schema_version": "graphmem-v5.13-atomic-summary-embeddings-v1",
         "source_db": str(args.source_db), "output_db": str(args.output_db),
+        "all_memories": args.all_memories,
         "model": config.models.embedding_model, "batch_size": args.batch_size,
         "memories": len(rows), "facts": sum(row["facts"] for row in rows),
         "vectors": sum(row["vectors"] for row in rows),

@@ -141,12 +141,43 @@ def test_rare_lexical_bridge_is_conditioned_on_multifact_plan_and_descends() -> 
         max_hops=2, max_visited_nodes=3, max_visited_edges=2,
         max_frontier=4, max_seed_nodes=1)
 
+    disabled = execute(
+        view, ir, ("seed",), budget, structured=True, expansion_beam=1,
+        rare_lexical_relations=False,
+        preferred_relations=(RelationType.COARSE_RELATED,))
     result = execute(
         view, ir, ("seed",), budget, structured=True, expansion_beam=1,
+        rare_lexical_relations=True,
         preferred_relations=(RelationType.COARSE_RELATED,))
 
+    assert disabled.visited_node_ids == ("seed", "semantic-region")
     assert result.visited_node_ids == ("seed", "rare-region", "fact")
     assert result.proof[0].edge_id == "e-rare"
+
+
+def test_disabling_rare_lexical_keeps_edges_with_nonlexical_signals() -> None:
+    nodes = (
+        GraphNode("seed", "m", NodeType.SCENE, 0, "anchor", "g:0"),
+        GraphNode("mixed", "m", NodeType.SCENE, 0,
+                  "entity-related region", "g:1"),
+    )
+    edges = (GraphEdge(
+        "e-mixed", "m", "seed", RelationType.COARSE_RELATED,
+        "mixed", "g:0", False, 0.9,
+        "relation_mask:lexical_rare,shared_entity"),)
+    budget = QueryBudget(
+        max_hops=1, max_visited_nodes=2, max_visited_edges=1,
+        max_frontier=2, max_seed_nodes=1)
+
+    result = execute(
+        GraphReadView(nodes, edges),
+        QueryIR("related entity", QueryOperator.LOOKUP, (OperandSpec("o1"),),
+                (ProofObligation("need-value", "o1", "value"),)),
+        ("seed",), budget, structured=True, expansion_beam=1,
+        rare_lexical_relations=False,
+        preferred_relations=(RelationType.COARSE_RELATED,))
+
+    assert result.visited_node_ids == ("seed", "mixed")
 
 
 def test_layered_search_reranks_each_level_and_reaches_leaf_at_hop_cap() -> None:
@@ -194,6 +225,7 @@ def test_layered_search_reranks_each_level_and_reaches_leaf_at_hop_cap() -> None
 
     result = execute(
         view, ir, ("seed",), budget, structured=True, expansion_beam=1,
+        rare_lexical_relations=True,
         preferred_relations=(RelationType.COARSE_RELATED,
                              RelationType.REFINES_TO))
 

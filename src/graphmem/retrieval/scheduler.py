@@ -113,13 +113,19 @@ def _obligation_relation_bonus(ir: QueryIR, relation: RelationType, *,
     return score
 
 
-def _coarse_signal_bonus(ir: QueryIR, source: str) -> float:
+def _relation_mask_signals(source: str) -> frozenset[str]:
+    prefix = "relation_mask:"
+    return (frozenset(source[len(prefix):].split(","))
+            if source.startswith(prefix) else frozenset())
+
+
+def _coarse_signal_bonus(ir: QueryIR, source: str, *,
+                         rare_lexical_relations: bool = False) -> float:
     """Use V5.14 relation-mask metadata without treating it as a fact claim."""
 
-    prefix = "relation_mask:"
-    if not source.startswith(prefix):
+    signals = set(_relation_mask_signals(source))
+    if not signals:
         return 0.0
-    signals = set(source[len(prefix):].split(","))
     kinds = {row.kind for row in ir.proof_obligations}
     score = 0.0
     if signals & {"temporal_near"} and kinds & {"time_endpoint", "ordering"}:
@@ -131,7 +137,7 @@ def _coarse_signal_bonus(ir: QueryIR, source: str) -> float:
         score += 1.5
     if "shared_entity" in signals and len(ir.operands) > 1:
         score += 1.0
-    if "lexical_rare" in signals and (
+    if rare_lexical_relations and "lexical_rare" in signals and (
             len(ir.operands) > 1 or kinds & {
                 "state_history", "time_endpoint", "ordering", "collection"}):
         # Rare overlap is strong for long-region -> long-region linkage but was
@@ -149,6 +155,7 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
             preferred_relations=None, fallback_relations=None,
             expansion_beam: int = 0,
             hierarchy_descent_beam: int = 1,
+            rare_lexical_relations: bool = False,
             obligation_aware_relations: bool = False) -> ScheduleResult:
     """Deterministic obligation-first traversal; provenance is hydrated later.
 
@@ -213,7 +220,9 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
             relation_bonus = (_obligation_relation_bonus(
                 ir, row.edge.relation, inverse=row.inverse)
                               if obligation_aware_relations else 0.0)
-            signal_bonus = _coarse_signal_bonus(ir, row.edge.source)
+            signal_bonus = _coarse_signal_bonus(
+                ir, row.edge.source,
+                rare_lexical_relations=rare_lexical_relations)
             posting_bonus = 0.0
             if structural:
                 parent_node = view.nodes.get(node_id)
@@ -269,7 +278,10 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
         if hop < budget.max_hops:
             scored = [(destination_priority(row), row) for row in
                       view.neighbors(
-                          node_id, relation_allowed, semantic_only=True)]
+                          node_id, relation_allowed, semantic_only=True)
+                      if (rare_lexical_relations
+                          or _relation_mask_signals(row.edge.source)
+                          != frozenset({"lexical_rare"}))]
             ordered = sorted(
                 scored, key=lambda item: (-item[0][0], item[0][1]))
             for _priority, row in ordered:

@@ -274,6 +274,7 @@ class RetrievalRuntimeConfig:
     hierarchy_root_beam: int = 2
     hierarchy_child_beam: int = 4
     hierarchy_descent_beam: int = 1
+    rare_lexical_relations: bool = False
     hierarchy_operator_aware: bool = True
     obligation_aware_packing: bool = True
     precision_aware_packing: bool = False
@@ -341,6 +342,7 @@ class RetrievalRuntimeConfig:
             "hierarchy_root_beam": self.hierarchy_root_beam,
             "hierarchy_child_beam": self.hierarchy_child_beam,
             "hierarchy_descent_beam": self.hierarchy_descent_beam,
+            "rare_lexical_relations": self.rare_lexical_relations,
             "hierarchy_operator_aware": self.hierarchy_operator_aware,
             "obligation_aware_packing": self.obligation_aware_packing,
             "precision_aware_packing": self.precision_aware_packing,

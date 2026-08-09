@@ -97,6 +97,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obligation-aware-relations", action="store_true")
     parser.add_argument("--graph-hop-decay", type=float, default=1.0)
     parser.add_argument("--expansion-beam", type=int, default=4)
+    parser.add_argument(
+        "--rare-lexical-relations", action="store_true",
+        help=("admit lexical_rare-only coarse edges and their QueryIR bonus; "
+              "off is the paired control on the same lexical graph"))
     parser.add_argument("--full", action="store_true",
                         help="score LongMemEval 500 + LoCoMo Cat 1-4 (2,040) instead of the "
                              "frozen 200-question development set")
@@ -195,7 +199,9 @@ def main() -> None:
                                queryir_soft_fallback_threshold=(
                                    args.queryir_soft_fallback_threshold),
                                graph_hop_decay=args.graph_hop_decay,
-                               expansion_beam=args.expansion_beam)
+                               expansion_beam=args.expansion_beam,
+                               rare_lexical_relations=(
+                                   args.rare_lexical_relations))
 
     stage = AnswerStage(store, config, "v5.6-answer", answer_config=answer_config,
                         require_exact_tokenizer=True, cache_store=cache_store)
@@ -313,6 +319,7 @@ def main() -> None:
         "queryir_soft_fallback_threshold": args.queryir_soft_fallback_threshold,
         "graph_hop_decay": args.graph_hop_decay,
         "expansion_beam": args.expansion_beam,
+        "rare_lexical_relations": args.rare_lexical_relations,
         "span_pack_window": args.span_pack_window,
         "closed_form_enabled": answer_config.closed_form_enabled,
         "max_output_tokens": answer_config.max_output_tokens,

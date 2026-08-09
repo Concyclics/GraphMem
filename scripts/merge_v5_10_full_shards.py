@@ -55,7 +55,8 @@ def main() -> None:
                  for shard in shard_dirs]
     for key in ("profile", "config_hash", "answer_prompt_hash",
                 "obligation_aware_packing", "native_seed_fusion",
-                "graph_hop_decay", "expansion_beam"):
+                "graph_hop_decay", "expansion_beam",
+                "rare_lexical_relations"):
         if len({json.dumps(row.get(key), sort_keys=True) for row in manifests}) != 1:
             raise ValueError(f"shard manifest mismatch for {key}")
     tokens = [int(row["prompt_tokens"]) for row in retrieval]
@@ -76,6 +77,7 @@ def main() -> None:
             "profile", "label", "source_db", "config_hash", "answer_prompt_hash",
             "obligation_aware_packing", "obligation_aware_relations",
             "native_seed_fusion", "graph_hop_decay", "expansion_beam",
+            "rare_lexical_relations",
             "span_pack_window", "closed_form_enabled", "budget", "token_counter")},
         "prompt_tokens": {
             "mean": statistics.fmean(tokens), "p50": percentile(tokens, .50),

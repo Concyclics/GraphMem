@@ -212,6 +212,9 @@ class GraphNavigator:
         #: region.  It is intentionally independent of ``expansion_beam``:
         #: relation hops and hierarchy depth are separate search dimensions.
         hierarchy_descent_beam: int = 1,
+        #: Admit coarse edges whose only construction signal is lexical_rare.
+        #: Mixed masks retain their non-lexical attributes when this is false.
+        rare_lexical_relations: bool = False,
         hierarchy_operator_aware: bool = True,
         read_pool_size: int = 4,
         snapshot_cache_bytes: int = 512 * 1024 * 1024,
@@ -262,6 +265,7 @@ class GraphNavigator:
         self.hierarchy_root_beam = max(1, hierarchy_root_beam)
         self.hierarchy_child_beam = max(1, hierarchy_child_beam)
         self.hierarchy_descent_beam = max(1, hierarchy_descent_beam)
+        self.rare_lexical_relations = rare_lexical_relations
         self.hierarchy_operator_aware = hierarchy_operator_aware
         self.h10_owner_rescue = h10_owner_rescue
         self.h10_traversal = h10_traversal
@@ -858,6 +862,8 @@ class GraphNavigator:
                                           expansion_beam=self.expansion_beam,
                                           hierarchy_descent_beam=(
                                               self.hierarchy_descent_beam),
+                                          rare_lexical_relations=(
+                                              self.rare_lexical_relations),
                                           obligation_aware_relations=(
                                               self.obligation_aware_relations),
                                           structured=profile in {HarnessProfile.H4_SCHEDULER,
