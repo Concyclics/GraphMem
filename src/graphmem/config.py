@@ -189,6 +189,27 @@ class EdgeConfig:
     cross_session_neighbor_quota: int = 0
     typed_relation_restoration: bool = False
     typed_relation_min_confidence: float = 0.82
+    # V5.14 experimental path.  Coarse candidate edges carry a relation-signal
+    # mask (semantic/entity/time/state) into their child scopes instead of
+    # propagating one untyped cosine.  Disabled by default so frozen V5.13
+    # snapshots and config hashes retain their historical behaviour.
+    relation_mask_propagation: bool = False
+    # The 200-question V5.14 audit found that adding entity/state/time postings
+    # to the already-unioned lexical+dense atomic candidates improved pair
+    # recall by only 0.053pp and changed no all-hit decision.  Keep it as a
+    # separate research arm; parent-mask routing does not require it.
+    atomic_relation_multiview: bool = False
+    # Independent quotas are intentionally combined by union.  A shared total
+    # top-k made dense/lexical similarity crowd out sparse entity, temporal and
+    # state signals on the hard multi-hop development set.
+    relation_view_quotas: Mapping[str, int] = field(default_factory=lambda: {
+        "lexical": 8,
+        "semantic": 8,
+        "entity": 4,
+        "state": 4,
+        "temporal": 2,
+        "collection": 2,
+    })
     predicate_embedding_threshold: float = 0.92
     # Predicates only ever merge inside one of these slots.  "slot" is the V5.4
     # behaviour, (owner, scope, value_type, polarity), which leaves 51% of

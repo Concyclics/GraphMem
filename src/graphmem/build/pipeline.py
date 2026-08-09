@@ -393,17 +393,26 @@ class GraphBuildPipeline:
                     profile.edges.max_refine_candidates_per_1000_nodes),
                 atomic_vector_channels=((semantic_vectors,)
                                         if semantic_vectors else ()),
+                relation_mask_propagation=(
+                    profile.edges.relation_mask_propagation),
+                atomic_relation_multiview=(
+                    profile.edges.atomic_relation_multiview),
+                relation_view_quotas=profile.edges.relation_view_quotas,
             )
             for left_id, right_id, score, _gate_level in gated_plan.accepted_pairs:
                 left, right = node_map[left_id], node_map[right_id]
                 relation_group_ids = tuple(dict.fromkeys((
                     left.evidence_group_id, right.evidence_group_id)))
+                signals = gated_plan.accepted_pair_signals.get(
+                    (left_id, right_id), ())
+                relation_source = ("relation_mask:" + ",".join(signals)
+                                   if signals else "cir_high_confidence")
                 edges.append(GraphEdge(
                     stable_id("edge", memory_id, left_id,
                               RelationType.COARSE_RELATED, right_id),
                     memory_id, left_id, RelationType.COARSE_RELATED, right_id,
                     relation_group_ids[0], False, score,
-                    "cir_high_confidence", relation_group_ids[1:]))
+                    relation_source, relation_group_ids[1:]))
             for (left_id, right_id, relation, confidence, _gate_level,
                  source) in gated_plan.typed_pairs:
                 left, right = node_map[left_id], node_map[right_id]
@@ -412,7 +421,9 @@ class GraphBuildPipeline:
                 edges.append(GraphEdge(
                     stable_id("edge", memory_id, left_id, relation, right_id),
                     memory_id, left_id, relation, right_id,
-                    relation_group_ids[0], True, confidence, source,
+                    relation_group_ids[0],
+                    relation in DIRECTIONAL_REFINED_RELATIONS,
+                    confidence, source,
                     relation_group_ids[1:]))
 
         refine_tokens = {"cached_input_tokens": 0, "uncached_input_tokens": 0,
@@ -486,6 +497,11 @@ class GraphBuildPipeline:
                     gated_plan.atomic_relation_candidates_generated),
                 "atomic_relation_pairs_proposed": (
                     gated_plan.atomic_relation_pairs_proposed),
+                "relation_mask_pairs": gated_plan.relation_mask_pairs,
+                "relation_mask_counts": dict(
+                    gated_plan.relation_mask_counts),
+                "atomic_candidate_source_counts": dict(
+                    gated_plan.atomic_candidate_source_counts),
                 "levels_with_relations": gated_plan.levels_with_relations,
                 "typed_pairs": len(gated_plan.typed_pairs),
                 "candidate_method": gated_plan.candidate_method,
@@ -1328,15 +1344,26 @@ class GraphBuildPipeline:
 
     @staticmethod
     def _bounded_edges(edges, profile):
-        by_relation: dict[tuple[str, RelationType], list[GraphEdge]] = defaultdict(list)
+        degree: dict[tuple[str, RelationType], int] = defaultdict(int)
+        result: list[GraphEdge] = []
         for edge in sorted(edges, key=lambda item: (-item.confidence, item.edge_id)):
-            key = (edge.src_id, edge.relation)
             cap = int(profile.edges.relation_degree_caps.get(
                 str(edge.relation), profile.edges.max_degree_per_relation
             ))
-            if len(by_relation[key]) < cap:
-                by_relation[key].append(edge)
-        return [edge for rows in by_relation.values() for edge in rows]
+            left = (edge.src_id, edge.relation)
+            right = (edge.dst_id, edge.relation)
+            if degree[left] >= cap:
+                continue
+            # An undirected edge consumes capacity at both endpoints.  The old
+            # source-only cap permitted a coreference hub to receive unbounded
+            # incoming edges even though every edge is traversable both ways.
+            if not edge.directed and degree[right] >= cap:
+                continue
+            result.append(edge)
+            degree[left] += 1
+            if not edge.directed:
+                degree[right] += 1
+        return result
 
     def _usage(self, memory_id):
         # Through ``_read`` so the store lock is held.  Going at

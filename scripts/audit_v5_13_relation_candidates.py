@@ -25,7 +25,12 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE = ROOT.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from graphmem.build.coarsen import _feature_vectors  # noqa: E402
+from graphmem.build.coarsen import (  # noqa: E402
+    _eligible_entity_keys,
+    _feature_vectors,
+    bounded_relation_view_pairs,
+    build_relation_features,
+)
 from graphmem.domain import NodeType  # noqa: E402
 from graphmem.eval import load_dev_questions, load_gold_turns  # noqa: E402
 from graphmem.storage import SQLiteGraphStore  # noqa: E402
@@ -56,6 +61,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--ann-pool", type=int, default=24)
     parser.add_argument("--cross-session-quota", type=int, default=2)
+    parser.add_argument(
+        "--relation-multiview", action="store_true",
+        help=("V5.14 candidate union: lexical+dense plus independently bounded "
+              "entity/state/temporal/collection views"))
     parser.add_argument("--output", type=Path, default=WORKSPACE /
                         "artifacts/report/v5_13/relation_candidate_vector_audit")
     return parser.parse_args()
@@ -238,6 +247,27 @@ def main() -> None:
                 f"lexical_or_atomic_k_le_{2 * args.k}": (
                     lexical_pairs | summary_by_k[args.k]),
             })
+            if args.relation_multiview:
+                node_map = {node.node_id: node for node in facts}
+                relation_features = build_relation_features(node_map, {})
+                eligible_entities = _eligible_entity_keys(
+                    facts, relation_features)
+                view_pairs, view_comparisons = bounded_relation_view_pairs(
+                    facts, relation_features,
+                    eligible_entities=eligible_entities,
+                    quotas={"entity": 4, "state": 4, "temporal": 2,
+                            "collection": 2},
+                    max_candidates=args.ann_pool,
+                    cross_session_only=True)
+                sparse_pairs = {(left, right)
+                                for left, right, _score, _signal in view_pairs}
+                views[memory_id][f"v5_14_multiview_k_le_{2 * args.k + 12}"] = (
+                    lexical_pairs | summary_by_k[args.k] | sparse_pairs)
+                coverage["relation_view_pairs"] = (
+                    coverage.get("relation_view_pairs", 0) + len(sparse_pairs))
+                coverage["relation_view_comparisons"] = (
+                    coverage.get("relation_view_comparisons", 0)
+                    + view_comparisons)
         coverage["memories"] += 1
         coverage["facts"] += len(facts)
         coverage["projected_facts"] += len(projected)
@@ -252,7 +282,9 @@ def main() -> None:
         "provenance_projected", f"lexical_or_projected_k_le_{2 * args.k}")), *(
         ("atomic_summary", f"lexical_or_atomic_fixed_k_{args.k}",
          f"lexical_or_atomic_k_le_{2 * args.k}")
-        if node_embedding_store is not None else ()))
+        if node_embedding_store is not None else ()), *(
+        (f"v5_14_multiview_k_le_{2 * args.k + 12}",)
+        if args.relation_multiview and node_embedding_store is not None else ()))
     for question in questions:
         current = view(question.memory_id)
         refs = tuple(dict.fromkeys(
@@ -282,6 +314,7 @@ def main() -> None:
         "inputs": {"db": str(args.db), "embedding_model": args.embedding_model},
         "method": {"k": args.k, "ann_pool": args.ann_pool,
                    "cross_session_quota": args.cross_session_quota,
+                   "relation_multiview": args.relation_multiview,
                    "gold_used_only_for_offline_evaluation": True,
                    "llm_calls": 0},
         "vector_coverage": {**coverage, "projected_fact_ratio": ratio(

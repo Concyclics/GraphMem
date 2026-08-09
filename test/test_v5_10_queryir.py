@@ -25,10 +25,11 @@ def _node(node_id: str, summary: str) -> GraphNode:
         node_id, "m", NodeType.CANONICAL_FACT, 0, summary, f"g:{node_id}")
 
 
-def _edge(edge_id: str, relation: RelationType, target: str) -> GraphEdge:
+def _edge(edge_id: str, relation: RelationType, target: str,
+          source: str = "test") -> GraphEdge:
     return GraphEdge(
         edge_id, "m", "seed", relation, target, "g:seed",
-        True, 0.9, "test")
+        True, 0.9, source)
 
 
 def test_obligation_aware_scheduler_prioritizes_state_relation_in_beam() -> None:
@@ -56,6 +57,61 @@ def test_obligation_aware_scheduler_prioritizes_state_relation_in_beam() -> None
 
     assert lexical.proof[0].relation == RelationType.COARSE_RELATED
     assert directed.proof[0].relation == RelationType.CONTRADICTION_UPDATE
+
+
+def test_relation_mask_metadata_prioritizes_matching_coarse_edge() -> None:
+    view = GraphReadView(
+        (_node("seed", "Alice"), _node("lexical", "currently"),
+         _node("masked", "address history")),
+        (_edge("e-lexical", RelationType.COARSE_RELATED, "lexical"),
+         _edge("e-masked", RelationType.COARSE_RELATED, "masked",
+               "relation_mask:scene_similar,state_compatible")))
+    ir = QueryIR(
+        "Where does Alice currently live?", QueryOperator.LATEST_STATE,
+        (OperandSpec("o1", owner_aliases=("alice",)),),
+        (ProofObligation("need-history", None, "state_history"),))
+    budget = QueryBudget(
+        max_hops=1, max_visited_nodes=2, max_visited_edges=1,
+        max_frontier=4, max_seed_nodes=1)
+
+    result = execute(
+        view, ir, ("seed",), budget, structured=True, expansion_beam=1,
+        preferred_relations=(RelationType.COARSE_RELATED,))
+
+    assert result.proof[0].edge_id == "e-masked"
+
+
+def test_typed_region_arrival_descends_to_fact_on_second_hop() -> None:
+    nodes = (
+        GraphNode("seed", "m", NodeType.SCENE, 0, "Alice old home", "g:0"),
+        GraphNode("region", "m", NodeType.SCENE, 0, "Alice new home", "g:1"),
+        _node("fact", "Alice lives in Paris"),
+        GraphNode("noise", "m", NodeType.SCENE, 0, "other region", "g:2"),
+    )
+    edges = (
+        GraphEdge("e-cross", "m", "seed", RelationType.COARSE_RELATED,
+                  "region", "g:0", False, 0.9,
+                  "relation_mask:shared_entity,state_compatible"),
+        GraphEdge("e-fact", "m", "region", RelationType.SCENE_CONTAINS,
+                  "fact", "g:1", True, 1.0, "structural"),
+        GraphEdge("e-noise", "m", "region", RelationType.COARSE_RELATED,
+                  "noise", "g:1", False, 0.9, "relation_mask:scene_similar"),
+    )
+    view = GraphReadView(nodes, edges)
+    ir = QueryIR(
+        "Where does Alice live?", QueryOperator.LATEST_STATE,
+        (OperandSpec("o1", owner_aliases=("alice",)),),
+        (ProofObligation("need-history", None, "state_history"),))
+    budget = QueryBudget(
+        max_hops=2, max_visited_nodes=3, max_visited_edges=2,
+        max_frontier=4, max_seed_nodes=1)
+
+    result = execute(
+        view, ir, ("seed",), budget, structured=True, expansion_beam=1,
+        preferred_relations=(RelationType.COARSE_RELATED,))
+
+    assert result.visited_node_ids == ("seed", "region", "fact")
+    assert result.proof[-1].relation == RelationType.SCENE_CONTAINS
 
 
 def test_typed_executor_requires_post_pack_proof_and_reports_units() -> None:

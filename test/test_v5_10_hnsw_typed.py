@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+from types import SimpleNamespace
 
 from graphmem.build.coarsen import (
     admit_llm_refined_relation,
+    bounded_relation_view_pairs,
+    build_relation_features,
     build_parent_gated_relations,
     build_recursive_hierarchy,
     classify_typed_relation,
+    RelationSignal,
 )
-from graphmem.domain import GraphNode, NodeType, RelationType
+from graphmem.build.pipeline import GraphBuildPipeline
+from graphmem.domain import GraphEdge, GraphNode, NodeType, RelationType
 
 
 def _card(index: int, *, topic: int | None = None, negated: bool = False) -> GraphNode:
@@ -275,3 +280,101 @@ def test_parent_gate_frontier_work_is_bounded_by_hierarchy_size() -> None:
     # Four-by-four child scoring for at most k gates per node and level leaves
     # generous constant-factor headroom while ruling out quadratic expansion.
     assert plan.score_comparisons < len(nodes) * 4 * 4 * 4 * 8
+
+
+def test_relation_mask_recovers_state_pair_below_semantic_gate() -> None:
+    sessions = (
+        replace(_card(0), summary="orchid greenhouse notes",
+                attributes={"session_id": "s:0"}),
+        replace(_card(1), summary="quantum circuit notebook",
+                attributes={"session_id": "s:1"}),
+    )
+    facts = (
+        GraphNode("fact:0", "m", NodeType.CANONICAL_FACT, 0,
+                  "Alice owns a red touring bicycle", "g:0",
+                  attributes={"session_id": "s:0", "owner_id": "alice",
+                              "predicate": "owns bicycle", "scope": "transport",
+                              "value": "touring bicycle", "observed_at": {
+                                  "start": "2025-01-01T00:00:00+00:00"}}),
+        GraphNode("fact:1", "m", NodeType.CANONICAL_FACT, 0,
+                  "Alice keeps the same touring bicycle", "g:1",
+                  attributes={"session_id": "s:1", "owner_id": "alice",
+                              "predicate": "owns bicycle", "scope": "transport",
+                              "value": "touring bicycle", "observed_at": {
+                                  "start": "2025-02-01T00:00:00+00:00"}}),
+    )
+    hierarchy = build_recursive_hierarchy(
+        "m", sessions, fanout=2, max_levels=4, summary_words=32,
+        max_candidates=4, assignment_method="bounded_semantic_partition")
+    nodes = {row.node_id: row for row in (
+        *sessions, *facts, *hierarchy.parent_cards)}
+    children = {key: list(value) for key, value in hierarchy.children.items()}
+    children[sessions[0].node_id] = [facts[0].node_id]
+    children[sessions[1].node_id] = [facts[1].node_id]
+
+    legacy = build_parent_gated_relations(
+        "m", hierarchy, nodes, children, embedding_k=4,
+        max_candidates_per_node=8, low_threshold=0.35,
+        high_threshold=0.78, refine_mode="ambiguous_only",
+        typed_restoration=True)
+    masked = build_parent_gated_relations(
+        "m", hierarchy, nodes, children, embedding_k=4,
+        max_candidates_per_node=8, low_threshold=0.35,
+        high_threshold=0.78, refine_mode="ambiguous_only",
+        typed_restoration=True, relation_mask_propagation=True,
+        atomic_relation_multiview=True,
+        relation_view_quotas={"entity": 2, "state": 2, "temporal": 1,
+                              "collection": 1, "lexical": 0,
+                              "semantic": 0})
+
+    assert not legacy.accepted_pairs
+    assert masked.accepted_pairs
+    assert any("state_compatible" in signals
+               for signals in masked.accepted_pair_signals.values())
+    assert masked.relation_mask_counts[str(RelationSignal.STATE_COMPATIBLE)] > 0
+    assert any(str(RelationType.COREFERENCE) in row.allowed_relations
+               for row in masked.refine_candidates)
+    assert masked.atomic_candidate_source_counts["state"] > 0
+
+
+def test_multiview_candidates_are_independently_bounded() -> None:
+    nodes = tuple(replace(
+        _card(index, topic=index), node_type=NodeType.CANONICAL_FACT,
+        attributes={**_card(index).attributes,
+                    "owner_id": f"entity:{index % 3}",
+                    "predicate": f"activity:{index % 5}",
+                    "scope": f"scope:{index % 4}",
+                    "observed_at": {"start": f"2025-01-{index % 28 + 1:02d}"}})
+        for index in range(60))
+    mapped = {node.node_id: node for node in nodes}
+    features = build_relation_features(mapped, {})
+    pairs, comparisons = bounded_relation_view_pairs(
+        nodes, features, eligible_entities=frozenset(),
+        quotas={"state": 2, "temporal": 1, "collection": 1},
+        max_candidates=8, cross_session_only=True)
+
+    per_signal_degree: dict[tuple[str, RelationSignal], int] = {}
+    for left, right, _score, signal in pairs:
+        per_signal_degree[(left, signal)] = per_signal_degree.get(
+            (left, signal), 0) + 1
+        per_signal_degree[(right, signal)] = per_signal_degree.get(
+            (right, signal), 0) + 1
+    # Unioning directed top-k proposals can double the endpoint degree, but it
+    # cannot grow with N for a fixed per-view quota.
+    assert max(per_signal_degree.values(), default=0) <= 4
+    assert comparisons < len(nodes) * 8 * 8
+
+
+def test_undirected_degree_cap_applies_to_both_endpoints() -> None:
+    edges = [GraphEdge(
+        f"e:{index}", "m", f"n:{index}", RelationType.COREFERENCE, "hub",
+        f"g:{index}", False, 1.0 - index / 100, "test")
+        for index in range(5)]
+    profile = SimpleNamespace(edges=SimpleNamespace(
+        relation_degree_caps={str(RelationType.COREFERENCE): 2},
+        max_degree_per_relation=2))
+
+    bounded = GraphBuildPipeline._bounded_edges(edges, profile)
+
+    assert len(bounded) == 2
+    assert sum(edge.dst_id == "hub" for edge in bounded) == 2

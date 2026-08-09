@@ -62,6 +62,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relation-candidate-method", choices=(
         "bounded_sparse", "hnsw"), default="hnsw")
     parser.add_argument("--typed-restoration", action="store_true")
+    parser.add_argument(
+        "--relation-mask-propagation", action="store_true",
+        help=("V5.14: propagate semantic/entity/time/state masks through "
+              "the hierarchy"))
+    parser.add_argument(
+        "--atomic-relation-multiview", action="store_true",
+        help=("V5.14 ablation: also add entity/state/time/collection atomic "
+              "candidates; disabled after the full candidate audit"))
     parser.add_argument("--cross-session-quota", type=int, default=2)
     parser.add_argument("--embedding-model",
                         default="Qwen/Qwen3-Embedding-0.6B")
@@ -98,14 +106,14 @@ def structural_edge(memory_id, left, right):
         groups[0], True, 1.0, "report_recursive_recoarsening", groups[1:])
 
 
-def relation_edge(memory_id, left, right, score):
+def relation_edge(memory_id, left, right, score, source="report_cir_high_confidence"):
     groups = tuple(dict.fromkeys((left.evidence_group_id,
                                  right.evidence_group_id)))
     return GraphEdge(
         stable_id("edge", memory_id, left.node_id,
                   RelationType.COARSE_RELATED, right.node_id),
         memory_id, left.node_id, RelationType.COARSE_RELATED, right.node_id,
-        groups[0], False, score, "report_cir_high_confidence", groups[1:])
+        groups[0], False, score, source, groups[1:])
 
 
 def typed_edge(memory_id, left, right, relation, confidence, source):
@@ -220,7 +228,10 @@ def recoarsen(memory_id: str, source: SQLiteGraphStore,
               relation_vector_mode: str = "hierarchy_only",
               relation_node_embedding_store: SQLiteGraphStore | None = None,
               refiner: Qwen30BRefiner | None = None,
-              typed_min_confidence: float = 0.82) -> dict:
+              typed_min_confidence: float = 0.82,
+              relation_mask_propagation: bool = False,
+              atomic_relation_multiview: bool = False,
+              relation_view_quotas=None) -> dict:
     nodes = list(source.nodes(memory_id))
     edges = list(source.edges(memory_id))
     groups = source.evidence_groups(memory_id)
@@ -294,11 +305,19 @@ def recoarsen(memory_id: str, source: SQLiteGraphStore,
         max_refine_candidates_per_node=2,
         max_refine_candidates_per_1000_nodes=480,
         atomic_vector_channels=((atomic_summary_vectors,)
-                                if atomic_summary_vectors else ()))
+                                if atomic_summary_vectors else ()),
+        relation_mask_propagation=relation_mask_propagation,
+        atomic_relation_multiview=atomic_relation_multiview,
+        relation_view_quotas=relation_view_quotas)
     new_relation_edges = []
     for left_id, right_id, score, _level in relation_plan.accepted_pairs:
+        signals = relation_plan.accepted_pair_signals.get(
+            (left_id, right_id), ())
+        source_name = ("relation_mask:" + ",".join(signals)
+                       if signals else "report_cir_high_confidence")
         new_relation_edges.append(relation_edge(
-            memory_id, node_map[left_id], node_map[right_id], score))
+            memory_id, node_map[left_id], node_map[right_id], score,
+            source_name))
     for (left_id, right_id, relation, confidence, _level,
          source_name) in relation_plan.typed_pairs:
         new_relation_edges.append(typed_edge(
@@ -379,6 +398,10 @@ def recoarsen(memory_id: str, source: SQLiteGraphStore,
             relation_plan.atomic_relation_candidates_generated),
         "atomic_relation_pairs_proposed": (
             relation_plan.atomic_relation_pairs_proposed),
+        "relation_mask_pairs": relation_plan.relation_mask_pairs,
+        "relation_mask_counts": dict(relation_plan.relation_mask_counts),
+        "atomic_candidate_source_counts": dict(
+            relation_plan.atomic_candidate_source_counts),
     }
 
 
@@ -455,7 +478,10 @@ def main() -> None:
             relation_vector_mode=args.relation_vector_mode,
             relation_node_embedding_store=relation_node_embedding_store,
             refiner=refiner,
-            typed_min_confidence=config.edges.typed_relation_min_confidence)
+            typed_min_confidence=config.edges.typed_relation_min_confidence,
+            relation_mask_propagation=args.relation_mask_propagation,
+            atomic_relation_multiview=args.atomic_relation_multiview,
+            relation_view_quotas=config.edges.relation_view_quotas)
         rows.append(row)
         with checkpoint_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -475,6 +501,9 @@ def main() -> None:
         "assignment_method": args.assignment_method,
         "relation_candidate_method": args.relation_candidate_method,
         "typed_restoration": args.typed_restoration,
+        "relation_mask_propagation": args.relation_mask_propagation,
+        "atomic_relation_multiview": args.atomic_relation_multiview,
+        "relation_view_quotas": dict(config.edges.relation_view_quotas),
         "cross_session_quota": args.cross_session_quota,
         "embedding_model": args.embedding_model,
         "relation_vector_mode": args.relation_vector_mode,

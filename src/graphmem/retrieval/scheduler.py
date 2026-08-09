@@ -113,6 +113,35 @@ def _obligation_relation_bonus(ir: QueryIR, relation: RelationType, *,
     return score
 
 
+def _coarse_signal_bonus(ir: QueryIR, source: str) -> float:
+    """Use V5.14 relation-mask metadata without treating it as a fact claim."""
+
+    prefix = "relation_mask:"
+    if not source.startswith(prefix):
+        return 0.0
+    signals = set(source[len(prefix):].split(","))
+    kinds = {row.kind for row in ir.proof_obligations}
+    score = 0.0
+    if signals & {"temporal_near"} and kinds & {"time_endpoint", "ordering"}:
+        score += 1.25
+    if "state_compatible" in signals and kinds & {
+            "state_history", "time_endpoint", "ordering"}:
+        score += 1.25
+    if "collection_related" in signals and "collection" in kinds:
+        score += 1.5
+    if "shared_entity" in signals and len(ir.operands) > 1:
+        score += 1.0
+    # A semantic-only mask remains a normal coarse edge.  Its relation-specific
+    # siblings should win ties, but it receives no extra proof authority.
+    return score
+
+
+def _relation_mask_signals(source: str) -> frozenset[str]:
+    prefix = "relation_mask:"
+    return (frozenset(source[len(prefix):].split(","))
+            if source.startswith(prefix) else frozenset())
+
+
 def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *,
             structured: bool,
             preferred_relations=None, fallback_relations=None,
@@ -154,6 +183,24 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
         if hop >= budget.max_hops:
             hop_cap = hop_cap or bool(view.neighbors(node_id, semantic_only=True)); continue
         allowed = fallback if is_fallback else preferred
+        arrived_signals = (_relation_mask_signals(parent.edge.source)
+                           if parent is not None
+                           and parent.edge.relation == RelationType.COARSE_RELATED
+                           else frozenset())
+        typed_region_arrival = bool(arrived_signals & {
+            "shared_entity", "state_compatible", "temporal_near",
+            "collection_related",
+        })
+        if typed_region_arrival:
+            # A typed coarse edge locates a related region; its value is lost if
+            # the next beam keeps following region edges and never hydrates the
+            # region's evidence.  Admit structural descent in the normal beam
+            # for this one expansion only.  Fact destinations then win via the
+            # existing fact bonus, while pure scene-similar edges retain the old
+            # conservative fallback behaviour.
+            allowed = tuple(dict.fromkeys((
+                *allowed, RelationType.SCENE_CONTAINS,
+                RelationType.REFINES_TO)))
         def destination_priority(row):
             node = view.nodes.get(row.next_node_id)
             if not node:
@@ -174,7 +221,9 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
             relation_bonus = (_obligation_relation_bonus(
                 ir, row.edge.relation, inverse=row.inverse)
                               if obligation_aware_relations else 0.0)
-            return (collection_bonus + lexical + fact_bonus + relation_bonus,
+            signal_bonus = _coarse_signal_bonus(ir, row.edge.source)
+            return (collection_bonus + lexical + fact_bonus + relation_bonus
+                    + signal_bonus,
                     row.edge.edge_id)
 
         # Score each neighbour once; the previous key lambda called
