@@ -9,7 +9,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from ..domain import GraphNode, NodeType, RelationType, stable_id
+from ..domain import GraphNode, NodeType, RelationType, canonical_json, stable_id
 from ..text import content_terms, normalize_key
 from .refine import RefineCandidate
 
@@ -49,6 +49,174 @@ class GatedRelationPlan:
     candidate_method: str = "bounded_sparse"
     refine_candidates_generated: int = 0
     refine_candidates_dropped: int = 0
+    atomic_relation_candidates_generated: int = 0
+    atomic_relation_pairs_proposed: int = 0
+
+
+ATOMIC_RELATION_NODE_TYPES = frozenset({
+    NodeType.CANONICAL_FACT, NodeType.EVENT_FRAME, NodeType.EVENT_SKELETON,
+    NodeType.STATE_HEAD, NodeType.STATE_VALUE,
+})
+
+COARSE_NAVIGATION_NODE_TYPES = frozenset({
+    NodeType.ROUTING_CARD, NodeType.SCENE,
+})
+
+def _relation_context(node: GraphNode) -> str:
+    """Compact endpoint contract for the bounded relation refiner.
+
+    A bare routing-card summary does not expose polarity, predicate or time, so
+    the model cannot distinguish continuation from contradiction.  Keep only
+    fields needed by the relation vocabulary; candidate count remains O(kN).
+    """
+    attrs = node.attributes
+    return canonical_json({
+        "type": str(node.node_type),
+        "summary": node.summary,
+        "owner": attrs.get("owner_id", attrs.get("owners", ())),
+        "predicate": attrs.get("predicate", attrs.get("predicates", ())),
+        "value": attrs.get("value", attrs.get("values", ())),
+        "scope": attrs.get("scope", attrs.get("scopes", ())),
+        "polarity": attrs.get("polarity", ""),
+        "observation_time": attrs.get(
+            "observed_at", attrs.get("observation_time_range", ())),
+        "event_time": attrs.get(
+            "time_interval", attrs.get("event_time_range", attrs.get("times", ()))),
+        "session": attrs.get("session_id", attrs.get("session_ids", ())),
+    })
+
+
+def _relation_field(node: GraphNode, field: str):
+    return node.attributes.get(field, node.attributes.get(f"{field}s", ""))
+
+
+def _field_overlap(left: GraphNode, right: GraphNode, field: str) -> bool:
+    return bool(content_terms(str(_relation_field(left, field)))
+                & content_terms(str(_relation_field(right, field))))
+
+
+def _field_containment(left: GraphNode, right: GraphNode, field: str) -> float:
+    left_terms = content_terms(str(_relation_field(left, field)))
+    right_terms = content_terms(str(_relation_field(right, field)))
+    return len(left_terms & right_terms) / max(
+        1, min(len(left_terms), len(right_terms)))
+
+
+def _owner_terms(node: GraphNode) -> frozenset[str]:
+    value = node.attributes.get("owner_id", node.attributes.get("owners", ()))
+    values = ((value,) if isinstance(value, (str, bytes))
+              else tuple(value or ()))
+    return frozenset(normalize_key(str(item)) for item in values
+                     if normalize_key(str(item)))
+
+
+def _observation_start(node: GraphNode) -> str:
+    for field in ("observed_at", "observation_time_range", "time_interval",
+                  "event_time_range"):
+        value = node.attributes.get(field)
+        if isinstance(value, Mapping):
+            start = value.get("start")
+            if start:
+                return str(start)
+        elif isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def structurally_allowed_refined_relations(
+    left: GraphNode, right: GraphNode,
+) -> tuple[RelationType, ...]:
+    """Relations that could pass the deterministic materialization contract.
+
+    This is deliberately direction-agnostic.  It runs before an LLM call to
+    remove endpoint pairs that every possible label would reject; directional
+    time ordering is checked after the refiner chooses LR/RL.
+    """
+    if (left.node_type not in ATOMIC_RELATION_NODE_TYPES
+            or right.node_type not in ATOMIC_RELATION_NODE_TYPES):
+        return ()
+    same_owner = bool(_owner_terms(left) & _owner_terms(right))
+    allowed: list[RelationType] = []
+    same_summary = (bool(normalize_key(left.summary))
+                    and normalize_key(left.summary)
+                    == normalize_key(right.summary))
+    left_value = normalize_key(str(_relation_field(left, "value")))
+    right_value = normalize_key(str(_relation_field(right, "value")))
+    high_precision_coreference = (
+        same_summary or (
+            bool(left_value) and left_value == right_value
+            and _field_containment(left, right, "predicate") >= 0.75))
+    if same_owner and high_precision_coreference:
+        allowed.append(RelationType.COREFERENCE)
+    shared_proposition = (
+        same_owner and _field_overlap(left, right, "predicate")
+        and _field_overlap(left, right, "scope"))
+    left_value = normalize_key(str(_relation_field(left, "value")))
+    right_value = normalize_key(str(_relation_field(right, "value")))
+    if (shared_proposition
+            and _field_containment(left, right, "value") >= 0.5
+            and (left.attributes.get("polarity")
+                 != right.attributes.get("polarity")
+                 or left_value != right_value)):
+        allowed.append(RelationType.CONTRADICTION_UPDATE)
+    if (shared_proposition
+            and left.attributes.get("polarity")
+            == right.attributes.get("polarity")
+            and _field_containment(left, right, "value") >= 0.25):
+        allowed.append(RelationType.TEMPORAL_CONTINUATION)
+    # The complete directional audit measured temporal/update/causal at
+    # 80%/0%/50% precision, below the online-edge gate.  Keep their structural
+    # logic above as the contract for a future second-stage verifier, but only
+    # coreference may enter the current one-stage LLM path.  Deterministic
+    # AT_TIME/TEMPORAL_BEFORE/STATE_NEXT edges continue to carry time queries.
+    return tuple(relation for relation in allowed
+                 if relation == RelationType.COREFERENCE)
+
+
+def admit_llm_refined_relation(
+    relation: RelationType,
+    left: GraphNode,
+    right: GraphNode,
+    confidence: float,
+    *,
+    min_confidence: float,
+) -> bool:
+    """Precision gate for materializing bounded LLM relation decisions.
+
+    Self-reported confidence was not calibrated: a five-memory audit measured
+    66% typed precision, including invalid edges at 0.98 confidence.  Structural
+    agreement is therefore required in addition to the model score.  Relations
+    without a validated discriminant stay deferred instead of polluting the
+    navigation graph.
+    """
+    if confidence < min_confidence:
+        return False
+    if (left.node_type not in ATOMIC_RELATION_NODE_TYPES
+            or right.node_type not in ATOMIC_RELATION_NODE_TYPES):
+        return False
+
+    if relation not in structurally_allowed_refined_relations(left, right):
+        return False
+    if relation == RelationType.COREFERENCE and confidence < 0.88:
+        return False
+    if relation == RelationType.TEMPORAL_CONTINUATION:
+        left_time = _observation_start(left)
+        right_time = _observation_start(right)
+        return not (left_time and right_time and left_time > right_time)
+    if relation in {
+            RelationType.COREFERENCE, RelationType.CONTRADICTION_UPDATE}:
+        return True
+    if relation == RelationType.CAUSAL:
+        # The full cross-session audit reached only 50% causal type precision;
+        # shared domains and an LLM confidence are not proof that one endpoint
+        # causes the other.  Keep decisions in the deferred ledger until a
+        # second-stage directional verifier is enabled.
+        return False
+    # SAME_ENTITY_STATE needs an explicit entity+state-domain key; shared topic
+    # words produced only 54.7% precision.  COLLECTION_CO_MEMBER belongs to the
+    # deterministic closed-manifest projection.  LLM COARSE_RELATED would lower
+    # the HNSW high-threshold gate using an uncalibrated model score.
+    return False
 
 
 def _feature_vectors(nodes: Sequence[GraphNode], dimension: int = 256) -> dict[str, np.ndarray]:
@@ -89,6 +257,10 @@ def _normalized_vectors(
         and np.asarray(vectors[node.node_id]).ndim == 1
         and np.asarray(vectors[node.node_id]).size
     }
+    if len(supplied_dimensions) > 1:
+        raise ValueError(
+            "all supplied HNSW vectors must use one embedding dimension; "
+            f"received {sorted(supplied_dimensions)}")
     effective_dimension = (next(iter(supplied_dimensions))
                            if len(supplied_dimensions) == 1 else dimension)
     fallback = _feature_vectors(nodes, effective_dimension)
@@ -538,11 +710,8 @@ def classify_typed_relation(
     the bounded LLM refiner instead of receiving a generic semantic label.
     """
 
-    atomic_types = {
-        NodeType.CANONICAL_FACT, NodeType.EVENT_FRAME, NodeType.EVENT_SKELETON,
-        NodeType.STATE_HEAD, NodeType.STATE_VALUE,
-    }
-    if left.node_type not in atomic_types or right.node_type not in atomic_types:
+    if (left.node_type not in ATOMIC_RELATION_NODE_TYPES
+            or right.node_type not in ATOMIC_RELATION_NODE_TYPES):
         return None
     left_sessions, right_sessions = _node_sessions(left), _node_sessions(right)
     if (not left_sessions or not right_sessions
@@ -591,6 +760,8 @@ def build_parent_gated_relations(
     typed_min_confidence: float = 0.82,
     max_refine_candidates_per_node: int = 0,
     max_refine_candidates_per_1000_nodes: int = 0,
+    atomic_vector_channels: Sequence[
+        Mapping[str, Sequence[float]]] = (),
 ) -> GatedRelationPlan:
     """Generate fine candidates only below a surviving coarse candidate edge.
 
@@ -667,7 +838,19 @@ def build_parent_gated_relations(
             level = max(left.level, right.level)
             relation_levels.add(level)
             pair = tuple(sorted((left_id, right_id)))
-            if score >= high_threshold:
+            atomic_pair = (
+                left.node_type in ATOMIC_RELATION_NODE_TYPES
+                and right.node_type in ATOMIC_RELATION_NODE_TYPES)
+            # Once typed restoration owns the atomic layer, a high semantic
+            # cosine is only a candidate signal, not a generic relation.  The
+            # Qwen-vector smoke otherwise more than doubled coarse edges because
+            # a threshold calibrated on hashed lexical vectors was applied in a
+            # different vector space.  Only routing/scene regions receive coarse
+            # edges; terminal facts/evidence must earn a typed relation or abstain.
+            if score >= high_threshold and not (
+                    typed_restoration and (
+                        left.node_type not in COARSE_NAVIGATION_NODE_TYPES
+                        or right.node_type not in COARSE_NAVIGATION_NODE_TYPES)):
                 accepted[pair] = (pair[0], pair[1], score, level)
             typed_decision = (classify_typed_relation(left, right, score)
                               if typed_restoration else None)
@@ -677,12 +860,32 @@ def build_parent_gated_relations(
                     typed[(pair[0], pair[1], relation)] = (
                         pair[0], pair[1], relation, confidence, level, source)
             ambiguous = low_threshold <= score < high_threshold
+            left_sessions = _node_sessions(left)
+            right_sessions = _node_sessions(right)
+            cross_session_pair = bool(
+                left_sessions and right_sessions
+                and left_sessions.isdisjoint(right_sessions))
             should_refine = (
                 (refine_mode == "ambiguous_only" and ambiguous)
                 or (refine_mode == "high_value_only" and ambiguous
                     and bool(child_map.get(left_id)) and bool(child_map.get(right_id)))
                 or (refine_mode == "all_bounded_candidates" and score >= low_threshold)
+                # Generic coarse-edge confidence and atomic relation confidence
+                # answer different questions.  In particular, highly similar
+                # facts from different sessions are often the best candidates
+                # for coreference, continuation or update.  Do not discard them
+                # merely because they sit above the coarse ambiguity band; the
+                # endpoint-degree and global O(|V|) budgets below still bound
+                # the token and materialized-edge cost.
+                or (typed_restoration and atomic_pair and cross_session_pair
+                    and score >= low_threshold)
             )
+            structurally_allowed = (
+                structurally_allowed_refined_relations(left, right)
+                if atomic_pair and cross_session_pair else ())
+            if (typed_restoration and atomic_pair and cross_session_pair
+                    and not structurally_allowed):
+                should_refine = False
             if should_refine:
                 candidate_id = stable_id("candidate", memory_id, "coarse", *pair, level)
                 estimated_pairs = (
@@ -691,22 +894,26 @@ def build_parent_gated_relations(
                 radius = max((high_threshold - low_threshold) / 2, 1e-9)
                 uncertainty = max(0.0, 1.0 - abs(score - midpoint) / radius)
                 bridge_value = 1.0 + math.log1p(max(1, estimated_pairs))
-                allowed = (
-                    str(RelationType.SAME_ENTITY_STATE),
-                    str(RelationType.TEMPORAL_CONTINUATION),
-                    str(RelationType.CAUSAL),
-                    str(RelationType.COLLECTION_CO_MEMBER),
-                    str(RelationType.CONTRADICTION_UPDATE),
-                    str(RelationType.COREFERENCE),
-                    str(RelationType.COARSE_RELATED),
-                    "NONE",
-                )
+                # Coarse cards are routing regions, not factual propositions.
+                # Giving a card pair atomic labels produced thousands of
+                # routing_card->routing_card "causal" and "update" edges whose
+                # direction and semantics were unverifiable.  Typed restoration
+                # is therefore an atomic-layer operation; higher levels may only
+                # accept/reject a generic coarse gate.
+                left_scene = str(left.attributes.get("scene_id", ""))
+                right_scene = str(right.attributes.get("scene_id", ""))
+                cross_scene_pair = bool(
+                    left_scene and right_scene and left_scene != right_scene)
+                allowed = ((*map(str, structurally_allowed), "NONE")
+                           if atomic_pair and cross_session_pair
+                           else (str(RelationType.COARSE_RELATED), "NONE"))
                 refine[candidate_id] = RefineCandidate(
                     candidate_id, "coarse_edge", pair[0], pair[1],
-                    nodes[pair[0]].summary, nodes[pair[1]].summary,
+                    _relation_context(nodes[pair[0]]),
+                    _relation_context(nodes[pair[1]]),
                     allowed,
                     min(abs(score - low_threshold), abs(high_threshold - score)),
-                    True, True, True,
+                    cross_scene_pair, cross_session_pair, cross_session_pair,
                     similarity=score, gate_level=level,
                     estimated_child_pairs=estimated_pairs,
                     priority=uncertainty * bridge_value / 448.0,
@@ -754,6 +961,67 @@ def build_parent_gated_relations(
             next_degree[right_id] += 1
         gates = bounded_next
 
+    # Atomic relations need a proposition-level safety channel across coarse
+    # partitions.  Keep it separate from the coarse graph: lexical and each
+    # supplied atomic-summary vector channel independently propose a bounded
+    # HNSW neighbourhood, but only cross-session atomic pairs enter the typed
+    # refiner.  They can never materialize as generic COARSE_RELATED edges.
+    atomic_relation_candidates_generated = 0
+    atomic_relation_pairs_proposed = 0
+    if typed_restoration and atomic_vector_channels:
+        atomic_nodes = tuple(node for node in all_nodes
+                             if node.node_type in ATOMIC_RELATION_NODE_TYPES)
+        channel_pairs: dict[tuple[str, str], tuple[float, str]] = {}
+        channels: tuple[tuple[str, Mapping[str, Sequence[float]] | None], ...] = (
+            ("lexical", None),
+            *((f"atomic_summary_{index}", channel)
+              for index, channel in enumerate(atomic_vector_channels)),
+        )
+        for channel_name, channel_vectors in channels:
+            pairs, channel_comparisons, _ = _hnsw_pairs(
+                atomic_nodes, vectors=channel_vectors,
+                per_node_k=embedding_k,
+                max_candidates=max_candidates_per_node,
+                dimension=hnsw_dimension, hnsw_m=hnsw_m,
+                ef_construction=hnsw_ef_construction,
+                cross_session_quota=max(1, cross_session_quota))
+            comparisons += channel_comparisons
+            for left_id, right_id, score in pairs:
+                left = nodes[left_id]; right = nodes[right_id]
+                left_sessions = _node_sessions(left)
+                right_sessions = _node_sessions(right)
+                if (not left_sessions or not right_sessions
+                        or not left_sessions.isdisjoint(right_sessions)):
+                    continue
+                pair = tuple(sorted((left_id, right_id)))
+                previous = channel_pairs.get(pair)
+                if previous is None or score > previous[0]:
+                    channel_pairs[pair] = (score, channel_name)
+        atomic_relation_pairs_proposed = len(channel_pairs)
+        for pair, (score, channel_name) in sorted(channel_pairs.items()):
+            allowed_relations = structurally_allowed_refined_relations(
+                nodes[pair[0]], nodes[pair[1]])
+            if not allowed_relations:
+                continue
+            candidate_id = stable_id(
+                "candidate", memory_id, "atomic_relation", *pair)
+            refine[candidate_id] = RefineCandidate(
+                candidate_id, "atomic_relation_edge", pair[0], pair[1],
+                _relation_context(nodes[pair[0]]),
+                _relation_context(nodes[pair[1]]),
+                (*map(str, allowed_relations), "NONE"),
+                0.0, True, True, True,
+                similarity=score, gate_level=0,
+                estimated_child_pairs=1,
+                # Atomic relation restoration is the purpose of the refiner;
+                # route-card ambiguity candidates must not consume its bounded
+                # per-memory call budget first.
+                priority=2.0 + max(-1.0, min(1.0, score)),
+            )
+        atomic_relation_candidates_generated = sum(
+            candidate.kind == "atomic_relation_edge"
+            for candidate in refine.values())
+
     # Generation over-samples the ambiguous band; admission then keeps the
     # highest expected information gain under endpoint and global budgets.
     # The latter is proportional to |V|, so LLM decision tokens are O(|V|).
@@ -791,4 +1059,7 @@ def build_parent_gated_relations(
         candidate_method=candidate_method,
         refine_candidates_generated=generated_refine,
         refine_candidates_dropped=generated_refine - len(admitted_refine),
+        atomic_relation_candidates_generated=(
+            atomic_relation_candidates_generated),
+        atomic_relation_pairs_proposed=atomic_relation_pairs_proposed,
     )

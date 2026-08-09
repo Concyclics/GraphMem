@@ -179,6 +179,21 @@ def test_question_without_any_owner_still_compiles() -> None:
     assert len(operand_ids(node)) == 1
 
 
+def test_operator_divergence_lowers_compile_confidence_and_softens_filters() -> None:
+    compiled = compile_query(
+        "Did both Alice and Bob have pets?",
+        _view("alice", "bob", predicates=()))
+    promoted = compiled.promote_ast()
+
+    softened = promoted.soften_with_legacy(compiled)
+
+    assert compiled.ast_diverges
+    assert compiled.compile_confidence < 0.80
+    assert "legacy_ast_operator_divergence" in compiled.fallback_reasons
+    assert softened.soft_fallback_applied
+    assert len(softened.operands) == len(promoted.operands)
+
+
 def test_negation_is_recorded_on_the_operands() -> None:
     ir = compile_query("What did Alice not visit?", _view("alice"))
 

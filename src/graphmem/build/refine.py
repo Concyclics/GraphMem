@@ -37,14 +37,26 @@ class RefineDecision:
     decision: str
     confidence: float
     source: str
+    #: True means the semantic direction is right -> left.  Symmetric
+    #: relations ignore this bit.  Earlier builds silently used node-id order
+    #: for causal/temporal/update edges, which made their direction arbitrary.
+    inverse: bool = False
 
 
-PROMPT_VERSION = "graphmem-v5-selective-refine-v2-compact"
+PROMPT_VERSION = "graphmem-v5-selective-refine-v3-typed-directional"
 SYSTEM_PROMPT = (
-    "Resolve only the supplied graph candidates. Do not invent entities or endpoints. "
-    "Return one compact JSON object per input line using keys i,d,c, where i is the supplied "
-    "integer row index, d is an offered candidate/relation or NONE, and c is confidence. "
-    "No markdown and no explanation."
+    "Resolve only the supplied graph candidates; never invent endpoints or facts. "
+    "Choose only an offered relation or NONE. Definitions: coreference=same real-world "
+    "fact/event; same_entity_state=same specific entity and state domain; "
+    "temporal_continuation=same subject-predicate chain continuing over time; "
+    "causal=one endpoint explicitly causes/explains the other; "
+    "contradiction_update=same proposition negated, replaced, or updated; "
+    "collection_co_member=two facts are members of the same explicit collection; "
+    "coarse_related=topically related routing regions without an atomic typed claim. "
+    "Generic shared speakers or words are insufficient. Use NONE below 0.82 confidence. "
+    "Return one compact JSON object per input line with i,d,c,o: i=row index, "
+    "d=relation/NONE, c=confidence, o=LR when left->right, RL when right->left, "
+    "or U for a symmetric relation. No markdown or explanation."
 )
 
 
@@ -65,6 +77,28 @@ class Qwen30BRefiner:
         self.client = client
 
     def eligible(self, candidate: RefineCandidate) -> bool:
+        atomic_relations = {
+            str(RelationType.COREFERENCE),
+            str(RelationType.TEMPORAL_CONTINUATION),
+            str(RelationType.CAUSAL),
+            str(RelationType.CONTRADICTION_UPDATE),
+        }
+        typed_atomic_candidate = bool(
+            candidate.kind in {"coarse_edge", "atomic_relation_edge"}
+            and atomic_relations & set(candidate.allowed_relations))
+        if candidate.kind == "coarse_edge" and not typed_atomic_candidate:
+            # The HNSW high-threshold gate already owns generic coarse edges.
+            # Sending route-card pairs to the LLM consumed 82% of smoke-test
+            # decisions, only for materialization to reject them.
+            return False
+        if candidate.kind == "atomic_relation_edge":
+            # This is already a bounded cross-session top-k proposal from a
+            # lexical or proposition-summary HNSW channel.  Its cosine is a
+            # candidate-ranking score, not a calibrated relation confidence;
+            # the directional LLM decision and structural materialization gate
+            # below own precision.
+            return (self.config.edges.refine_mode != "none"
+                    and typed_atomic_candidate and candidate.cross_session)
         if candidate.similarity is not None:
             mode = self.config.edges.refine_mode
             ambiguous = (self.config.edges.low_threshold <= candidate.similarity
@@ -72,10 +106,15 @@ class Qwen30BRefiner:
             if mode == "none":
                 return False
             if mode == "ambiguous_only":
-                return ambiguous
+                return ambiguous or (
+                    typed_atomic_candidate and candidate.cross_session
+                    and candidate.similarity >= self.config.edges.low_threshold)
             if mode == "high_value_only":
-                return ambiguous and (
-                    candidate.cross_session or candidate.estimated_child_pairs > 1)
+                return ((ambiguous and (
+                    candidate.cross_session or candidate.estimated_child_pairs > 1))
+                    or (typed_atomic_candidate and candidate.cross_session
+                        and candidate.similarity
+                        >= self.config.edges.high_threshold))
             if mode == "all_bounded_candidates":
                 return candidate.similarity >= self.config.edges.low_threshold
         return (
@@ -196,10 +235,15 @@ class Qwen30BRefiner:
                 candidate_id = (aliases[int(row["i"])] if "i" in row else str(row["candidate_id"]))
                 decision = str(row.get("d", row.get("decision")))
                 confidence = float(row.get("c", row.get("confidence", 0.0)))
+                orientation = str(row.get("o", row.get("orientation", "LR"))).upper()
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
-            if candidate_id in allowed and decision in allowed[candidate_id] and 0 <= confidence <= 1:
-                parsed[candidate_id] = RefineDecision(candidate_id, decision, confidence, "qwen30b")
+            if (candidate_id in allowed and decision in allowed[candidate_id]
+                    and 0 <= confidence <= 1
+                    and orientation in {"LR", "RL", "U"}):
+                parsed[candidate_id] = RefineDecision(
+                    candidate_id, decision, confidence, "qwen30b",
+                    inverse=orientation == "RL")
         return [parsed.get(item.candidate_id, RefineDecision(
             item.candidate_id, "NONE", 0.0, "parse_fallback"
         )) for item in batch]

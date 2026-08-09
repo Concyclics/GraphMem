@@ -41,6 +41,7 @@ from .compiled_memory import (
     CompiledMemorySidecar,
 )
 from .packer import (
+    adaptive_evidence_turn_limit,
     build_proof_units,
     pack as pack_proof_units,
     pack_obligation_aware,
@@ -216,6 +217,8 @@ class GraphNavigator:
         #: on selects atomic proof units by marginal obligation coverage per
         #: rendered span token and attaches spans for the answer stage.
         obligation_aware_packing: bool = False,
+        precision_aware_packing: bool = False,
+        candidate_pool_limit: int = 0,
         span_pack_window: int = 96,
         #: Compile QueryIR obligations into relation-specific beam priorities.
         #: Off preserves H0--H10 traversal ordering for clean ablations.
@@ -223,6 +226,8 @@ class GraphNavigator:
         #: Use the immutable TurnSearchIndex for every query view instead of a
         #: SQLite FTS call per view.  Kept opt-in for accuracy/latency gating.
         native_seed_fusion: bool = False,
+        queryir_soft_fallback: bool = False,
+        queryir_soft_fallback_threshold: float = 0.80,
         #: Optional trusted local directory containing versioned compiled
         #: graph/turn/provenance sidecars.  SQLite remains the authority.
         compiled_cache_dir: str | Path | None = None,
@@ -282,9 +287,14 @@ class GraphNavigator:
         # stays opt-in until the owner resolution it depends on is fixed.
         self.binding_discriminant = binding_discriminant
         self.obligation_aware_packing = obligation_aware_packing
+        self.precision_aware_packing = precision_aware_packing
+        self.candidate_pool_limit = max(0, candidate_pool_limit)
         self.span_pack_window = max(0, span_pack_window)
         self.obligation_aware_relations = obligation_aware_relations
         self.native_seed_fusion = native_seed_fusion
+        self.queryir_soft_fallback = queryir_soft_fallback
+        self.queryir_soft_fallback_threshold = max(
+            0.0, min(1.0, queryir_soft_fallback_threshold))
         self.compiled_sidecar = (
             CompiledMemorySidecar(compiled_cache_dir)
             if compiled_cache_dir is not None else None)
@@ -757,8 +767,14 @@ class GraphNavigator:
         registry = self._principals(memory_id, view)
         compiled_ir = compile_query(query, view, registry=registry)
         profile = self.harness_profile
-        ir = (compiled_ir.promote_ast()
-              if profile is HarnessProfile.H11_UNIFIED_IR else compiled_ir)
+        if profile is HarnessProfile.H11_UNIFIED_IR:
+            ir = compiled_ir.promote_ast()
+            if (self.queryir_soft_fallback
+                    and compiled_ir.compile_confidence
+                    < self.queryir_soft_fallback_threshold):
+                ir = ir.soften_with_legacy(compiled_ir)
+        else:
+            ir = compiled_ir
         stage_times["query_compile"] = (time.perf_counter() - tick) * 1000
         ast_profiles = {HarnessProfile.H10_AST, HarnessProfile.H11_UNIFIED_IR}
         use_postings = profile in {HarnessProfile.H2_POSTINGS, HarnessProfile.H3_MULTI_ANCHOR,
@@ -1026,6 +1042,7 @@ class GraphNavigator:
         units = build_proof_units(
             proof_bindings, group_turns, obligations=active_obligations,
             group_members=group_members, fact_spans=fact_spans)
+        pack_turn_limit = budget.max_evidence_turns
         if self.obligation_aware_packing:
             raw_fallback_turn_ids = tuple(dict.fromkeys(
                 turn_id
@@ -1153,6 +1170,9 @@ class GraphNavigator:
                                        mandatory=turn_id in mandatory,
                                        proof_unit_ids=tuple(unit.unit_id for unit in units if turn_id in unit.source_turn_ids)))
         rows.sort(key=lambda row: (-row.mandatory, -row.fused_score, row.turn_id))
+        candidate_count_before_limit = len(rows)
+        if self.candidate_pool_limit:
+            rows = rows[:self.candidate_pool_limit]
         # H10 is deliberately not in this set.  `rows` above is already sorted
         # mandatory-first and then by fused_score, so `_rank_pack` packs the
         # mandatory turns in relevance order.  `pack_proof_units` instead keeps
@@ -1166,15 +1186,22 @@ class GraphNavigator:
         if self.obligation_aware_packing:
             answer_kind = (algebra_result.answer_kind if algebra_result is not None
                            else str(ir.ast_operator or ir.operator))
+            pack_turn_limit = (
+                adaptive_evidence_turn_limit(
+                    answer_kind, len(ir.operands), budget.max_evidence_turns,
+                    query=query)
+                if self.precision_aware_packing else budget.max_evidence_turns)
+            pack_budget = replace(budget, max_evidence_turns=pack_turn_limit)
             baseline_floor, _baseline_dropped, _baseline_coverage = self._rank_pack(
-                rows, by_id, budget, self.per_session_quota)
+                rows, by_id, pack_budget, self.per_session_quota)
             packed, dropped, pack_exhaustion, packed_units, packed_span_tokens = pack_obligation_aware(
                 units, rows, by_id, query=query, answer_kind=answer_kind,
-                max_turns=budget.max_evidence_turns,
+                max_turns=pack_turn_limit,
                 max_tokens=budget.max_evidence_tokens,
                 count_text_tokens=self._count_tokens_cached,
                 span_window=self.span_pack_window,
-                baseline_floor=baseline_floor)
+                baseline_floor=baseline_floor,
+                precision_aware=self.precision_aware_packing)
             units = packed_units
         elif profile in {HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
                        HarnessProfile.H9_FACT_RESERVOIR}:
@@ -1229,6 +1256,9 @@ class GraphNavigator:
                    "ast_operator": (str(compiled_ir.ast_operator)
                                     if compiled_ir.ast_operator else ""),
                    "ast_diverges": compiled_ir.ast_diverges,
+                   "query_ir_confidence": compiled_ir.compile_confidence,
+                   "query_ir_fallback_reasons": list(compiled_ir.fallback_reasons),
+                   "query_ir_soft_fallback": ir.soft_fallback_applied,
                    "query_ir_mode": ("unified_ast" if profile is HarnessProfile.H11_UNIFIED_IR
                                      else "legacy_plus_shadow_ast"),
                    "ast_operands": [item.operand_id for item in compiled_ir.ast_operands],
@@ -1245,7 +1275,11 @@ class GraphNavigator:
                    "obligation_aware_packing": self.obligation_aware_packing,
                    "obligation_aware_relations": self.obligation_aware_relations,
                    "native_seed_fusion": self.native_seed_fusion,
-                   "span_pack_window": self.span_pack_window},
+                   "span_pack_window": self.span_pack_window,
+                   "precision_aware_packing": self.precision_aware_packing,
+                   "adaptive_pack_turn_limit": pack_turn_limit,
+                   "candidate_count_before_limit": candidate_count_before_limit,
+                   "candidate_pool_limit": self.candidate_pool_limit},
             seed_node_ids=semantic_seeds, visited_path_node_ids=tuple(dict.fromkeys(
                 (*schedule.visited_node_ids, *direct_owner_terminals))),
             slot_coverage={item.operand_id: tuple(row.binding_id for row in bindings if row.operand_id == item.operand_id)

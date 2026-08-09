@@ -126,12 +126,47 @@ def main() -> None:
                 (turn_map[item.turn_id].session_id,
                  turn_map[item.turn_id].turn_index)
                 for item in result.candidate_scores if item.turn_id in turn_map}
+            ranked_candidate_refs = tuple(dict.fromkeys(
+                (turn_map[item.turn_id].session_id,
+                 turn_map[item.turn_id].turn_index)
+                for item in result.candidate_scores if item.turn_id in turn_map))
+            packed_hits = len(gold_refs & packed_refs)
+            candidate_hits = len(gold_refs & candidate_refs)
+            precision = packed_hits / len(packed_refs) if packed_refs else 0.0
+            recall = packed_hits / len(gold_refs) if gold_refs else 1.0
+            candidate_precision = (
+                candidate_hits / len(candidate_refs) if candidate_refs else 0.0)
+            candidate_recall = (
+                candidate_hits / len(gold_refs) if gold_refs else 1.0)
+            top32 = set(ranked_candidate_refs[:32])
+            top32_hits = len(gold_refs & top32)
+            top32_precision = top32_hits / len(top32) if top32 else 0.0
+            top32_recall = top32_hits / len(gold_refs) if gold_refs else 1.0
             trace = result.trace
             row[arm] = {
                 "all_hit": float(gold_refs <= packed_refs),
-                "recall": (len(gold_refs & packed_refs) / len(gold_refs)
-                           if gold_refs else 1.0),
+                "recall": recall,
+                "precision": precision,
+                "f1": (2 * precision * recall / (precision + recall)
+                       if precision + recall else 0.0),
                 "candidate_all_hit": float(gold_refs <= candidate_refs),
+                "candidate_recall": candidate_recall,
+                "candidate_precision": candidate_precision,
+                "candidate_f1": (
+                    2 * candidate_precision * candidate_recall
+                    / (candidate_precision + candidate_recall)
+                    if candidate_precision + candidate_recall else 0.0),
+                "candidate_count": len(candidate_refs),
+                "candidate_selectivity": (
+                    len(candidate_refs) / len(turn_map) if turn_map else 0.0),
+                "top32_all_hit": float(gold_refs <= top32),
+                "top32_recall": top32_recall,
+                "top32_precision": top32_precision,
+                "top32_f1": (2 * top32_precision * top32_recall
+                             / (top32_precision + top32_recall)
+                             if top32_precision + top32_recall else 0.0),
+                "candidate_to_pack_recall_loss": candidate_recall - recall,
+                "candidate_to_pack_precision_gain": precision - candidate_precision,
                 "turns": len(result.packed_turn_ids),
                 "tokens": result.evidence_tokens,
                 "latency_ms": latency,
@@ -152,7 +187,12 @@ def main() -> None:
             print(f"{index}/{len(questions)}", flush=True)
 
     fields = (
-        "all_hit", "recall", "candidate_all_hit", "turns", "tokens",
+        "all_hit", "recall", "precision", "f1", "candidate_all_hit",
+        "candidate_recall", "candidate_precision", "candidate_f1",
+        "candidate_count", "candidate_selectivity", "top32_all_hit",
+        "top32_recall", "top32_precision", "top32_f1",
+        "candidate_to_pack_recall_loss", "candidate_to_pack_precision_gain",
+        "turns", "tokens",
         "latency_ms", "visited_nodes", "visited_edges", "typed_edges_walked",
         "false_complete", "ast_diverges")
 
@@ -172,7 +212,10 @@ def main() -> None:
                 "mean": statistics.fmean(
                     row[right][key] - row[left][key] for row in rows),
                 "ci95": ci(rows, left, right, key),
-            } for key in ("all_hit", "recall", "tokens", "latency_ms",
+            } for key in ("all_hit", "recall", "precision", "f1",
+                          "candidate_recall", "candidate_precision",
+                          "candidate_selectivity", "top32_recall",
+                          "top32_precision", "tokens", "latency_ms",
                           "typed_edges_walked", "false_complete")
         }
         comparisons[f"{left}->{right}"]["transitions"] = dict(Counter(

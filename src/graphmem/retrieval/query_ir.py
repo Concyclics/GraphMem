@@ -54,6 +54,12 @@ class QueryIR:
     # above still drive execution until this is validated on its own.
     resolved_owners: tuple[ResolvedOwner, ...] = ()
     owner_resolution_warnings: tuple[str, ...] = ()
+    # Confidence controls a safety union, never an answer shortcut.  A low
+    # value means AST/owner/type filters may be wrong, so retrieval should keep
+    # the AST operator but soften operand constraints with the legacy parse.
+    compile_confidence: float = 1.0
+    fallback_reasons: tuple[str, ...] = ()
+    soft_fallback_applied: bool = False
 
     @property
     def ast_operator(self) -> QueryOperator | None:
@@ -90,6 +96,37 @@ class QueryIR:
             self, operator=operator, operands=operands,
             proof_obligations=obligations, ordering=ordering,
             distinct_by=distinct_by)
+
+    def soften_with_legacy(self, legacy: "QueryIR") -> "QueryIR":
+        """Keep the AST plan while unioning/relaxing uncertain seed filters.
+
+        This is intentionally not a second unbounded retrieval.  Corresponding
+        operands retain the promoted stable ids and multiplicity, but owner,
+        predicate and scope views are unioned.  A temporal/polarity constraint
+        that only one compiler inferred becomes a score hint rather than a hard
+        binding veto by being removed from the executable operand.
+        """
+
+        if len(self.operands) != len(legacy.operands):
+            return replace(
+                self, soft_fallback_applied=True,
+                fallback_reasons=tuple(dict.fromkeys((
+                    *self.fallback_reasons, "operand_cardinality_mismatch"))))
+        operands = tuple(replace(
+            promoted,
+            owner_aliases=tuple(dict.fromkeys((
+                *promoted.owner_aliases, *old.owner_aliases))),
+            predicate_candidates=tuple(dict.fromkeys((
+                *promoted.predicate_candidates, *old.predicate_candidates))),
+            scope_candidates=tuple(dict.fromkeys((
+                *promoted.scope_candidates, *old.scope_candidates))),
+            temporal_constraint=(
+                promoted.temporal_constraint
+                if promoted.temporal_constraint == old.temporal_constraint else None),
+            polarity=(promoted.polarity
+                      if promoted.polarity == old.polarity else None),
+        ) for promoted, old in zip(self.operands, legacy.operands))
+        return replace(self, operands=operands, soft_fallback_applied=True)
 
 
 def _operator(query: str) -> QueryOperator:
@@ -301,8 +338,26 @@ def compile_query(query: str, view: "GraphReadView", *,
                             for row in resolved_owners) or owners)
     ast_operands = _ast_operands(query, slots, ast_owner_rows, predicates, scopes)
     ast = compose_operator(slots, ast_operands)
+    ast_operator = root_operator(ast)
+    fallback_reasons: list[str] = []
+    confidence = 1.0
+    if ast_operator != operator:
+        fallback_reasons.append("legacy_ast_operator_divergence")
+        confidence -= 0.30
+    if slots.warnings:
+        fallback_reasons.extend(f"parse:{warning}" for warning in slots.warnings)
+        confidence -= min(0.30, 0.10 * len(slots.warnings))
+    if owner_warnings:
+        fallback_reasons.extend(f"owner:{warning}" for warning in owner_warnings)
+        confidence -= min(0.35, 0.12 * len(owner_warnings))
+    if (slots.is_count or slots.expects_multiple) and not predicates:
+        fallback_reasons.append("exhaustive_query_without_predicate_match")
+        confidence -= 0.15
+    confidence = max(0.0, min(1.0, confidence))
     return QueryIR(query, operator, operands, tuple(obligations), ordering, distinct_by,
                    ast=ast, ast_operands=ast_operands,
                    ast_obligations=_ast_obligations(ast, ast_operands), slots=slots,
                    parse_warnings=slots.warnings, resolved_owners=resolved_owners,
-                   owner_resolution_warnings=owner_warnings)
+                   owner_resolution_warnings=owner_warnings,
+                   compile_confidence=confidence,
+                   fallback_reasons=tuple(dict.fromkeys(fallback_reasons)))

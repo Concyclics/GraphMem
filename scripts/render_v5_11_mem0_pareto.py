@@ -17,6 +17,7 @@ FANDOL = Path(
 
 # Keep the two paper-facing comparison figures visually interchangeable.
 PAPER_FIGSIZE = (14.4, 4.8)
+PARETO_FIGSIZE = (14.4, 10.5)
 SYSTEM_COLORS = {"GraphMem": "#2563EB", "Mem0 OSS": "#F97316"}
 CORE_STYLES = {
     1: {"marker": "^", "linestyle": ":"},
@@ -68,6 +69,7 @@ def load_rows(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
                     "latency_p50_ms": metric(cell, "latency_ms", "p50"),
                     "latency_p95_ms": metric(cell, "latency_ms", "p95"),
                     "latency_p99_ms": metric(cell, "latency_ms", "p99"),
+                    "latency_max_ms": metric(cell, "latency_ms", "max"),
                     "service_mean_ms": metric(cell, "service_ms", "mean"),
                     "service_p95_ms": metric(cell, "service_ms", "p95"),
                     "queue_mean_ms": metric(cell, "queue_ms", "mean"),
@@ -149,13 +151,13 @@ def configure_plotting():
         "grid.alpha": 0.55,
         "figure.facecolor": "white",
         "axes.facecolor": "#F8FAFC",
-        "font.size": 10,
-        "axes.titlesize": 11,
-        "axes.labelsize": 10,
-        "xtick.labelsize": 9,
-        "ytick.labelsize": 9,
-        "legend.fontsize": 9,
-        "lines.linewidth": 1.8,
+        "font.size": 15,
+        "axes.titlesize": 17,
+        "axes.labelsize": 16,
+        "xtick.labelsize": 14,
+        "ytick.labelsize": 14,
+        "legend.fontsize": 15,
+        "lines.linewidth": 2.6,
     })
     return plt
 
@@ -163,9 +165,17 @@ def configure_plotting():
 def save_figure(fig, base: Path, *, fixed_canvas: bool = False) -> None:
     base.parent.mkdir(parents=True, exist_ok=True)
     for suffix in ("png", "pdf", "svg"):
-        fig.savefig(base.with_suffix(f".{suffix}"), dpi=220,
+        output = base.with_suffix(f".{suffix}")
+        fig.savefig(output, dpi=220,
                     bbox_inches=None if fixed_canvas else "tight",
                     facecolor="white")
+        if suffix == "svg":
+            output.write_text(
+                "\n".join(line.rstrip() for line in
+                          output.read_text(encoding="utf-8").splitlines())
+                + "\n",
+                encoding="utf-8",
+            )
 
 
 def place_concurrency_labels(fig, axis, points: list[dict[str, Any]]) -> None:
@@ -175,7 +185,7 @@ def place_concurrency_labels(fig, axis, points: list[dict[str, Any]]) -> None:
     from matplotlib.transforms import Bbox
 
     renderer = fig.canvas.get_renderer()
-    font = FontProperties(size=7.4)
+    font = FontProperties(size=13)
     pixels_per_point = fig.dpi / 72.0
     axis_box = axis.get_window_extent(renderer)
     axis_box = Bbox.from_extents(
@@ -184,12 +194,12 @@ def place_concurrency_labels(fig, axis, points: list[dict[str, Any]]) -> None:
     )
     display_points = [axis.transData.transform((row["x"], row["y"]))
                       for row in points]
-    marker_boxes = [Bbox.from_extents(x - 5, y - 5, x + 5, y + 5)
+    marker_boxes = [Bbox.from_extents(x - 8, y - 8, x + 8, y + 8)
                     for x, y in display_points]
     densities = []
     for index, (x, y) in enumerate(display_points):
         density = sum(
-            int(other != index and abs(x - ox) < 48 and abs(y - oy) < 24)
+            int(other != index and abs(x - ox) < 72 and abs(y - oy) < 40)
             for other, (ox, oy) in enumerate(display_points)
         )
         densities.append(density)
@@ -199,10 +209,10 @@ def place_concurrency_labels(fig, axis, points: list[dict[str, Any]]) -> None:
                                       points[index]["x"]))
     placed: list[Bbox] = []
     fallback_offsets = [
-        (0, 9), (0, -9), (8, 7), (-8, 7), (8, -7), (-8, -7),
-        (12, 0), (-12, 0), (0, 15), (0, -15),
-        (14, 9), (-14, 9), (14, -9), (-14, -9),
-        (19, 0), (-19, 0), (0, 21), (0, -21),
+        (0, 14), (0, -14), (13, 11), (-13, 11), (13, -11), (-13, -11),
+        (19, 0), (-19, 0), (0, 22), (0, -22),
+        (21, 14), (-21, 14), (21, -14), (-21, -14),
+        (28, 0), (-28, 0), (0, 31), (0, -31),
     ]
 
     for index in order:
@@ -254,12 +264,12 @@ def place_concurrency_labels(fig, axis, points: list[dict[str, Any]]) -> None:
         annotation = axis.annotate(
             point["label"], (point["x"], point["y"]),
             xytext=selected, textcoords="offset points",
-            fontsize=7.4, color=point["color"],
+            fontsize=13, color=point["color"],
             ha=selected_alignment[0], va=selected_alignment[1],
             clip_on=True, zorder=5,
         )
         annotation.set_path_effects([
-            patheffects.withStroke(linewidth=2.8, foreground="white"),
+            patheffects.withStroke(linewidth=4.0, foreground="white"),
             patheffects.Normal(),
         ])
 
@@ -272,8 +282,10 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
         ("latency_p50_ms", "(a) p50"),
         ("latency_p95_ms", "(b) p95"),
         ("latency_p99_ms", "(c) p99"),
+        ("latency_max_ms", "(d) max"),
     )
-    fig, axes = plt.subplots(1, 3, figsize=PAPER_FIGSIZE, sharey=True)
+    fig, axes_grid = plt.subplots(2, 2, figsize=PARETO_FIGSIZE, sharey=True)
+    axes = list(axes_grid.flat)
     labels_by_axis: list[list[dict[str, Any]]] = []
     for axis, (metric_key, panel_title) in zip(axes, metrics):
         point_labels: list[dict[str, Any]] = []
@@ -290,7 +302,7 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
                     color=SYSTEM_COLORS[system],
                     marker=style["marker"],
                     linestyle=style["linestyle"],
-                    markersize=5.8,
+                    markersize=8.2,
                     markeredgecolor="white",
                     markeredgewidth=0.75,
                     alpha=0.90,
@@ -298,8 +310,8 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
                 )
                 for row in group:
                     preferred = {
-                        "GraphMem": {1: (4, -10), 4: (4, 6), 8: (4, 5)},
-                        "Mem0 OSS": {1: (-4, 11), 4: (-4, -12), 8: (-4, 7)},
+                        "GraphMem": {1: (8, -17), 4: (8, 12), 8: (8, 11)},
+                        "Mem0 OSS": {1: (-8, 18), 4: (-8, -19), 8: (-8, 13)},
                     }[system][workers]
                     point_labels.append({
                         "x": row[metric_key], "y": row["qps"],
@@ -317,31 +329,32 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
         axis.set_xlabel("端到端延迟（ms，对数轴）")
         labels_by_axis.append(point_labels)
     axes[0].set_ylabel("吞吐（QPS，对数轴）")
+    axes[2].set_ylabel("吞吐（QPS，对数轴）")
     method_handles = [
-        Line2D([0], [0], color=SYSTEM_COLORS[system], linewidth=2.6,
+        Line2D([0], [0], color=SYSTEM_COLORS[system], linewidth=3.4,
                label=system)
         for system in ("GraphMem", "Mem0 OSS")
     ]
     core_handles = [
         Line2D([0], [0], color="#64748B", marker=CORE_STYLES[workers]["marker"],
-               linestyle=CORE_STYLES[workers]["linestyle"], markersize=6,
+               linestyle=CORE_STYLES[workers]["linestyle"], markersize=8.4,
                markerfacecolor="#64748B", markeredgecolor="white",
                label=f"{workers} core")
         for workers in (1, 4, 8)
     ]
     fig.legend(handles=method_handles + core_handles, loc="upper center", ncol=5,
-               bbox_to_anchor=(0.5, 0.91), frameon=False,
-               handlelength=2.4, columnspacing=1.5)
+               bbox_to_anchor=(0.5, 0.925), frameon=False,
+               handlelength=2.8, columnspacing=1.7)
     fig.suptitle(
         "GraphMem vs. Mem0：吞吐–延迟并发对比（左上更优）",
-        y=0.985, fontsize=14, fontweight="bold",
+        y=0.985, fontsize=21, fontweight="bold",
     )
     fig.text(0.995, 0.018, "点旁数字 = 并发用户数", ha="right",
-             fontsize=8.5, color="#64748B")
+             fontsize=13.5, color="#64748B")
     fig.text(0.005, 0.018, "完整在线检索路径；不含回答模型生成",
-             ha="left", fontsize=8.5, color="#64748B")
-    fig.subplots_adjust(left=0.055, right=0.992, bottom=0.17, top=0.77,
-                        wspace=0.19)
+             ha="left", fontsize=13.5, color="#64748B")
+    fig.subplots_adjust(left=0.065, right=0.992, bottom=0.095, top=0.835,
+                        wspace=0.16, hspace=0.34)
     fig.canvas.draw()
     for axis, point_labels in zip(axes, labels_by_axis):
         place_concurrency_labels(fig, axis, point_labels)
@@ -350,8 +363,10 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
 
 
 def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
-    """Compare aggregate 8-worker memory under every concurrency level."""
+    """Show GraphMem memory and its relative saving over Mem0 at 8 workers."""
     plt = configure_plotting()
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
     import numpy as np
 
     clients = (1, 4, 16, 64, 128, 256)
@@ -363,7 +378,8 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
     )
     fig, axes = plt.subplots(1, 2, figsize=PAPER_FIGSIZE, sharey=False)
     x = np.arange(len(clients), dtype=float)
-    width = 0.34
+    width = 0.56
+    legend_handles = None
     for axis, (metric_key, panel_title) in zip(axes, metrics):
         graph_values = np.array([
             indexed[("GraphMem", client)][metric_key] / 1024.0
@@ -374,57 +390,67 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
             for client in clients
         ])
         graph_bars = axis.bar(
-            x - width / 2, graph_values, width,
-            color=SYSTEM_COLORS["GraphMem"], label="GraphMem",
+            x, graph_values, width,
+            color=SYSTEM_COLORS["GraphMem"], label="GraphMem 绝对开支",
             edgecolor="white", linewidth=0.7, zorder=3,
         )
-        mem0_bars = axis.bar(
-            x + width / 2, mem0_values, width,
-            color=SYSTEM_COLORS["Mem0 OSS"], label="Mem0 OSS",
-            edgecolor="white", linewidth=0.7, hatch="//", zorder=3,
-        )
         ratios = mem0_values / graph_values
-        ymax = float(max(mem0_values)) * 1.16
+        ratio_axis = axis.twinx()
+        ratio_axis.plot(
+            x, ratios,
+            color=SYSTEM_COLORS["Mem0 OSS"], marker="o",
+            markersize=8.6, markerfacecolor="white", markeredgewidth=2.1,
+            linewidth=3.0, label="相对 Mem0 节省倍数", zorder=5,
+        )
+        ymax = float(max(graph_values)) * 1.22
+        ratio_ymax = max(16.5, float(max(ratios)) * 1.16)
         for index, ratio in enumerate(ratios):
-            pair_top = max(graph_bars[index].get_height(),
-                           mem0_bars[index].get_height())
-            axis.text(
-                x[index], pair_top + ymax * 0.055,
-                f"节省 {ratio:.1f}×",
-                ha="center", va="bottom", fontsize=8.2,
-                color="#334155", fontweight="bold",
-            )
             axis.text(
                 graph_bars[index].get_x() + graph_bars[index].get_width() / 2,
-                graph_bars[index].get_height() + ymax * 0.010,
+                graph_bars[index].get_height() * 0.54,
                 f"{graph_values[index]:.2f}",
-                ha="center", va="bottom", fontsize=8.0,
-                color="#1E40AF", fontweight="bold",
+                ha="center", va="center", fontsize=13.5,
+                color="white", fontweight="bold",
             )
-            axis.text(
-                mem0_bars[index].get_x() + mem0_bars[index].get_width() / 2,
-                mem0_bars[index].get_height() + ymax * 0.010,
-                f"{mem0_values[index]:.2f}",
-                ha="center", va="bottom", fontsize=8.0,
+            ratio_axis.annotate(
+                f"{ratio:.1f}×", (x[index], ratio),
+                xytext=(0, 14), textcoords="offset points",
+                ha="center", va="bottom", fontsize=13.5,
                 color="#9A3412", fontweight="bold",
             )
         axis.set_xticks(x, [str(client) for client in clients])
         axis.set_ylim(0, ymax)
+        ratio_axis.set_ylim(0, ratio_ymax)
         axis.set_xlabel("并发用户数")
-        axis.set_ylabel("8-worker 聚合内存（GiB）")
+        axis.set_ylabel("GraphMem 8-worker 聚合内存（GiB）",
+                        color=SYSTEM_COLORS["GraphMem"])
+        ratio_axis.set_ylabel("相对 Mem0 节省倍数（×）",
+                              color=SYSTEM_COLORS["Mem0 OSS"])
+        axis.tick_params(axis="y", colors=SYSTEM_COLORS["GraphMem"])
+        ratio_axis.tick_params(axis="y", colors=SYSTEM_COLORS["Mem0 OSS"])
+        axis.spines["left"].set_color(SYSTEM_COLORS["GraphMem"])
+        ratio_axis.spines["right"].set_color(SYSTEM_COLORS["Mem0 OSS"])
         axis.set_title(panel_title, fontweight="bold")
         axis.grid(True, axis="y", linestyle="--", linewidth=0.65, zorder=0)
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=2,
+        if legend_handles is None:
+            legend_handles = [
+                Patch(facecolor=SYSTEM_COLORS["GraphMem"], edgecolor="white",
+                      label="GraphMem 绝对开支"),
+                Line2D([0], [0], color=SYSTEM_COLORS["Mem0 OSS"], marker="o",
+                       markerfacecolor="white", linewidth=3.0,
+                       label="Mem0 / GraphMem"),
+            ]
+    fig.legend(legend_handles, [handle.get_label() for handle in legend_handles],
+               loc="upper center", ncol=2,
                bbox_to_anchor=(0.5, 0.91), frameon=False,
                handlelength=2.4, columnspacing=1.8)
-    fig.suptitle("GraphMem vs. Mem0：8-core 常驻内存开支",
-                 y=0.985, fontsize=14, fontweight="bold")
+    fig.suptitle("GraphMem：8-core 常驻内存与相对 Mem0 节省倍数",
+                 y=0.985, fontsize=21, fontweight="bold")
     fig.text(0.005, 0.018,
-             "柱内/柱顶数字单位为 GiB；仅统计检索 worker，不含回答模型与外部 Embedding 服务",
-             ha="left", fontsize=8.5, color="#64748B")
-    fig.subplots_adjust(left=0.06, right=0.992, bottom=0.17, top=0.77,
-                        wspace=0.18)
+             "柱内数字单位为 GiB；折线标注为 Mem0 / GraphMem；仅统计检索 worker",
+             ha="left", fontsize=13.5, color="#64748B")
+    fig.subplots_adjust(left=0.065, right=0.935, bottom=0.17, top=0.77,
+                        wspace=0.34)
     save_figure(fig, base, fixed_canvas=True)
     plt.close(fig)
 

@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 from ..config import CacheIdentity, GraphMemV5Config
@@ -30,8 +30,10 @@ from ..storage import SQLiteGraphStore
 from ..tokenization import resolve_token_counter
 from .composer import AnswerDraft, compose
 from ..retrieval.executor import inspect_execution
-from .prompts import PROMPT_HASH, PROMPT_VERSION, build_answer_messages
-from .rendering import AnswerConfig, RenderedEvidence, render_evidence
+from .prompts import PROMPT_HASH, build_answer_messages, prompt_contract
+from .rendering import (
+    AnswerConfig, RenderedEvidence, render_evidence, resolve_evidence_order,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +47,7 @@ class AnswerResult:
     prompt_tokens: int
     completion_tokens: int
     closed_form: bool
+    finish_reason: str = ""
     draft_text: str = ""
     draft_certified: bool = False
     cached: bool = False
@@ -107,7 +110,7 @@ class AnswerStage:
             return entry
 
     def render(self, result: NavigationResult, budget: QueryBudget,
-               max_tokens: int | None = None) -> RenderedEvidence:
+               max_tokens: int | None = None, *, question: str = "") -> RenderedEvidence:
         turn_map, session_order = self._turns(result.memory_id)
         packed = result.packed_turn_ids or result.retrieved_turn_ids
         spans = {
@@ -119,9 +122,13 @@ class AnswerStage:
         mandatory = tuple(dict.fromkeys(
             turn_id for unit in result.proof_units if unit.mandatory
             for turn_id in unit.source_turn_ids))
+        evidence_order = resolve_evidence_order(
+            self.answer_config.evidence_order, question,
+            str(result.trace.get("query_operator") or ""))
+        render_config = replace(self.answer_config, evidence_order=evidence_order)
         return render_evidence(
             [turn_map[turn_id] for turn_id in packed if turn_id in turn_map],
-            config=self.answer_config, counter=self.counter,
+            config=render_config, counter=self.counter,
             max_tokens=max_tokens if max_tokens is not None else budget.max_answer_tokens,
             session_order=session_order,
             spans_by_turn=spans, mandatory_turn_ids=mandatory,
@@ -139,7 +146,10 @@ class AnswerStage:
 
         typed_execution = inspect_execution(algebra, result.certificate)
 
-        evidence = self.render(result, budget)
+        evidence_order = resolve_evidence_order(
+            self.answer_config.evidence_order, question,
+            str(result.trace.get("query_operator") or ""))
+        evidence = self.render(result, budget, question=question)
         if evidence.mandatory_dropped:
             warnings.append("mandatory_turn_dropped_for_budget")
         if (self.answer_config.deterministic_bypass_enabled
@@ -152,6 +162,7 @@ class AnswerStage:
                 dropped_turn_ids=evidence.dropped_turn_ids,
                 evidence_tokens=evidence.tokens, prompt_tokens=0,
                 completion_tokens=0, closed_form=True,
+                finish_reason="deterministic",
                 draft_text=typed_execution.text, draft_certified=True,
                 latency_ms=(time.perf_counter() - started) * 1000,
                 warnings=tuple(warnings), trace={
@@ -170,7 +181,10 @@ class AnswerStage:
                 })
         messages = build_answer_messages(
             question=question, question_date=question_date, evidence_text=evidence.text,
-            candidate_answer=draft.text if draft else None)
+            candidate_answer=draft.text if draft else None,
+            normalize_relative_time=self.answer_config.normalize_relative_time)
+        prompt_version, _prompt_text, prompt_hash = prompt_contract(
+            self.answer_config.normalize_relative_time)
         prompt_tokens = self._prompt_tokens(messages)
         relaxed = False
         if prompt_tokens > budget.max_answer_tokens:
@@ -178,11 +192,13 @@ class AnswerStage:
             # total over.  Re-render against the remaining headroom before
             # touching the hard ceiling.
             overhead = prompt_tokens - evidence.tokens
-            evidence = self.render(result, budget,
-                                   max_tokens=max(1, budget.max_answer_tokens - overhead))
+            evidence = self.render(
+                result, budget, max_tokens=max(1, budget.max_answer_tokens - overhead),
+                question=question)
             messages = build_answer_messages(
                 question=question, question_date=question_date, evidence_text=evidence.text,
-                candidate_answer=draft.text if draft else None)
+                candidate_answer=draft.text if draft else None,
+                normalize_relative_time=self.answer_config.normalize_relative_time)
             prompt_tokens = self._prompt_tokens(messages)
             if prompt_tokens > budget.max_answer_tokens:
                 relaxed = True
@@ -192,25 +208,32 @@ class AnswerStage:
                 f"answer prompt for {question_id} is {prompt_tokens} tokens, above the hard "
                 f"ceiling {budget.max_answer_tokens_hard}")
 
-        text, completion_tokens, cached = self._call(question_id, result.memory_id, messages)
+        text, completion_tokens, cached, finish_reason = self._call(
+            question_id, result.memory_id, messages, prompt_hash)
         prediction = " ".join(text.split())
         if not prediction:
             warnings.append("empty_prediction")
+        if finish_reason == "length":
+            warnings.append("answer_output_truncated")
         return AnswerResult(
             question_id=question_id, memory_id=result.memory_id, prediction=prediction,
             evidence_turn_ids=evidence.turn_ids, dropped_turn_ids=evidence.dropped_turn_ids,
             evidence_tokens=evidence.tokens, prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             closed_form=bool(draft and draft.certified),
+            finish_reason=finish_reason,
             draft_text=draft.text if draft else "",
             draft_certified=bool(draft and draft.certified),
             cached=cached, budget_relaxed=relaxed, latency_ms=(time.perf_counter() - started) * 1000,
-            warnings=tuple(warnings),
+            warnings=tuple(warnings), prompt_hash=prompt_hash,
             trace={
-                "prompt_version": PROMPT_VERSION,
+                "prompt_version": prompt_version,
                 "span_window": self.answer_config.span_window,
+                "evidence_order": self.answer_config.evidence_order,
+                "resolved_evidence_order": evidence_order,
                 "packed_turns": len(evidence.turn_ids),
                 "evidence_truncated": evidence.truncated,
+                "finish_reason": finish_reason,
                 "token_counter": self.counter.describe(),
                 "draft_kind": draft.answer_kind if draft else None,
                 "draft_degradations": list(draft.degradations) if draft else [],
@@ -230,20 +253,26 @@ class AnswerStage:
         return sum(self.counter.count_many([str(row["content"]) for row in messages]))
 
     def _call(self, question_id: str, memory_id: str,
-              messages: Sequence[Mapping[str, str]]) -> tuple[str, int, bool]:
+              messages: Sequence[Mapping[str, str]], prompt_hash: str,
+              ) -> tuple[str, int, bool, str]:
         request = {
             "model": self.config.models.llm_model, "messages": list(messages),
-            "temperature": 0, "max_tokens": self.answer_config.max_output_tokens,
+            "temperature": 0, "seed": self.answer_config.sampling_seed,
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
         }
+        if self.answer_config.max_output_tokens is not None:
+            request["max_tokens"] = self.answer_config.max_output_tokens
         identity = CacheIdentity(
-            self.dataset_hash, self.config.models.llm_model, PROMPT_HASH,
+            self.dataset_hash, self.config.models.llm_model, prompt_hash,
             self.config.schema_version,
             hashlib.sha256(canonical_json({
                 "span_window": self.answer_config.span_window,
                 "include_dates": self.answer_config.include_dates,
                 "include_speaker": self.answer_config.include_speaker,
+                "evidence_order": self.answer_config.evidence_order,
+                "normalize_relative_time": self.answer_config.normalize_relative_time,
                 "max_output_tokens": self.answer_config.max_output_tokens,
+                "sampling_seed": self.answer_config.sampling_seed,
             }).encode()).hexdigest(),
             "answer:" + hashlib.sha256(canonical_json(request["messages"]).encode()).hexdigest(),
         )
@@ -270,7 +299,7 @@ class AnswerStage:
             usage = {"cached_input_tokens": 0, "uncached_input_tokens": prompt,
                      "output_tokens": completion, "reasoning_tokens": 0,
                      "total_tokens": prompt + completion}
-            self.cache_store.cache_put(key, "answer", request, response, usage, PROMPT_HASH)
+            self.cache_store.cache_put(key, "answer", request, response, usage, prompt_hash)
             is_cached = False
         occurrence = self.cache_store._read_one(
             "SELECT count(*) FROM llm_calls WHERE memory_id=? AND cache_key=?",
@@ -280,5 +309,6 @@ class AnswerStage:
             memory_id=memory_id, stage="answer", cache_key=key, cached=is_cached,
             request=request, response=response, usage=usage,
             latency_ms=(time.perf_counter() - started) * 1000, retry_count=0, batch_size=1,
-            prompt_hash=PROMPT_HASH)
-        return str(response.get("content", "")), completion, is_cached
+            prompt_hash=prompt_hash)
+        return (str(response.get("content", "")), completion, is_cached,
+                str(response.get("finish_reason") or ""))

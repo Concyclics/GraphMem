@@ -7,7 +7,7 @@ import pytest
 
 from graphmem.answer import (
     AnswerConfig, AnswerStage, PROMPT_HASH, build_answer_messages, compose, render_evidence,
-    render_turn,
+    render_turn, resolve_evidence_order,
 )
 from graphmem.domain import (
     AlgebraResult, AnswerMember, Conversation, EvidenceMember, EvidenceUnit, NavigationResult,
@@ -32,6 +32,23 @@ def test_full_turn_rendering_carries_session_speaker_and_date() -> None:
     text = render_turn(_turn(0, "I adopted a beagle named Rex."), AnswerConfig())
 
     assert text == "[s1 @ 2023-05-01] user: I adopted a beagle named Rex."
+
+
+def test_relative_memory_time_is_anchored_to_the_source_not_question_date() -> None:
+    turn = _turn(0, "I joined the gym last week.")
+    turn = replace(turn, timestamp="2023-06-16")
+
+    text = render_turn(turn, AnswerConfig(normalize_relative_time=True))
+
+    assert '[source-time "last week" => 2023-06-05..2023-06-11; anchor=2023-06-16]' in text
+
+
+def test_source_time_annotation_can_be_disabled_for_a_frozen_ablation() -> None:
+    turn = replace(_turn(0, "I joined the gym last week."), timestamp="2023-06-16")
+
+    text = render_turn(turn, AnswerConfig(normalize_relative_time=False))
+
+    assert "source-time" not in text
 
 
 def test_span_window_zero_renders_only_the_cited_span() -> None:
@@ -72,6 +89,34 @@ def test_rendering_is_ordered_by_session_then_turn_not_by_input_order() -> None:
 
     assert [row.split(": ", 1)[1] for row in rendered.text.splitlines()] == \
         ["first", "third", "second"]
+
+
+def test_relevance_rendering_preserves_packer_rank() -> None:
+    turns = [_turn(1, "strongest", "s2"), _turn(0, "second", "s1"),
+             _turn(0, "weakest", "s2")]
+
+    rendered = render_evidence(
+        turns, config=AnswerConfig(evidence_order="relevance"), counter=COUNTER,
+        max_tokens=1000, session_order={"s1": 0, "s2": 1})
+
+    assert [row.split(": ", 1)[1] for row in rendered.text.splitlines()] == \
+        ["strongest", "second", "weakest"]
+
+
+def test_invalid_evidence_order_is_rejected() -> None:
+    with pytest.raises(ValueError, match="evidence_order"):
+        AnswerConfig(evidence_order="random")
+
+
+@pytest.mark.parametrize("question,operator,expected", [
+    ("What did Alice and Bob both enjoy?", "intersection_distinct", "relevance"),
+    ("When did Alice move to Kyoto?", "lookup", "chronological"),
+    ("What changed after Alice moved?", "lookup", "chronological"),
+    ("Where does Alice live?", "latest_state", "chronological"),
+])
+def test_adaptive_evidence_order_is_query_directed(
+        question: str, operator: str, expected: str) -> None:
+    assert resolve_evidence_order("adaptive", question, operator) == expected
 
 
 def test_rendering_drops_optional_turns_before_mandatory_ones() -> None:
@@ -195,6 +240,14 @@ def test_the_prompt_hash_is_frozen() -> None:
             "graphmem.answer.prompts", fromlist=["x"]).ANSWER_SYSTEM_PROMPT).encode()).hexdigest()
 
 
+def test_source_time_prompt_is_an_explicit_separate_contract() -> None:
+    messages = build_answer_messages(
+        question="when?", question_date="2023-06-20", evidence_text="",
+        normalize_relative_time=True)
+
+    assert "[source-time ...]" in messages[0]["content"]
+
+
 def test_a_candidate_answer_is_labelled_a_proposal_not_evidence() -> None:
     messages = build_answer_messages(question="how many?", question_date="2023-05-01",
                                      evidence_text="[s1] user: three cats", candidate_answer="3")
@@ -216,14 +269,15 @@ def test_scalar_delta_questions_state_the_arithmetic_contract() -> None:
 class _FakeClient:
     """Records requests and returns a fixed completion."""
 
-    def __init__(self, text: str = "Rex") -> None:
-        self.text, self.requests = text, []
+    def __init__(self, text: str = "Rex", finish_reason: str = "stop") -> None:
+        self.text, self.finish_reason, self.requests = text, finish_reason, []
         self.chat = type("_Chat", (), {"completions": self})()
 
     def create(self, **request):
         self.requests.append(request)
         message = type("_M", (), {"content": self.text, "reasoning_content": None})()
-        choice = type("_C", (), {"message": message, "finish_reason": "stop"})()
+        choice = type("_C", (), {
+            "message": message, "finish_reason": self.finish_reason})()
         usage = type("_U", (), {"prompt_tokens": 100, "completion_tokens": 3})()
         return type("_R", (), {"choices": [choice], "usage": usage, "model": "test"})()
 
@@ -261,7 +315,35 @@ def test_the_stage_makes_exactly_one_call_and_returns_the_prediction(tmp_path) -
     assert answer.prediction == "Rex"
     assert len(client.requests) == 1
     assert client.requests[0]["temperature"] == 0
+    assert client.requests[0]["seed"] == 0
+    assert "max_tokens" not in client.requests[0]
     assert client.requests[0]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert answer.finish_reason == "stop"
+    store.close()
+
+
+def test_an_explicit_output_cap_is_sent_only_for_an_ablation(tmp_path) -> None:
+    store = _store(tmp_path, ["I adopted a beagle named Rex."])
+    client = _FakeClient("Rex")
+    stage = _stage(
+        store, client, answer_config=AnswerConfig(max_output_tokens=512))
+    result = _result([turn.turn_id for turn in store.turns("m")])
+
+    stage.answer("q1", "What is the dog called?", result, QueryBudget())
+
+    assert client.requests[0]["max_tokens"] == 512
+    store.close()
+
+
+def test_output_length_finish_is_reported_as_truncation(tmp_path) -> None:
+    store = _store(tmp_path, ["I adopted a beagle named Rex."])
+    stage = _stage(store, _FakeClient("Rex...", finish_reason="length"))
+    result = _result([turn.turn_id for turn in store.turns("m")])
+
+    answer = stage.answer("q1", "What is the dog called?", result, QueryBudget())
+
+    assert answer.finish_reason == "length"
+    assert "answer_output_truncated" in answer.warnings
     store.close()
 
 

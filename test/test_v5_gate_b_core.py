@@ -195,7 +195,8 @@ def test_refiner_value_gate_cache_and_zero_reasoning(tmp_path: Path) -> None:
             self.calls += 1
             candidate_id = __import__("json").loads(request["messages"][1]["content"])["candidate_id"]
             content = __import__("json").dumps({
-                "candidate_id": candidate_id, "decision": "portal", "confidence": 0.9
+                "candidate_id": candidate_id, "decision": "portal", "confidence": 0.9,
+                "orientation": "RL",
             })
             message = SimpleNamespace(content=content, reasoning_content=None)
             return SimpleNamespace(
@@ -206,6 +207,15 @@ def test_refiner_value_gate_cache_and_zero_reasoning(tmp_path: Path) -> None:
     completions = Completions()
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     refiner = Qwen30BRefiner(store, GraphMemV5Config(), "dataset", client=client)
+    high_similarity_atomic = RefineCandidate(
+        "candidate:atomic", "coarse_edge", "left", "right", "Alice kept the role",
+        "Alice still has the role", ("coreference", "temporal_continuation", "NONE"),
+        0.20, True, True, True, similarity=0.95,
+    )
+    assert refiner.eligible(high_similarity_atomic)
+    assert not refiner.eligible(replace(
+        high_similarity_atomic, candidate_id="candidate:atomic-local",
+        cross_session=False))
     eligible = RefineCandidate(
         "candidate:1", "edge", "left", "right", "Alice booked Paris",
         "She later cancelled it", ("portal", "NONE"), 0.05, True, True, True,
@@ -216,6 +226,7 @@ def test_refiner_value_gate_cache_and_zero_reasoning(tmp_path: Path) -> None:
     second, _ = refiner.refine("travel", [eligible])
     assert not truncated
     assert first[0].decision == second[0].decision == "portal"
+    assert first[0].inverse and second[0].inverse
     assert completions.calls == 1
     usages = [__import__("json").loads(row[0]) for row in store._connection.execute(
         "SELECT usage_json FROM llm_calls"

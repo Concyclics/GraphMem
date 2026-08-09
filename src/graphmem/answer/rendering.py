@@ -14,13 +14,43 @@ Two things here are load-bearing:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Iterable, Mapping, Sequence
 
+from ..build.temporal import extract_time_expressions, normalize_time
 from ..domain import EvidenceMember, SourceTurn
 from ..tokenization import TokenCounter
 
 #: ``span_window=None`` renders the whole turn.  0 renders only the cited span.
 FULL_TURN: None = None
+
+_TEMPORAL_OPERATORS = frozenset({
+    "argmin_time", "argmax_time", "date_difference", "latest_state", "ordinal",
+})
+_TEMPORAL_QUERY_RE = re.compile(
+    r"\b(?:when|date|time|days?|weeks?|months?|years?|before|after|since|until|"
+    r"during|first|last|latest|earliest|recent(?:ly)?|ago|long|older|old|age|"
+    r"then|next|previous|currently|now|past|weekend|summer|spring|winter|fall|"
+    r"january|february|march|april|may|june|july|august|september|october|"
+    r"november|december|20[12]\d)\b",
+    re.I,
+)
+
+
+def resolve_evidence_order(configured: str, question: str = "",
+                           query_operator: str = "") -> str:
+    """Choose presentation order without benchmark labels or gold evidence.
+
+    Temporal calculations depend on source order, while ordinary multi-hop
+    questions benefit from putting the highest-ranked proof first.  QueryIR's
+    operator is authoritative when it is typed; lexical time cues cover lookup
+    questions whose requested value happens to be a date or duration.
+    """
+    if configured != "adaptive":
+        return configured
+    if query_operator.casefold() in _TEMPORAL_OPERATORS:
+        return "chronological"
+    return "chronological" if _TEMPORAL_QUERY_RE.search(question) else "relevance"
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,11 +66,25 @@ class AnswerConfig:
     span_window: int | None = FULL_TURN
     include_dates: bool = True
     include_speaker: bool = True
+    # ``chronological`` preserves the original answer contract.  ``relevance``
+    # keeps the navigator/packer rank so the strongest evidence appears first
+    # and the weakest tail is the first to be dropped under a token budget.
+    # ``adaptive`` is resolved before rendering: temporal queries use the
+    # former and other queries use the latter.
+    evidence_order: str = "chronological"
+    # Materialize relative phrases against the source turn timestamp in the
+    # rendered evidence.  This prevents the answer model from re-anchoring
+    # ``last week/month/year`` against the later question date.
+    normalize_relative_time: bool = False
     closed_form_enabled: bool = True
     # Remains false until an untouched holdout demonstrates >=99.5% precision
     # and <=0.5% false-complete for each whitelisted operator.
     deterministic_bypass_enabled: bool = False
-    max_output_tokens: int = 256
+    # ``None`` deliberately omits ``max_tokens`` from the API request.  The
+    # model then ends on its stop condition or context limit; actual completion
+    # usage and finish_reason are still recorded for every call.
+    max_output_tokens: int | None = None
+    sampling_seed: int = 0
     #: Rendered evidence is ``[session date] speaker: text``; this bounds the
     #: per-turn header so a pathological speaker label cannot eat the budget.
     max_speaker_chars: int = 48
@@ -48,8 +92,13 @@ class AnswerConfig:
     def __post_init__(self) -> None:
         if self.span_window is not None and self.span_window < 0:
             raise ValueError("span_window must be None or non-negative")
-        if self.max_output_tokens <= 0:
-            raise ValueError("max_output_tokens must be positive")
+        if self.evidence_order not in {"chronological", "relevance", "adaptive"}:
+            raise ValueError(
+                "evidence_order must be chronological, relevance, or adaptive")
+        if self.max_output_tokens is not None and self.max_output_tokens <= 0:
+            raise ValueError("max_output_tokens must be None or positive")
+        if self.sampling_seed < 0:
+            raise ValueError("sampling_seed must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +145,35 @@ def render_turn(turn: SourceTurn, config: AnswerConfig,
         header.append(f"[{turn.session_id}]")
     if config.include_speaker and turn.speaker:
         header.append(f"{turn.speaker[:config.max_speaker_chars]}:")
-    return " ".join(header) + " " + " ".join(text.split())
+    body = " ".join(text.split())
+    if config.normalize_relative_time and turn.timestamp:
+        notes = _source_time_notes(body, turn)
+        if notes:
+            body = f"{body} {' '.join(notes)}"
+    return " ".join(header) + " " + body
+
+
+_SOURCE_RELATIVE_RE = re.compile(
+    r"\b(?:today|yesterday|tomorrow|last|next|ago)\b", re.I)
+
+
+def _source_time_notes(text: str, turn: SourceTurn) -> tuple[str, ...]:
+    """Render deterministic source-anchored intervals for relative phrases."""
+
+    rows: list[str] = []
+    for phrase in extract_time_expressions(text):
+        if not _SOURCE_RELATIVE_RE.search(phrase):
+            continue
+        interval = normalize_time(phrase, turn.timestamp, turn.turn_id)
+        if interval.kind != "relative" or not interval.start:
+            continue
+        start = interval.start.split("T", 1)[0]
+        end = (interval.end or interval.start).split("T", 1)[0]
+        resolved = start if start == end else f"{start}..{end}"
+        anchor = str(turn.timestamp).split(" ", 1)[0].split("T", 1)[0]
+        rows.append(
+            f'[source-time "{phrase}" => {resolved}; anchor={anchor}]')
+    return tuple(rows)
 
 
 def render_evidence(
@@ -119,8 +196,11 @@ def render_evidence(
     order = session_order or {}
     spans = spans_by_turn or {}
     mandatory = set(mandatory_turn_ids)
-    rows = sorted(turns, key=lambda turn: (order.get(turn.session_id, 1 << 30),
-                                           turn.session_id, turn.turn_index, turn.turn_id))
+    source_rows = list(turns)
+    rows = (source_rows if config.evidence_order == "relevance" else
+            sorted(source_rows,
+                   key=lambda turn: (order.get(turn.session_id, 1 << 30),
+                                     turn.session_id, turn.turn_index, turn.turn_id)))
     rendered = {turn.turn_id: render_turn(turn, config, spans.get(turn.turn_id, ()))
                 for turn in rows}
     costs = dict(zip(rendered, counter.count_many(list(rendered.values()))))

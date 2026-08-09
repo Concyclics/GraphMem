@@ -32,6 +32,20 @@ def extract_time_expression(text: str) -> str | None:
     return " ".join(match.group(0).split()) if match else None
 
 
+def extract_time_expressions(text: str) -> tuple[str, ...]:
+    """Return every distinct temporal phrase in source order.
+
+    Extraction historically returned only the first match, which is enough for
+    a single fact field but not for answer rendering: an absolute date early in
+    a turn could hide a later ``last week`` phrase and leave the model to anchor
+    it against the question date.
+    """
+
+    return tuple(dict.fromkeys(
+        " ".join(match.group(0).split())
+        for match in _TIME_PHRASE_RE.finditer(text or "")))
+
+
 def _clean(value: str) -> str:
     value = re.sub(r"\([^)]*\)", " ", value)
     value = re.sub(r"(?<=\d)(?:st|nd|rd|th)\b", "", value, flags=re.I)

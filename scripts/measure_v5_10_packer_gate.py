@@ -131,16 +131,51 @@ def main() -> None:
                 (turn_map[item.turn_id].session_id, turn_map[item.turn_id].turn_index)
                 for item in result.candidate_scores if item.turn_id in turn_map
             }
+            ranked_candidate_refs = tuple(dict.fromkeys(
+                (turn_map[item.turn_id].session_id,
+                 turn_map[item.turn_id].turn_index)
+                for item in result.candidate_scores if item.turn_id in turn_map))
             candidate_ranks = {
                 (turn_map[item.turn_id].session_id, turn_map[item.turn_id].turn_index): rank
                 for rank, item in enumerate(result.candidate_scores, 1)
                 if item.turn_id in turn_map
             }
             recall = len(gold_refs & packed_refs) / len(gold_refs) if gold_refs else 1.0
+            packed_hits = len(gold_refs & packed_refs)
+            candidate_hits = len(gold_refs & candidate_refs)
+            precision = packed_hits / len(packed_refs) if packed_refs else 0.0
+            candidate_precision = (
+                candidate_hits / len(candidate_refs) if candidate_refs else 0.0)
+            candidate_recall = (
+                candidate_hits / len(gold_refs) if gold_refs else 1.0)
+            top32 = set(ranked_candidate_refs[:32])
+            top32_hits = len(gold_refs & top32)
+            top32_precision = top32_hits / len(top32) if top32 else 0.0
+            top32_recall = top32_hits / len(gold_refs) if gold_refs else 1.0
             result_row[name] = {
                 "all_hit": float(gold_refs <= packed_refs),
                 "recall": recall,
+                "precision": precision,
+                "f1": (2 * precision * recall / (precision + recall)
+                       if precision + recall else 0.0),
                 "candidate_all_hit": float(gold_refs <= candidate_refs),
+                "candidate_recall": candidate_recall,
+                "candidate_precision": candidate_precision,
+                "candidate_f1": (
+                    2 * candidate_precision * candidate_recall
+                    / (candidate_precision + candidate_recall)
+                    if candidate_precision + candidate_recall else 0.0),
+                "candidate_count": len(candidate_refs),
+                "candidate_selectivity": (
+                    len(candidate_refs) / len(turn_map) if turn_map else 0.0),
+                "top32_all_hit": float(gold_refs <= top32),
+                "top32_recall": top32_recall,
+                "top32_precision": top32_precision,
+                "top32_f1": (2 * top32_precision * top32_recall
+                             / (top32_precision + top32_recall)
+                             if top32_precision + top32_recall else 0.0),
+                "candidate_to_pack_recall_loss": candidate_recall - recall,
+                "candidate_to_pack_precision_gain": precision - candidate_precision,
                 "turns": len(result.packed_turn_ids),
                 "evidence_tokens": result.evidence_tokens,
                 "latency_ms": latency,
@@ -171,7 +206,31 @@ def main() -> None:
             "n": len(metrics),
             "all_hit": statistics.fmean(row["all_hit"] for row in metrics),
             "recall": statistics.fmean(row["recall"] for row in metrics),
+            "precision": statistics.fmean(row["precision"] for row in metrics),
+            "f1": statistics.fmean(row["f1"] for row in metrics),
             "candidate_all_hit": statistics.fmean(row["candidate_all_hit"] for row in metrics),
+            "candidate_recall": statistics.fmean(
+                row["candidate_recall"] for row in metrics),
+            "candidate_precision": statistics.fmean(
+                row["candidate_precision"] for row in metrics),
+            "candidate_f1": statistics.fmean(
+                row["candidate_f1"] for row in metrics),
+            "candidate_count": statistics.fmean(
+                row["candidate_count"] for row in metrics),
+            "candidate_selectivity": statistics.fmean(
+                row["candidate_selectivity"] for row in metrics),
+            "top32_all_hit": statistics.fmean(
+                row["top32_all_hit"] for row in metrics),
+            "top32_recall": statistics.fmean(
+                row["top32_recall"] for row in metrics),
+            "top32_precision": statistics.fmean(
+                row["top32_precision"] for row in metrics),
+            "top32_f1": statistics.fmean(
+                row["top32_f1"] for row in metrics),
+            "candidate_to_pack_recall_loss": statistics.fmean(
+                row["candidate_to_pack_recall_loss"] for row in metrics),
+            "candidate_to_pack_precision_gain": statistics.fmean(
+                row["candidate_to_pack_precision_gain"] for row in metrics),
             "mean_turns": statistics.fmean(row["turns"] for row in metrics),
             "mean_evidence_tokens": statistics.fmean(tokens),
             "p95_evidence_tokens": percentile(tokens, 0.95),
@@ -204,7 +263,10 @@ def main() -> None:
                 "mean": statistics.fmean(
                     row["obligation"][key] - row["baseline"][key] for row in rows),
                 "ci95": paired_ci(rows, key),
-            } for key in ("all_hit", "recall", "evidence_tokens", "latency_ms")
+            } for key in ("all_hit", "recall", "precision", "f1",
+                          "candidate_precision", "candidate_selectivity",
+                          "top32_recall", "top32_precision",
+                          "evidence_tokens", "latency_ms")
         },
         "transitions": dict(Counter(
             f"{int(row['baseline']['all_hit'])}->{int(row['obligation']['all_hit'])}"

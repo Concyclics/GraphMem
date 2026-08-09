@@ -111,3 +111,48 @@ def test_pipeline_report_arm_emits_recursive_tree_and_cir_diagnostics(tmp_path) 
     assert manifest.build_diagnostics["method"]["recursive_hierarchy_enabled"]
     assert manifest.build_diagnostics["method"]["parent_gated_relations_enabled"]
     assert manifest.build_token_usage["coarsen_candidate_comparisons"] >= 0
+
+
+def test_pipeline_uses_atomic_summary_vectors_for_relation_candidates(tmp_path) -> None:
+    store = _store(tmp_path / "graph.sqlite")
+    base = GraphMemV5Config(profile="b5")
+    config = replace(
+        base,
+        coarsen=replace(base.coarsen, recursive_hierarchy=True, fanout=2,
+                        max_levels=5, assignment_method="hnsw",
+                        hnsw_dimension=32),
+        edges=replace(base.edges, parent_gated_relations=True,
+                      relation_candidate_method="hnsw", refine_mode="none",
+                      typed_relation_restoration=True,
+                      cross_session_neighbor_quota=2,
+                      low_threshold=0.05, high_threshold=0.8),
+    )
+    vectorized_types = []
+
+    def vectors(_memory_id, nodes):
+        vectorized_types.extend(node.node_type for node in nodes)
+        result = {}
+        for ordinal, node in enumerate(nodes):
+            vector = [0.0] * 32
+            vector[ordinal % 32] = 1.0
+            result[node.node_id] = vector
+        return result
+
+    manifest = GraphBuildPipeline(
+        store, dataset_hash="dataset", coarsen_vector_provider=vectors,
+        relation_vector_provider=vectors).build("m", config)
+
+    assert any(node_type in {
+        NodeType.EVENT_FRAME, NodeType.EVENT_SKELETON, NodeType.STATE_HEAD,
+        NodeType.STATE_VALUE, NodeType.CANONICAL_FACT,
+    } for node_type in vectorized_types)
+    assert manifest.build_diagnostics["method"][
+        "relation_semantic_vector_count"] > 0
+    assert manifest.build_diagnostics["method"][
+        "relation_vector_granularity"] == "atomic_summary"
+    assert manifest.build_diagnostics["method"]["cir"][
+        "atomic_relation_pairs_proposed"] > 0
+    # Synthetic fallback events do not expose the structured owner/predicate/
+    # scope/value contract, so they are correctly removed before any refiner.
+    assert manifest.build_diagnostics["method"]["cir"][
+        "atomic_relation_candidates_generated"] == 0

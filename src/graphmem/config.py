@@ -244,9 +244,17 @@ class RetrievalRuntimeConfig:
     hierarchy_child_beam: int = 4
     hierarchy_operator_aware: bool = True
     obligation_aware_packing: bool = True
+    precision_aware_packing: bool = False
+    # 0 keeps the full id-only reservoir. Positive values expose a genuine
+    # candidate precision/recall operating point before evidence packing.
+    candidate_pool_limit: int = 0
     span_pack_window: int = 96
     obligation_aware_relations: bool = False
     native_seed_fusion: bool = True
+    # At low compiler confidence, retain the AST operator but union/relax its
+    # seed filters with the legacy parse instead of hard-excluding evidence.
+    queryir_soft_fallback: bool = False
+    queryir_soft_fallback_threshold: float = 0.80
     read_pool_size: int = 1
     snapshot_cache_bytes: int = 256 * 1024 * 1024
     snapshot_cache_memories: int = 8
@@ -274,10 +282,14 @@ class RetrievalRuntimeConfig:
             raise ValueError(f"positive retrieval runtime values required: {positive}")
         if self.session_router_k < 0 or self.session_flood_k < 0:
             raise ValueError("session routing limits cannot be negative")
+        if self.candidate_pool_limit < 0:
+            raise ValueError("candidate_pool_limit cannot be negative")
         if self.span_pack_window < 0:
             raise ValueError("span_pack_window cannot be negative")
         if any(float(value) < 0 for value in self.fusion_weights.values()):
             raise ValueError("fusion weights cannot be negative")
+        if not 0.0 <= self.queryir_soft_fallback_threshold <= 1.0:
+            raise ValueError("queryir_soft_fallback_threshold must be in [0, 1]")
 
     def navigator_options(
         self, *, compiled_cache_dir: str | Path | None = None,
@@ -297,9 +309,13 @@ class RetrievalRuntimeConfig:
             "hierarchy_child_beam": self.hierarchy_child_beam,
             "hierarchy_operator_aware": self.hierarchy_operator_aware,
             "obligation_aware_packing": self.obligation_aware_packing,
+            "precision_aware_packing": self.precision_aware_packing,
+            "candidate_pool_limit": self.candidate_pool_limit,
             "span_pack_window": self.span_pack_window,
             "obligation_aware_relations": self.obligation_aware_relations,
             "native_seed_fusion": self.native_seed_fusion,
+            "queryir_soft_fallback": self.queryir_soft_fallback,
+            "queryir_soft_fallback_threshold": self.queryir_soft_fallback_threshold,
             "read_pool_size": self.read_pool_size,
             "snapshot_cache_bytes": self.snapshot_cache_bytes,
             "snapshot_cache_memories": self.snapshot_cache_memories,

@@ -44,6 +44,15 @@ ANSWER_SYSTEM_PROMPT = (
     "Return only the concise final answer."
 )
 
+SOURCE_TIME_PROMPT_VERSION = "graphmem-v5.12-answer-source-time-v1"
+SOURCE_TIME_SYSTEM_PROMPT = ANSWER_SYSTEM_PROMPT.replace(
+    "Resolve relative dates from each memory's conversation date. Observation ",
+    "Resolve relative dates inside each memory from that memory's conversation "
+    "date, never from the question date. The question date anchors only relative "
+    "phrases in the question itself. A [source-time ...] annotation is the "
+    "deterministic resolution of a memory phrase and must be used as written. Observation ",
+)
+
 
 def _query_operation_contract(question: str) -> str:
     """Name the arithmetic contract when the question form fixes it.
@@ -65,6 +74,7 @@ def build_answer_messages(
     question_date: str | None,
     evidence_text: str,
     candidate_answer: str | None = None,
+    normalize_relative_time: bool = False,
 ) -> list[dict[str, str]]:
     sections = [
         f"Question date: {question_date or 'unknown'}",
@@ -76,7 +86,8 @@ def build_answer_messages(
         sections += ["", f"Candidate answer (unverified proposal): {candidate_answer}"]
     sections += ["", "Conversation memories:", evidence_text]
     return [
-        {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+        {"role": "system", "content": prompt_contract(
+            normalize_relative_time)[1]},
         {"role": "user", "content": "\n".join(sections)},
     ]
 
@@ -84,3 +95,12 @@ def build_answer_messages(
 PROMPT_HASH = hashlib.sha256(
     (PROMPT_VERSION + ANSWER_SYSTEM_PROMPT).encode("utf-8")
 ).hexdigest()
+
+
+def prompt_contract(normalize_relative_time: bool = False) -> tuple[str, str, str]:
+    """Return the exact version/text/hash for an answer configuration."""
+
+    version, prompt = (
+        (SOURCE_TIME_PROMPT_VERSION, SOURCE_TIME_SYSTEM_PROMPT)
+        if normalize_relative_time else (PROMPT_VERSION, ANSWER_SYSTEM_PROMPT))
+    return version, prompt, hashlib.sha256((version + prompt).encode("utf-8")).hexdigest()

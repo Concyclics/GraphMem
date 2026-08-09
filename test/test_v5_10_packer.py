@@ -11,6 +11,7 @@ from graphmem.domain import (
     SourceTurn,
 )
 from graphmem.retrieval.packer import (
+    adaptive_evidence_turn_limit,
     build_proof_units,
     pack_obligation_aware,
     salient_spans,
@@ -171,3 +172,39 @@ def test_span_pack_is_a_monotone_extension_of_full_turn_floor() -> None:
         baseline_floor=floor)
 
     assert set(floor) <= set(packed)
+
+
+def test_adaptive_limit_keeps_collections_wide_and_lookups_focused() -> None:
+    assert adaptive_evidence_turn_limit("lookup", 1, 32) == 12
+    assert adaptive_evidence_turn_limit("lookup", 2, 32) == 16
+    assert adaptive_evidence_turn_limit("date_difference", 2, 32) == 24
+    assert adaptive_evidence_turn_limit(
+        "lookup", 1, 32, query="What did I cook a couple of days ago?") == 24
+    assert adaptive_evidence_turn_limit("count", 1, 32) == 24
+    assert adaptive_evidence_turn_limit("union_distinct", 4, 32) == 32
+
+
+def test_precision_aware_pack_can_displace_a_noisy_monotonic_floor() -> None:
+    left = _turn("left", "s1", "Alice bought 3 cameras on Monday.")
+    right = _turn("right", "s2", "Bob returned 2 cameras on Friday.")
+    noise = _turn("noise", "s1", "camera camera camera unrelated chatter")
+    units = (
+        EvidenceUnit("u1", ("o1",), ("b1",), ("left",), (), 0, True,
+                     ("op1",), "alice-camera"),
+        EvidenceUnit("u2", ("o2",), ("b2",), ("right",), (), 0, True,
+                     ("op2",), "bob-camera"),
+    )
+    candidates = (
+        _candidate(noise, 9.0), _candidate(left, 2.0, ("op1",)),
+        _candidate(right, 1.5, ("op2",)),
+    )
+
+    packed, _dropped, flags, _audit, _used = pack_obligation_aware(
+        units, candidates, {row.turn_id: row for row in (left, right, noise)},
+        query="How many cameras did Alice and Bob handle?", answer_kind="count",
+        max_turns=2, max_tokens=100,
+        count_text_tokens=lambda text: len(text.split()), span_window=0,
+        baseline_floor=("noise", "left"), precision_aware=True)
+
+    assert set(packed) == {"left", "right"}
+    assert flags["precision_aware"]

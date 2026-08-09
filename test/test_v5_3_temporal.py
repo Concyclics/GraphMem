@@ -1,4 +1,9 @@
-from graphmem.build.temporal import extract_time_expression, normalize_time, observed_interval
+from graphmem.build.temporal import (
+    extract_time_expression,
+    extract_time_expressions,
+    normalize_time,
+    observed_interval,
+)
 
 
 def test_absolute_natural_date_normalizes_to_interval() -> None:
@@ -51,3 +56,9 @@ def test_out_of_range_relative_year_is_unresolved() -> None:
     row = normalize_time("6000 years ago", "2023-05-29", "turn:7")
     assert row.kind == "unresolved"
     assert row.start is None and row.end is None
+
+
+def test_all_time_expressions_are_returned_in_source_order() -> None:
+    assert extract_time_expressions(
+        "On June 16 2023 I said I joined last week and went yesterday.") == (
+            "June 16 2023", "last week", "yesterday")

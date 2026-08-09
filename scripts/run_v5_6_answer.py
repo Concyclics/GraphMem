@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from graphmem.answer import AnswerConfig, AnswerStage, PROMPT_HASH  # noqa: E402
+from graphmem.answer import AnswerConfig, AnswerStage, prompt_contract  # noqa: E402
 from graphmem.config import config_hash, load_config  # noqa: E402
 from graphmem.domain import dataclass_dict  # noqa: E402
 from graphmem.embedding import QwenEmbeddingIndex  # noqa: E402
@@ -45,9 +45,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--profile", default="h9")
     parser.add_argument("--max-evidence-turns", type=int, default=32)
+    parser.add_argument("--max-evidence-tokens", type=int,
+                        help="override retrieval evidence-token budget")
     parser.add_argument("--max-answer-tokens", type=int)
+    parser.add_argument("--max-output-tokens", type=int, default=0,
+                        help="0 omits the API output cap; positive values enable an ablation cap")
+    parser.add_argument("--sampling-seed", type=int, default=0,
+                        help="explicit seed sent to the answer service")
     parser.add_argument("--span-window", type=int, default=-1,
                         help="-1 renders whole turns; >=0 renders cited spans widened by N chars")
+    parser.add_argument("--evidence-order",
+                        choices=("chronological", "relevance", "adaptive"),
+                        default="chronological",
+                        help="render by source time, retrieval rank, or query-directed order")
     parser.add_argument("--no-closed-form", action="store_true")
     parser.add_argument("--no-h10-owner-rescue", action="store_true")
     parser.add_argument("--no-h10-traversal", action="store_true")
@@ -58,10 +68,19 @@ def parse_args() -> argparse.Namespace:
                              "locomo_cat4 and +17.4pp on cat2, no effect on LongMemEval")
     parser.add_argument("--obligation-aware-packing", action="store_true",
                         help="V5.10 greedy obligation/span packer; preserves frozen profiles when off")
+    parser.add_argument("--precision-aware-packing", action="store_true",
+                        help="use adaptive evidence limits, operand floors and MMR optional fill")
+    parser.add_argument("--candidate-pool-limit", type=int, default=0,
+                        help="0 keeps the full id reservoir; positive values expose a bounded "
+                             "candidate precision/recall operating point")
     parser.add_argument("--span-pack-window", type=int, default=96,
                         help="character context charged around each selected evidence span")
     parser.add_argument("--embedding", action="store_true")
+    parser.add_argument("--embedding-db", type=Path,
+                        help="read turn vectors from a separate immutable SQLite sidecar")
     parser.add_argument("--max-questions", type=int)
+    parser.add_argument("--question-id", action="append", default=[],
+                        help="run one or more exact question ids; may be repeated")
     parser.add_argument("--answer-workers", type=int, default=32)
     parser.add_argument("--label", default="")
     parser.add_argument("--run-root", type=Path,
@@ -71,6 +90,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-every", type=int, default=25,
                         help="Navigate/answer/append this many questions per durable batch")
     parser.add_argument("--native-seed-fusion", action="store_true")
+    parser.add_argument("--queryir-soft-fallback", action="store_true")
+    parser.add_argument("--queryir-soft-fallback-threshold", type=float, default=0.80)
+    parser.add_argument("--source-time-normalization", action="store_true",
+                        help="experimental: materialize source-anchored relative time in evidence")
     parser.add_argument("--obligation-aware-relations", action="store_true")
     parser.add_argument("--graph-hop-decay", type=float, default=1.0)
     parser.add_argument("--expansion-beam", type=int, default=4)
@@ -114,6 +137,12 @@ def main() -> None:
     else:
         questions = load_dev_questions(args.lme, args.locomo, gold)
         flags = {}
+    if args.question_id:
+        requested = set(args.question_id)
+        questions = [row for row in questions if row.question_id in requested]
+        missing = requested - {row.question_id for row in questions}
+        if missing:
+            raise ValueError(f"unknown question ids: {sorted(missing)}")
     if args.shards > 1:
         # Shard on memory_id so each process touches a disjoint set of graphs and
         # builds each view exactly once; sharding on question_id would make every
@@ -127,16 +156,29 @@ def main() -> None:
     if args.max_questions:
         questions = questions[:args.max_questions]
 
-    budget = replace(config.query_budget, max_evidence_turns=args.max_evidence_turns,
-                     **({"max_answer_tokens": args.max_answer_tokens}
-                        if args.max_answer_tokens else {}))
+    budget = replace(
+        config.query_budget, max_evidence_turns=args.max_evidence_turns,
+        **({"max_evidence_tokens": args.max_evidence_tokens}
+           if args.max_evidence_tokens else {}),
+        **({"max_answer_tokens": args.max_answer_tokens}
+           if args.max_answer_tokens else {}))
     answer_config = AnswerConfig(
         span_window=(args.span_pack_window if args.obligation_aware_packing
                      and args.span_window < 0 else
                      (None if args.span_window < 0 else args.span_window)),
-        closed_form_enabled=not args.no_closed_form)
+        closed_form_enabled=not args.no_closed_form,
+        evidence_order=args.evidence_order,
+        normalize_relative_time=args.source_time_normalization,
+        max_output_tokens=(args.max_output_tokens or None),
+        sampling_seed=args.sampling_seed)
 
-    embedding = QwenEmbeddingIndex(store, config, record_usage=False) if args.embedding else None
+    embedding_store = None
+    if args.embedding_db:
+        embedding_store = SQLiteGraphStore(args.embedding_db, read_only=True)
+        embedding = QwenEmbeddingIndex(embedding_store, config, record_usage=False)
+    else:
+        embedding = QwenEmbeddingIndex(
+            store, config, record_usage=False) if args.embedding else None
     navigator = GraphNavigator(store, dense_search=embedding.search if embedding else None,
                                harness_profile=HarnessProfile(args.profile),
                                rank_mandatory=args.rank_mandatory,
@@ -144,9 +186,14 @@ def main() -> None:
                                h10_traversal=not args.no_h10_traversal,
                                manifest_collection_key=not args.no_manifest_collection_key,
                                obligation_aware_packing=args.obligation_aware_packing,
+                               precision_aware_packing=args.precision_aware_packing,
+                               candidate_pool_limit=args.candidate_pool_limit,
                                span_pack_window=args.span_pack_window,
                                obligation_aware_relations=args.obligation_aware_relations,
                                native_seed_fusion=args.native_seed_fusion,
+                               queryir_soft_fallback=args.queryir_soft_fallback,
+                               queryir_soft_fallback_threshold=(
+                                   args.queryir_soft_fallback_threshold),
                                graph_hop_decay=args.graph_hop_decay,
                                expansion_beam=args.expansion_beam)
 
@@ -216,6 +263,7 @@ def main() -> None:
                 "prompt_tokens": answer.prompt_tokens,
                 "evidence_tokens": answer.evidence_tokens,
                 "completion_tokens": answer.completion_tokens,
+                "answer_finish_reason": answer.finish_reason,
                 "packed_turns": len(answer.evidence_turn_ids),
                 "closed_form": answer.closed_form,
                 "budget_relaxed": answer.budget_relaxed,
@@ -233,20 +281,44 @@ def main() -> None:
 
     answer_rows = load_rows(answer_path)
     retrieval_rows = load_rows(retrieval_path)
+    # Emit benchmark-specific judge inputs for both development and full runs.
+    # Previously only the shard merger did this, which made a single-process
+    # precision ablation require an ad-hoc filtering step before judging.
+    for benchmark, filename in (
+        ("longmemeval", "answers_longmemeval.jsonl"),
+        ("locomo", "answers_locomo.jsonl"),
+    ):
+        (root / filename).write_text("".join(
+            json.dumps(row, ensure_ascii=True) + "\n"
+            for row in answer_rows if row.get("benchmark") == benchmark),
+            encoding="utf-8")
 
     tokens = sorted(row["prompt_tokens"] for row in retrieval_rows)
     manifest = {
         "profile": args.profile, "label": label, "questions": len(answer_rows),
         "source_db": str(args.source_db), "config_hash": config_hash(config),
-        "answer_prompt_hash": PROMPT_HASH,
+        "answer_prompt_hash": prompt_contract(
+            answer_config.normalize_relative_time)[2],
         "span_window": answer_config.span_window,
+        "evidence_order": answer_config.evidence_order,
+        "source_time_normalization": answer_config.normalize_relative_time,
         "obligation_aware_packing": args.obligation_aware_packing,
+        "precision_aware_packing": args.precision_aware_packing,
+        "candidate_pool_limit": args.candidate_pool_limit,
         "obligation_aware_relations": args.obligation_aware_relations,
         "native_seed_fusion": args.native_seed_fusion,
+        "dense_search": embedding is not None,
+        "embedding_db": str(args.embedding_db) if args.embedding_db else None,
+        "queryir_soft_fallback": args.queryir_soft_fallback,
+        "queryir_soft_fallback_threshold": args.queryir_soft_fallback_threshold,
         "graph_hop_decay": args.graph_hop_decay,
         "expansion_beam": args.expansion_beam,
         "span_pack_window": args.span_pack_window,
         "closed_form_enabled": answer_config.closed_form_enabled,
+        "max_output_tokens": answer_config.max_output_tokens,
+        "sampling_seed": answer_config.sampling_seed,
+        "output_truncated": sum(
+            row.get("answer_finish_reason") == "length" for row in retrieval_rows),
         "budget": dataclass_dict(budget),
         "token_counter": stage.counter.describe(),
         "prompt_tokens": {
@@ -263,6 +335,8 @@ def main() -> None:
     print(json.dumps(manifest, indent=2))
     print(f"\nwrote {root}")
     store.close()
+    if embedding_store is not None:
+        embedding_store.close()
     cache_store.close()
 
 

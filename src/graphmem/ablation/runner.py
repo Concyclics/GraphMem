@@ -89,7 +89,12 @@ class GateBAblationRunner:
             if source_cache:
                 source_cache.close()
         refiner = Qwen30BRefiner(store, self.config, dataset_hash) if self.enable_llm else None
-        builder = GraphBuildPipeline(store, dataset_hash=dataset_hash, refiner=refiner)
+        vector_provider = (embedding_index.embed_graph_nodes
+                           if embedding_index is not None else None)
+        builder = GraphBuildPipeline(
+            store, dataset_hash=dataset_hash, refiner=refiner,
+            coarsen_vector_provider=vector_provider,
+            relation_vector_provider=vector_provider)
         all_rows: list[dict[str, Any]] = []
         nav_rows: list[dict[str, Any]] = []
         graph_manifests: list[dict[str, Any]] = []

@@ -24,8 +24,10 @@ from ..domain import (
 )
 from ..storage import SQLiteGraphStore
 from .coarsen import (
+    ATOMIC_RELATION_NODE_TYPES,
     GatedRelationPlan,
     RecursiveHierarchy,
+    admit_llm_refined_relation,
     build_parent_gated_relations,
     build_recursive_hierarchy,
 )
@@ -65,6 +67,12 @@ VERB_RE = re.compile(r"\b([A-Za-z]+(?:ed|ing|s)|went|go|got|made|took|had|has|is
 
 PROFILE_LEVEL = {f"b{index}": index for index in range(7)}
 
+DIRECTIONAL_REFINED_RELATIONS = frozenset({
+    RelationType.TEMPORAL_CONTINUATION,
+    RelationType.CAUSAL,
+    RelationType.CONTRADICTION_UPDATE,
+})
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +89,8 @@ class GraphBuildPipeline:
                  distiller: QwenSemanticDistiller | None = None,
                  predicate_canonicalizer: PredicateCanonicalizer | None = None,
                  coarsen_vector_provider: Callable[[
+                     str, Sequence[GraphNode]], Mapping[str, Sequence[float]]] | None = None,
+                 relation_vector_provider: Callable[[
                      str, Sequence[GraphNode]], Mapping[str, Sequence[float]]] | None = None) -> None:
         self.store = store
         self.dataset_hash = dataset_hash
@@ -88,6 +98,7 @@ class GraphBuildPipeline:
         self.distiller = distiller
         self.predicate_canonicalizer = predicate_canonicalizer
         self.coarsen_vector_provider = coarsen_vector_provider
+        self.relation_vector_provider = relation_vector_provider
 
     def build(self, memory_id: str, profile: GraphMemV5Config) -> GraphArtifactManifest:
         started = time.perf_counter()
@@ -330,6 +341,7 @@ class GraphBuildPipeline:
             edges.extend(self._typed_edges(memory_id, event_nodes, entity_nodes))
 
         gated_plan: GatedRelationPlan | None = None
+        relation_semantic_vector_count = 0
         if (recursive_hierarchy is not None
                 and profile.edges.parent_gated_relations and level >= 3):
             node_map = {node.node_id: node for node in nodes}
@@ -345,6 +357,21 @@ class GraphBuildPipeline:
             for edge in edges:
                 if edge.relation == RelationType.SCENE_CONTAINS:
                     child_map.setdefault(edge.src_id, []).append(edge.dst_id)
+            # Relation candidates need proposition-level geometry.  Reusing a
+            # supporting turn vector collapses every fact extracted from that
+            # turn to one point and loses predicate/value distinctions.  An
+            # explicit provider therefore embeds atomic summaries at their
+            # native granularity.  These vectors feed a typed-only side channel
+            # and never alter routing/scene coarse-edge scores.
+            semantic_vectors: Mapping[str, Sequence[float]] = {}
+            if (profile.edges.relation_candidate_method == "hnsw"
+                    and self.relation_vector_provider is not None):
+                relation_vector_nodes = tuple(
+                    node for node in node_map.values()
+                    if node.node_type in ATOMIC_RELATION_NODE_TYPES)
+                semantic_vectors = self.relation_vector_provider(
+                    memory_id, relation_vector_nodes)
+                relation_semantic_vector_count = len(semantic_vectors)
             gated_plan = build_parent_gated_relations(
                 memory_id, recursive_hierarchy, node_map, child_map,
                 embedding_k=profile.edges.embedding_k,
@@ -364,6 +391,8 @@ class GraphBuildPipeline:
                     profile.edges.max_refine_candidates_per_node),
                 max_refine_candidates_per_1000_nodes=(
                     profile.edges.max_refine_candidates_per_1000_nodes),
+                atomic_vector_channels=((semantic_vectors,)
+                                        if semantic_vectors else ()),
             )
             for left_id, right_id, score, _gate_level in gated_plan.accepted_pairs:
                 left, right = node_map[left_id], node_map[right_id]
@@ -401,13 +430,23 @@ class GraphBuildPipeline:
                     continue
                 candidate = by_candidate[decision.candidate_id]
                 relation = RelationType(decision.decision)
-                left = node_map[candidate.left_id]; right = node_map[candidate.right_id]
+                left_id, right_id = candidate.left_id, candidate.right_id
+                if not admit_llm_refined_relation(
+                        relation, node_map[left_id], node_map[right_id],
+                        decision.confidence,
+                        min_confidence=(
+                            profile.edges.typed_relation_min_confidence)):
+                    continue
+                if (decision.inverse
+                        and relation in DIRECTIONAL_REFINED_RELATIONS):
+                    left_id, right_id = right_id, left_id
+                left = node_map[left_id]; right = node_map[right_id]
                 evidence_groups = tuple(dict.fromkeys((
                     left.evidence_group_id, right.evidence_group_id)))
                 edges.append(GraphEdge(
-                    stable_id("edge", memory_id, candidate.left_id, relation, candidate.right_id),
-                    memory_id, candidate.left_id, relation, candidate.right_id,
-                    evidence_groups[0], relation != RelationType.COARSE_RELATED,
+                    stable_id("edge", memory_id, left_id, relation, right_id),
+                    memory_id, left_id, relation, right_id,
+                    evidence_groups[0], relation in DIRECTIONAL_REFINED_RELATIONS,
                     decision.confidence, decision.source, evidence_groups[1:],
                 ))
             usage_after = self._usage(memory_id)
@@ -424,6 +463,10 @@ class GraphBuildPipeline:
         method_diagnostics: dict[str, Any] = {
             "recursive_hierarchy_enabled": recursive_hierarchy is not None,
             "parent_gated_relations_enabled": gated_plan is not None,
+            "relation_semantic_vector_count": relation_semantic_vector_count,
+            "relation_vector_granularity": (
+                "atomic_summary" if relation_semantic_vector_count
+                else "deterministic_lexical_fallback"),
         }
         if recursive_hierarchy is not None:
             method_diagnostics["coarsening"] = dataclass_dict(
@@ -439,6 +482,10 @@ class GraphBuildPipeline:
                     gated_plan.refine_candidates_generated),
                 "refine_candidates_dropped": (
                     gated_plan.refine_candidates_dropped),
+                "atomic_relation_candidates_generated": (
+                    gated_plan.atomic_relation_candidates_generated),
+                "atomic_relation_pairs_proposed": (
+                    gated_plan.atomic_relation_pairs_proposed),
                 "levels_with_relations": gated_plan.levels_with_relations,
                 "typed_pairs": len(gated_plan.typed_pairs),
                 "candidate_method": gated_plan.candidate_method,

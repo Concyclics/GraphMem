@@ -77,6 +77,41 @@ _STATUS_RE = re.compile(
     r"became|bought|sold|moved|joined|left|won|lost|received|returned)\b", re.I)
 
 
+def adaptive_evidence_turn_limit(
+    answer_kind: str, operand_count: int, requested: int, *, query: str = "",
+) -> int:
+    """Bound distractors without starving genuinely exhaustive operators.
+
+    A universal 32-turn pack gives a one-turn lookup only 3.1% annotated
+    precision.  Direct lookups need a small ambiguity set, temporal operators
+    need endpoints, and collection operators need the widest scope.  The limit
+    is deterministic and never exceeds the caller's declared budget.
+    """
+
+    kind = str(answer_kind).casefold()
+    exhaustive = any(token in kind for token in (
+        "count", "list", "union", "intersection", "group", "collection"))
+    temporal = any(token in kind for token in (
+        "temporal", "duration", "date_difference", "ordering", "argmin", "argmax"))
+    # The current algebra compiler still labels many temporal lookups as a
+    # generic lookup.  A 12-turn cap on those queries caused an 8pp answer
+    # regression on the LME temporal stratum even though aggregate F1 rose.
+    # Use query language only to choose a budget floor, never to filter facts.
+    temporal = temporal or bool(re.search(
+        r"\b(?:when|what\s+time|how\s+long|how\s+many\s+"
+        r"(?:days?|weeks?|months?|years?)|before|after|first|last|earlier|later|"
+        r"ago|yesterday|tomorrow|past\s+weekend|"
+        r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        query, re.I))
+    if exhaustive:
+        target = max(24, 8 * max(1, operand_count))
+    elif temporal:
+        target = max(24, 6 * max(1, operand_count))
+    else:
+        target = max(12, 8 * max(1, operand_count))
+    return max(1, min(requested, target))
+
+
 def _sentences(text: str) -> tuple[tuple[int, int, str], ...]:
     rows = tuple((match.start(), match.end(), match.group(0))
                  for match in _SENTENCE_RE.finditer(text) if match.group(0).strip())
@@ -184,6 +219,7 @@ def pack_obligation_aware(
     count_text_tokens: Callable[[str], int],
     span_window: int = 96,
     baseline_floor: Sequence[str] = (),
+    precision_aware: bool = False,
 ) -> tuple[
     tuple[str, ...], tuple[str, ...], dict[str, bool], tuple[EvidenceUnit, ...], int
 ]:
@@ -302,10 +338,11 @@ def pack_obligation_aware(
     # floor, a span pack takes ranks 1..K while the token-constrained baseline
     # can skip expensive ranks and reach a relevant lower-ranked turn; a real
     # dev example lost rank-40 gold evidence despite admitting seven more turns.
-    for turn_id in baseline_floor:
-        row = candidate_by_turn.get(turn_id)
-        if row is not None:
-            admit_optional(row)
+    if not precision_aware:
+        for turn_id in baseline_floor:
+            row = candidate_by_turn.get(turn_id)
+            if row is not None:
+                admit_optional(row)
 
     # Reserve only the minimum number of high-ranked complete proof units needed
     # to cover QueryIR obligations/operands.  The former cost-normalized greedy
@@ -319,7 +356,10 @@ def pack_obligation_aware(
     required_operands = {item for unit in units for item in unit.operand_ids}
     uncovered_obligations = set(required_obligations)
     uncovered_operands = set(required_operands)
-    reserve_limit = max(1, min(4, max_turns // 2)) if max_turns else 0
+    reserve_capacity = max_turns if precision_aware else max_turns // 2
+    reserve_limit = (max(1, min(
+        reserve_capacity,
+        max(4, len(required_operands) * 2))) if max_turns else 0)
     considered: set[str] = set()
     while (uncovered_obligations or uncovered_operands) and len(considered) < len(viable):
         choices = [unit for unit in viable if unit.unit_id not in considered and (
@@ -345,7 +385,13 @@ def pack_obligation_aware(
         if unit.atomic and len(unit.source_turn_ids) > 1:
             for turn_id in unit.source_turn_ids:
                 multi_unit_by_turn[turn_id].append(unit)
-    for row in candidates:
+    # The upstream fused ranking is already query/operand-aware.  A dynamic MMR
+    # scan changed ~16% of the pack but rescued only 0.040 gold turns/question
+    # while losing 0.035 and added ~89 ms on dev200.  Keep the proof floor above
+    # and use the existing rank for optional fill; bounded stopping supplies the
+    # precision gain without a second O(KN) online reranker.
+    fill_candidates = candidates
+    for row in fill_candidates:
         if len(packed) >= max_turns:
             break
         if row.turn_id in packed or row.turn_id not in turns:
@@ -386,6 +432,7 @@ def pack_obligation_aware(
         "obligation_incomplete": not required_obligations <= covered_obligations,
         "operand_incomplete": not required_operands <= covered_operands,
         "span_packing": True,
+        "precision_aware": precision_aware,
     }
     selected_by_id = {unit.unit_id: unit for unit in selected_units}
     audit_units = tuple(
