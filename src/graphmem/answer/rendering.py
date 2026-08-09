@@ -37,6 +37,9 @@ class AnswerConfig:
     include_dates: bool = True
     include_speaker: bool = True
     closed_form_enabled: bool = True
+    # Remains false until an untouched holdout demonstrates >=99.5% precision
+    # and <=0.5% false-complete for each whitelisted operator.
+    deterministic_bypass_enabled: bool = False
     max_output_tokens: int = 256
     #: Rendered evidence is ``[session date] speaker: text``; this bounds the
     #: per-turn header so a pathological speaker label cannot eat the budget.

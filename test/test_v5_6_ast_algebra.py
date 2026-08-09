@@ -7,6 +7,7 @@ from graphmem.projection.config import ProjectionConfig
 from graphmem.projection.manifest import build_manifests, manifest_stats
 from graphmem.retrieval import operators as ops
 from graphmem.retrieval.ast_algebra import evaluate_ast
+from graphmem.runtime import GraphReadView
 
 
 def _binding(operand: str, value: str, *, owner: str = "alice", start: str | None = None,
@@ -56,6 +57,16 @@ def test_a_manifest_enumerates_its_members() -> None:
     assert nodes[0].attributes["closed"] is True
     assert len(edges) == 3 and all(str(edge.relation) == "member_of" for edge in edges)
     assert rows[0].member_count == 3
+
+
+def test_manifest_values_are_compiled_into_the_read_view() -> None:
+    nodes, edges, _rows = build_manifests(
+        "m", [_fact("hat"), _fact("coat", turn=1)], ON)
+
+    view = GraphReadView(nodes, edges)
+
+    assert view.manifest_value_index["hat"] == (nodes[0].node_id,)
+    assert view.manifest_value_index["coat"] == (nodes[0].node_id,)
 
 
 def test_a_single_member_collection_gets_a_manifest() -> None:
@@ -316,3 +327,74 @@ def test_evaluation_is_deterministic() -> None:
     right = evaluate_ast(_count_ast(), list(reversed(bindings)), collection_closed={"o1": True})
 
     assert left == right
+
+
+def test_count_executes_its_intersection_child_instead_of_counting_the_union() -> None:
+    node = ops.CountDistinct(ops.IntersectionDistinct((
+        ops.FactSet("o1"), ops.FactSet("o2"))))
+    bindings = [_binding("o1", "kyoto"), _binding("o1", "osaka", turn=1),
+                _binding("o2", "kyoto", owner="bob", turn=2),
+                _binding("o2", "nagoya", owner="bob", turn=3)]
+
+    result = evaluate_ast(node, bindings,
+                          collection_closed={"o1": True, "o2": True})
+
+    assert result.count == 1
+    assert [row.value for row in result.members] == ["kyoto"]
+    assert set(result.members[0].operand_ids) == {"o1", "o2"}
+    assert result.scope_complete
+
+
+def test_count_executes_its_union_child() -> None:
+    node = ops.CountDistinct(ops.UnionDistinct((
+        ops.FactSet("o1"), ops.FactSet("o2"))))
+    bindings = [_binding("o1", "kyoto"), _binding("o1", "osaka", turn=1),
+                _binding("o2", "kyoto", owner="bob", turn=2),
+                _binding("o2", "nagoya", owner="bob", turn=3)]
+
+    result = evaluate_ast(node, bindings,
+                          collection_closed={"o1": True, "o2": True})
+
+    assert result.count == 3
+    assert {row.value for row in result.members} == {"kyoto", "osaka", "nagoya"}
+
+
+def test_date_difference_respects_left_and_right_operand_scopes() -> None:
+    node = ops.DateDifference(ops.FactSet("o1"), ops.FactSet("o2"))
+    bindings = [
+        _binding("o1", "left-a", start="2023-03-01"),
+        _binding("o1", "left-b", start="2023-12-01", turn=1),
+        _binding("o2", "right-a", start="2023-01-01", turn=2),
+        _binding("o2", "right-b", start="2023-06-01", turn=3),
+    ]
+
+    result = evaluate_ast(node, bindings)
+
+    assert result.temporal_endpoints[0].binding_id.startswith("b:o1:left-a")
+    assert result.temporal_endpoints[1].binding_id.startswith("b:o2:right-b")
+
+
+def test_descending_ordinal_reverses_the_time_order() -> None:
+    node = ops.Ordinal(ops.FactSet("o1"), index=2, order="descending")
+    bindings = [_binding("o1", "a", start="2023-01-01"),
+                _binding("o1", "b", start="2023-02-01", turn=1),
+                _binding("o1", "c", start="2023-03-01", turn=2)]
+
+    result = evaluate_ast(node, bindings, collection_closed={"o1": True})
+
+    assert [row.value for row in result.members] == ["b"]
+    assert result.scope_complete
+
+
+def test_latest_state_marks_overlapping_conflicting_values_unsafe() -> None:
+    node = ops.LatestState(ops.FactSet("o1"))
+    bindings = [
+        _binding("o1", "kyoto", start="2023-03-01"),
+        _binding("o1", "osaka", start="2023-03-01", turn=1),
+    ]
+
+    result = evaluate_ast(node, bindings, collection_closed={"o1": True})
+
+    assert result.state_result is not None
+    assert result.state_result.contradiction_status == "conflicting_latest"
+    assert "conflicting_latest_state" in result.degradations

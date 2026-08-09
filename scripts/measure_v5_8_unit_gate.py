@@ -131,11 +131,25 @@ def main() -> None:
                          "fallback_scenes": diagnostics.get("extraction_fallback_scenes")})
             print(f"  {memory_id}: {total:,} tokens in {seconds:.0f}s", flush=True)
 
-    truncated = store._read(
-        "SELECT COUNT(*) FROM llm_calls WHERE cached=0 AND stage LIKE 'scene_semantic%' "
-        "AND response_json LIKE '%\"length\"%'")[0][0]
+    # `response_json LIKE '%"length"%'` counts the *word* length wherever it
+    # appears, including inside an extracted quote, so it reported 3 truncations
+    # of 856 calls on a run whose real `finish_reason` was never length.  The
+    # baseline arm scored a clean 0.0000 only because it emitted no free text at
+    # all.  Parse the finish reason instead.
     calls = store._read(
         "SELECT COUNT(*) FROM llm_calls WHERE cached=0 AND stage LIKE 'scene_semantic%'")[0][0]
+    truncated = 0
+    for row in store._read(
+        "SELECT response_json FROM llm_calls WHERE cached=0 AND stage LIKE 'scene_semantic%' "
+        "AND response_json LIKE '%\"length\"%'"
+    ):
+        try:
+            payload = json.loads(row["response_json"])
+        except (TypeError, ValueError):
+            continue
+        if any(choice.get("finish_reason") == "length"
+               for choice in payload.get("choices", ())):
+            truncated += 1
 
     prose, lengths, cross, per_memory_entities = [], [], [], []
     samples: list[str] = []

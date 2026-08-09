@@ -23,6 +23,7 @@ class GraphDiagnosticProbe:
         RelationType.TEMPORAL_AFTER: 0.92,
         RelationType.COLLECTION_CO_MEMBER: 0.88,
         RelationType.PORTAL: 0.86,
+        RelationType.COARSE_RELATED: 0.84,
         RelationType.REFINES_TO: 0.82,
         RelationType.PARTICIPATES_IN: 0.55,
     }

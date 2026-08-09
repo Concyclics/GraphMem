@@ -4,15 +4,19 @@ import heapq
 import itertools
 import math
 import re
+import threading
 import time
-from collections import defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import replace
 from enum import StrEnum
+from functools import lru_cache
+from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from ..domain import (
     CandidateScore,
     EvidenceCertificate,
+    EvidenceMember,
     EvidenceUnit,
     NavigationResult,
     NodeType,
@@ -23,20 +27,29 @@ from ..domain import (
     stable_id,
 )
 from ..principals import build_principal_registry, resolution_stats
-from ..runtime import SQLiteSnapshotRuntime
+from ..runtime import GraphReadView, SQLiteSnapshotRuntime
 from ..storage import SQLiteGraphStore
 from ..tokenization import TokenCounter, resolve_token_counter
 from .algebra import evaluate as evaluate_algebra
 from .ast_algebra import evaluate_ast
 from .operators import requires_exhaustive_scope as ops_requires_scope
 from .bindings import bind_facts, bind_facts_discriminant
-from .certificate import evaluate_certificate
-from .packer import build_proof_units, pack as pack_proof_units
+from .certificate import evaluate_certificate, finalize_ast_certificate
+from .compiled_memory import (
+    COMPILED_MEMORY_SCHEMA,
+    CompiledMemoryArtifact,
+    CompiledMemorySidecar,
+)
+from .packer import (
+    build_proof_units,
+    pack as pack_proof_units,
+    pack_obligation_aware,
+)
 from .query_ir import compile_query
 from .scheduler import ScheduleResult, execute as schedule_relations
 from .facts import (CHANNELS as FACT_CHANNELS, build_fact_reservoir,
-                    select_active_facts, turn_group_index)
-from .seeding import seed_operands
+                    select_active_facts)
+from .seeding import TurnSearchIndex, seed_operands
 
 
 DEFAULT_BACKBONE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
@@ -83,9 +96,24 @@ class HarnessProfile(StrEnum):
     # its worst category at 51.9%; without members the closed-form composer has
     # nothing to read and fired on 0 of 200 questions.
     H10_AST = "h10"
+    # V5.10: promote the AST once at the compiler boundary.  H10 keeps the
+    # historical split legacy/AST execution for a frozen ablation baseline.
+    H11_UNIFIED_IR = "h11"
 
 
 VARIANT_RANK = {variant: index for index, variant in enumerate(NavigatorVariant)}
+
+
+#: The wide-reservoir fusion, one name per term.  `operand_cap` is the number of
+#: operands past which `operand` stops accumulating: the term used to be
+#: `0.4 * len(operand_ids)` with no ceiling, so a turn bound to six operands
+#: collected 2.4 before any lexical channel was consulted, while exact/bm25/dense
+#: are each normalised to about [0, 1].
+FUSION_DEFAULTS: dict[str, float] = {
+    "exact": 1.2, "bm25": 1.0, "dense": 1.0, "graph": 0.8, "binding": 0.7,
+    "operand": 0.4, "operand_cap": 1e9, "role": 0.25, "slot": 0.5,
+    "session": 0.12, "adjacency": 1.0,
+}
 
 
 DenseSearch = Callable[[str, str, int], Sequence[tuple[str, float]]]
@@ -95,6 +123,7 @@ def terms(text: str) -> tuple[str, ...]:
     return tuple(token.casefold() for token in TOKEN_RE.findall(text))
 
 
+@lru_cache(maxsize=8_192)
 def content_terms(text: str) -> frozenset[str]:
     return frozenset(token for token in terms(text) if token not in STOPWORDS and len(token) > 1)
 
@@ -139,6 +168,67 @@ class GraphNavigator:
         h10_owner_rescue: bool = True,
         h10_traversal: bool = True,
         manifest_collection_key: bool = True,
+        #: Measured on 761 questions: decay alone +0.92pp, beam alone -52% mean
+        #: latency and -76% p95, together +1.31pp at 122ms mean against 257ms.
+        #: 1.0 / 0 restore the pre-V5.8 flag-and-no-pruning behaviour.
+        graph_hop_decay: float = 0.3,
+        expansion_beam: int = 2,
+        #: Fusion weights, so the W-series can move one term at a time.  Defaults
+        #: are the values that were inline in `_harness_rows`.  `operand_cap`
+        #: bounds `operand * len(operand_ids)`, which was unbounded and is the
+        #: main reason graph-only candidates scored 2.41 against 1.24.
+        fusion_weights: Mapping[str, float] | None = None,
+        #: Restrict candidates to the best `session_router_k` sessions, scored by
+        #: BM25 of the question against each session's own text.  0 keeps the old
+        #: behaviour, where sessions are never ranked as units and the 32-turn
+        #: pack is drawn from a 578-turn pool spanning ~26 sessions.  Measured:
+        #: single-session questions score 0.6895 against an oracle of 1.0000, so
+        #: the entire deficit on 78.7% of the set is that no routing happens.
+        session_router_k: int = 0,
+        #: Give every routed session a floor of the evidence budget instead of
+        #: letting one session's high-scoring turns take all 32 slots.
+        per_session_quota: bool = False,
+        #: Add *every* turn of the best `session_flood_k` sessions to the pool,
+        #: which is what the legacy path does (`_navigate_legacy`, top-8).
+        #: `session_router_k` filters an already-diluted pool; this one builds the
+        #: pool from whole sessions, so a gold turn with no lexical match of its
+        #: own still enters on its session's evidence.  The two are the only
+        #: pipeline difference that survived attribution of the h0/h10 gap, so
+        #: this is what isolates it from Query IR and the algebra.
+        session_flood_k: int = 0,
+        #: Pack with the legacy `_set_cover` instead of `_rank_pack`.  Pool size
+        #: is not what separates the two pipelines -- h0 wins on 297 candidate
+        #: turns against h10's 420 -- so the packer is the remaining difference.
+        #: `_set_cover` picks by marginal utility with a slot-coverage gain and a
+        #: bonus for a session not yet represented; `_rank_pack` sorts once.
+        harness_set_cover: bool = False,
+        #: Execute H10 through directional root-to-leaf routing.  Earlier
+        #: profiles keep the flat postings path as frozen baselines.
+        hierarchical_routing: bool = True,
+        hierarchy_root_beam: int = 2,
+        hierarchy_child_beam: int = 4,
+        hierarchy_operator_aware: bool = True,
+        read_pool_size: int = 4,
+        snapshot_cache_bytes: int = 512 * 1024 * 1024,
+        snapshot_cache_memories: int = 16,
+        metadata_cache_memories: int = 16,
+        #: V5.10 span/token packer.  Off keeps every frozen H0--H10 result;
+        #: on selects atomic proof units by marginal obligation coverage per
+        #: rendered span token and attaches spans for the answer stage.
+        obligation_aware_packing: bool = False,
+        span_pack_window: int = 96,
+        #: Compile QueryIR obligations into relation-specific beam priorities.
+        #: Off preserves H0--H10 traversal ordering for clean ablations.
+        obligation_aware_relations: bool = False,
+        #: Use the immutable TurnSearchIndex for every query view instead of a
+        #: SQLite FTS call per view.  Kept opt-in for accuracy/latency gating.
+        native_seed_fusion: bool = False,
+        #: Optional trusted local directory containing versioned compiled
+        #: graph/turn/provenance sidecars.  SQLite remains the authority.
+        compiled_cache_dir: str | Path | None = None,
+        #: Frequency-aware admission prevents one-shot tenants from evicting a
+        #: hot memory when a compiled sidecar can serve the cold request once.
+        compiled_cache_admission: bool = True,
     ) -> None:
         self.store = store
         self.skip_traversal_on_certificate = skip_traversal_on_certificate
@@ -147,12 +237,31 @@ class GraphNavigator:
         # one batch.  The packing one measured -11pp on LoCoMo and is reverted;
         # these two and the manifest collection_key match were never measured
         # alone, and together they are the residual against the V5.6 baseline.
+        # The graph term was `1.0 if reached else 0.0`, so a node three hops from
+        # the seed contributed exactly what a seed did.  Measured consequence:
+        # candidates reached by graph alone score 2.41 against 1.24 for ones with
+        # a lexical match, take 25.9% of a 32-turn pack, and yield gold at 0.4%.
+        # `graph_hop_decay ** hop` discounts by distance; 1.0 keeps the old flag.
+        self.graph_hop_decay = graph_hop_decay
+        self.expansion_beam = expansion_beam
+        self.fusion = {**FUSION_DEFAULTS, **dict(fusion_weights or {})}
+        self.session_router_k = session_router_k
+        self.per_session_quota = per_session_quota
+        self.session_flood_k = session_flood_k
+        self.harness_set_cover = harness_set_cover
+        self.hierarchical_routing = hierarchical_routing
+        self.hierarchy_root_beam = max(1, hierarchy_root_beam)
+        self.hierarchy_child_beam = max(1, hierarchy_child_beam)
+        self.hierarchy_operator_aware = hierarchy_operator_aware
         self.h10_owner_rescue = h10_owner_rescue
         self.h10_traversal = h10_traversal
         self.manifest_collection_key = manifest_collection_key
         self.preferred_relations = preferred_relations
         self.fallback_relations = fallback_relations
-        self.runtime = SQLiteSnapshotRuntime(store)
+        self.read_pool_size = store.enable_read_pool(read_pool_size)
+        self.runtime = SQLiteSnapshotRuntime(
+            store, max_cached_views=snapshot_cache_memories,
+            max_cache_bytes=snapshot_cache_bytes)
         self.variant = NavigatorVariant(variant)
         self.dense_search = dense_search
         self.harness_profile = HarnessProfile(harness_profile) if harness_profile else None
@@ -161,52 +270,370 @@ class GraphNavigator:
         # fallback so a run without a local tokenizer still completes, but the
         # manifest then has to say the numbers are estimates.
         self.token_counter = token_counter or resolve_token_counter(DEFAULT_BACKBONE_MODEL)
+        # Tokenization is deterministic for a frozen backbone and dominates the
+        # evidence packer's CPU time.  Cache by source text so concurrent queries
+        # do not repeatedly encode the same immutable turn.
+        self._count_tokens_cached = lru_cache(maxsize=131_072)(
+            self.token_counter.count)
         # Channel set for the fact reservoir, so F0-F5 can be ablated.
         self.fact_channels = tuple(fact_channels) if fact_channels is not None else FACT_CHANNELS
         # PR4b is measured but not yet promoted: on the fixed 200 it halves
         # binding coverage because operand owners are junk or unresolved, so it
         # stays opt-in until the owner resolution it depends on is fixed.
         self.binding_discriminant = binding_discriminant
-        self._turn_group_cache: dict[str, dict[str, tuple[str, ...]]] = {}
-        self._principal_cache: dict[str, object] = {}
+        self.obligation_aware_packing = obligation_aware_packing
+        self.span_pack_window = max(0, span_pack_window)
+        self.obligation_aware_relations = obligation_aware_relations
+        self.native_seed_fusion = native_seed_fusion
+        self.compiled_sidecar = (
+            CompiledMemorySidecar(compiled_cache_dir)
+            if compiled_cache_dir is not None else None)
+        self.compiled_cache_admission = compiled_cache_admission
+        self._compiled_hydrations = 0
+        self._compiled_admissions = 0
+        self._compiled_bypasses = 0
+        self._compiled_retained: dict[str, tuple[int, int]] = {}
+        self._memory_frequency: dict[str, int] = {}
+        self._frequency_observations = 0
+        self._request_state = threading.local()
+        self.metadata_cache_memories = max(1, metadata_cache_memories)
+        self._metadata_lock = threading.RLock()
+        self._turn_group_cache: OrderedDict[
+            str, tuple[int, dict[str, tuple[str, ...]]]
+        ] = OrderedDict()
+        self._principal_cache: OrderedDict[str, tuple[int, object]] = OrderedDict()
+        self._turn_search_cache: OrderedDict[str, TurnSearchIndex] = OrderedDict()
+        self._turn_bundle_cache: OrderedDict[
+            str, tuple[int, tuple[SourceTurn, ...], dict[str, SourceTurn],
+                       dict[tuple[str, int], str]]
+        ] = OrderedDict()
+        self._evidence_index_cache: OrderedDict[
+            str, tuple[int, dict[str, tuple[str, ...]],
+                       dict[str, tuple[str, ...]],
+                       dict[str, tuple[EvidenceMember, ...]]]
+        ] = OrderedDict()
+
+    def _observe_memory(self, memory_id: str) -> int:
+        self._frequency_observations += 1
+        if self._frequency_observations % 4096 == 0:
+            self._memory_frequency = {
+                key: max(1, value // 2)
+                for key, value in self._memory_frequency.items()}
+        value = self._memory_frequency.get(memory_id, 0) + 1
+        self._memory_frequency[memory_id] = value
+        return value
+
+    def _request_compiled_artifact(
+            self, memory_id: str, version: int | None = None,
+    ) -> CompiledMemoryArtifact | None:
+        artifact = getattr(self._request_state, "artifact", None)
+        if (artifact is not None and artifact.memory_id == memory_id
+                and (version is None or artifact.graph_version == version)):
+            return artifact
+        return None
+
+    def _hydrate_compiled_memory(self, memory_id: str) -> GraphReadView | None:
+        """Install a cold memory's validated materialized indexes as one unit."""
+        sidecar = self.compiled_sidecar
+        if sidecar is None:
+            return None
+        frequency = self._observe_memory(memory_id)
+        version, checksum = self.store.graph_identity(memory_id)
+        cached = self.runtime.peek(memory_id, version)
+        if cached is not None and cached.graph_checksum == checksum:
+            return self.runtime.touch(memory_id, version)
+        # GraphNavigator can also be used concurrently without the process
+        # serving layer.  The metadata lock makes sidecar hydration single-flight
+        # inside that case; runtime.install provides the final atomic swap.
+        with self._metadata_lock:
+            cached = self.runtime.peek(memory_id, version)
+            if cached is not None and cached.graph_checksum == checksum:
+                return self.runtime.touch(memory_id, version)
+            artifact = sidecar.load(memory_id, version, checksum)
+            if artifact is None:
+                return None
+            lru_keys = self.runtime.lru_keys()
+            stats = self.runtime.cache_stats()
+            capacity_pressure = (
+                len(lru_keys) >= self.runtime.max_cached_views
+                or int(stats["accounted_bytes"]) + artifact.view_retained_bytes
+                > self.runtime.max_cache_bytes)
+            if (self.compiled_cache_admission
+                    and not getattr(self._request_state, "force_admit", False)
+                    and capacity_pressure and lru_keys
+                    and frequency <= self._memory_frequency.get(lru_keys[0][0], 0)):
+                # The artifact is immutable and can serve this request directly.
+                # Do not let a one-shot tenant evict four coordinated hot
+                # structures (view, turn index, evidence index and principals).
+                self._request_state.artifact = artifact
+                self._compiled_bypasses += 1
+                return artifact.view
+            self.runtime.install(
+                artifact.view, memory_id=memory_id,
+                accounted_bytes=artifact.view_retained_bytes)
+            self._turn_bundle_cache[memory_id] = (
+                version, artifact.turn_index.turns,
+                artifact.turn_index.turn_by_id,
+                artifact.turn_by_session_index)
+            self._turn_search_cache[memory_id] = artifact.turn_index
+            self._evidence_index_cache[memory_id] = (
+                version, artifact.groups_by_turn,
+                artifact.turns_by_group, artifact.members_by_group)
+            self._principal_cache[memory_id] = (version, artifact.principals)
+            for cache in (
+                    self._turn_bundle_cache, self._turn_search_cache,
+                    self._evidence_index_cache, self._principal_cache):
+                cache.move_to_end(memory_id)
+                while len(cache) > self.metadata_cache_memories:
+                    cache.popitem(last=False)
+            self._compiled_hydrations += 1
+            self._compiled_admissions += 1
+            self._compiled_retained[memory_id] = (
+                version, artifact.total_retained_bytes)
+            return artifact.view
+
+    def precompile_memory(self, memory_id: str, *, force: bool = False,
+                          account_bytes: bool = True) -> CompiledMemoryArtifact:
+        """Build and atomically publish one disposable compiled sidecar."""
+        sidecar = self.compiled_sidecar
+        if sidecar is None:
+            raise RuntimeError("compiled_cache_dir is required for precompilation")
+        version, checksum = self.store.graph_identity(memory_id)
+        if not force:
+            cached = sidecar.load(memory_id, version, checksum)
+            if cached is not None:
+                return cached
+        view = self.runtime.view(memory_id)
+        turns_, by_id, by_session_index = self._turn_bundle(
+            memory_id, view.graph_version)
+        turn_index = self._turn_search_index(memory_id, turns_)
+        groups_by_turn, turns_by_group, members_by_group = self._evidence_indexes(
+            memory_id, view.graph_version)
+        principals = self._principals(memory_id, view)
+        artifact = CompiledMemoryArtifact(
+            schema_version=COMPILED_MEMORY_SCHEMA,
+            memory_id=memory_id,
+            graph_version=view.graph_version,
+            graph_checksum=view.graph_checksum,
+            created_ns=time.time_ns(),
+            view=view,
+            turns=turn_index.turns,
+            turn_by_id=turn_index.turn_by_id,
+            turn_by_session_index=by_session_index,
+            turn_index=turn_index,
+            groups_by_turn=groups_by_turn,
+            turns_by_group=turns_by_group,
+            members_by_group=members_by_group,
+            principals=principals,
+        )
+        if account_bytes:
+            artifact = artifact.with_accounting()
+        else:
+            artifact = replace(
+                artifact,
+                view_retained_bytes=view.estimated_bytes,
+                total_retained_bytes=view.estimated_bytes)
+        if self.store.graph_identity(memory_id) != (
+                artifact.graph_version, artifact.graph_checksum):
+            raise RuntimeError(
+                f"graph {memory_id!r} changed during sidecar compilation")
+        sidecar.save(artifact)
+        return artifact
+
+    def warm_memory(self, memory_id: str, queries: Sequence[str],
+                    budget: QueryBudget) -> GraphReadView:
+        """Explicitly admit a memory while running representative warm queries."""
+        if not queries:
+            raise ValueError("at least one warm query is required")
+        self._request_state.force_admit = True
+        try:
+            for query in queries:
+                self.navigate(memory_id, query, budget)
+            view = self.runtime.peek(memory_id)
+            return view if view is not None else self.runtime.view(memory_id)
+        finally:
+            self._request_state.force_admit = False
+
+    def cache_stats(self) -> dict[str, object]:
+        """Expose view lifecycle, sidecar and metadata-cache observability."""
+        retained_memories = set(self._turn_bundle_cache)
+        retained_memories.update(self._turn_search_cache)
+        retained_memories.update(self._evidence_index_cache)
+        retained_memories.update(self._principal_cache)
+        for memory_id, (version, _bytes) in self._compiled_retained.items():
+            if self.runtime.peek(memory_id, version) is not None:
+                retained_memories.add(memory_id)
+        return {
+            "runtime": self.runtime.cache_stats(),
+            "metadata_entries": {
+                "turn_bundles": len(self._turn_bundle_cache),
+                "turn_search_indexes": len(self._turn_search_cache),
+                "evidence_indexes": len(self._evidence_index_cache),
+                "principal_registries": len(self._principal_cache),
+            },
+            "compiled": ({
+                **self.compiled_sidecar.stats(),
+                "hydrations": self._compiled_hydrations,
+                "admissions": self._compiled_admissions,
+                "bypasses": self._compiled_bypasses,
+                "frequency_entries": len(self._memory_frequency),
+                "retained_artifact_bytes": sum(
+                    row[1] for memory_id, row in self._compiled_retained.items()
+                    if memory_id in retained_memories),
+            } if self.compiled_sidecar is not None else {
+                "enabled": False, "hydrations": 0,
+            }),
+        }
 
     def _turn_tokens(self, turn: SourceTurn) -> int:
-        return self.token_counter.count(turn.raw_text)
+        return self._count_tokens_cached(turn.raw_text)
+
+    def _turn_bundle(
+        self, memory_id: str, version: int,
+    ) -> tuple[tuple[SourceTurn, ...], dict[str, SourceTurn],
+               dict[tuple[str, int], str]]:
+        """Return one immutable raw-turn projection per visible graph version."""
+        artifact = self._request_compiled_artifact(memory_id, version)
+        if artifact is not None:
+            return (artifact.turn_index.turns, artifact.turn_index.turn_by_id,
+                    artifact.turn_by_session_index)
+        with self._metadata_lock:
+            cached = self._turn_bundle_cache.get(memory_id)
+            if cached is None or cached[0] != version:
+                turns_ = tuple(self.store.turns(memory_id))
+                cached = (
+                    version,
+                    turns_,
+                    {row.turn_id: row for row in turns_},
+                    {(row.session_id, row.turn_index): row.turn_id for row in turns_},
+                )
+                self._turn_bundle_cache[memory_id] = cached
+            self._turn_bundle_cache.move_to_end(memory_id)
+            while len(self._turn_bundle_cache) > self.metadata_cache_memories:
+                self._turn_bundle_cache.popitem(last=False)
+            return cached[1], cached[2], cached[3]
+
+    def _evidence_indexes(
+        self, memory_id: str, version: int,
+    ) -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]],
+               dict[str, tuple[EvidenceMember, ...]]]:
+        """Compile both directions of provenance once per graph snapshot."""
+        artifact = self._request_compiled_artifact(memory_id, version)
+        if artifact is not None:
+            return (artifact.groups_by_turn, artifact.turns_by_group,
+                    artifact.members_by_group)
+        with self._metadata_lock:
+            cached = self._evidence_index_cache.get(memory_id)
+            if cached is None or cached[0] != version:
+                groups_by_turn: dict[str, list[str]] = defaultdict(list)
+                turns_by_group: dict[str, tuple[str, ...]] = {}
+                members_by_group: dict[str, tuple[EvidenceMember, ...]] = {}
+                for group in self.store.evidence_groups(memory_id):
+                    turns_by_group[group.evidence_group_id] = tuple(
+                        member.turn_id for member in group.members)
+                    members_by_group[group.evidence_group_id] = group.members
+                    for member in group.members:
+                        groups_by_turn[member.turn_id].append(group.evidence_group_id)
+                cached = (
+                    version,
+                    {key: tuple(dict.fromkeys(value))
+                     for key, value in groups_by_turn.items()},
+                    turns_by_group,
+                    members_by_group,
+                )
+                self._evidence_index_cache[memory_id] = cached
+            self._evidence_index_cache.move_to_end(memory_id)
+            while len(self._evidence_index_cache) > self.metadata_cache_memories:
+                self._evidence_index_cache.popitem(last=False)
+            return cached[1], cached[2], cached[3]
+
+    def route_sessions(self, all_turns, query: str, limit: int) -> tuple[str, ...]:
+        """Rank sessions as units by BM25 of the question against session text.
+
+        The session score in `_top_sessions` is a max over turn scores, which is
+        a by-product of turn ranking rather than a session signal: evidence
+        spread over several turns of one session does not accumulate.  This
+        scores the session itself, with the length normalisation that a max
+        cannot have -- sessions here run from 6 to 60 turns.
+        """
+        if not all_turns:
+            return ()
+        return self._turn_search_index(all_turns[0].memory_id, all_turns).rank_sessions(
+            query, limit)
+
+    def _turn_search_index(self, memory_id: str,
+                           turns_: Sequence[SourceTurn]) -> TurnSearchIndex:
+        artifact = self._request_compiled_artifact(memory_id)
+        if artifact is not None:
+            return artifact.turn_index
+        signature = ((len(turns_), turns_[-1].turn_id, turns_[-1].content_hash)
+                     if turns_ else (0, "", ""))
+        with self._metadata_lock:
+            cached = self._turn_search_cache.get(memory_id)
+            if cached is not None and cached.signature == signature:
+                self._turn_search_cache.move_to_end(memory_id)
+                return cached
+            index = TurnSearchIndex(turns_)
+            self._turn_search_cache[memory_id] = index
+            bundle = self._turn_bundle_cache.get(memory_id)
+            if bundle is not None:
+                # One authoritative id map is enough.  TurnSearchIndex already
+                # retains it, so make the bundle share that table instead of
+                # holding an equal per-memory dict for every worker.
+                self._turn_bundle_cache[memory_id] = (
+                    bundle[0], index.turns, index.turn_by_id, bundle[3])
+            self._turn_search_cache.move_to_end(memory_id)
+            while len(self._turn_search_cache) > self.metadata_cache_memories:
+                self._turn_search_cache.popitem(last=False)
+            return index
 
     def _principals(self, memory_id: str, view):
-        if memory_id not in self._principal_cache:
-            self._principal_cache = {memory_id: build_principal_registry(self.store, memory_id, view)}
-        return self._principal_cache[memory_id]
+        version = view.graph_version
+        artifact = self._request_compiled_artifact(memory_id, version)
+        if artifact is not None:
+            return artifact.principals
+        with self._metadata_lock:
+            cached = self._principal_cache.get(memory_id)
+            if cached is None or cached[0] != version:
+                cached = (version, build_principal_registry(self.store, memory_id, view))
+                self._principal_cache[memory_id] = cached
+            self._principal_cache.move_to_end(memory_id)
+            while len(self._principal_cache) > self.metadata_cache_memories:
+                self._principal_cache.popitem(last=False)
+            return cached[1]
 
-    def _turn_groups(self, memory_id: str) -> dict[str, tuple[str, ...]]:
-        if memory_id not in self._turn_group_cache:
-            self._turn_group_cache = {memory_id: turn_group_index(self.store, memory_id)}
-        return self._turn_group_cache[memory_id]
+    def _turn_groups(self, memory_id: str, version: int) -> dict[str, tuple[str, ...]]:
+        return self._evidence_indexes(memory_id, version)[0]
 
     def navigate(self, memory_id: str, query: str, budget: QueryBudget) -> NavigationResult:
-        if self.harness_profile in {None, HarnessProfile.H0_N5, HarnessProfile.H1_TELEMETRY}:
-            result = self._navigate_legacy(memory_id, query, budget)
-            if self.harness_profile == HarnessProfile.H1_TELEMETRY:
-                trace = dict(result.trace)
-                trace["exhaustion_telemetry"] = {
-                    "search_budget_exhausted": bool(result.budget_exhausted and result.visited_nodes >= budget.max_visited_nodes),
-                    "node_cap_reached": result.visited_nodes >= budget.max_visited_nodes,
-                    "edge_cap_reached": result.visited_edges >= budget.max_visited_edges,
-                    "hop_cap_reached": False,
-                    "frontier_truncated": result.frontier_peak >= budget.max_frontier,
-                    "pack_turn_cap_reached": len(result.packed_turn_ids) >= budget.max_evidence_turns,
-                    "pack_token_cap_reached": result.evidence_tokens >= budget.max_evidence_tokens,
-                    "normal_candidate_drop": len(result.dropped_turn_ids) > 0,
-                }
-                return replace(result, trace=trace)
-            return result
-        return self._navigate_harness(memory_id, query, budget)
+        try:
+            if self.harness_profile in {None, HarnessProfile.H0_N5, HarnessProfile.H1_TELEMETRY}:
+                result = self._navigate_legacy(memory_id, query, budget)
+                if self.harness_profile == HarnessProfile.H1_TELEMETRY:
+                    trace = dict(result.trace)
+                    trace["exhaustion_telemetry"] = {
+                        "search_budget_exhausted": bool(result.budget_exhausted and result.visited_nodes >= budget.max_visited_nodes),
+                        "node_cap_reached": result.visited_nodes >= budget.max_visited_nodes,
+                        "edge_cap_reached": result.visited_edges >= budget.max_visited_edges,
+                        "hop_cap_reached": False,
+                        "frontier_truncated": result.frontier_peak >= budget.max_frontier,
+                        "pack_turn_cap_reached": len(result.packed_turn_ids) >= budget.max_evidence_turns,
+                        "pack_token_cap_reached": result.evidence_tokens >= budget.max_evidence_tokens,
+                        "normal_candidate_drop": len(result.dropped_turn_ids) > 0,
+                    }
+                    return replace(result, trace=trace)
+                return result
+            return self._navigate_harness(memory_id, query, budget)
+        finally:
+            self._request_state.artifact = None
 
     def _navigate_legacy(self, memory_id: str, query: str, budget: QueryBudget) -> NavigationResult:
         started = time.perf_counter()
         stage_times: dict[str, float] = {}
-        all_turns = list(self.store.turns(memory_id))
-        by_id = {turn.turn_id: turn for turn in all_turns}
+        compiled_view = self._hydrate_compiled_memory(memory_id)
+        view = compiled_view or self.runtime.view(memory_id)
+        all_turns, by_id, _by_session_index = self._turn_bundle(
+            memory_id, view.graph_version)
         query_terms = content_terms(query)
 
         tick = time.perf_counter()
@@ -218,7 +645,6 @@ class GraphNavigator:
             if turn.session_id in top_sessions:
                 candidate_ids.add(turn.turn_id)
 
-        view = self.runtime.view(memory_id)
         node_relevance = self._node_relevance(view.nodes, query_terms)
         seeds = tuple(node_id for node_id, _ in sorted(
             node_relevance.items(), key=lambda item: (-item[1], item[0])
@@ -243,10 +669,10 @@ class GraphNavigator:
         if VARIANT_RANK[self.variant] >= VARIANT_RANK[NavigatorVariant.N2_PROVENANCE]:
             tick = time.perf_counter()
             group_ids = view.evidence_group_ids_for_nodes(visited or seeds)
+            turns_by_group = self._evidence_indexes(
+                memory_id, view.graph_version)[1]
             for group_id in group_ids:
-                group = self.store.evidence_group(group_id)
-                if group:
-                    candidate_ids.update(member.turn_id for member in group.members)
+                candidate_ids.update(turns_by_group.get(group_id, ()))
             stage_times["provenance_closure"] = (time.perf_counter() - tick) * 1000
 
         kind, required_slots, negative_required = question_slots(query)
@@ -282,8 +708,8 @@ class GraphNavigator:
         retrieved_sessions = tuple(dict.fromkeys(by_id[item].session_id for item in packed))
         stage_times["total"] = (time.perf_counter() - started) * 1000
         graph_id = stable_id(
-            "graph-artifact", memory_id, self.store.graph_version(memory_id),
-            self.store.graph_checksum(memory_id),
+            "graph-artifact", memory_id, view.graph_version,
+            view.graph_checksum,
         )
         return NavigationResult(
             question_id=stable_id("question", memory_id, query),
@@ -322,38 +748,53 @@ class GraphNavigator:
     def _navigate_harness(self, memory_id: str, query: str, budget: QueryBudget) -> NavigationResult:
         """V5.5 query-only Graph Harness over an immutable V5.4 graph."""
         started = time.perf_counter(); stage_times: dict[str, float] = {}
-        all_turns = list(self.store.turns(memory_id)); by_id = {row.turn_id: row for row in all_turns}
-        view = self.runtime.view(memory_id)
+        compiled_view = self._hydrate_compiled_memory(memory_id)
+        view = compiled_view or self.runtime.view(memory_id)
+        all_turns, by_id, by_session_index = self._turn_bundle(
+            memory_id, view.graph_version)
+        turn_index = self._turn_search_index(memory_id, all_turns)
         tick = time.perf_counter()
         registry = self._principals(memory_id, view)
-        ir = compile_query(query, view, registry=registry)
-        stage_times["query_compile"] = (time.perf_counter() - tick) * 1000
+        compiled_ir = compile_query(query, view, registry=registry)
         profile = self.harness_profile
+        ir = (compiled_ir.promote_ast()
+              if profile is HarnessProfile.H11_UNIFIED_IR else compiled_ir)
+        stage_times["query_compile"] = (time.perf_counter() - tick) * 1000
+        ast_profiles = {HarnessProfile.H10_AST, HarnessProfile.H11_UNIFIED_IR}
         use_postings = profile in {HarnessProfile.H2_POSTINGS, HarnessProfile.H3_MULTI_ANCHOR,
                                    HarnessProfile.H4_SCHEDULER, HarnessProfile.H5_ALGEBRA,
                                    HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
                                    HarnessProfile.H9_FACT_RESERVOIR,
-                                   HarnessProfile.H10_AST}
+                                   *ast_profiles}
         use_rrf = profile in {HarnessProfile.H3_MULTI_ANCHOR, HarnessProfile.H4_SCHEDULER,
                               HarnessProfile.H5_ALGEBRA, HarnessProfile.H6_PROOF_PACKING,
                               HarnessProfile.H8_RESERVOIR, HarnessProfile.H9_FACT_RESERVOIR,
-                              HarnessProfile.H10_AST}
+                              *ast_profiles}
         # H7 is the first profile with the wide reservoir; H2-H6 keep the narrow
         # V5.5 seeding so the ablation ladder stays interpretable.
         wide_reservoir = profile in {HarnessProfile.H8_RESERVOIR,
                                      HarnessProfile.H9_FACT_RESERVOIR,
-                                     HarnessProfile.H10_AST}
+                                     *ast_profiles}
         fact_reservoir_enabled = profile in {HarnessProfile.H9_FACT_RESERVOIR,
-                                             HarnessProfile.H10_AST}
-        execute_ast = profile is HarnessProfile.H10_AST
+                                             *ast_profiles}
+        execute_ast = profile in ast_profiles
         tick = time.perf_counter()
         seeded = seed_operands(self.store, view, memory_id, ir, all_turns, dense_search=self.dense_search,
                                use_rrf=use_rrf, use_postings=use_postings,
                                reservoir_limit=budget.max_candidate_reservoir,
                                max_views_per_operand=budget.max_query_views_per_operand,
                                node_budget=budget.seed_nodes,
-                               wide_reservoir=wide_reservoir)
+                               wide_reservoir=wide_reservoir,
+                               hierarchical_routing=(execute_ast and self.hierarchical_routing),
+                               hierarchy_root_beam=self.hierarchy_root_beam,
+                               hierarchy_child_beam=self.hierarchy_child_beam,
+                               hierarchy_operator_aware=self.hierarchy_operator_aware,
+                               turn_index=turn_index,
+                               native_bm25=self.native_seed_fusion)
         stage_times["seed_fusion"] = (time.perf_counter() - tick) * 1000
+        if seeded.stats.get("hierarchical_route_ms"):
+            stage_times["hierarchical_route"] = float(
+                seeded.stats["hierarchical_route_ms"])
         route_closure = (self._route_terminal_closure(view, seeded.semantic_node_ids)
                          if profile in {HarnessProfile.H2_POSTINGS, HarnessProfile.H3_MULTI_ANCHOR} else ())
         # Capped at the seed budget, not the traversal budget: handing the
@@ -364,7 +805,7 @@ class GraphNavigator:
         ) if profile in {HarnessProfile.H4_SCHEDULER, HarnessProfile.H5_ALGEBRA,
                          HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
                          HarnessProfile.H9_FACT_RESERVOIR,
-                         *((HarnessProfile.H10_AST,) if self.h10_owner_rescue else ())} else ()
+                         *(ast_profiles if self.h10_owner_rescue else set())} else ()
         owners = {
             operand.operand_id: set().union(*(set(view.owner_alias_index.get(alias.casefold(), ()))
                                                for alias in operand.owner_aliases))
@@ -388,18 +829,21 @@ class GraphNavigator:
             schedule = ScheduleResult(semantic_seeds, (), {}, {
                 "node_cap_reached": False, "edge_cap_reached": False,
                 "hop_cap_reached": False, "frontier_truncated": False,
-            })
+            }, {node_id: 0 for node_id in semantic_seeds})
         else:
             schedule = schedule_relations(view, ir, semantic_seeds, budget,
                                           preferred_relations=self.preferred_relations,
                                           fallback_relations=self.fallback_relations,
+                                          expansion_beam=self.expansion_beam,
+                                          obligation_aware_relations=(
+                                              self.obligation_aware_relations),
                                           structured=profile in {HarnessProfile.H4_SCHEDULER,
                                                                  HarnessProfile.H5_ALGEBRA,
                                                                  HarnessProfile.H6_PROOF_PACKING,
                                                                  HarnessProfile.H8_RESERVOIR,
                                                                  HarnessProfile.H9_FACT_RESERVOIR,
-                                                                 *((HarnessProfile.H10_AST,)
-                                                                   if self.h10_traversal else ())})
+                                                                 *(ast_profiles
+                                                                   if self.h10_traversal else set())})
         stage_times["graph_read_view"] = (time.perf_counter() - tick) * 1000
         fact_ids = set(semantic_seeds) | set(schedule.visited_node_ids) | set(direct_owner_terminals)
         fact_reservoir = None
@@ -411,7 +855,9 @@ class GraphNavigator:
             core_facts = tuple(node_id for node_id in fact_ids if node_id in view.nodes
                                and view.nodes[node_id].node_type == NodeType.CANONICAL_FACT)
             fact_reservoir = select_active_facts(
-                build_fact_reservoir(view, ir, seeded, self._turn_groups(memory_id),
+                build_fact_reservoir(
+                    view, ir, seeded,
+                    self._turn_groups(memory_id, view.graph_version),
                                      core_fact_ids=core_facts,
                                      channels=self.fact_channels),
                 view, ir,
@@ -461,9 +907,10 @@ class GraphNavigator:
         # the packer and certificate still consume ``closure``, so the frozen
         # ladder's behaviour is untouched and only the answer stage sees members.
         algebra_result = None
+        algebra_bindings = ()
         # Set by the AST branch when a manifest is matched; read again below by
         # the mandatory-packing step, so it must exist on every path.
-        member_scope: set[str] = set()
+        member_scope_by_operand: dict[str, set[str]] = {}
         if execute_ast and ir.ast is not None:
             # PR2b compiled the AST in shadow mode with its own operand ids, so
             # the bindings -- produced against the legacy ir.operands -- carry
@@ -518,12 +965,21 @@ class GraphNavigator:
                                for value in node.attributes.get("value_keys", ())))
                 ]
                 closed_by_operand[operand.operand_id] = bool(matched)
+                scoped_members: set[str] = set()
                 for node in matched:
-                    member_scope.update(str(item) for item in
-                                        node.attributes.get("member_ids", ()))
-            if member_scope:
+                    scoped_members.update(str(item) for item in
+                                          node.attributes.get("member_ids", ()))
+                if scoped_members:
+                    member_scope_by_operand[operand.operand_id] = scoped_members
+            if member_scope_by_operand:
+                # Scope each operand independently.  A global union lets facts
+                # from Alice's matched collection satisfy Bob's operand, which
+                # turns Intersection/Count into a cross-owner false positive.
                 ast_bindings = tuple(row for row in ast_bindings
-                                     if row.fact_node_id in member_scope)
+                                     if not closed_by_operand.get(row.operand_id, False)
+                                     or row.fact_node_id in member_scope_by_operand.get(
+                                         row.operand_id, set()))
+            algebra_bindings = ast_bindings
             if any(closed_by_operand.values()) or not ops_requires_scope(ir.ast):
                 algebra_result = evaluate_ast(ir.ast, ast_bindings,
                                               collection_closed=closed_by_operand)
@@ -535,30 +991,99 @@ class GraphNavigator:
         exhausted = any(schedule.exhaustion.values())
         certificate = evaluate_certificate(ir, closure, exhausted=exhausted, no_progress=no_progress)
         tick = time.perf_counter()
-        group_turns: dict[str, tuple[str, ...]] = {}
-        for group_id in view.terminal_groups_for_nodes(tuple(fact_ids)):
-            group = self.store.evidence_group(group_id)
-            if group:
-                group_turns[group_id] = tuple(member.turn_id for member in group.members)
-        units = build_proof_units(closure.bindings, group_turns)
+        _groups_by_turn, all_group_turns, all_group_members = (
+            self._evidence_indexes(memory_id, view.graph_version))
+        group_turns = {
+            group_id: all_group_turns[group_id]
+            for group_id in view.terminal_groups_for_nodes(tuple(fact_ids))
+            if group_id in all_group_turns
+        }
+        # H10 packs only the witnesses that the recursive algebra selected.
+        # Making every candidate binding mandatory produced 95--104 mandatory
+        # turns for a 32-turn budget and erased the benefit of evidence ranking.
+        proof_bindings = algebra_result.bindings if algebra_result is not None else closure.bindings
+        group_members = {
+            group_id: all_group_members[group_id]
+            for group_id in group_turns if group_id in all_group_members
+        }
+        fact_spans: dict[str, tuple[EvidenceMember, ...]] = {}
+        for binding in proof_bindings:
+            node = view.nodes.get(binding.fact_node_id)
+            rows = node.attributes.get("evidence_spans", ()) if node else ()
+            spans = []
+            for row in rows if isinstance(rows, (list, tuple)) else ():
+                if not isinstance(row, Mapping):
+                    continue
+                try:
+                    spans.append(EvidenceMember(
+                        str(row["turn_id"]), int(row["start"]), int(row["end"]),
+                        "fact_quote"))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if spans:
+                fact_spans[binding.fact_node_id] = tuple(spans)
+        active_obligations = ir.ast_obligations or ir.proof_obligations
+        units = build_proof_units(
+            proof_bindings, group_turns, obligations=active_obligations,
+            group_members=group_members, fact_spans=fact_spans)
+        if self.obligation_aware_packing:
+            raw_fallback_turn_ids = tuple(dict.fromkeys(
+                turn_id
+                for node_id in schedule.visited_node_ids
+                if node_id in view.nodes
+                for turn_id in view.nodes[node_id].attributes.get(
+                    "raw_fallback_turn_ids", ())
+            ))
+            units = (*units, *(EvidenceUnit(
+                stable_id("raw-fallback-unit", turn_id),
+                (stable_id("raw-fallback-obligation", turn_id),), (),
+                (turn_id,), (), 0, True, (), "", (), True)
+                for turn_id in raw_fallback_turn_ids))
         # Hydrate every terminal reached by the structured route, not only the
         # subset already accepted as an algebra result.  The latter is a proof
         # preference, while the former is the lossless CandidatePool contract.
         hydrated_turn_ids = tuple(dict.fromkeys(turn_id for turn_ids in group_turns.values() for turn_id in turn_ids))
+        # Hop distance per hydrated turn, nearest wins.  Facts admitted by the
+        # reservoir rather than walked to have no hop; they are charged the hop
+        # cap, since nothing established how far away they are.
+        turn_hop: dict[str, int] = {}
+        if self.graph_hop_decay < 1.0:
+            by_hop: dict[int, list[str]] = defaultdict(list)
+            for node_id in fact_ids:
+                by_hop[schedule.node_hops.get(node_id, budget.max_hops)].append(node_id)
+            for hop in sorted(by_hop):
+                for group_id in view.terminal_groups_for_nodes(tuple(by_hop[hop])):
+                    for turn_id in group_turns.get(group_id, ()):
+                        turn_hop.setdefault(turn_id, hop)
         proof_turn_ids = tuple(dict.fromkeys(turn_id for unit in units for turn_id in unit.source_turn_ids))
         direct_owner_turn_ids = tuple(dict.fromkeys(
             turn_id for group_id in view.terminal_groups_for_nodes(direct_owner_terminals)
             for turn_id in group_turns.get(group_id, ())
         ))
         candidate_ids = tuple(dict.fromkeys((*seeded.source_turn_ids, *hydrated_turn_ids)))
+        hydrated_set = frozenset(hydrated_turn_ids)
         mandatory = set(proof_turn_ids)
+        if self.session_flood_k:
+            flooded = frozenset(self.route_sessions(all_turns, query, self.session_flood_k))
+            candidate_ids = tuple(dict.fromkeys(
+                (*candidate_ids, *(turn.turn_id for turn in all_turns
+                                   if turn.session_id in flooded))))
+        # Route before ranking.  A mandatory turn is never dropped: those come
+        # from proof units the algebra already committed to, and discarding one
+        # would trade a certified answer for a routing guess.
+        if self.session_router_k:
+            routed = frozenset(self.route_sessions(all_turns, query, self.session_router_k))
+            kept = tuple(turn_id for turn_id in candidate_ids
+                         if turn_id in mandatory
+                         or (by_id[turn_id].session_id in routed if turn_id in by_id else False))
+            if kept:
+                candidate_ids = kept
         # A wider pool only helps if it is ranked at least as well as the narrow
         # one was.  The legacy scorer's lexical, session and adjacency terms are
         # what let it pick 16 useful turns out of 278; without them a 474-turn
         # pool ranks worse than the 45-turn pool it replaced.
         query_terms = content_terms(query)
         session_best: dict[str, float] = defaultdict(float)
-        by_session_index = {(row.session_id, row.turn_index): row.turn_id for row in all_turns}
         base_score: dict[str, float] = {}
         for turn_id in candidate_ids:
             turn = by_id.get(turn_id)
@@ -576,32 +1101,49 @@ class GraphNavigator:
                     neighbour = by_session_index.get((turn.session_id, index))
                     if neighbour:
                         adjacency[neighbour] = max(adjacency[neighbour], value * (0.35 / distance))
+        # Invert binding provenance once.  The former inner loop rebuilt the
+        # union of every binding's evidence turns for every candidate, making
+        # ranking O(|candidates| * |bindings| * |evidence|).
+        binding_operands_by_turn: dict[str, set[str]] = defaultdict(set)
+        binding_confidence_by_operand: dict[str, float] = defaultdict(float)
+        for binding in closure.bindings:
+            binding_confidence_by_operand[binding.operand_id] = max(
+                binding_confidence_by_operand[binding.operand_id],
+                binding.confidence)
+            for group_id in binding.evidence_group_ids:
+                for turn_id in group_turns.get(group_id, ()):
+                    binding_operands_by_turn[turn_id].add(binding.operand_id)
         rows: list[CandidateScore] = []
         for turn_id in candidate_ids:
             turn = by_id.get(turn_id)
             if not turn: continue
             channels = seeded.raw_scores.get(turn_id, {})
             exact = float(channels.get("exact", 0.0)); bm25 = float(channels.get("bm25", 0.0)); dense = float(channels.get("dense", 0.0))
-            graph = 1.0 if turn_id in hydrated_turn_ids else 0.0
+            graph = (self.graph_hop_decay ** turn_hop.get(turn_id, budget.max_hops)
+                     if self.graph_hop_decay < 1.0 else 1.0) if turn_id in hydrated_set else 0.0
             text_terms = content_terms(turn.raw_text)
             slot_gain = min(1.0, len(query_terms & text_terms) / max(1, len(query_terms)))
             role_gain = (0.3 if text_terms & TIME_TERMS else 0.0) + (0.3 if text_terms & NEGATIVE_TERMS else 0.0)
             session_score = session_best.get(turn.session_id, 0.0)
             adjacency_score = adjacency.get(turn_id, 0.0)
-            operand_ids = set(binding.operand_id for binding in closure.bindings
-                                        if turn_id in set().union(*(set(group_turns.get(group_id, ()))
-                                                                    for group_id in binding.evidence_group_ids)))
+            operand_ids = set(binding_operands_by_turn.get(turn_id, ()))
             if turn_id in direct_owner_turn_ids:
                 operand_ids.update(item.operand_id for item in ir.operands if item.owner_aliases)
             operand_ids = tuple(sorted(operand_ids))
-            bscore = max((binding.confidence for binding in closure.bindings if binding.operand_id in operand_ids), default=0.0)
+            bscore = max((binding_confidence_by_operand[item]
+                          for item in operand_ids), default=0.0)
             # The richer lexical/session/adjacency terms exist because a 545-turn
             # pool needs them to rank as well as the legacy scorer ranked 278.
             # They stay off for H2-H6 so those rungs keep their frozen V5.5 values.
-            fused = ((1.2 * exact + bm25 + dense + 0.8 * graph + 0.7 * bscore
-                      + 0.4 * len(operand_ids) + 0.25 * role_gain + 0.5 * slot_gain
-                      + 0.12 * session_score + adjacency_score) if wide_reservoir else
-                     (exact + bm25 + dense + 0.8 * graph + 0.7 * bscore + 0.4 * len(operand_ids)))
+            w = self.fusion
+            operand_gain = w["operand"] * min(len(operand_ids), w["operand_cap"])
+            fused = ((w["exact"] * exact + w["bm25"] * bm25 + w["dense"] * dense
+                      + w["graph"] * graph + w["binding"] * bscore + operand_gain
+                      + w["role"] * role_gain + w["slot"] * slot_gain
+                      + w["session"] * session_score + w["adjacency"] * adjacency_score)
+                     if wide_reservoir else
+                     (exact + bm25 + dense + w["graph"] * graph + w["binding"] * bscore
+                      + operand_gain))
             rows.append(CandidateScore(turn_id, turn.session_id, exact, bm25, dense, graph,
                                        role_gain, slot_gain,
                                        self._turn_tokens(turn), fused,
@@ -621,7 +1163,20 @@ class GraphNavigator:
         # "missing profile" fix cost 11pp of LoCoMo accuracy (0.823 -> 0.714);
         # `rank_mandatory=True` recovers 0.808 by restoring exactly the ordering
         # `_rank_pack` already had.
-        if profile in {HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
+        if self.obligation_aware_packing:
+            answer_kind = (algebra_result.answer_kind if algebra_result is not None
+                           else str(ir.ast_operator or ir.operator))
+            baseline_floor, _baseline_dropped, _baseline_coverage = self._rank_pack(
+                rows, by_id, budget, self.per_session_quota)
+            packed, dropped, pack_exhaustion, packed_units, packed_span_tokens = pack_obligation_aware(
+                units, rows, by_id, query=query, answer_kind=answer_kind,
+                max_turns=budget.max_evidence_turns,
+                max_tokens=budget.max_evidence_tokens,
+                count_text_tokens=self._count_tokens_cached,
+                span_window=self.span_pack_window,
+                baseline_floor=baseline_floor)
+            units = packed_units
+        elif profile in {HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
                        HarnessProfile.H9_FACT_RESERVOIR}:
             packed, dropped, pack_exhaustion = pack_proof_units(units, rows, by_id,
                                                                  max_turns=budget.max_evidence_turns,
@@ -629,13 +1184,24 @@ class GraphNavigator:
                                                                  token_cost=self._turn_tokens,
                                                                  rank_mandatory=self.rank_mandatory)
         else:
-            packed, dropped, _ = self._rank_pack(rows, by_id, budget)
+            if self.harness_set_cover:
+                kind, required_slots, _negative = question_slots(query)
+                packed, dropped, _cover = self._set_cover(rows, by_id, kind, required_slots, budget)
+            else:
+                packed, dropped, _ = self._rank_pack(rows, by_id, budget, self.per_session_quota)
             pack_exhaustion = {"turn_cap_reached": len(packed) >= budget.max_evidence_turns,
                                "token_cap_reached": sum(self._turn_tokens(by_id[item]) for item in packed) >= budget.max_evidence_tokens}
         stage_times["evidence_pack"] = (time.perf_counter() - tick) * 1000
+        if algebra_result is not None:
+            certificate = finalize_ast_certificate(
+                ir, algebra_result, algebra_bindings, group_turns, packed,
+                units=units, exhausted=exhausted or any(pack_exhaustion.values()))
         stage_times["total"] = (time.perf_counter() - started) * 1000
-        graph_id = stable_id("graph-artifact", memory_id, self.store.graph_version(memory_id), self.store.graph_checksum(memory_id))
-        evidence_tokens = sum(self._turn_tokens(by_id[item]) for item in packed)
+        graph_id = stable_id(
+            "graph-artifact", memory_id, view.graph_version, view.graph_checksum)
+        evidence_tokens = (packed_span_tokens
+                           if self.obligation_aware_packing else
+                           sum(self._turn_tokens(by_id[item]) for item in packed))
         operand_coverage = {
             operand.operand_id: {
                 "seed_nodes": seeded.operand_nodes.get(operand.operand_id, ()),
@@ -659,24 +1225,37 @@ class GraphNavigator:
                    # The AST is compiled but not executed yet.  Recording it here,
                    # together with where it disagrees with the legacy classifier,
                    # measures the compiler before anything depends on it.
-                   "operator_ast": ir.describe_ast(),
-                   "ast_operator": str(ir.ast_operator) if ir.ast_operator else "",
-                   "ast_diverges": ir.ast_diverges,
-                   "ast_operands": [item.operand_id for item in ir.ast_operands],
+                   "operator_ast": compiled_ir.describe_ast(),
+                   "ast_operator": (str(compiled_ir.ast_operator)
+                                    if compiled_ir.ast_operator else ""),
+                   "ast_diverges": compiled_ir.ast_diverges,
+                   "query_ir_mode": ("unified_ast" if profile is HarnessProfile.H11_UNIFIED_IR
+                                     else "legacy_plus_shadow_ast"),
+                   "ast_operands": [item.operand_id for item in compiled_ir.ast_operands],
                    "ast_obligations": [f"{item.kind}:{item.operand_id or 'root'}"
-                                       for item in ir.ast_obligations],
+                                       for item in compiled_ir.ast_obligations],
                    "parse_warnings": list(ir.parse_warnings),
                    "principals": registry.stats(),
                    "owner_resolution": resolution_stats(ir.resolved_owners,
                                                         ir.owner_resolution_warnings),
                    "fact_reservoir": dict(fact_reservoir.stats) if fact_reservoir else {},
-                   "binding_reasons": binding_reasons},
+                   "binding_reasons": binding_reasons,
+                   "runtime_cache": self.runtime.cache_stats(),
+                   "sqlite_read_pool_size": self.read_pool_size,
+                   "obligation_aware_packing": self.obligation_aware_packing,
+                   "obligation_aware_relations": self.obligation_aware_relations,
+                   "native_seed_fusion": self.native_seed_fusion,
+                   "span_pack_window": self.span_pack_window},
             seed_node_ids=semantic_seeds, visited_path_node_ids=tuple(dict.fromkeys(
                 (*schedule.visited_node_ids, *direct_owner_terminals))),
             slot_coverage={item.operand_id: tuple(row.binding_id for row in bindings if row.operand_id == item.operand_id)
                            for item in ir.operands}, certificate=certificate, candidate_scores=tuple(rows),
             packed_turn_ids=packed, dropped_turn_ids=dropped, stage_latency_ms=stage_times,
-            graph_only_candidate_turn_ids=hydrated_turn_ids, relation_trace=schedule.proof,
+            # Diagnostic set, not a ranking.  Canonical order keeps a view
+            # compiled in another process byte-for-byte comparable with one
+            # compiled locally under a different hash seed.
+            graph_only_candidate_turn_ids=tuple(sorted(hydrated_turn_ids)),
+            relation_trace=schedule.proof,
             first_hit_relations={item.operand_id: (paths.get(item.fact_node_id, ("posting",))[0]) for item in bindings},
             search_exhaustion=schedule.exhaustion, pack_exhaustion=pack_exhaustion,
             operand_coverage=operand_coverage, proof_units=units, stop_reason=certificate.stop_reason,
@@ -686,7 +1265,9 @@ class GraphNavigator:
                 node_id for node_id in fact_ids
                 if node_id in view.nodes and view.nodes[node_id].node_type == NodeType.CANONICAL_FACT)),
             bound_fact_node_ids=tuple(dict.fromkeys(row.fact_node_id for row in bindings)),
-            selected_fact_node_ids=tuple(dict.fromkeys(row.fact_node_id for row in closure.bindings)),
+            selected_fact_node_ids=tuple(dict.fromkeys(
+                row.fact_node_id for row in (
+                    algebra_result.bindings if algebra_result is not None else closure.bindings))),
             algebra=algebra_result,
         )
 
@@ -964,12 +1545,36 @@ class GraphNavigator:
         return tuple(packed), dropped, coverage
 
     @staticmethod
-    def _rank_pack(rows, by_id, budget):
+    def _rank_pack(rows, by_id, budget, per_session_quota: bool = False):
         packed: list[str] = []
         tokens_used = 0
+        if per_session_quota:
+            # Two passes.  The first gives every session present in `rows` a
+            # floor, so a session whose turns all rank just below another
+            # session's still contributes; the second spends what is left by
+            # rank.  Without the floor one session can take all 32 slots, which
+            # is what makes a multi-session answer unreachable even when both
+            # of its sessions are in the pool.
+            sessions = list(dict.fromkeys(
+                by_id[row.turn_id].session_id for row in rows if row.turn_id in by_id))
+            quota = max(1, budget.max_evidence_turns // max(1, len(sessions)))
+            taken: Counter = Counter()
+            for row in rows:
+                if len(packed) >= budget.max_evidence_turns:
+                    break
+                session_id = by_id[row.turn_id].session_id if row.turn_id in by_id else ""
+                if not row.mandatory and taken[session_id] >= quota:
+                    continue
+                if tokens_used + row.token_cost > budget.max_evidence_tokens:
+                    continue
+                packed.append(row.turn_id)
+                taken[session_id] += 1
+                tokens_used += row.token_cost
         for row in rows:
             if len(packed) >= budget.max_evidence_turns:
                 break
+            if row.turn_id in packed:
+                continue
             if tokens_used + row.token_cost > budget.max_evidence_tokens:
                 continue
             packed.append(row.turn_id)

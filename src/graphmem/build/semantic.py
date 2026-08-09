@@ -5,12 +5,19 @@ import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
 from ..config import CacheIdentity, GraphMemV5Config, config_hash
 from ..domain import SourceTurn, canonical_json, stable_id
 from ..storage import SQLiteGraphStore
+from .atomic_extractor import (
+    InformationUnit,
+    adaptive_fact_cap,
+    scan_information_units,
+    sentence_chunks,
+    units_for_span,
+)
 from .budget import BuildTokenLedger
 
 
@@ -25,6 +32,7 @@ ESTIMATE_SAFETY = 1.10
 
 PROMPT_VERSION = "graphmem-v5.1-scene-semantic-v1"
 STRICT_PROMPT_VERSION = "graphmem-v5.8-strict-scene-facts-v7"
+ATOMIC_PROMPT_VERSION = "graphmem-v5.10-lossless-atomic-facts-v1"
 SYSTEM_PROMPT = """Extract grounded memory facts. Return compact JSON {"s":[{"i":scene_id,"m":summary,"f":[{"o":owner,"p":predicate,"v":value,"y":value_type,"g":scope,"n":"positive|negative","t":time_or_null,"c":confidence,"e":[{"i":turn_id,"a":start,"b":end}]}],"u":[]}]}. Every fact must cite exact supplied offsets. No invention, markdown, explanations, or reasoning. Summary <=64 tokens. Omit empty optional fields."""
 STRICT_PROMPT = """Extract durable facts that help route later questions to exact source turns. Return only schema JSON. Each scene supplies its turns in order, and every turn shows only who spoke, when, and what was said. Fact keys: o=owner entity; p=short canonical verb phrase; v=the concrete value including names and ordinals; g=short domain; n=positive or negative; r=one or two 0-based positions of the cited turns within this scene's turn array; q=one exact quote containing the value and any explicit time. Cover every informative turn before adding a second fact from any turn. Highest priority: quantities and ordinals, named people/places/books/pets, acquisitions and state changes, participation or wins, preferences, explicit or relative time, and factual media-caption details. Preserve words such as first/second/third and numeric caption facts. Never emit generic facts such as shared/showed/sent a photo when the caption supports a more concrete fact. Omit greetings, acknowledgements, emotions without a durable state, advice, and filler. Input d is observation metadata and may only anchor relative time; never copy it as event time. Do not invent, explain, reason, summarize, or create aliases."""
 HIERARCHY_PROMPT = """Compress supplied child semantic records for routing. Return compact JSON with summary, owners, predicates, values, scopes, times, child_postings mapping keys to child ID arrays, and aliases as arrays of equivalent value strings found in the children. Only copy supported values and IDs. Never put IDs in scopes or aliases. No markdown or reasoning."""
@@ -53,6 +61,8 @@ def strict_scene_schema(max_scenes: int, max_facts: int, *,
                         predicate_max_chars: int = 0,
                         scene_summary_chars: int = 0,
                         scene_entities: bool = False,
+                        atomic_coverage: bool = False,
+                        max_information_units: int = 0,
                         max_turn_index: int = 63) -> Mapping[str, Any]:
     """Schema for one strict extraction call.
 
@@ -81,6 +91,19 @@ def strict_scene_schema(max_scenes: int, max_facts: int, *,
     if quote_evidence:
         properties["q"] = {"type": "string", "minLength": 1, "maxLength": 160}
         required.append("q")
+    if atomic_coverage:
+        # Confidence is part of the strict contract.  Before V5.10 it was named
+        # in the legacy prompt but absent from the strict schema, so guided
+        # decoding could never emit it and every fact became the same synthetic
+        # 0.5 downstream.
+        properties["c"] = {"type": "number", "minimum": 0.0, "maximum": 1.0}
+        properties["z"] = {
+            "type": "array", "minItems": 1 if max_information_units else 0,
+            "maxItems": max(1, max_information_units),
+            "items": {"type": "integer", "minimum": 0,
+                      "maximum": max(0, max_information_units - 1)},
+        }
+        required.extend(("c", "z"))
     fact = {"type": "object", "additionalProperties": False,
             "required": required, "properties": properties}
     scene_properties: dict[str, Any] = {
@@ -103,6 +126,20 @@ def strict_scene_schema(max_scenes: int, max_facts: int, *,
         scene_properties["e"] = {"type": "array", "maxItems": 8,
                                  "items": {"type": "string", "minLength": 1, "maxLength": 40}}
         scene_required.append("e")
+    if atomic_coverage:
+        scene_properties["u"] = {
+            "type": "array", "maxItems": max(0, max_information_units),
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["i", "r"],
+                "properties": {
+                    "i": {"type": "integer", "minimum": 0,
+                          "maximum": max(0, max_information_units - 1)},
+                    "r": {"type": "string", "minLength": 1, "maxLength": 80},
+                },
+            },
+        }
+        scene_required.append("u")
     scene = {"type": "object", "additionalProperties": False,
              "required": scene_required, "properties": scene_properties}
     return {"type": "object", "additionalProperties": False, "required": ["s"],
@@ -121,6 +158,7 @@ class SemanticFact:
     time: str | None
     confidence: float
     evidence: tuple[tuple[str, int, int], ...]
+    information_unit_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +171,20 @@ class ScenePacket:
     #: Named entities the scene mentions.  Empty when the config does not ask for
     #: `e`, which is what every graph before V5.8 carries.
     entities: tuple[str, ...] = ()
+    information_units: tuple[InformationUnit, ...] = ()
+    covered_unit_ids: tuple[int, ...] = ()
+    unresolved_unit_ids: tuple[int, ...] = ()
+    missing_unit_ids: tuple[int, ...] = ()
+    raw_fallback_turn_ids: tuple[str, ...] = ()
+    fact_cap: int = 0
+    implicitly_covered_unit_ids: tuple[int, ...] = ()
+
+    @property
+    def unit_coverage(self) -> float:
+        if not self.information_units:
+            return 1.0
+        accounted = set(self.covered_unit_ids) | set(self.unresolved_unit_ids)
+        return len(accounted) / len(self.information_units)
 
 
 class QwenSemanticDistiller:
@@ -170,7 +222,32 @@ class QwenSemanticDistiller:
                 "anywhere in the input, so the same entity in two sessions yields the same string. "
                 "Scene and turn labels such as s1 or s1t0 are not entities and must never appear "
                 "in e.")
-        prompt_material = (STRICT_PROMPT_VERSION + strict_prompt if
+        if config.models.semantic_atomic_coverage:
+            strict_prompt += (
+                " Each input scene provides k, its fact budget, and compact information-unit entries "
+                "u=[unit_id,type,verbatim_surface] beside the source chunk that contains them. Every "
+                "unit must be accounted for exactly: put its integer id in z on at least one fact "
+                "grounded in that same source turn, or put {i:unit_id,r:short_reason} in scene-level u "
+                "when the surface cannot support a durable fact. A fact may cover several units. "
+                "c is calibrated confidence in [0,1]: use high confidence only when owner, relation, "
+                "value, polarity and citation are explicit. Never mark a unit covered merely because "
+                "it was listed in the input. Return no more than the scene's k facts. k is a ceiling, "
+                "not a target: never fill it with paraphrases, progressively longer versions of the "
+                "same proposition, or relations inferred from a place name. Questions and requests "
+                "are not evidence for their presupposed answers: record only that the speaker asked "
+                "or wanted something, never invent the requested movie technique, recommendation, "
+                "event detail, or explanation. q must be a byte-for-byte substring of one input t, "
+                "including its quotation marks; choose a shorter exact clause instead of rewriting it. "
+                "For every number_unit, date, duration, negation, or modality id, the linked fact must "
+                "preserve that exact surface in p, v, or q. Put dates and durations in v even when d "
+                "also supplies an observation anchor. Resolve pronouns to the nearest type-compatible "
+                "explicit antecedent; do not default a third-person pronoun to the speaker, and keep "
+                "giver, recipient, owner and object roles distinct. Never replace a quantity or object "
+                "with a person named in a later question in the same turn.")
+        self.strict_prompt = strict_prompt
+        strict_version = (ATOMIC_PROMPT_VERSION if config.models.semantic_atomic_coverage
+                          else STRICT_PROMPT_VERSION)
+        prompt_material = (strict_version + strict_prompt if
                            config.models.semantic_extraction_mode != "legacy_batch" else
                            PROMPT_VERSION + SYSTEM_PROMPT + HIERARCHY_PROMPT)
         self.prompt_hash = hashlib.sha256(prompt_material.encode()).hexdigest()
@@ -328,50 +405,123 @@ class QwenSemanticDistiller:
         return result
 
     def _extract_strict_batch(self, memory_id: str, batch: Sequence[Any]) -> list[ScenePacket]:
-        payload, scene_aliases, turn_aliases = self._strict_payload(batch)
+        units_by_scene = {
+            scene.scene_id: (scan_information_units(scene.turns)
+                             if self.config.models.semantic_atomic_coverage else ())
+            for scene in batch
+        }
+        fact_caps = {scene.scene_id: self._scene_fact_cap(units_by_scene[scene.scene_id])
+                     for scene in batch}
+        payload, scene_aliases, turn_aliases = self._strict_payload(
+            batch, units_by_scene, fact_caps)
         output_cap = self.config.models.semantic_batch_output_tokens
         allowed, degrade = self._ledger().reserve(self._batch_estimate(batch, output_cap))
         if not allowed:
             # Budget exhausted: keep the scenes in the graph with deterministic
             # summaries rather than dropping the tail of the conversation.
-            return [self._fallback(scene) for scene in batch]
-        max_facts = self.config.models.semantic_max_facts_per_scene
+            return [self._fallback(scene, units_by_scene[scene.scene_id],
+                                   fact_caps[scene.scene_id]) for scene in batch]
+        max_facts = max(fact_caps.values(), default=self.config.models.semantic_max_facts_per_scene)
         if degrade:
-            max_facts = max(1, max_facts // 2)
-        strict_prompt = STRICT_PROMPT + (
-            f" Return at most {max_facts} highest-routing-value facts per scene.")
-        response, usage = self._call(memory_id, "scene_semantic", strict_prompt, payload,
-                                     len(batch), max_facts=max_facts)
+            fact_caps = {key: max(1, value // 2) for key, value in fact_caps.items()}
+            max_facts = max(fact_caps.values())
+            payload, scene_aliases, turn_aliases = self._strict_payload(
+                batch, units_by_scene, fact_caps)
+        strict_base = (self.strict_prompt if self.config.models.semantic_atomic_coverage
+                       else STRICT_PROMPT)
+        strict_prompt = strict_base + (
+            f" This call's schema permits at most {max_facts} facts per scene; obey each scene's k.")
+        response, usage = self._call(
+            memory_id, "scene_semantic", strict_prompt, payload, len(batch),
+            max_facts=max_facts,
+            max_information_units=max(
+                (len(value) for value in units_by_scene.values()), default=0),
+            max_turn_index=max(
+                (len(value) for value in turn_aliases.values()), default=1) - 1)
         self._ledger().settle(self._batch_estimate(batch, output_cap),
                               int(usage.get("total_tokens", 0)))
         rows = self._strict_rows(response, scene_aliases, turn_aliases)
         by_scene = {str(row.get("i")): row for row in rows}
-        missing = [scene for scene in batch if scene.scene_id not in by_scene]
-        if missing and self.config.models.semantic_max_retries:
+        packets = {
+            scene.scene_id: (
+                self._validate_scene(
+                    scene, by_scene[scene.scene_id],
+                    units=units_by_scene[scene.scene_id],
+                    fact_cap=fact_caps[scene.scene_id])
+                if scene.scene_id in by_scene else
+                self._fallback(scene, units_by_scene[scene.scene_id],
+                               fact_caps[scene.scene_id]))
+            for scene in batch
+        }
+        retry_scenes = [
+            scene for scene in batch
+            if (scene.scene_id not in by_scene
+                or (self.config.models.semantic_atomic_coverage
+                    and packets[scene.scene_id].unit_coverage
+                    < self.config.models.semantic_min_unit_coverage))
+        ]
+        if retry_scenes and self.config.models.semantic_max_retries:
             retry_cap = self.config.models.semantic_retry_output_tokens
-            for scene in missing:
+            for scene in retry_scenes:
                 # Retries must be ledgered too.  Leaving them out let a memory
                 # finish at 221,305 tokens against a 220,000 ceiling: ~11 retry
                 # calls per memory were spending outside the budget entirely.
                 retry_estimate = self._batch_estimate((scene,), retry_cap)
                 if not self._ledger().reserve(retry_estimate)[0]:
                     continue
-                retry_payload, retry_scenes, retry_turns = self._strict_payload((scene,))
+                retry_payload, retry_aliases, retry_turns = self._strict_payload(
+                    (scene,), units_by_scene,
+                    {scene.scene_id: fact_caps[scene.scene_id]})
+                if self.config.models.semantic_atomic_coverage:
+                    current = packets[scene.scene_id]
+                    retry_payload = dict(retry_payload)
+                    retry_payload["repair"] = {
+                        "instruction": "Return one complete replacement scene; cover or reject every unit.",
+                        "missing_unit_ids": list(current.missing_unit_ids),
+                    }
                 repaired, retry_usage = self._call(
                     memory_id, "scene_semantic_retry", strict_prompt, retry_payload, 1,
-                    max_tokens=retry_cap, retry_count=1)
+                    max_tokens=retry_cap, retry_count=1,
+                    max_facts=fact_caps[scene.scene_id],
+                    max_information_units=len(units_by_scene[scene.scene_id]),
+                    max_turn_index=max(0, len(retry_turns.get("0", ())) - 1))
                 self._ledger().settle(retry_estimate, int(retry_usage.get("total_tokens", 0)))
-                for row in self._strict_rows(repaired, retry_scenes, retry_turns):
-                    by_scene[str(row.get("i"))] = row
-        result = []
-        for scene in batch:
-            row = by_scene.get(scene.scene_id)
-            result.append(self._validate_scene(scene, row) if row else self._fallback(scene))
-        return result
+                for row in self._strict_rows(repaired, retry_aliases, retry_turns):
+                    candidate = self._validate_scene(
+                        scene, row, units=units_by_scene[scene.scene_id],
+                        fact_cap=fact_caps[scene.scene_id])
+                    previous = packets[scene.scene_id]
+                    candidate_score = (
+                        -len(candidate.missing_unit_ids), len(candidate.covered_unit_ids),
+                        len(candidate.facts))
+                    previous_score = (
+                        -len(previous.missing_unit_ids), len(previous.covered_unit_ids),
+                        len(previous.facts))
+                    if candidate_score >= previous_score:
+                        packets[scene.scene_id] = candidate
+        return [packets[scene.scene_id] for scene in batch]
 
-    def _strict_payload(self, batch: Sequence[Any]) -> tuple[Mapping[str, Any], Mapping[str, str], Mapping[str, str]]:
+    def _scene_fact_cap(self, units: Sequence[InformationUnit]) -> int:
+        base = self.config.models.semantic_max_facts_per_scene
+        if not self.config.models.semantic_adaptive_fact_cap:
+            return base
+        return adaptive_fact_cap(
+            units,
+            floor=base,
+            ceiling=self.config.models.semantic_adaptive_fact_cap_max,
+            alpha=self.config.models.semantic_fact_cap_alpha,
+            beta=self.config.models.semantic_fact_cap_beta,
+            gamma=self.config.models.semantic_fact_cap_gamma,
+        )
+
+    def _strict_payload(
+        self,
+        batch: Sequence[Any],
+        units_by_scene: Mapping[str, Sequence[InformationUnit]] | None = None,
+        fact_caps: Mapping[str, int] | None = None,
+    ) -> tuple[Mapping[str, Any], Mapping[str, str], Mapping[str, Sequence[Any]]]:
         scene_aliases: dict[str, str] = {}
-        turn_aliases: dict[str, str] = {}
+        turn_aliases: dict[str, Sequence[Any]] = {}
         rows = []
         # A turn shows the model three things: who spoke, when, and what was said.
         # Everything else is our plumbing, and plumbing that is shaped like prose
@@ -383,17 +533,42 @@ class QwenSemanticDistiller:
         for scene_index, scene in enumerate(batch):
             scene_alias = str(scene_index); scene_aliases[scene_alias] = scene.scene_id
             turns = []
+            aliases = []
+            scene_units = tuple((units_by_scene or {}).get(scene.scene_id, ()))
             for turn in scene.turns:
-                turns.append({"s": turn.speaker, "d": turn.timestamp,
-                              "t": self._compact_turn(turn.raw_text)})
+                if (self.config.models.semantic_sentence_chunking
+                        and self.config.models.semantic_turn_input_chars):
+                    chunks = sentence_chunks(
+                        turn.turn_id, turn.raw_text,
+                        self.config.models.semantic_turn_input_chars,
+                        tuple((unit.start, unit.end) for unit in scene_units
+                              if unit.turn_id == turn.turn_id))
+                else:
+                    compacted = self._compact_turn(turn.raw_text)
+                    chunks = sentence_chunks(turn.turn_id, compacted, 0)
+                for chunk in chunks:
+                    item: dict[str, Any] = {
+                        "s": turn.speaker, "d": turn.timestamp, "t": chunk.text}
+                    if self.config.models.semantic_atomic_coverage:
+                        item["u"] = [
+                            [unit.unit_id, unit.kind, unit.text]
+                            for unit in units_for_span(
+                                scene_units, turn.turn_id, chunk.start, chunk.end)
+                        ]
+                    turns.append(item)
+                    aliases.append((turn.turn_id, chunk.start, chunk.end))
             # Citations resolve against this scene's own turn order, so the model
             # never needs -- and never sees -- an identifier it could copy.
-            turn_aliases[scene_alias] = tuple(turn.turn_id for turn in scene.turns)
-            rows.append({"i": scene_alias, "r": turns})
+            turn_aliases[scene_alias] = tuple(aliases)
+            scene_row: dict[str, Any] = {"i": scene_alias, "r": turns}
+            if self.config.models.semantic_atomic_coverage:
+                scene_row["k"] = int((fact_caps or {}).get(
+                    scene.scene_id, self._scene_fact_cap(scene_units)))
+            rows.append(scene_row)
         return {"s": rows}, scene_aliases, turn_aliases
 
     def _strict_rows(self, response: Mapping[str, Any], scene_aliases: Mapping[str, str],
-                     turn_aliases: Mapping[str, str]) -> list[Mapping[str, Any]]:
+                     turn_aliases: Mapping[str, Sequence[Any]]) -> list[Mapping[str, Any]]:
         content = str(response.get("content", ""))
         objects = self._parse_objects(content)
         root = objects[0] if objects else {}
@@ -441,7 +616,13 @@ class QwenSemanticDistiller:
                         continue
                     if not 0 <= index < len(scene_turns):
                         continue
-                    refs.append({"i": scene_turns[index], "q": quote})
+                    target = scene_turns[index]
+                    if isinstance(target, (list, tuple)) and len(target) >= 3:
+                        turn_id, chunk_start, chunk_end = target[:3]
+                        refs.append({"i": turn_id, "q": quote,
+                                     "h": chunk_start, "j": chunk_end})
+                    else:  # Backward-compatible direct tests and cached rows.
+                        refs.append({"i": target, "q": quote})
                 fact["e"] = refs; facts.append(fact)
             row["f"] = facts; result.append(row)
         return result
@@ -486,11 +667,20 @@ class QwenSemanticDistiller:
                         break
         return rows
 
-    def _validate_scene(self, scene: Any, row: Mapping[str, Any]) -> ScenePacket:
+    def _validate_scene(
+        self,
+        scene: Any,
+        row: Mapping[str, Any],
+        *,
+        units: Sequence[InformationUnit] = (),
+        fact_cap: int | None = None,
+    ) -> ScenePacket:
         turns = {turn.turn_id: turn for turn in scene.turns}
         facts = []
         fact_rows = row.get("f", row.get("facts", ()))
-        for item in (fact_rows[:self.config.models.semantic_max_facts_per_scene]
+        cap = fact_cap or self.config.models.semantic_max_facts_per_scene
+        valid_unit_ids = {unit.unit_id for unit in units}
+        for item in (fact_rows[:cap]
                      if isinstance(fact_rows, list) else ()):
             if not isinstance(item, dict):
                 continue
@@ -502,7 +692,13 @@ class QwenSemanticDistiller:
                     continue
                 quote = " ".join(str(ref.get("q", "")).split())
                 if quote:
-                    start = turn.raw_text.casefold().find(quote.casefold())
+                    try:
+                        hint = max(0, int(ref.get("h", 0)))
+                        chunk_end = min(len(turn.raw_text), int(ref.get("j", len(turn.raw_text))))
+                    except (TypeError, ValueError):
+                        hint, chunk_end = 0, len(turn.raw_text)
+                    relative = turn.raw_text[hint:chunk_end].casefold().find(quote.casefold())
+                    start = hint + relative if relative >= 0 else -1
                     end = start + len(quote) if start >= 0 else -1
                 elif ref.get("a") is not None or ref.get("start") is not None:
                     try:
@@ -543,12 +739,30 @@ class QwenSemanticDistiller:
             raw_time = None
             value_type = str(item.get("y", item.get("value_type", ""))).strip() \
                 or self._infer_value_type(value)
+            raw_confidence = item.get("c", item.get("confidence"))
+            if self.config.models.semantic_atomic_coverage and raw_confidence is None:
+                # A missing confidence is a schema/contract violation, not a
+                # calibrated 0.5.  Silently manufacturing one made confidence
+                # unusable for scheduling and certification in every strict
+                # graph before V5.10.
+                continue
+            try:
+                confidence = float(0.5 if raw_confidence is None else raw_confidence)
+            except (TypeError, ValueError):
+                continue
+            if not 0.0 <= confidence <= 1.0:
+                continue
+            information_unit_ids = tuple(dict.fromkeys(
+                int(unit_id) for unit_id in item.get("z", ())
+                if isinstance(unit_id, int) and int(unit_id) in valid_unit_ids
+            ))
             facts.append(SemanticFact(owner, predicate, value, value_type,
                                       scope,
                                       str(item.get("n", item.get("polarity", "positive"))),
                                       raw_time,
-                                      min(1.0, max(0.0, float(item.get("c", item.get("confidence", 0.5))))),
-                                      tuple(evidence)))
+                                      confidence,
+                                      tuple(evidence), information_unit_ids))
+        facts = self._dedup_facts(facts)
         summary = " ".join(strip_aliases(row.get("m", row.get("summary", ""))).split()[
             :self.config.models.semantic_summary_tokens])
         # `semantic_compile_summary` replaces the model's sentence with a
@@ -564,9 +778,107 @@ class QwenSemanticDistiller:
             summary = " ".join(scene.summary.split()[:96])
         entities = tuple(dict.fromkeys(
             filter(None, (strip_aliases(item) for item in (row.get("e") or ())))))[:8]
-        return ScenePacket(scene.scene_id, summary, tuple(facts),
-                           self._strings(row.get("u", row.get("unresolved"))), False,
-                           entities)
+        unresolved_rows = row.get("u", row.get("unresolved", ()))
+        unresolved: list[str] = []
+        unresolved_ids: list[int] = []
+        if isinstance(unresolved_rows, list):
+            for item in unresolved_rows:
+                if isinstance(item, dict):
+                    try:
+                        unit_id = int(item.get("i"))
+                    except (TypeError, ValueError):
+                        continue
+                    reason = " ".join(str(item.get("r", "unresolved")).split())[:80]
+                    if unit_id in valid_unit_ids and unit_id not in unresolved_ids:
+                        unresolved_ids.append(unit_id)
+                        unresolved.append(f"{unit_id}:{reason}")
+                elif str(item).strip():
+                    unresolved.append(str(item).strip())
+
+        units_by_id = {unit.unit_id: unit for unit in units}
+        covered: list[int] = []
+        for fact in facts:
+            fact_text = self._normal_unit_text(
+                f"{fact.owner} {fact.predicate} {fact.value} {fact.scope}")
+            for unit_id in fact.information_unit_ids:
+                unit = units_by_id[unit_id]
+                grounded = False
+                for turn_id, start, end in fact.evidence:
+                    if turn_id != unit.turn_id:
+                        continue
+                    overlaps = max(start, unit.start) < min(end, unit.end)
+                    unit_in_fact = self._normal_unit_text(unit.text) in fact_text
+                    if overlaps or unit_in_fact:
+                        grounded = True
+                        break
+                if grounded and unit_id not in covered:
+                    covered.append(unit_id)
+        explicitly_covered = set(covered)
+        implicitly_covered: list[int] = []
+        # z is a compact model-produced accounting link, not the source of
+        # truth.  Independently recover a missed link when a grounded fact
+        # literally preserves the unit surface.  This makes the verifier robust
+        # to an otherwise correct fact omitting one id, while still exposing the
+        # omission as ``implicitly_covered_unit_ids``.
+        for unit in units:
+            if unit.unit_id in explicitly_covered:
+                continue
+            unit_text = self._normal_unit_text(unit.text)
+            if not unit_text:
+                continue
+            needle = f" {unit_text} "
+            for fact in facts:
+                if not any(turn_id == unit.turn_id for turn_id, _, _ in fact.evidence):
+                    continue
+                fact_text = " " + self._normal_unit_text(
+                    f"{fact.owner} {fact.predicate} {fact.value} {fact.scope}") + " "
+                if needle in fact_text:
+                    covered.append(unit.unit_id)
+                    implicitly_covered.append(unit.unit_id)
+                    break
+        # A unit explicitly covered by a fact wins over an unresolved entry.
+        unresolved_ids = [unit_id for unit_id in unresolved_ids if unit_id not in covered]
+        unresolved = [item for item in unresolved
+                      if not item.split(":", 1)[0].isdigit()
+                      or int(item.split(":", 1)[0]) not in covered]
+        missing = sorted(valid_unit_ids - set(covered) - set(unresolved_ids))
+        raw_fallback_ids = set(missing) | set(unresolved_ids)
+        raw_fallback_turns = tuple(dict.fromkeys(
+            unit.turn_id for unit in units if unit.unit_id in raw_fallback_ids
+        )) if self.config.models.semantic_raw_fallback_on_low_coverage else ()
+        return ScenePacket(
+            scene.scene_id, summary, tuple(facts), tuple(unresolved), False,
+            entities, tuple(units), tuple(sorted(covered)), tuple(unresolved_ids),
+            tuple(missing), raw_fallback_turns, cap,
+            tuple(sorted(implicitly_covered)))
+
+    @staticmethod
+    def _normal_unit_text(value: str) -> str:
+        return " ".join(re.findall(r"[\w$%£€¥.-]+", value.casefold()))
+
+    @staticmethod
+    def _dedup_facts(facts: Sequence[SemanticFact]) -> list[SemanticFact]:
+        merged: dict[tuple[Any, ...], SemanticFact] = {}
+        order: list[tuple[Any, ...]] = []
+        for fact in facts:
+            key = (
+                " ".join(fact.owner.casefold().split()),
+                " ".join(fact.predicate.casefold().replace("_", " ").split()),
+                " ".join(fact.value.casefold().split()),
+                fact.polarity.casefold(), fact.evidence,
+            )
+            if key not in merged:
+                merged[key] = fact
+                order.append(key)
+                continue
+            previous = merged[key]
+            merged[key] = replace(
+                previous,
+                confidence=max(previous.confidence, fact.confidence),
+                information_unit_ids=tuple(dict.fromkeys(
+                    previous.information_unit_ids + fact.information_unit_ids)),
+            )
+        return [merged[key] for key in order]
 
     @staticmethod
     def _compiled_summary(facts: Sequence[SemanticFact]) -> str:
@@ -614,13 +926,23 @@ class QwenSemanticDistiller:
         )
 
     @staticmethod
-    def _fallback(scene: Any) -> ScenePacket:
-        return ScenePacket(scene.scene_id, " ".join(scene.summary.split()[:96]), (), ("llm_parse_fallback",), True)
+    def _fallback(
+        scene: Any,
+        units: Sequence[InformationUnit] = (),
+        fact_cap: int = 0,
+    ) -> ScenePacket:
+        return ScenePacket(
+            scene.scene_id, " ".join(scene.summary.split()[:96]), (),
+            ("llm_parse_fallback",), True, (), tuple(units), (), (),
+            tuple(unit.unit_id for unit in units),
+            tuple(dict.fromkeys(unit.turn_id for unit in units)), fact_cap)
 
     def _call(self, memory_id: str, stage: str, system: str, payload: Any,
               batch_size: int, max_tokens: int | None = None,
               retry_count: int = 0,
-              max_facts: int | None = None) -> tuple[Mapping[str, Any], Mapping[str, int]]:
+              max_facts: int | None = None,
+              max_information_units: int = 0,
+              max_turn_index: int | None = None) -> tuple[Mapping[str, Any], Mapping[str, int]]:
         serialized = canonical_json(payload)
         semantic_settings = {
             "schema": self.config.schema_version, "model": self.config.models.llm_model,
@@ -636,6 +958,21 @@ class QwenSemanticDistiller:
                 "max_retries": self.config.models.semantic_max_retries,
                 "retry_output": self.config.models.semantic_retry_output_tokens,
                 "compile_summary": self.config.models.semantic_compile_summary,
+            })
+        if self.config.models.semantic_atomic_coverage:
+            semantic_settings.update({
+                "atomic_coverage": True,
+                "adaptive_fact_cap": self.config.models.semantic_adaptive_fact_cap,
+                "adaptive_fact_cap_max": self.config.models.semantic_adaptive_fact_cap_max,
+                "fact_cap_coefficients": (
+                    self.config.models.semantic_fact_cap_alpha,
+                    self.config.models.semantic_fact_cap_beta,
+                    self.config.models.semantic_fact_cap_gamma,
+                ),
+                "min_unit_coverage": self.config.models.semantic_min_unit_coverage,
+                "sentence_chunking": self.config.models.semantic_sentence_chunking,
+                "max_information_units": max_information_units,
+                "max_turn_index": max_turn_index,
             })
         if (self.config.models.semantic_max_facts_per_scene,
                 self.config.models.semantic_summary_tokens,
@@ -677,7 +1014,10 @@ class QwenSemanticDistiller:
                     predicate_max_chars=self.config.models.semantic_predicate_max_chars,
                     scene_summary_chars=self.config.models.semantic_scene_summary_chars,
                     scene_entities=self.config.models.semantic_scene_entities,
-                    max_turn_index=max(0, self.config.scenes.max_turns - 1))}}
+                    atomic_coverage=self.config.models.semantic_atomic_coverage,
+                    max_information_units=max_information_units,
+                    max_turn_index=(max(0, self.config.scenes.max_turns - 1)
+                                    if max_turn_index is None else max(0, max_turn_index)))}}
         elif self.config.models.semantic_constrained_json:
             request["response_format"] = {"type": "json_object"}
         cached = self.store.cache_get(key); started = time.perf_counter()

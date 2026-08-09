@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Sequence
 
 from ..domain import OperandSpec, ProofObligation, QueryOperator, stable_id
@@ -23,6 +23,7 @@ from .operators import (
     operand_ids,
     requires_exhaustive_scope,
     root_operator,
+    walk,
 )
 from ..principals import PrincipalRegistry, ResolvedOwner, resolve_query_owners
 from .slots import QuerySlots, parse_slots
@@ -65,6 +66,30 @@ class QueryIR:
 
     def describe_ast(self) -> str:
         return describe(self.ast) if self.ast is not None else ""
+
+    def promote_ast(self) -> "QueryIR":
+        """Return one executable IR whose public fields all name the AST plan.
+
+        V5.6--V5.10 compiled the AST in shadow while seeding, binding and the
+        certificate still consumed legacy fields.  Promoting once at the
+        compiler boundary removes positional operand remapping and guarantees
+        every downstream stage sees identical operand ids and obligations.
+        The original instance remains available to the caller for divergence
+        telemetry and frozen-profile comparisons.
+        """
+        if self.ast is None:
+            return self
+        operator = root_operator(self.ast)
+        operands = self.ast_operands or self.operands
+        obligations = self.ast_obligations or self.proof_obligations
+        distinct_by = (operands[0].distinct_by if operands else self.distinct_by)
+        ordering = self.ordering
+        if self.slots is not None and self.slots.ordinal_order:
+            ordering = self.slots.ordinal_order
+        return replace(
+            self, operator=operator, operands=operands,
+            proof_obligations=obligations, ordering=ordering,
+            distinct_by=distinct_by)
 
 
 def _operator(query: str) -> QueryOperator:
@@ -205,9 +230,13 @@ def _ast_obligations(ast: OperatorNode, operands: Sequence[OperandSpec]) -> tupl
         for operand_id in operand_ids(ast):
             rows.append(ProofObligation(
                 stable_id("ast-obligation", operand_id, "collection"), operand_id, "collection"))
-    kind = _AST_EXTRA_OBLIGATION.get(type(ast))
-    if kind:
-        rows.append(ProofObligation(stable_id("ast-obligation", "root", kind), None, kind))
+    # Extra obligations belong to every physical operator, not only the root.
+    # For example Count(Ordinal(FactSet(...))) still needs an ordering proof.
+    for index, node in enumerate(walk(ast)):
+        kind = _AST_EXTRA_OBLIGATION.get(type(node))
+        if kind:
+            rows.append(ProofObligation(
+                stable_id("ast-obligation", index, type(node).__name__, kind), None, kind))
     return tuple(rows)
 
 

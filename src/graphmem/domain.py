@@ -68,6 +68,7 @@ class RelationType(StrEnum):
     PARTICIPATES_IN = "participates_in"
     TEMPORAL_AFTER = "temporal_after"
     REFINES_TO = "refines_to"
+    COARSE_RELATED = "coarse_related"
     CONTAINS = "contains"
     HAS_ACTOR = "has_actor"
     HAS_OBJECT = "has_object"
@@ -92,6 +93,16 @@ class RelationType(StrEnum):
     SAME_PREFERENCE_DOMAIN = "same_preference_domain"
     STATE_NEXT = "state_next"
     COLLECTION_CO_MEMBER = "collection_co_member"
+    SAME_ENTITY_STATE = "same_entity_state"
+    TEMPORAL_CONTINUATION = "temporal_continuation"
+    CAUSAL = "causal"
+    CONTRADICTION_UPDATE = "contradiction_update"
+    #: Two scenes in different sessions that share several low-document-frequency
+    #: terms.  Derived from the raw text rather than from anything the extractor
+    #: wrote, which is the point: every extractor-supplied join key degenerates
+    #: (92.1% of predicates occur once), and the measured result is a graph whose
+    #: edges are 100% single-session.  See scripts/build_shared_referent_edges.py.
+    SHARED_REFERENT = "shared_referent"
 
 
 class QueryOperator(StrEnum):
@@ -483,6 +494,69 @@ class DiagnosticRunManifest:
 
 
 @dataclass(frozen=True, slots=True)
+class GraphChecksumState:
+    """Incrementally composable digest state for a logical graph.
+
+    Each canonical row contributes a domain-separated SHA-256 value.  XOR and
+    modular sum make insert/delete/upsert O(1) per touched row; counts prevent
+    cancellation from making graphs with different cardinality equivalent.
+    The published checksum hashes the complete state again, so callers only see
+    the usual opaque 256-bit artifact identifier.
+    """
+
+    node_xor: int = 0
+    node_sum: int = 0
+    node_count: int = 0
+    edge_xor: int = 0
+    edge_sum: int = 0
+    edge_count: int = 0
+
+    @property
+    def checksum(self) -> str:
+        payload = canonical_json({
+            "algorithm": "graphmem-multiset-sha256-v1",
+            "node_xor": f"{self.node_xor:064x}",
+            "node_sum": f"{self.node_sum:064x}",
+            "node_count": self.node_count,
+            "edge_xor": f"{self.edge_xor:064x}",
+            "edge_sum": f"{self.edge_sum:064x}",
+            "edge_count": self.edge_count,
+        }).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+
+_HASH_MODULUS = 1 << 256
+
+
+def logical_graph_row_digest(kind: str, value: GraphNode | GraphEdge) -> int:
+    if kind not in {"node", "edge"}:
+        raise ValueError(f"unsupported graph row kind: {kind!r}")
+    payload = (kind + "\0" + canonical_json(dataclass_dict(value))).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest(), "big")
+
+
+def logical_graph_checksum_state(
+    nodes: Iterable[GraphNode], edges: Iterable[GraphEdge]
+) -> GraphChecksumState:
+    node_xor = node_sum = node_count = 0
+    for node in nodes:
+        digest = logical_graph_row_digest("node", node)
+        node_xor ^= digest
+        node_sum = (node_sum + digest) % _HASH_MODULUS
+        node_count += 1
+    edge_xor = edge_sum = edge_count = 0
+    for edge in edges:
+        digest = logical_graph_row_digest("edge", edge)
+        edge_xor ^= digest
+        edge_sum = (edge_sum + digest) % _HASH_MODULUS
+        edge_count += 1
+    return GraphChecksumState(
+        node_xor, node_sum, node_count,
+        edge_xor, edge_sum, edge_count,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class RoutingCard:
     card_id: str
     memory_id: str
@@ -735,6 +809,8 @@ class StateResult:
     current_binding_id: str
     prior_binding_ids: tuple[str, ...] = ()
     superseded: bool = False
+    contradiction_status: str = "none"
+    interval_uncertainty: str = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -899,7 +975,4 @@ def dataclass_dict(value: Any) -> dict[str, Any]:
 def logical_graph_checksum(
     nodes: Iterable[GraphNode], edges: Iterable[GraphEdge]
 ) -> str:
-    node_rows = sorted(canonical_json(dataclass_dict(node)) for node in nodes)
-    edge_rows = sorted(canonical_json(dataclass_dict(edge)) for edge in edges)
-    payload = "\n".join([*node_rows, "--edges--", *edge_rows]).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return logical_graph_checksum_state(nodes, edges).checksum

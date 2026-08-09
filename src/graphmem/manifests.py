@@ -30,8 +30,10 @@ def combined_dataset_hash(paths: Iterable[Path]) -> str:
 
 
 def git_commit(repo: Path) -> str:
+    resolved_repo = repo.resolve()
     result = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        ["git", "-c", f"safe.directory={resolved_repo}", "rev-parse", "HEAD"],
+        cwd=resolved_repo, check=True,
         capture_output=True, text=True,
     )
     return result.stdout.strip()

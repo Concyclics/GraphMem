@@ -1,0 +1,324 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "GraphMem V5.8 消融实验：方法、代价与下一步",
+    "description": "面向 GraphMem 工程与研究团队的双阶段消融可视化报告。",
+    "generatedAt": "2026-08-07T12:00:00+08:00",
+    "cards": [
+      {
+        "id": "build_knobs",
+        "description": "图构建配置中真正可消融的字段数量；改动均会触发昂贵重建。",
+        "dataset": "headline",
+        "sourceId": "parameter_space_doc",
+        "metrics": [{"label": "构建侧可消融项", "field": "build_knobs", "format": "number"}]
+      },
+      {
+        "id": "best_build_gain",
+        "description": "仅加入原文证据引用相对核心抽取基线的 all-hit 增益。",
+        "dataset": "headline",
+        "sourceId": "phase_a_results",
+        "metrics": [{"label": "Quoted evidence 增益", "field": "best_build_gain_pp", "format": "number", "signed": true}]
+      },
+      {
+        "id": "best_retrieval",
+        "description": "固定 B1 图、32 turns 下总体检索 all-hit 的最高值。",
+        "dataset": "headline",
+        "sourceId": "phase_b_results",
+        "metrics": [{"label": "Legacy N5 all-hit", "field": "best_retrieval", "format": "percent"}]
+      },
+      {
+        "id": "rebuild_cost",
+        "description": "110-memory T2 构建臂的实测量级，且历史运行出现超时。",
+        "dataset": "headline",
+        "sourceId": "parameter_space_doc",
+        "metrics": [{"label": "单个 T2 臂墙钟", "field": "rebuild_hours", "format": "number"}]
+      }
+    ],
+    "charts": [
+      {
+        "id": "build_ablation",
+        "title": "语义抽取方法的 turn-level all-hit",
+        "subtitle": "761 题；横轴为 all-hit，括号内实验编号仅用于追溯。",
+        "headerMarkdown": "**Quoted evidence 单独开启表现最好。** 自由摘要和场景实体不但没有帮助，还会干扰引用证据带来的收益。",
+        "intent": "comparison",
+        "type": "horizontalBar",
+        "dataset": "build_arms",
+        "sourceId": "phase_a_results",
+        "encodings": {
+          "x": {"field": "method", "type": "nominal", "label": "抽取方法"},
+          "y": {"field": "all_hit", "type": "quantitative", "label": "All-hit", "format": "percent"},
+          "tooltip": [
+            {"field": "arm", "type": "text", "label": "实验臂"},
+            {"field": "recall", "type": "quantitative", "label": "Recall", "format": "percent"},
+            {"field": "delta_pp", "type": "quantitative", "label": "相对核心基线", "unit": "pp"}
+          ]
+        },
+        "xAxisTitle": "Turn all-hit",
+        "valueFormat": "percent",
+        "layout": "full",
+        "surface": {"surface": "card", "viewMode": "both"}
+      },
+      {
+        "id": "retrieval_quality",
+        "title": "召回方法的总体 turn-level all-hit",
+        "subtitle": "固定 B1 quoted-evidence 图，761 题；方法名称描述实际执行链。",
+        "headerMarkdown": "**简单的 raw fusion / legacy set-cover 仍然领先。** 引入事实蓄水池后质量大幅下降，AST 与更大证据预算只能部分修复。",
+        "intent": "comparison",
+        "type": "horizontalBar",
+        "dataset": "retrieval_arms",
+        "sourceId": "phase_b_results",
+        "encodings": {
+          "x": {"field": "method", "type": "nominal", "label": "召回流程"},
+          "y": {"field": "all_hit", "type": "quantitative", "label": "All-hit", "format": "percent"},
+          "tooltip": [
+            {"field": "arm", "type": "text", "label": "实验臂"},
+            {"field": "recall", "type": "quantitative", "label": "Recall", "format": "percent"},
+            {"field": "turn_budget", "type": "quantitative", "label": "Turn budget"}
+          ]
+        },
+        "xAxisTitle": "Turn all-hit",
+        "valueFormat": "percent",
+        "layout": "full",
+        "surface": {"surface": "card", "viewMode": "both"}
+      },
+      {
+        "id": "retrieval_latency",
+        "title": "召回方法的 p50 延迟",
+        "subtitle": "9 路并发共享 embedding 服务；适合比较相对开销，不代表串行容量。",
+        "headerMarkdown": "**Harness 复杂度同时增加了延迟。** AST 流程约为 legacy N5 的 2.7 倍，而总体 all-hit 仍更低。",
+        "intent": "comparison",
+        "type": "horizontalBar",
+        "dataset": "retrieval_arms",
+        "sourceId": "phase_b_results",
+        "encodings": {
+          "x": {"field": "method", "type": "nominal", "label": "召回流程"},
+          "y": {"field": "p50_ms", "type": "quantitative", "label": "p50", "unit": "ms"},
+          "tooltip": [
+            {"field": "p95_ms", "type": "quantitative", "label": "p95", "unit": "ms"},
+            {"field": "mean_ms", "type": "quantitative", "label": "Mean", "unit": "ms"},
+            {"field": "all_hit", "type": "quantitative", "label": "All-hit", "format": "percent"}
+          ]
+        },
+        "xAxisTitle": "p50 latency (ms)",
+        "valueFormat": "number",
+        "unit": "ms",
+        "layout": "full",
+        "surface": {"surface": "card", "viewMode": "both"}
+      },
+      {
+        "id": "budget_curve",
+        "title": "AST Graph Harness 的 evidence-turn budget 扫描",
+        "subtitle": "同一 H10 AST 流程，turn 上限从 32 增至 64；检索延迟几乎不变。",
+        "headerMarkdown": "**证据预算是当前唯一免费且单调有效的召回旋钮。** 32→64 turns 带来 +5.5pp all-hit，但仍未追上 legacy N5@32。",
+        "intent": "trend",
+        "type": "bar",
+        "dataset": "budget_scan",
+        "sourceId": "phase_b_results",
+        "encodings": {
+          "x": {"field": "turn_budget_label", "type": "ordinal", "label": "Evidence turns"},
+          "y": {"field": "all_hit", "type": "quantitative", "label": "All-hit", "format": "percent"},
+          "tooltip": [
+            {"field": "recall", "type": "quantitative", "label": "Recall", "format": "percent"},
+            {"field": "p50_ms", "type": "quantitative", "label": "p50", "unit": "ms"}
+          ]
+        },
+        "yAxisTitle": "Turn all-hit",
+        "valueFormat": "percent",
+        "layout": "full",
+        "referenceLines": [{"axis": "y", "value": 0.7004, "label": "Legacy N5@32", "color": "neutral", "lineStyle": "dashed"}],
+        "surface": {"surface": "card", "viewMode": "both"}
+      },
+      {
+        "id": "stratum_tradeoff",
+        "title": "Legacy set-cover 与 AST Graph Harness 的题型差异",
+        "subtitle": "LoCoMo 四类；H10 使用 64 turns，legacy N5 使用 32 turns。",
+        "headerMarkdown": "**AST Harness 的价值集中在 Cat1 多跳。** 它在 Cat1 高 9.2pp，但在占比最大的 Cat4 单跳低 13.4pp，因此总体分数被题型分布主导。",
+        "intent": "comparison",
+        "type": "bar",
+        "dataset": "stratum_comparison",
+        "sourceId": "phase_b_results",
+        "encodings": {
+          "x": {"field": "stratum", "type": "nominal", "label": "LoCoMo category"},
+          "y": {"field": "all_hit", "type": "quantitative", "label": "All-hit", "format": "percent"},
+          "color": {"field": "method", "type": "nominal", "label": "召回流程"},
+          "tooltip": [
+            {"field": "n", "type": "quantitative", "label": "Questions"},
+            {"field": "delta_vs_legacy_pp", "type": "quantitative", "label": "相对 legacy", "unit": "pp"}
+          ]
+        },
+        "yAxisTitle": "Turn all-hit",
+        "valueFormat": "percent",
+        "layout": "full",
+        "surface": {"surface": "card", "interactiveLegend": true, "viewMode": "both"}
+      }
+    ],
+    "tables": [
+      {
+        "id": "method_catalog",
+        "title": "方法实现流程与关键差别",
+        "subtitle": "名称优先描述执行机制；实验编号只用于映射代码和产物。",
+        "dataset": "method_catalog",
+        "sourceId": "parameter_space_doc",
+        "defaultSort": {"field": "order", "direction": "asc"},
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {"field": "order", "label": "顺序", "format": "number"},
+          {"field": "method", "label": "方法", "type": "text"},
+          {"field": "stage", "label": "阶段", "type": "text"},
+          {"field": "flow", "label": "大致实现流程", "type": "text"},
+          {"field": "difference", "label": "相对前一方法的差别", "type": "text"},
+          {"field": "cost", "label": "实验代价", "type": "text"},
+          {"field": "result", "label": "当前结论", "type": "text"}
+        ]
+      },
+      {
+        "id": "cost_tiers",
+        "title": "实验代价分层",
+        "subtitle": "先穷举免费和投影重放层，再把昂贵重建限制在少数高价值臂。",
+        "dataset": "cost_tiers",
+        "sourceId": "parameter_space_doc",
+        "defaultSort": {"field": "order", "direction": "asc"},
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {"field": "order", "label": "顺序", "format": "number"},
+          {"field": "tier", "label": "层级", "type": "text"},
+          {"field": "scope", "label": "包含内容", "type": "text"},
+          {"field": "cost", "label": "单臂代价", "type": "text"},
+          {"field": "reuse", "label": "Graph 复用", "type": "text"},
+          {"field": "recommended_use", "label": "适合回答的问题", "type": "text"}
+        ]
+      },
+      {
+        "id": "next_matrix",
+        "title": "下一轮实验矩阵",
+        "subtitle": "按决策价值排序；先补答案/judge证据，再做低成本召回参数化。",
+        "dataset": "next_steps",
+        "sourceId": "parameter_space_doc",
+        "defaultSort": {"field": "priority_order", "direction": "asc"},
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {"field": "priority_order", "label": "顺序", "format": "number"},
+          {"field": "priority", "label": "优先级", "type": "text"},
+          {"field": "experiment", "label": "实验", "type": "text"},
+          {"field": "implementation", "label": "具体怎么做", "type": "text"},
+          {"field": "question", "label": "要回答的问题", "type": "text"},
+          {"field": "gate", "label": "进入下一阶段的门槛", "type": "text"}
+        ]
+      }
+    ],
+    "sources": [
+      {"id": "parameter_space_doc", "label": "GraphMem V5.8 双阶段参数与消融设计", "path": "GraphMem/docs/V5_8_ABLATION_PARAMETER_SPACE.md", "query": {"engine": "duckdb", "language": "sql", "sql": "SELECT * FROM (VALUES (58, 6.0, 0.7004, 2.0)) AS reviewed(build_knobs, best_build_gain_pp, best_retrieval, rebuild_hours)", "description": "从参数空间文档复核并结构化的报告头部指标。", "tables_used": ["GraphMem/docs/V5_8_ABLATION_PARAMETER_SPACE.md"], "metric_definitions": ["build_knobs 为文档列出的构建侧真正可消融项数量。", "best_build_gain_pp 为 B1 相对 B0 的 all-hit 百分点差。", "best_retrieval 为 Phase B 的最高 turn-level all-hit。", "rebuild_hours 为 110-memory T2 臂的实测墙钟量级。"]}},
+      {"id": "phase_a_results", "label": "V5.8 Phase A 构建消融结果", "path": "artifacts/v5_8/phase_a/arm_recall.json", "query": {"engine": "duckdb", "language": "sql", "sql": "SELECT * FROM read_json_auto('artifacts/v5_8/phase_a/arm_recall.json')", "description": "读取保存的 Phase A 构建消融逐臂结果并计算总体 all-hit/recall。", "tables_used": ["artifacts/v5_8/phase_a/arm_recall.json"], "filters": ["761-question fixed evaluation set"], "metric_definitions": ["all_hit 为全部 gold evidence turns 均进入最终证据包的问题占比。", "recall 为召回 gold turns 数除以 gold turns 总数。"]}},
+      {"id": "phase_b_results", "label": "V5.8 Phase B 召回消融结果", "path": "artifacts/v5_8/phase_b/retrieval_arms.json", "query": {"engine": "duckdb", "language": "sql", "sql": "SELECT * FROM read_json_auto('artifacts/v5_8/phase_b/retrieval_arms.json')", "description": "读取固定 B1 图上的 Phase B 召回臂结果。", "tables_used": ["artifacts/v5_8/phase_b/retrieval_arms.json"], "filters": ["Fixed B1 quoted-evidence graph", "761-question evaluation set", "Nine retrieval arms run concurrently"], "metric_definitions": ["all_hit 为全部 gold evidence turns 均进入最终证据包的问题占比。", "p50_ms/p95_ms 为九路并发共享 embedding 服务时的阶段延迟。"]}}
+    ],
+    "blocks": [
+      {"id": "title", "type": "markdown", "body": "# GraphMem V5.8 消融实验：方法、代价与下一步"},
+      {"id": "technical_summary", "type": "markdown", "sourceId": "parameter_space_doc", "body": "## 结论：构建侧保留引用证据，召回侧暂时保留 legacy 主路径\n\n**图构建最明确的增益来自保留原文证据引用。** 只开启 quoted evidence 的方法比核心抽取基线高 **6.0pp**，而自由场景摘要和场景实体单独开启均为负收益。\n\n**总体召回仍应以 raw fusion + legacy set-cover 为默认。** 固定 B1 图、32 turns 时，它达到 **70.0% all-hit**；完整 AST Graph Harness 即使放宽到 64 turns 也只有 **62.7%**。\n\n**Harness 并非整体无效，而是作用高度集中。** 它在 LoCoMo Cat1 多跳上优于 legacy 9.2pp，却在 Cat4 单跳上回退 13.4pp。下一步应先做 answer + judge 和按题型路由验证，不能仅凭总体检索 all-hit 删除 Harness。"},
+      {"id": "headline_metrics", "type": "metric-strip", "cardIds": ["build_knobs", "best_build_gain", "best_retrieval", "rebuild_cost"]},
+      {"id": "architecture", "type": "markdown", "body": "## 两阶段系统：哪些变化需要重建，哪些可以直接重放\n\nGraphMem V5.8 的实验边界可以读成一条明确的数据流：\n\n**原始 turns → scene 切分 → LLM 语义事实抽取 → hierarchy / entity / typed edge 构建 → authority SQLite**\n\n**authority SQLite → 确定性 projection → query seeding → fact binding / graph traversal → evidence packing → answer rendering**\n\n前半段由 `GraphMemV5Config` 控制，任何改动都会改变 config hash 并触发完整重建；projection、retrieval 与 answer 位于后半段，原则上都应复用同一图。当前 `query_budget` 仍错误地放在构建配置中，后续应迁出到独立 `RetrievalConfig`。"},
+      {"id": "cost_explain", "type": "markdown", "sourceId": "parameter_space_doc", "body": "## 成本分层决定实验顺序\n\n**先测 T0/T1，最后才动 T2。** T0 只重跑查询，分钟级且不调用构建 LLM；T1 只重放确定性投影；T2 每个 110-memory 臂约需 2 小时，并有历史超时风险。这个约束意味着构建侧不能对 58 个可调项做盲目网格搜索。"},
+      {"id": "cost_table", "type": "table", "tableId": "cost_tiers", "layout": "full"},
+      {"id": "build_finding", "type": "markdown", "sourceId": "phase_a_results", "body": "## 构建侧：证据引用有效，自由压缩特征会互相干扰\n\n`Quoted evidence` 让模型输出事实时同时保留可定位的原文证据，因此 terminal provenance 更稳定。`Scene summary` 让模型额外生成自由文本压缩，`Scene entities` 则额外输出场景实体集合；两者都会消耗输出容量，并可能产生与事实槽位不一致的第二套表达。实验显示它们单独为负，全部叠加也低于只保留引用证据。"},
+      {"id": "build_chart", "type": "chart", "chartId": "build_ablation", "layout": "full"},
+      {"id": "method_intro", "type": "markdown", "body": "## 召回侧：方法不是编号阶梯，而是不同的数据组织方式\n\nLegacy 路径直接把问题与原始 turn 做 exact、BM25、dense 融合，再用 turn-level set-cover 打包证据。Graph Harness 路径则先把候选组织成事实蓄水池，进行 owner/predicate/scope 绑定，再编译查询 AST、执行集合或时间关系代数，最后把结构化 witness 回溯为原始 turn。它理论上更适合多跳与闭包问题，但每增加一层都会引入候选裁剪、绑定阈值和证明单元排序误差。"},
+      {"id": "method_table", "type": "table", "tableId": "method_catalog", "layout": "full"},
+      {"id": "retrieval_finding", "type": "markdown", "sourceId": "phase_b_results", "body": "## 总体召回：事实蓄水池是当前最大退化点\n\nRaw fusion 与 legacy N5/set-cover 的差距很小，说明简单的原始证据融合已经很强。加入 algebra 后质量下降；再加入宽事实蓄水池与结构化 fact 激活时，all-hit 降至约 41.7%。AST 查询规划能恢复一部分，但仍无法完全弥补在候选蓄水池和打包阶段丢掉的原始证据。"},
+      {"id": "retrieval_quality_chart", "type": "chart", "chartId": "retrieval_quality", "layout": "full"},
+      {"id": "latency_explain", "type": "markdown", "sourceId": "phase_b_results", "body": "## 复杂 Harness 目前同时付出了质量和延迟成本\n\n复杂方法需要生成多 query views、扩充 fact reservoir、建立 binding，并运行证书或 AST，因此 p50 从 raw fusion 的 40.8ms 增至 AST 的约 157–159ms。由于九个进程共享 embedding 服务，绝对时延需要串行复测；但相对排序差异足够大，能够确认额外阶段确实有显著开销。"},
+      {"id": "latency_chart", "type": "chart", "chartId": "retrieval_latency", "layout": "full"},
+      {"id": "budget_explain", "type": "markdown", "sourceId": "phase_b_results", "body": "## 增加 evidence turns 能稳定补回证据，但不能修复候选排序\n\n在同一 AST Harness 上，把证据 turn 上限从 32 提高到 48、64，all-hit 单调从 57.2% 上升到 60.3%、62.7%，检索延迟几乎不变。它是可以立即采用的低成本杠杆，但增加的是下游作答 context；而且 64 turns 仍比 legacy N5@32 低 7.4pp。"},
+      {"id": "budget_chart", "type": "chart", "chartId": "budget_curve", "layout": "full"},
+      {"id": "category_explain", "type": "markdown", "sourceId": "phase_b_results", "body": "## 按题型看，AST Harness 应被视为专用路径\n\nCat1 多跳需要集合闭包、跨事实组合和多个 witness，正是 AST / algebra 的设计目标，因此 H10@64 达到 31.0%，高于 legacy 的 21.8%。Cat4 单跳主要依赖直接事实命中，额外绑定与候选裁剪反而伤害召回。最合理的工程方向不是强行统一默认路径，而是验证一个可泛化的题型路由器。"},
+      {"id": "category_chart", "type": "chart", "chartId": "stratum_tradeoff", "layout": "full"},
+      {"id": "definitions", "type": "markdown", "body": "## 指标与比较口径\n\n- **Turn all-hit**：一道题的全部 gold evidence turns 都进入最终证据包的比例。\n- **Turn recall**：召回到的 gold turns 数量除以 gold turns 总数。\n- **Phase A 构建比较**：761 题，在固定召回口径下只改变图构建/抽取特征。\n- **Phase B 召回比较**：固定 B1 quoted-evidence 图，在 761 题上只改变导航与打包流程。\n- **延迟**：九个召回臂并发、共享 embedding 服务时记录的 stage latency。\n- **重要边界**：检索 all-hit 不等于最终 answer/judge accuracy，尤其无法度量 closed-form composer 的收益。"},
+      {"id": "next_steps_intro", "type": "markdown", "sourceId": "parameter_space_doc", "body": "## 下一轮应先验证 Harness 的答案价值，再继续调召回权重\n\n优先在 legacy N5@64 与 AST Harness@64 上跑 answer + judge，判断结构化事实和 closed-form 是否能用更低的 turn all-hit换来更高的最终答案质量。随后把硬编码融合权重、绑定阈值、种子深度和 query budget 迁入独立 `RetrievalConfig`，才能用同一图做可复现的 T0 扫描。"},
+      {"id": "next_steps_table", "type": "table", "tableId": "next_matrix", "layout": "full"},
+      {"id": "limitations", "type": "markdown", "sourceId": "parameter_space_doc", "body": "## 结论的适用边界\n\n1. 761 题中 LongMemEval multi-session 只有 1 题，因此当前构建与召回结论主要适用于 LoCoMo。\n2. Phase B 延迟来自 9 路并发共享 embedding 服务，只能支持相对比较。\n3. `A5_free_predicate.json` 与 `A6_out3072.json` 含已移除字段，当前无法重现，应修复或标记作废。\n4. `max_llm_reranks` 与 `max_iterations` 是死旋钮，不应占用实验臂。\n5. 当前报告总结已完成的 retrieval 指标；最终默认路径必须等待 answer + judge。"},
+      {"id": "further_questions", "type": "markdown", "body": "## 仍需回答的问题\n\n- Fact reservoir 的 28pp 退化来自候选准入、binding threshold，还是 proof-unit packing？\n- Cat1 路由能否仅依靠问题文本泛化，而不读取 benchmark 标签？\n- Legacy N5 的 evidence budget 从 32 增至 64 后，是否仍保持总体领先？\n- 在补齐 100 道 LongMemEval 难题后，quoted evidence 与 AST Harness 的结论是否反转？\n- P8 predicate head-stem 投影能否改善集合闭包而不伤害单跳事实？"}
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-07T12:00:00+08:00",
+    "status": "ready",
+    "datasets": {
+      "headline": [{"build_knobs": 58, "best_build_gain_pp": 6.0, "best_retrieval": 0.7004, "rebuild_hours": 2}],
+      "build_arms": [
+        {"order": 1, "arm": "B0_core", "method": "核心事实抽取（B0）", "all_hit": 0.512, "recall": 0.532, "delta_pp": 0.0, "mechanism": "只抽 owner/predicate/value/scope 等核心事实"},
+        {"order": 2, "arm": "B1_quote", "method": "核心事实 + 原文证据引用（B1）", "all_hit": 0.572, "recall": 0.572, "delta_pp": 6.0, "mechanism": "每条事实保留 quote/span provenance"},
+        {"order": 3, "arm": "B2_summary", "method": "核心事实 + 自由场景摘要（B2）", "all_hit": 0.493, "recall": 0.506, "delta_pp": -1.9, "mechanism": "额外生成 scene summary"},
+        {"order": 4, "arm": "B3_entities", "method": "核心事实 + 场景实体列表（B3）", "all_hit": 0.482, "recall": 0.504, "delta_pp": -3.0, "mechanism": "额外生成 scene entity set"},
+        {"order": 5, "arm": "B4_all", "method": "引用 + 摘要 + 实体全开（B4）", "all_hit": 0.549, "recall": 0.556, "delta_pp": 3.7, "mechanism": "三种扩展字段同时生成"},
+        {"order": 6, "arm": "B5_all_free_p", "method": "全开 + 自由谓词（B5）", "all_hit": 0.560, "recall": 0.562, "delta_pp": 4.8, "mechanism": "取消 predicate 字符限制"}
+      ],
+      "retrieval_arms": [
+        {"arm": "n1_raw_fusion@32", "method": "原始 turn 三路融合", "all_hit": 0.6899, "recall": 0.6489, "p50_ms": 40.8, "p95_ms": 395.8, "mean_ms": 82.6, "turn_budget": 32, "flow": "Exact + BM25 + dense → turn rank → pack"},
+        {"arm": "h0_n5@32", "method": "Legacy N5 集合覆盖", "all_hit": 0.7004, "recall": 0.6579, "p50_ms": 57.6, "p95_ms": 680.4, "mean_ms": 114.2, "turn_budget": 32, "flow": "融合候选 → turn-level set-cover → pack"},
+        {"arm": "n5_set_cover@32", "method": "显式 N5 集合覆盖", "all_hit": 0.7004, "recall": 0.6579, "p50_ms": 58.4, "p95_ms": 592.6, "mean_ms": 113.8, "turn_budget": 32, "flow": "与 H0 相同的 N5 执行路径"},
+        {"arm": "h5_algebra@32", "method": "事实绑定 + 关系代数", "all_hit": 0.5020, "recall": 0.5171, "p50_ms": 60.9, "p95_ms": 685.6, "mean_ms": 123.2, "turn_budget": 32, "flow": "多锚点 seed → FactBinding → algebra → certificate"},
+        {"arm": "h8_reservoir@32", "method": "宽事实蓄水池", "all_hit": 0.4166, "recall": 0.4260, "p50_ms": 128.1, "p95_ms": 838.8, "mean_ms": 237.8, "turn_budget": 32, "flow": "多来源事实 reservoir → active fact 裁剪 → binding"},
+        {"arm": "h9_facts@32", "method": "结构化事实激活", "all_hit": 0.4166, "recall": 0.4296, "p50_ms": 142.8, "p95_ms": 864.2, "mean_ms": 263.6, "turn_budget": 32, "flow": "reservoir → per-operand fact activation → structured pack"},
+        {"arm": "h10_ast@32", "method": "查询 AST + Graph Harness（32 turns）", "all_hit": 0.5716, "recall": 0.5722, "p50_ms": 156.7, "p95_ms": 871.9, "mean_ms": 278.9, "turn_budget": 32, "flow": "QueryIR/AST → operand execution → proof units → pack"},
+        {"arm": "h10_ast@48", "method": "查询 AST + Graph Harness（48 turns）", "all_hit": 0.6032, "recall": 0.6155, "p50_ms": 156.9, "p95_ms": 882.1, "mean_ms": 279.7, "turn_budget": 48, "flow": "同 H10，仅扩大最终证据 turn 上限"},
+        {"arm": "h10_ast@64", "method": "查询 AST + Graph Harness（64 turns）", "all_hit": 0.6268, "recall": 0.6471, "p50_ms": 158.7, "p95_ms": 850.2, "mean_ms": 276.1, "turn_budget": 64, "flow": "同 H10，进一步扩大最终证据 turn 上限"}
+      ],
+      "budget_scan": [
+        {"turn_budget": 32, "turn_budget_label": "32 turns", "all_hit": 0.5716, "recall": 0.5722, "p50_ms": 156.7},
+        {"turn_budget": 48, "turn_budget_label": "48 turns", "all_hit": 0.6032, "recall": 0.6155, "p50_ms": 156.9},
+        {"turn_budget": 64, "turn_budget_label": "64 turns", "all_hit": 0.6268, "recall": 0.6471, "p50_ms": 158.7}
+      ],
+      "stratum_comparison": [
+        {"stratum": "Cat1 多跳", "n": 142, "method": "Legacy N5 · 32 turns", "all_hit": 0.218, "delta_vs_legacy_pp": 0.0},
+        {"stratum": "Cat1 多跳", "n": 142, "method": "AST Harness · 64 turns", "all_hit": 0.310, "delta_vs_legacy_pp": 9.2},
+        {"stratum": "Cat2 时序", "n": 156, "method": "Legacy N5 · 32 turns", "all_hit": 0.853, "delta_vs_legacy_pp": 0.0},
+        {"stratum": "Cat2 时序", "n": 156, "method": "AST Harness · 64 turns", "all_hit": 0.763, "delta_vs_legacy_pp": -9.0},
+        {"stratum": "Cat3 开放域", "n": 44, "method": "Legacy N5 · 32 turns", "all_hit": 0.318, "delta_vs_legacy_pp": 0.0},
+        {"stratum": "Cat3 开放域", "n": 44, "method": "AST Harness · 64 turns", "all_hit": 0.341, "delta_vs_legacy_pp": 2.3},
+        {"stratum": "Cat4 单跳", "n": 418, "method": "Legacy N5 · 32 turns", "all_hit": 0.847, "delta_vs_legacy_pp": 0.0},
+        {"stratum": "Cat4 单跳", "n": 418, "method": "AST Harness · 64 turns", "all_hit": 0.713, "delta_vs_legacy_pp": -13.4}
+      ],
+      "cost_tiers": [
+        {"order": 1, "tier": "T0 · 在线免费层", "scope": "QueryBudget、召回 profile、融合/绑定权重、AnswerConfig", "cost": "分钟级；零构建 LLM", "reuse": "完全复用 authority SQLite", "recommended_use": "先定位 seed、binding、packing 与 evidence budget 问题"},
+        {"order": 2, "tier": "T1 · 确定性投影层", "scope": "Collection manifest、value lattice、temporal closure、predicate normalization", "cost": "投影重放；零构建 LLM", "reuse": "复用抽取事实，生成新投影", "recommended_use": "验证索引结构是否限制集合、时间与跨度闭包"},
+        {"order": 3, "tier": "T2 · LLM 重建层", "scope": "Scene、semantic extraction、hierarchy、entity merge、edge config", "cost": "约 2 小时 / 110 memories，存在超时风险", "reuse": "config hash 变化，需新图", "recommended_use": "仅测试已有 T0/T1 诊断支持的高价值构建假设"}
+      ],
+      "method_catalog": [
+        {"order": 1, "method": "核心事实抽取（B0）", "stage": "构建", "flow": "Scene turns → LLM 抽 owner/predicate/value/scope/time → CanonicalFact", "difference": "最小语义结构，不要求 quote，不生成自由摘要或实体列表", "cost": "T2 重建", "result": "51.2% all-hit；构建基线"},
+        {"order": 2, "method": "带原文证据的事实抽取（B1）", "stage": "构建", "flow": "核心事实抽取 + 每条 fact 的 quote/span → terminal provenance", "difference": "事实与原始 turn 直接对齐，减少抽取后无法回溯", "cost": "T2 重建", "result": "57.2%；当前最优构建方法"},
+        {"order": 3, "method": "自由场景摘要扩展（B2）", "stage": "构建", "flow": "核心事实抽取 + LLM scene summary → 可检索摘要字段", "difference": "增加一套非槽位化的自由文本压缩", "cost": "T2 重建与额外输出 token", "result": "49.3%；单独为负收益"},
+        {"order": 4, "method": "场景实体扩展（B3）", "stage": "构建", "flow": "核心事实抽取 + scene entity set → entity routing", "difference": "显式增加场景实体列表，可能与 fact owner/participants 重复", "cost": "T2 重建与额外输出 token", "result": "48.2%；单独为负收益"},
+        {"order": 5, "method": "原始 turn 三路融合", "stage": "召回", "flow": "Question → exact/BM25/dense → session fanout → ranked turns", "difference": "直接检索 lossless turns，不依赖结构化事实闭包", "cost": "T0，约 41ms p50", "result": "69.0%；最快且接近最佳"},
+        {"order": 6, "method": "Legacy N5 集合覆盖", "stage": "召回", "flow": "三路融合候选 → turn-level gain/token set-cover → evidence pack", "difference": "在 raw fusion 后用覆盖增益选择互补 turns", "cost": "T0，约 58ms p50", "result": "70.0%；总体最佳"},
+        {"order": 7, "method": "事实绑定 + 关系代数", "stage": "召回", "flow": "Operand seeds → owner/predicate/scope binding → union/intersection/count/time algebra → certificate", "difference": "从 turn 排序转为可执行查询义务与独立 witness", "cost": "T0，约 61ms p50", "result": "50.2%；绑定/证书带来召回损失"},
+        {"order": 8, "method": "宽事实蓄水池", "stage": "召回", "flow": "source/structured/routing 多来源 facts → reservoir → per-operand active facts", "difference": "加宽候选 ID 池，再按结构信号裁剪为活动 facts", "cost": "T0，约 128ms p50", "result": "41.7%；当前最大退化点"},
+        {"order": 9, "method": "查询 AST Graph Harness", "stage": "召回", "flow": "Question → QueryIR/AST → operands → fact reservoir/binding → algebra → proof-unit pack", "difference": "显式表达多跳、集合与时间运算，可为 closed-form composer 提供结构化输入", "cost": "T0，约 157–159ms p50", "result": "32 turns 57.2%；64 turns 62.7%；Cat1 有优势"},
+        {"order": 10, "method": "确定性 Projection P8/P9", "stage": "投影", "flow": "Canonical facts → predicate head-stem / scope-relaxed chains → manifests/value lattice", "difference": "不重新抽取，只改变集合与值关系的权威投影", "cost": "T1 投影重放", "result": "高性价比候选，尚需与胜出召回路径组合验证"}
+      ],
+      "next_steps": [
+        {"priority_order": 1, "priority": "P0", "experiment": "最终答案价值验证", "implementation": "Legacy N5@64 与 AST Harness@64 分别运行 answer + judge", "question": "AST 的 closed-form/结构化输入能否抵消较低的 turn all-hit？", "gate": "最终 answer/judge 指标，而非 retrieval all-hit"},
+        {"priority_order": 2, "priority": "P0", "experiment": "胜出 legacy 路径的预算扫描", "implementation": "固定 N5，扫描 evidence turns 32/48/64", "question": "H10 上的免费单调增益能否迁移到总体最优路径？", "gate": "all-hit 单调且 answer context 不超预算"},
+        {"priority_order": 3, "priority": "P1", "experiment": "Fact reservoir 退化诊断", "implementation": "逐段记录 source admission、active-fact 裁剪、binding、candidate→packed gap", "question": "28pp 损失首先发生在哪一阶段？", "gate": "找到可复现的首个损失阶段"},
+        {"priority_order": 4, "priority": "P1", "experiment": "独立 RetrievalConfig", "implementation": "迁出 seed depth、binding threshold、fusion weights、QueryBudget，默认值保持 parity", "question": "能否在不作废 graph/cache 的条件下系统扫描 T0？", "gate": "默认配置逐题 parity"},
+        {"priority_order": 5, "priority": "P1", "experiment": "召回权重与深度扫描", "implementation": "exact 1.2→1.0；graph 0.8→1.2；binding 0.30→0.20；view depth 48→96", "question": "Harness 是权重失配还是结构本身有损？", "gate": "Cat1 增益保留，Cat2/Cat4 回退收窄"},
+        {"priority_order": 6, "priority": "P2", "experiment": "无标签题型路由", "implementation": "仅从问题文本编译 operator/complexity，Cat1-like 走 AST，其余走 N5", "question": "能否获取 Cat1 增益而不依赖 benchmark 标签？", "gate": "held-out 路由优于单一路径且不读取类别"},
+        {"priority_order": 7, "priority": "P2", "experiment": "P8/P9 投影重放", "implementation": "predicate head-stem + relaxed chain scope，再叠 value lattice", "question": "更好的集合 manifest 能否减少 AST 对宽 reservoir 的依赖？", "gate": "集合闭包改善且单跳无显著回退"},
+        {"priority_order": 8, "priority": "P3", "experiment": "有限 T2 重建", "implementation": "C1 只开 quote；C2 scene max turns 4→6", "question": "构建结构是否还能在合理成本下增加可导航信息？", "gate": "先由 T0/T1 诊断证明重建必要性"}
+      ]
+    }
+  },
+  "sources": [
+    {"id": "parameter_space_doc", "label": "GraphMem V5.8 双阶段参数与消融设计", "path": "GraphMem/docs/V5_8_ABLATION_PARAMETER_SPACE.md", "query": {"engine": "duckdb", "language": "sql", "sql": "SELECT * FROM (VALUES (58, 6.0, 0.7004, 2.0)) AS reviewed(build_knobs, best_build_gain_pp, best_retrieval, rebuild_hours)", "description": "从参数空间文档复核并结构化的报告头部指标。", "tables_used": ["GraphMem/docs/V5_8_ABLATION_PARAMETER_SPACE.md"], "metric_definitions": ["build_knobs 为文档列出的构建侧真正可消融项数量。", "best_build_gain_pp 为 B1 相对 B0 的 all-hit 百分点差。", "best_retrieval 为 Phase B 的最高 turn-level all-hit。", "rebuild_hours 为 110-memory T2 臂的实测墙钟量级。"]}},
+    {"id": "phase_a_results", "label": "V5.8 Phase A 构建消融结果", "path": "artifacts/v5_8/phase_a/arm_recall.json", "query": {"engine": "duckdb", "language": "sql", "sql": "SELECT * FROM read_json_auto('artifacts/v5_8/phase_a/arm_recall.json')", "description": "读取保存的 Phase A 构建消融逐臂结果并计算总体 all-hit/recall。", "tables_used": ["artifacts/v5_8/phase_a/arm_recall.json"], "filters": ["761-question fixed evaluation set"], "metric_definitions": ["all_hit 为全部 gold evidence turns 均进入最终证据包的问题占比。", "recall 为召回 gold turns 数除以 gold turns 总数。"]}},
+    {"id": "phase_b_results", "label": "V5.8 Phase B 召回消融结果", "path": "artifacts/v5_8/phase_b/retrieval_arms.json", "query": {"engine": "duckdb", "language": "sql", "sql": "SELECT * FROM read_json_auto('artifacts/v5_8/phase_b/retrieval_arms.json')", "description": "读取固定 B1 图上的 Phase B 召回臂结果。", "tables_used": ["artifacts/v5_8/phase_b/retrieval_arms.json"], "filters": ["Fixed B1 quoted-evidence graph", "761-question evaluation set", "Nine retrieval arms run concurrently"], "metric_definitions": ["all_hit 为全部 gold evidence turns 均进入最终证据包的问题占比。", "p50_ms/p95_ms 为九路并发共享 embedding 服务时的阶段延迟。"]}}
+  ],
+  "package_info": {
+    "root": "GraphMem V5.8",
+    "manifestPath": "artifact.json",
+    "snapshotPath": "artifact.json"
+  }
+}

@@ -29,6 +29,7 @@ from ..domain import (
 from ..storage import SQLiteGraphStore
 from ..tokenization import resolve_token_counter
 from .composer import AnswerDraft, compose
+from ..retrieval.executor import inspect_execution
 from .prompts import PROMPT_HASH, PROMPT_VERSION, build_answer_messages
 from .rendering import AnswerConfig, RenderedEvidence, render_evidence
 
@@ -136,9 +137,37 @@ class AnswerStage:
         draft: AnswerDraft | None = (
             compose(algebra, result.certificate) if self.answer_config.closed_form_enabled else None)
 
+        typed_execution = inspect_execution(algebra, result.certificate)
+
         evidence = self.render(result, budget)
         if evidence.mandatory_dropped:
             warnings.append("mandatory_turn_dropped_for_budget")
+        if (self.answer_config.deterministic_bypass_enabled
+                and typed_execution is not None
+                and typed_execution.safe_to_bypass):
+            return AnswerResult(
+                question_id=question_id, memory_id=result.memory_id,
+                prediction=typed_execution.text,
+                evidence_turn_ids=evidence.turn_ids,
+                dropped_turn_ids=evidence.dropped_turn_ids,
+                evidence_tokens=evidence.tokens, prompt_tokens=0,
+                completion_tokens=0, closed_form=True,
+                draft_text=typed_execution.text, draft_certified=True,
+                latency_ms=(time.perf_counter() - started) * 1000,
+                warnings=tuple(warnings), trace={
+                    "deterministic_bypass": True,
+                    "typed_execution": {
+                        "kind": typed_execution.answer_kind,
+                        "unit": typed_execution.unit,
+                        "interval_uncertainty": (
+                            typed_execution.interval_uncertainty),
+                        "contradiction_status": (
+                            typed_execution.contradiction_status),
+                        "provenance_binding_ids": list(
+                            typed_execution.provenance_binding_ids),
+                        "reason_codes": list(typed_execution.reason_codes),
+                    },
+                })
         messages = build_answer_messages(
             question=question, question_date=question_date, evidence_text=evidence.text,
             candidate_answer=draft.text if draft else None)
@@ -185,6 +214,15 @@ class AnswerStage:
                 "token_counter": self.counter.describe(),
                 "draft_kind": draft.answer_kind if draft else None,
                 "draft_degradations": list(draft.degradations) if draft else [],
+                "deterministic_bypass": False,
+                "typed_execution": ({
+                    "kind": typed_execution.answer_kind,
+                    "unit": typed_execution.unit,
+                    "interval_uncertainty": typed_execution.interval_uncertainty,
+                    "contradiction_status": typed_execution.contradiction_status,
+                    "safe_to_bypass": typed_execution.safe_to_bypass,
+                    "reason_codes": list(typed_execution.reason_codes),
+                } if typed_execution is not None else None),
             },
         )
 

@@ -56,10 +56,24 @@ def parse_args() -> argparse.Namespace:
                         help="order mandatory proof-unit turns by candidate score before the "
                              "turn cap truncates them; measured +16.0pp turn_all_hit on "
                              "locomo_cat4 and +17.4pp on cat2, no effect on LongMemEval")
+    parser.add_argument("--obligation-aware-packing", action="store_true",
+                        help="V5.10 greedy obligation/span packer; preserves frozen profiles when off")
+    parser.add_argument("--span-pack-window", type=int, default=96,
+                        help="character context charged around each selected evidence span")
     parser.add_argument("--embedding", action="store_true")
     parser.add_argument("--max-questions", type=int)
     parser.add_argument("--answer-workers", type=int, default=32)
     parser.add_argument("--label", default="")
+    parser.add_argument("--run-root", type=Path,
+                        help="Exact output directory; enables deterministic resume paths")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip question ids already present in both checkpoint JSONL files")
+    parser.add_argument("--checkpoint-every", type=int, default=25,
+                        help="Navigate/answer/append this many questions per durable batch")
+    parser.add_argument("--native-seed-fusion", action="store_true")
+    parser.add_argument("--obligation-aware-relations", action="store_true")
+    parser.add_argument("--graph-hop-decay", type=float, default=1.0)
+    parser.add_argument("--expansion-beam", type=int, default=4)
     parser.add_argument("--full", action="store_true",
                         help="score LongMemEval 500 + LoCoMo Cat 1-4 (2,040) instead of the "
                              "frozen 200-question development set")
@@ -78,9 +92,10 @@ def main() -> None:
     args = parse_args()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     label = args.label or args.profile
-    root = args.output_root / (f"v5_6_answer_{label}_{stamp}"
-                              + (f"_shard{args.shard}" if args.shards > 1 else ""))
-    root.mkdir(parents=True)
+    root = (args.run_root if args.run_root else
+            args.output_root / (f"v5_6_answer_{label}_{stamp}"
+                                + (f"_shard{args.shard}" if args.shards > 1 else "")))
+    root.mkdir(parents=True, exist_ok=args.resume)
 
     # The authority graph is opened read-only; answers are cached in a separate
     # sidecar so a scoring run can never mutate the frozen build.
@@ -116,7 +131,9 @@ def main() -> None:
                      **({"max_answer_tokens": args.max_answer_tokens}
                         if args.max_answer_tokens else {}))
     answer_config = AnswerConfig(
-        span_window=None if args.span_window < 0 else args.span_window,
+        span_window=(args.span_pack_window if args.obligation_aware_packing
+                     and args.span_window < 0 else
+                     (None if args.span_window < 0 else args.span_window)),
         closed_form_enabled=not args.no_closed_form)
 
     embedding = QwenEmbeddingIndex(store, config, record_usage=False) if args.embedding else None
@@ -125,17 +142,13 @@ def main() -> None:
                                rank_mandatory=args.rank_mandatory,
                                h10_owner_rescue=not args.no_h10_owner_rescue,
                                h10_traversal=not args.no_h10_traversal,
-                               manifest_collection_key=not args.no_manifest_collection_key)
-
-    # Navigation is single-threaded and in-process; answering is IO-bound on the
-    # backbone, so only that stage fans out.
-    print(f"navigating {len(questions)} questions with {args.profile}", flush=True)
-    navigations = []
-    for index, question in enumerate(questions, 1):
-        result = navigator.navigate(question.memory_id, question.query, budget)
-        navigations.append((question, result, navigation_metrics(question, result, store)))
-        if index % 25 == 0:
-            print(f"  navigated {index}/{len(questions)}", flush=True)
+                               manifest_collection_key=not args.no_manifest_collection_key,
+                               obligation_aware_packing=args.obligation_aware_packing,
+                               span_pack_window=args.span_pack_window,
+                               obligation_aware_relations=args.obligation_aware_relations,
+                               native_seed_fusion=args.native_seed_fusion,
+                               graph_hop_decay=args.graph_hop_decay,
+                               expansion_beam=args.expansion_beam)
 
     stage = AnswerStage(store, config, "v5.6-answer", answer_config=answer_config,
                         require_exact_tokenizer=True, cache_store=cache_store)
@@ -148,46 +161,78 @@ def main() -> None:
         return stage.answer(question.question_id, question.query, result, budget,
                             question_date=question_date, algebra=result.algebra)
 
-    print(f"answering with {args.answer_workers} workers", flush=True)
-    with ThreadPoolExecutor(max_workers=max(1, args.answer_workers)) as pool:
-        answers = list(pool.map(run, navigations))
+    answer_path = root / "answers.jsonl"
+    retrieval_path = root / "retrieval.jsonl"
 
-    answer_rows, retrieval_rows = [], []
-    for (question, result, metric), answer in zip(navigations, answers):
-        raw = question.raw
-        answer_rows.append({
-            "question_id": question.question_id,
-            "question": question.query,
-            "question_type": str(raw.get("question_type")
-                                 or f"locomo_category_{raw.get('locomo_category')}"),
-            "question_date": raw.get("question_date") or "",
-            "answer": raw.get("answer", ""),
-            "gold_answer": raw.get("answer", ""),
-            "prediction": answer.prediction,
-            "benchmark": question.benchmark,
-            "stratum": question.stratum,
-        })
-        row_flags = flags.get(question.question_id)
-        retrieval_rows.append({
-            "dev_question_id": question.question_id, "stratum": question.stratum,
-            # turn_all_hit is vacuously true where no gold turns are annotated,
-            # so the full-set report must be able to exclude those rows.
-            "has_turn_gold": bool(row_flags.has_turn_gold) if row_flags else True,
-            "is_abstention": bool(row_flags.is_abstention) if row_flags else False,
-            "benchmark": question.benchmark, "configuration": label,
-            "prompt_tokens": answer.prompt_tokens, "evidence_tokens": answer.evidence_tokens,
-            "completion_tokens": answer.completion_tokens,
-            "packed_turns": len(answer.evidence_turn_ids),
-            "closed_form": answer.closed_form, "budget_relaxed": answer.budget_relaxed,
-            "answer_warnings": list(answer.warnings),
-            **{key: value for key, value in metric.items() if key != "question_id"},
-        })
+    def load_rows(path: Path):
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
 
-    (root / "answers.jsonl").write_text(
-        "".join(json.dumps(row, ensure_ascii=True) + "\n" for row in answer_rows), encoding="utf-8")
-    (root / "retrieval.jsonl").write_text(
-        "".join(json.dumps(row, ensure_ascii=True) + "\n" for row in retrieval_rows),
-        encoding="utf-8")
+    completed = set()
+    if args.resume:
+        answered = {str(row["question_id"]) for row in load_rows(answer_path)}
+        retrieved = {str(row["dev_question_id"]) for row in load_rows(retrieval_path)}
+        completed = answered & retrieved
+    remaining = [row for row in questions if row.question_id not in completed]
+    batch_size = max(1, args.checkpoint_every)
+    print(
+        f"running {len(remaining)} remaining / {len(questions)} questions with "
+        f"{args.profile}; checkpoint batch={batch_size}", flush=True)
+    for start in range(0, len(remaining), batch_size):
+        batch = remaining[start:start + batch_size]
+        navigations = []
+        for question in batch:
+            result = navigator.navigate(question.memory_id, question.query, budget)
+            navigations.append(
+                (question, result, navigation_metrics(question, result, store)))
+        with ThreadPoolExecutor(max_workers=max(1, args.answer_workers)) as pool:
+            answers = list(pool.map(run, navigations))
+
+        answer_rows, retrieval_rows = [], []
+        for (question, result, metric), answer in zip(navigations, answers):
+            raw = question.raw
+            answer_rows.append({
+                "question_id": question.question_id,
+                "question": question.query,
+                "question_type": str(raw.get("question_type")
+                                     or f"locomo_category_{raw.get('locomo_category')}"),
+                "question_date": raw.get("question_date") or "",
+                "answer": raw.get("answer", ""),
+                "gold_answer": raw.get("answer", ""),
+                "prediction": answer.prediction,
+                "benchmark": question.benchmark,
+                "stratum": question.stratum,
+            })
+            row_flags = flags.get(question.question_id)
+            retrieval_rows.append({
+                "dev_question_id": question.question_id, "stratum": question.stratum,
+                # turn_all_hit is vacuously true where no gold turns are annotated,
+                # so the full-set report must be able to exclude those rows.
+                "has_turn_gold": bool(row_flags.has_turn_gold) if row_flags else True,
+                "is_abstention": bool(row_flags.is_abstention) if row_flags else False,
+                "benchmark": question.benchmark, "configuration": label,
+                "prompt_tokens": answer.prompt_tokens,
+                "evidence_tokens": answer.evidence_tokens,
+                "completion_tokens": answer.completion_tokens,
+                "packed_turns": len(answer.evidence_turn_ids),
+                "closed_form": answer.closed_form,
+                "budget_relaxed": answer.budget_relaxed,
+                "answer_warnings": list(answer.warnings),
+                **{key: value for key, value in metric.items() if key != "question_id"},
+            })
+        with answer_path.open("a", encoding="utf-8") as handle:
+            handle.writelines(
+                json.dumps(row, ensure_ascii=True) + "\n" for row in answer_rows)
+        with retrieval_path.open("a", encoding="utf-8") as handle:
+            handle.writelines(
+                json.dumps(row, ensure_ascii=True) + "\n" for row in retrieval_rows)
+        done = len(completed) + min(start + len(batch), len(remaining))
+        print(f"  checkpointed {done}/{len(questions)}", flush=True)
+
+    answer_rows = load_rows(answer_path)
+    retrieval_rows = load_rows(retrieval_path)
 
     tokens = sorted(row["prompt_tokens"] for row in retrieval_rows)
     manifest = {
@@ -195,12 +240,20 @@ def main() -> None:
         "source_db": str(args.source_db), "config_hash": config_hash(config),
         "answer_prompt_hash": PROMPT_HASH,
         "span_window": answer_config.span_window,
+        "obligation_aware_packing": args.obligation_aware_packing,
+        "obligation_aware_relations": args.obligation_aware_relations,
+        "native_seed_fusion": args.native_seed_fusion,
+        "graph_hop_decay": args.graph_hop_decay,
+        "expansion_beam": args.expansion_beam,
+        "span_pack_window": args.span_pack_window,
         "closed_form_enabled": answer_config.closed_form_enabled,
         "budget": dataclass_dict(budget),
         "token_counter": stage.counter.describe(),
         "prompt_tokens": {
-            "mean": sum(tokens) / max(1, len(tokens)), "p50": tokens[len(tokens) // 2],
-            "p95": tokens[max(0, int(0.95 * len(tokens)) - 1)], "max": max(tokens),
+            "mean": sum(tokens) / max(1, len(tokens)),
+            "p50": tokens[len(tokens) // 2] if tokens else 0,
+            "p95": tokens[max(0, int(0.95 * len(tokens)) - 1)] if tokens else 0,
+            "max": max(tokens, default=0),
             "over_soft_budget": sum(1 for row in tokens if row > budget.max_answer_tokens),
         },
         "closed_form_rate": sum(row["closed_form"] for row in retrieval_rows) / max(1, len(retrieval_rows)),

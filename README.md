@@ -2,13 +2,42 @@
 
 GraphMem is a graph-structured long-term memory system for conversational QA benchmarks such as [LongMemEval](https://github.com/LongMemEval/LongMemEval) and LoCoMo.
 
+## Current V5.11 query plane
+
+The measured V5.11 retrieval path is now available through one runtime schema
+instead of benchmark-only hardcoded options. It includes H11 QueryIR,
+hierarchical routing, bounded process workers, rendezvous memory affinity,
+per-tenant admission, versioned compiled views, frequency-aware cache admission,
+CPU pinning, deadlines, worker restart, and cache/RSS/PSS telemetry.
+
+```bash
+python scripts/serve_v5_11.py \
+  --db /path/to/graphmem.sqlite \
+  --runtime-config configs/v5/runtime_v5_11_balanced.json \
+  --compiled-cache-dir /trusted/local/compiled_views \
+  --cpu-ids 0-7
+```
+
+Alternative frozen profiles are provided for low-tail-latency, low-memory and
+the exact 8-core report setup. See
+[`docs/V5_11_RUNTIME_DEPLOYMENT.md`](docs/V5_11_RUNTIME_DEPLOYMENT.md) for the
+endpoint, full parameter table, sidecar lifecycle and benchmark reproduction.
+
+The opt-in V5.9 report path (recursive coarsening, parent-gated relation
+construction, physical hierarchical QueryIR routing, post-pack certificates and
+affected-path snapshot publication) is documented in
+[`docs/V5_9_REPORT_IMPLEMENTATION.md`](docs/V5_9_REPORT_IMPLEMENTATION.md). It
+does not change the frozen V5.8 B0--B5 profiles.
+The measured report numbers and their interpretation boundaries are recorded in
+[`docs/V5_9_REPORT_RESULTS.md`](docs/V5_9_REPORT_RESULTS.md).
+
 It builds a hierarchical memory graph from dialogue sessions, retrieves evidence with hybrid semantic / structured / graph signals, and answers questions with timeline-aware context assembly.
 
 ## Architecture
 
 See [`docs/2026-07-08_graphmem_architecture_overview.md`](docs/2026-07-08_graphmem_architecture_overview.md) for the current design overview.
 
-## Current V4.1 development snapshot
+## Historical V4.1 development snapshot
 
 The latest cross-backbone implementation and experiment history are maintained on
 `codex/graphmem-v419-qwen32b`. It includes the V4.1 online Graph Harness,
@@ -104,7 +133,7 @@ Unit tests use synthetic fixtures under `test/fixtures/` and do not require benc
 ## Project layout
 
 ```
-src/graphmem_demo/   Core library (build, retrieve, answer pipeline)
+src/graphmem/        Core library (build, retrieve, answer and serving pipeline)
 scripts/             CLI entrypoints and evaluation utilities
 test/                Unit tests and fixtures
 docs/                Design notes and experiment reports

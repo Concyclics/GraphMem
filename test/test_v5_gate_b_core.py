@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -96,6 +97,55 @@ def test_runtime_refreshes_after_graph_version_change(tmp_path: Path) -> None:
     second = runtime.view("travel")
     assert first is not second
     assert len(second.nodes) > len(first.nodes)
+
+
+def test_snapshot_runtime_singleflights_concurrent_cold_compilation(tmp_path: Path) -> None:
+    store = _store(tmp_path / "graph.sqlite")
+    GraphBuildPipeline(store, dataset_hash="dataset").build(
+        "travel", replace(GraphMemV5Config(), profile="b5"))
+    runtime = SQLiteSnapshotRuntime(store)
+    original = store.graph_snapshot
+    calls = 0
+
+    def counted(memory_id: str):
+        nonlocal calls
+        calls += 1
+        return original(memory_id)
+
+    store.graph_snapshot = counted  # type: ignore[method-assign]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        views = list(pool.map(lambda _index: runtime.view("travel"), range(16)))
+
+    assert len({id(view) for view in views}) == 1
+    assert calls == 1
+    assert runtime.cache_stats()["views"] == 1
+
+
+def test_sqlite_read_pool_serves_concurrent_snapshot_queries(tmp_path: Path) -> None:
+    store = _store(tmp_path / "graph.sqlite")
+    assert store.enable_read_pool(4) == 4
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        rows = list(pool.map(
+            lambda _index: (len(store.turns("travel")),
+                            len(store.search_turns("travel", "Paris"))),
+            range(64)))
+
+    assert rows == [(4, 2)] * 64
+
+
+def test_sqlite_control_read_cannot_be_starved_by_full_read_pool(tmp_path: Path) -> None:
+    store = _store(tmp_path / "graph.sqlite")
+    assert store.enable_read_pool(2) == 2
+    assert store._read_pool is not None
+    held = [store._read_pool.get(), store._read_pool.get()]
+    started = __import__("time").perf_counter()
+    try:
+        assert store.graph_version("travel") == 0
+    finally:
+        for connection in held:
+            store._read_pool.put(connection)
+    assert __import__("time").perf_counter() - started < 0.5
 
 
 def test_online_modules_do_not_import_gold_or_answers() -> None:

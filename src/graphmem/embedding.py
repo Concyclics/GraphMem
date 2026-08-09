@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -65,6 +65,47 @@ class QwenEmbeddingIndex:
             self.store.upsert_embeddings(memory_id, self.model_id, rows)
             self._memory_cache.pop(memory_id, None)
         return len(rows)
+
+    def embed_graph_nodes(self, memory_id: str, nodes: Sequence[Any]) -> Mapping[
+            str, Sequence[float]]:
+        """Embed routing-card summaries and persist them in the shared cache.
+
+        ``GraphBuildPipeline`` accepts this method directly as its coarsening
+        vector provider.  Item hashes prevent a stale card vector from surviving
+        a summary or graph-compiler change.
+        """
+
+        items = [(str(node.node_id), str(node.summary)) for node in nodes]
+        hashes = {item_id: hashlib.sha256(text.encode("utf-8")).hexdigest()
+                  for item_id, text in items}
+        existing = self.store.embedding_hashes(memory_id, self.model_id)
+        pending = [(item_id, text) for item_id, text in items
+                   if existing.get(item_id) != hashes[item_id]]
+        for start in range(0, len(pending), self.batch_size):
+            batch = pending[start:start + self.batch_size]
+            vectors, tokens, latency = self._embed([text for _item_id, text in batch])
+            if len(vectors) != len(batch):
+                raise RuntimeError("embedding response cardinality mismatch")
+            self.store.upsert_embeddings(memory_id, self.model_id, [
+                (item_id, hashes[item_id], vector)
+                for (item_id, _text), vector in zip(batch, vectors)
+            ])
+            self.store.log_embedding_call(
+                stable_id("embedding-call", memory_id, "routing-card", start,
+                          *(hashes[item_id] for item_id, _text in batch)),
+                memory_id, self.model_id, len(batch), tokens, latency)
+        result: dict[str, Sequence[float]] = {}
+        expected = set(hashes)
+        for row in self.store._read(
+                "SELECT item_id,dimension,vector FROM embeddings "
+                "WHERE memory_id=? AND model_id=?",
+                (memory_id, self.model_id)):
+            item_id = str(row["item_id"])
+            if item_id in expected:
+                result[item_id] = np.frombuffer(
+                    row["vector"], dtype=np.float32,
+                    count=int(row["dimension"])).copy()
+        return result
 
     def search(self, memory_id: str, query: str, limit: int) -> Sequence[tuple[str, float]]:
         query_text = (

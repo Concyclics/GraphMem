@@ -1,0 +1,27 @@
+name: graphmem-v58-report
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy>=1.26
+  - pandas>=2.2
+  - pyarrow>=16
+  - matplotlib>=3.9
+  - seaborn>=0.13
+  - psutil>=6
+  - pymupdf>=1.28
+  - tectonic>=0.15
+  - pytest>=8
+  - hypothesis>=6
+  - pyyaml>=6
+  - tqdm
+  - networkx
+  - rank-bm25
+  - hnswlib
+  - pip:
+      - openai>=1.0
+      - tokenizers>=0.20
+      - nltk>=3.9
+      - neo4j>=5.26
+      - -e .

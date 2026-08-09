@@ -1,0 +1,49 @@
+{
+  "schema_version": "graphmem-runtime-v5.11",
+  "profile": "v5_11_balanced",
+  "retrieval": {
+    "harness_profile": "h11",
+    "graph_hop_decay": 0.3,
+    "expansion_beam": 2,
+    "hierarchical_routing": true,
+    "hierarchy_root_beam": 2,
+    "hierarchy_child_beam": 4,
+    "hierarchy_operator_aware": true,
+    "obligation_aware_packing": true,
+    "span_pack_window": 96,
+    "obligation_aware_relations": false,
+    "native_seed_fusion": true,
+    "read_pool_size": 1,
+    "snapshot_cache_bytes": 268435456,
+    "snapshot_cache_memories": 8,
+    "metadata_cache_memories": 8,
+    "compiled_cache_dir": "artifacts/v5_11/compiled_memory_views",
+    "compiled_cache_admission": true
+  },
+  "serving": {
+    "workers": 8,
+    "start_method": "spawn",
+    "max_queued": 64,
+    "per_tenant_outstanding": 8,
+    "affinity_replicas": 2,
+    "warm_replicas": 1,
+    "retry_broken_worker": 1,
+    "worker_cpu_ids": [],
+    "request_timeout_seconds": 5.0,
+    "precompile_on_start": true,
+    "precompile_workers": 4,
+    "sidecar_refresh_seconds": 10.0,
+    "host": "127.0.0.1",
+    "port": 8090
+  },
+  "query_budget": {
+    "max_hops": 2,
+    "max_iterations": 4,
+    "max_visited_nodes": 96,
+    "max_visited_edges": 192,
+    "max_frontier": 32,
+    "max_evidence_turns": 32,
+    "max_evidence_tokens": 5000,
+    "max_llm_reranks": 0
+  }
+}

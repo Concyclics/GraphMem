@@ -69,131 +69,304 @@ def _by_operand(bindings: Sequence[FactBinding]) -> dict[str, list[FactBinding]]
     return grouped
 
 
+def _dedup_bindings(bindings: Sequence[FactBinding]) -> tuple[FactBinding, ...]:
+    return tuple(sorted({row.binding_id: row for row in bindings}.values(),
+                        key=lambda row: row.binding_id))
+
+
+def _dedup_members(members: Sequence[AnswerMember]) -> tuple[AnswerMember, ...]:
+    """Merge equal answer members without dropping witnesses from a child plan."""
+    buckets: dict[str, list[AnswerMember]] = defaultdict(list)
+    for member in members:
+        buckets[member.member_key].append(member)
+    result: list[AnswerMember] = []
+    for key, rows in sorted(buckets.items()):
+        head = rows[0]
+        result.append(AnswerMember(
+            member_key=key,
+            value=head.value,
+            value_key=head.value_key,
+            owner_id=head.owner_id,
+            value_type=head.value_type,
+            witness_binding_ids=tuple(dict.fromkeys(
+                binding_id for row in rows for binding_id in row.witness_binding_ids)),
+            operand_ids=tuple(dict.fromkeys(
+                operand_id for row in rows for operand_id in row.operand_ids)),
+        ))
+    return tuple(result)
+
+
+def _build_result(
+    node: ops.OperatorNode,
+    source_bindings: Sequence[FactBinding],
+    members: Sequence[AnswerMember],
+    *,
+    scope_complete: bool,
+    count: int | None = None,
+    groups: Mapping[str, tuple[str, ...]] | None = None,
+    endpoints: Sequence[TemporalEndpoint] = (),
+    state: StateResult | None = None,
+    degradations: Sequence[str] = (),
+) -> AlgebraResult:
+    stable_members = _dedup_members(members)
+    output_ids = tuple(dict.fromkeys(
+        binding_id for row in stable_members for binding_id in row.witness_binding_ids))
+    # Temporal and state operators can carry a witness outside the ordinary
+    # member rendering.  Keep it in the selected binding set and certificate.
+    output_ids = tuple(dict.fromkeys((
+        *output_ids,
+        *(row.binding_id for row in endpoints),
+        *((state.current_binding_id,) if state is not None else ()),
+    )))
+    by_id = {row.binding_id: row for row in source_bindings}
+    selected = tuple(by_id[binding_id] for binding_id in output_ids if binding_id in by_id)
+    required = ops.operand_ids(node)
+    complete = tuple(operand_id for operand_id in required
+                     if any(row.operand_id == operand_id for row in source_bindings))
+    return AlgebraResult(
+        operator=ops.root_operator(node),
+        bindings=_dedup_bindings(selected),
+        output_binding_ids=output_ids,
+        members=stable_members,
+        count=count,
+        groups=dict(groups or {}),
+        temporal_endpoints=tuple(endpoints),
+        state_result=state,
+        witness_map={row.member_key: row.witness_binding_ids for row in stable_members},
+        complete_operands=complete,
+        scope_complete=scope_complete,
+        answer_kind=ops.answer_kind(node),
+        degradations=tuple(dict.fromkeys(degradations)),
+    )
+
+
+def _children_complete(children: Sequence[AlgebraResult]) -> bool:
+    return bool(children) and all(row.scope_complete and not row.degradations for row in children)
+
+
 def evaluate_ast(node: ops.OperatorNode, bindings: Sequence[FactBinding], *,
                  collection_closed: Mapping[str, bool] | None = None) -> AlgebraResult:
-    """Execute the AST and return members with their witnesses.
+    """Recursively execute an operator AST and retain witness provenance.
 
     ``collection_closed`` maps an operand id to whether the collection backing it
     is closed, which the projection's COLLECTION_MANIFEST supplies.  Absent that,
     no aggregate may claim exactness.
+
+    Earlier versions switched only on the root operator.  That made
+    ``Count(Intersection(A, B))`` count the union of A and B and made
+    ``DateDifference(A, B)`` choose two endpoints from a global pool.  Each node
+    below now consumes the result of its actual children, which is the physical
+    contract promised by QueryIR.
     """
     closed = dict(collection_closed or {})
-    required = ops.operand_ids(node)
-    grouped = _by_operand(bindings)
-    scoped = [binding for binding in bindings
-              if not required or binding.operand_id in set(required)]
-    complete = tuple(key for key in required if grouped.get(key))
-    distinct_by = ops.distinct_by(node)
-    kind = ops.answer_kind(node)
-    operator = ops.root_operator(node)
-    degradations: list[str] = []
+    all_bindings = _dedup_bindings(bindings)
 
-    def scope_ok(members: Sequence[AnswerMember]) -> bool:
-        if not members:
-            return False
-        if set(required) - set(complete):
-            return False
-        if ops.requires_exhaustive_scope(node) and not all(
-                closed.get(key, False) for key in required):
-            return False
-        return True
+    def exhaustive_complete(current: ops.OperatorNode) -> bool:
+        required = ops.operand_ids(current)
+        return bool(required) and all(closed.get(operand_id, False) for operand_id in required)
 
-    members: list[AnswerMember] = []
-    count: int | None = None
-    groups: dict[str, tuple[str, ...]] = {}
-    endpoints: tuple[TemporalEndpoint, ...] = ()
-    state: StateResult | None = None
+    def run(current: ops.OperatorNode) -> AlgebraResult:
+        if isinstance(current, ops.FactSet):
+            rows = tuple(row for row in all_bindings if row.operand_id == current.operand_id)
+            members = _group(rows, "value")
+            return _build_result(current, rows, members, scope_complete=bool(rows))
 
-    if operator == QueryOperator.INTERSECTION_DISTINCT and len(required) > 1:
-        common: set[str] | None = None
-        for key in required:
-            values = {_distinct_key(item, distinct_by) for item in grouped.get(key, ())}
-            common = values if common is None else common & values
-        common = common or set()
-        witnesses = [item for item in scoped if _distinct_key(item, distinct_by) in common]
-        members = _group(witnesses, distinct_by)
-        # An intersection member is only proved if every operand witnesses it.
-        members = [row for row in members if len(set(row.operand_ids)) >= len(required)]
-        if not members and common:
-            degradations.append("intersection_witness_incomplete")
+        children = tuple(run(child) for child in ops.children_of(current))
+        child_bindings = _dedup_bindings(tuple(
+            binding for child in children for binding in child.bindings))
+        child_degradations = tuple(
+            degradation for child in children for degradation in child.degradations)
 
-    elif operator == QueryOperator.COUNT_DISTINCT:
-        members = _group(scoped, distinct_by)
-        count = len(members)
+        if isinstance(current, ops.Lookup):
+            child = children[0]
+            return _build_result(current, child_bindings, child.members,
+                                 scope_complete=child.scope_complete,
+                                 degradations=child_degradations)
 
-    elif operator == QueryOperator.GROUP_BY_OWNER:
-        members = _group(scoped, "owner_value")
-        owners: dict[str, list[str]] = defaultdict(list)
-        for row in members:
-            owners[row.owner_id or ""].append(row.value)
-        groups = {owner: tuple(dict.fromkeys(values)) for owner, values in sorted(owners.items())}
+        if isinstance(current, ops.UnionDistinct):
+            members = _group(child_bindings, current.distinct_by)
+            complete = _children_complete(children) and exhaustive_complete(current)
+            return _build_result(current, child_bindings, members,
+                                 scope_complete=complete,
+                                 degradations=child_degradations)
 
-    elif operator == QueryOperator.EXISTS_ALL:
-        members = _group(scoped, distinct_by)
-        # Existence is per-operand: "did both A and B happen" needs a witness for
-        # each, not one witness twice.
-        if set(required) - set(complete):
-            members = []
+        if isinstance(current, ops.IntersectionDistinct):
+            keys = [set(member.member_key for member in child.members) for child in children]
+            common = set.intersection(*keys) if keys else set()
+            witnesses: list[FactBinding] = []
+            for child in children:
+                member_ids = {
+                    binding_id
+                    for member in child.members if member.member_key in common
+                    for binding_id in member.witness_binding_ids
+                }
+                witnesses.extend(row for row in child.bindings if row.binding_id in member_ids)
+            members = _group(witnesses, current.distinct_by)
+            # Rebuild via the child member keys when a distinct key is not the
+            # binding's value key (for example event_instance).
+            if current.distinct_by != "value":
+                members = []
+                by_binding = {row.binding_id: row for row in witnesses}
+                for key in sorted(common):
+                    ids = tuple(dict.fromkeys(
+                        binding_id for child in children for member in child.members
+                        if member.member_key == key for binding_id in member.witness_binding_ids))
+                    rows = [by_binding[item] for item in ids if item in by_binding]
+                    if rows:
+                        members.append(_member(key, rows))
+            complete = _children_complete(children) and exhaustive_complete(current)
+            return _build_result(current, witnesses, members,
+                                 scope_complete=complete,
+                                 degradations=child_degradations)
 
-    elif operator in {QueryOperator.ARGMIN_TIME, QueryOperator.ARGMAX_TIME, QueryOperator.ORDINAL}:
-        resolved = [item for item in scoped if item.time_interval and item.time_interval.resolved]
-        if not resolved:
-            degradations.append("no_resolved_time_interval")
-        else:
-            ordered = sorted(resolved, key=lambda item: (item.time_interval.sort_key,
-                                                         item.binding_id))
-            index = ops.ordinal_index(node) if operator == QueryOperator.ORDINAL else (
-                -1 if operator == QueryOperator.ARGMAX_TIME else 0)
-            try:
-                picked = ordered[index]
-            except IndexError:
-                picked = None
-                degradations.append("ordinal_out_of_range")
-            if picked is not None:
-                members = [_member(_distinct_key(picked, distinct_by), [picked])]
-            if len(resolved) < len(scoped):
-                degradations.append("unresolved_intervals_excluded")
+        if isinstance(current, ops.GroupByOwner):
+            members = _group(child_bindings, "owner_value")
+            owners: dict[str, list[str]] = defaultdict(list)
+            for member in members:
+                owners[member.owner_id or ""].append(member.value)
+            groups = {owner: tuple(dict.fromkeys(values))
+                      for owner, values in sorted(owners.items())}
+            complete = _children_complete(children) and exhaustive_complete(current)
+            return _build_result(current, child_bindings, members,
+                                 scope_complete=complete, groups=groups,
+                                 degradations=child_degradations)
 
-    elif operator == QueryOperator.DATE_DIFFERENCE:
-        resolved = [item for item in scoped if item.time_interval and item.time_interval.resolved]
-        ordered = sorted(resolved, key=lambda item: (item.time_interval.sort_key, item.binding_id))
-        if len(ordered) >= 2:
-            endpoints = (TemporalEndpoint("start", ordered[0].time_interval, ordered[0].binding_id),
-                         TemporalEndpoint("end", ordered[-1].time_interval, ordered[-1].binding_id))
-            members = [_member(_distinct_key(row, distinct_by), [row])
-                       for row in (ordered[0], ordered[-1])]
-        else:
-            degradations.append("date_difference_needs_two_endpoints")
+        if isinstance(current, ops.CountDistinct):
+            child = children[0]
+            # Distinctness belongs to Count, not to the FactSet leaf.  Keeping
+            # the child's value-grouped members would collapse two occurrences
+            # with different event_instance ids before Count sees them.
+            members = _group(child.bindings, current.distinct_by)
+            complete = child.scope_complete and exhaustive_complete(current)
+            return _build_result(current, child.bindings, members,
+                                 scope_complete=complete, count=len(members),
+                                 degradations=child_degradations)
 
-    elif operator == QueryOperator.LATEST_STATE:
-        ordered = sorted(scoped, key=lambda item: (
-            item.time_interval.sort_key if item.time_interval else ((1,) + ("",) * 2 + (99, 99, 0.0)),
-            item.session_id, item.turn_index, item.binding_id))
-        if ordered:
-            current = ordered[-1]
-            state = StateResult(
-                owner_id=current.owner_id, predicate=current.predicate,
-                current_value=current.value or current.value_key,
-                current_binding_id=current.binding_id,
-                prior_binding_ids=tuple(row.binding_id for row in ordered[:-1]),
-                superseded=len(ordered) > 1)
-            members = [_member(_distinct_key(current, distinct_by), [current])]
+        if isinstance(current, ops.ExistsAll):
+            present = all(child.members for child in children)
+            members = tuple(member for child in children for member in child.members) if present else ()
+            return _build_result(current, child_bindings, members,
+                                 scope_complete=present,
+                                 degradations=child_degradations)
 
-    else:  # LOOKUP, UNION_DISTINCT
-        members = _group(scoped, distinct_by)
+        if isinstance(current, (ops.Ordinal, ops.ArgMinTime, ops.ArgMaxTime)):
+            child = children[0]
+            resolved = [row for row in child.bindings
+                        if row.time_interval and row.time_interval.resolved]
+            degradations = list(child_degradations)
+            members: list[AnswerMember] = []
+            picked: FactBinding | None = None
+            if not resolved:
+                degradations.append("no_resolved_time_interval")
+            else:
+                ordered = sorted(resolved, key=lambda row: (
+                    row.time_interval.sort_key, row.binding_id))
+                if isinstance(current, ops.Ordinal) and current.order == "descending":
+                    ordered.reverse()
+                index = (current.index - 1 if current.index > 0 else current.index
+                         ) if isinstance(current, ops.Ordinal) else (
+                             -1 if isinstance(current, ops.ArgMaxTime) else 0)
+                try:
+                    picked = ordered[index]
+                except IndexError:
+                    degradations.append("ordinal_out_of_range")
+                if picked is not None:
+                    members = [_member(_distinct_key(picked, ops.distinct_by(current)), [picked])]
+                if len(resolved) < len(child.bindings):
+                    degradations.append("unresolved_intervals_excluded")
+            complete = bool(picked) and child.scope_complete and exhaustive_complete(current)
+            return _build_result(current, (picked,) if picked else (), members,
+                                 scope_complete=complete,
+                                 degradations=degradations)
 
-    output = tuple(dict.fromkeys(
-        binding_id for row in members for binding_id in row.witness_binding_ids))
-    # Sort rather than filter in input order: the caller's binding order varies
-    # with channel interleaving, and an AlgebraResult that changes with it would
-    # make the packer's output depend on retrieval order.
-    selected = sorted((binding for binding in bindings if binding.binding_id in set(output)),
-                      key=lambda item: item.binding_id)
-    return AlgebraResult(
-        operator=operator, bindings=tuple(selected), output_binding_ids=output,
-        members=tuple(members), count=count, groups=groups,
-        temporal_endpoints=endpoints, state_result=state,
-        witness_map={row.member_key: row.witness_binding_ids for row in members},
-        complete_operands=complete, scope_complete=scope_ok(members),
-        answer_kind=kind, degradations=tuple(degradations),
-    )
+        if isinstance(current, ops.DateDifference):
+            left, right = children
+            left_rows = sorted((row for row in left.bindings
+                                if row.time_interval and row.time_interval.resolved),
+                               key=lambda row: (row.time_interval.sort_key, row.binding_id))
+            right_rows = sorted((row for row in right.bindings
+                                 if row.time_interval and row.time_interval.resolved),
+                                key=lambda row: (row.time_interval.sort_key, row.binding_id))
+            degradations = list(child_degradations)
+            endpoints: tuple[TemporalEndpoint, ...] = ()
+            members: list[AnswerMember] = []
+            selected: tuple[FactBinding, ...] = ()
+            if left_rows and right_rows:
+                # Respect the AST sides.  For a repeated operand, first/last
+                # preserves the natural interval semantics while still avoiding
+                # a global pool across unrelated operands.
+                first, last = left_rows[0], right_rows[-1]
+                endpoints = (
+                    TemporalEndpoint("start", first.time_interval, first.binding_id),
+                    TemporalEndpoint("end", last.time_interval, last.binding_id),
+                )
+                selected = (first, last)
+                members = [_member(_distinct_key(row, ops.distinct_by(current)), [row])
+                           for row in selected]
+            else:
+                degradations.append("date_difference_needs_two_endpoints")
+            complete = len(endpoints) == 2 and left.scope_complete and right.scope_complete
+            return _build_result(current, selected, members,
+                                 scope_complete=complete, endpoints=endpoints,
+                                 degradations=degradations)
+
+        if isinstance(current, ops.LatestState):
+            child = children[0]
+            ordered = sorted(child.bindings, key=lambda row: (
+                row.time_interval.sort_key if row.time_interval else
+                ((1,) + ("",) * 2 + (99, 99, 0.0)),
+                row.session_id, row.turn_index, row.binding_id))
+            state: StateResult | None = None
+            members: list[AnswerMember] = []
+            current_binding: tuple[FactBinding, ...] = ()
+            degradations = list(child_degradations)
+            if ordered:
+                current_row = ordered[-1]
+                current_value = current_row.value or current_row.value_key
+                contenders = [row for row in ordered[:-1] if (
+                    (row.time_interval is not None
+                     and current_row.time_interval is not None
+                     and row.time_interval.overlaps(current_row.time_interval))
+                    or (row.session_id == current_row.session_id
+                        and row.turn_index == current_row.turn_index))]
+                conflict = any(
+                    (row.value or row.value_key) != current_value
+                    or row.polarity != current_row.polarity
+                    for row in contenders)
+                changed = any(
+                    (row.value or row.value_key) != current_value
+                    for row in ordered[:-1])
+                if conflict:
+                    contradiction_status = "conflicting_latest"
+                    degradations.append("conflicting_latest_state")
+                elif changed:
+                    contradiction_status = "superseded_history"
+                else:
+                    contradiction_status = "none"
+                interval = current_row.time_interval
+                interval_uncertainty = (
+                    "unresolved" if interval is None or not interval.resolved
+                    else "exact" if interval.precision in {"second", "minute", "day"}
+                    and interval.confidence >= 0.99
+                    else "bounded")
+                current_binding = (current_row,)
+                state = StateResult(
+                    owner_id=current_row.owner_id,
+                    predicate=current_row.predicate,
+                    current_value=current_value,
+                    current_binding_id=current_row.binding_id,
+                    prior_binding_ids=tuple(row.binding_id for row in ordered[:-1]),
+                    superseded=len(ordered) > 1,
+                    contradiction_status=contradiction_status,
+                    interval_uncertainty=interval_uncertainty,
+                )
+                members = [_member(_distinct_key(current_row, ops.distinct_by(current)),
+                                   [current_row])]
+            complete = bool(state) and child.scope_complete and exhaustive_complete(current)
+            return _build_result(current, current_binding, members,
+                                 scope_complete=complete, state=state,
+                                 degradations=degradations)
+
+        raise TypeError(f"unsupported operator node: {type(current).__name__}")
+
+    return run(node)

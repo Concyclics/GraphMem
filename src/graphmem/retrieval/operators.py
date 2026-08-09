@@ -197,7 +197,8 @@ def ordinal_index(node: OperatorNode, default: int = 0) -> int:
 def requires_exhaustive_scope(node: OperatorNode) -> bool:
     """Operators whose answer is wrong unless the collection is fully enumerated."""
     return any(isinstance(row, (UnionDistinct, IntersectionDistinct, GroupByOwner,
-                                CountDistinct, Ordinal))
+                                CountDistinct, Ordinal, ArgMinTime, ArgMaxTime,
+                                LatestState))
                for row in walk(node))
 
 

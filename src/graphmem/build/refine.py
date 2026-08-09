@@ -25,6 +25,10 @@ class RefineCandidate:
     cross_scene: bool
     cross_session: bool
     affects_portal: bool
+    similarity: float | None = None
+    gate_level: int = 0
+    estimated_child_pairs: int = 0
+    priority: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +65,19 @@ class Qwen30BRefiner:
         self.client = client
 
     def eligible(self, candidate: RefineCandidate) -> bool:
+        if candidate.similarity is not None:
+            mode = self.config.edges.refine_mode
+            ambiguous = (self.config.edges.low_threshold <= candidate.similarity
+                         < self.config.edges.high_threshold)
+            if mode == "none":
+                return False
+            if mode == "ambiguous_only":
+                return ambiguous
+            if mode == "high_value_only":
+                return ambiguous and (
+                    candidate.cross_session or candidate.estimated_child_pairs > 1)
+            if mode == "all_bounded_candidates":
+                return candidate.similarity >= self.config.edges.low_threshold
         return (
             candidate.score_margin < self.config.scenes.coreference_margin
             and (candidate.cross_scene or candidate.cross_session)
@@ -71,7 +88,7 @@ class Qwen30BRefiner:
         tuple[RefineDecision, ...], tuple[str, ...]
     ]:
         unique = {candidate.candidate_id: candidate for candidate in candidates if self.eligible(candidate)}
-        ordered = [unique[key] for key in sorted(unique)]
+        ordered = sorted(unique.values(), key=lambda row: (-row.priority, row.candidate_id))
         turn_count = len(self.store.turns(memory_id))
         rate = self.config.edges.max_refine_calls_per_1000_turns
         max_batches = 0 if rate == 0 else max(1, math.ceil(turn_count * rate / 1000))
@@ -99,6 +116,7 @@ class Qwen30BRefiner:
                 "left": self._truncate(item.left_context, endpoint_limit),
                 "right": self._truncate(item.right_context, endpoint_limit),
                 "allowed": item.allowed_relations,
+                "priority": round(item.priority, 6),
             })
         payload = "\n".join(canonical_json(row) for row in rows)
         identity = CacheIdentity(

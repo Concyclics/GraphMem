@@ -13,12 +13,15 @@ where it is budget-driven and measured.
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+import math
+import time
 from typing import Any, Callable, Mapping, Sequence
 
 from ..domain import SourceTurn, stable_id
-from ..text import content_terms, normalize_key
+from ..text import content_terms, normalize_key, terms as text_terms
+from .hierarchy import compile_physical_route, route_hierarchy
 from .query_ir import QueryIR
 
 
@@ -78,6 +81,125 @@ class SeedResult:
     reservoir: tuple[ReservoirEntry, ...] = ()
     views: tuple[QueryView, ...] = ()
     stats: Mapping[str, Any] = field(default_factory=dict)
+
+
+class TurnSearchIndex:
+    """Immutable per-memory lexical index shared by concurrent queries."""
+
+    def __init__(self, turns: Sequence[SourceTurn]) -> None:
+        self.turns = tuple(turns)
+        self.turn_by_id = {turn.turn_id: turn for turn in turns}
+        self.turn_terms = {
+            turn.turn_id: content_terms(turn.raw_text) for turn in turns
+        }
+        self.turn_frequency = {
+            turn.turn_id: Counter(
+                token for token in text_terms(turn.raw_text)
+                if token in self.turn_terms[turn.turn_id])
+            for turn in turns
+        }
+        postings: dict[str, list[str]] = defaultdict(list)
+        sessions: dict[str, list[SourceTurn]] = defaultdict(list)
+        session_frequency: dict[str, Counter[str]] = defaultdict(Counter)
+        for turn in turns:
+            sessions[turn.session_id].append(turn)
+            for term in self.turn_terms[turn.turn_id]:
+                postings[term].append(turn.turn_id)
+            session_frequency[turn.session_id].update(self.turn_terms[turn.turn_id])
+        self.postings = {key: tuple(rows) for key, rows in postings.items()}
+        self.turns_by_session = {
+            key: tuple(sorted(rows, key=lambda row: row.turn_index))
+            for key, rows in sessions.items()
+        }
+        self.session_frequency = dict(session_frequency)
+        self.average_turn_length = (
+            sum(sum(row.values()) for row in self.turn_frequency.values())
+            / max(1, len(self.turn_frequency)))
+        document = Counter()
+        for terms_ in session_frequency.values():
+            document.update(terms_.keys())
+        self.session_document_frequency = document
+        self.average_session_length = (
+            sum(sum(terms_.values()) for terms_ in session_frequency.values())
+            / max(1, len(session_frequency)))
+
+    @property
+    def signature(self) -> tuple[int, str, str]:
+        if not self.turns:
+            return (0, "", "")
+        return (len(self.turns), self.turns[-1].turn_id, self.turns[-1].content_hash)
+
+    def exact(self, text: str, *, limit: int | None) -> list[tuple[str, float]]:
+        query_terms = content_terms(text)
+        if not query_terms:
+            return []
+        candidates = set().union(*(set(self.postings.get(term, ())) for term in query_terms))
+        lowered = " ".join(sorted(query_terms))
+        rows: list[tuple[float, str]] = []
+        for turn_id in candidates:
+            overlap = len(query_terms & self.turn_terms[turn_id])
+            score = overlap / len(query_terms)
+            if lowered and lowered in self.turn_by_id[turn_id].raw_text.casefold():
+                score += 0.5
+            rows.append((score, turn_id))
+        rows.sort(key=lambda row: (-row[0], row[1]))
+        selected = rows[:limit] if limit else rows
+        return [(turn_id, score) for score, turn_id in selected]
+
+    def bm25(self, text: str, *, limit: int) -> list[tuple[str, float]]:
+        """Query the immutable per-memory postings without a SQLite roundtrip."""
+        query_terms = content_terms(text)
+        if not query_terms or not self.turns:
+            return []
+        candidates = set().union(*(
+            set(self.postings.get(term, ())) for term in query_terms))
+        total = len(self.turns)
+        scored: list[tuple[float, str]] = []
+        for turn_id in candidates:
+            frequency = self.turn_frequency[turn_id]
+            length = sum(frequency.values())
+            score = 0.0
+            for term in query_terms:
+                count = frequency.get(term, 0)
+                if not count:
+                    continue
+                document_frequency = len(self.postings.get(term, ()))
+                idf = math.log(
+                    1 + (total - document_frequency + 0.5)
+                    / (document_frequency + 0.5))
+                score += idf * (count * 2.5) / (
+                    count + 1.5 * (
+                        0.25 + 0.75 * length
+                        / max(1.0, self.average_turn_length)))
+            if score:
+                scored.append((score, turn_id))
+        scored.sort(key=lambda row: (-row[0], row[1]))
+        return [(turn_id, score) for score, turn_id in scored[:limit]]
+
+    def rank_sessions(self, query: str, limit: int) -> tuple[str, ...]:
+        if limit <= 0:
+            return ()
+        if len(self.session_frequency) <= limit:
+            return tuple(self.session_frequency)
+        query_terms = content_terms(query)
+        total = len(self.session_frequency)
+        scored: list[tuple[float, str]] = []
+        for session_id, terms_ in self.session_frequency.items():
+            length = sum(terms_.values())
+            score = 0.0
+            for term in query_terms:
+                count = terms_.get(term, 0)
+                if not count:
+                    continue
+                frequency = self.session_document_frequency[term]
+                idf = math.log(
+                    1 + (total - frequency + 0.5) / (frequency + 0.5))
+                score += idf * (count * 2.5) / (
+                    count + 1.5 * (
+                        0.25 + 0.75 * length / max(1.0, self.average_session_length)))
+            scored.append((score, session_id))
+        scored.sort(key=lambda row: (-row[0], row[1]))
+        return tuple(session_id for _, session_id in scored[:limit])
 
 
 def _rrf(ranked: Mapping[str, Sequence[str]], *, k: int = 60) -> dict[str, float]:
@@ -149,11 +271,17 @@ class _ChannelRunner:
     """Runs exact/BM25/dense for a view and keeps both true scores and ranks."""
 
     def __init__(self, store, memory_id: str, turns: Sequence[SourceTurn],
-                 turn_terms: Mapping[str, frozenset[str]], dense_search: DenseSearch | None) -> None:
+                 turn_terms: Mapping[str, frozenset[str]], dense_search: DenseSearch | None,
+                 turn_index: TurnSearchIndex | None = None,
+                 native_bm25: bool = False) -> None:
         self.store, self.memory_id, self.turns = store, memory_id, turns
         self.turn_terms, self.dense_search = turn_terms, dense_search
+        self.turn_index = turn_index
+        self.native_bm25 = native_bm25
 
     def exact(self, text: str, *, limit: int | None) -> list[tuple[str, float]]:
+        if self.turn_index is not None:
+            return self.turn_index.exact(text, limit=limit)
         query_terms = content_terms(text)
         if not query_terms:
             return []
@@ -171,6 +299,8 @@ class _ChannelRunner:
         return [(turn_id, score) for score, turn_id in (rows[:limit] if limit else rows)]
 
     def bm25(self, text: str, *, limit: int) -> list[tuple[str, float]]:
+        if self.native_bm25 and self.turn_index is not None:
+            return self.turn_index.bm25(text, limit=limit)
         return [(turn_id, max(0.0, score))
                 for turn_id, score in self.store.search_turns(self.memory_id, text, limit=limit)]
 
@@ -213,6 +343,9 @@ def _lexical_nodes(view, query_terms: frozenset[str], *, limit: int) -> tuple[st
     predicate attribute.  The legacy navigator seeded purely on summary overlap,
     and that is where the last of its provenance reach comes from.
     """
+    indexed = getattr(view, "lexical_nodes", None)
+    if indexed is not None:
+        return indexed(query_terms, limit=limit)
     if not query_terms:
         return ()
     rows: list[tuple[float, str]] = []
@@ -318,18 +451,36 @@ def seed_operands(store, view, memory_id: str, ir: QueryIR, turns: Sequence[Sour
                   dense_search: DenseSearch | None, use_rrf: bool, use_postings: bool,
                   reservoir_limit: int = 576, max_views_per_operand: int = 6,
                   node_budget: int = 96, wide_reservoir: bool = True,
-                  session_fanout: int = 0) -> SeedResult:
+                  session_fanout: int = 0,
+                  hierarchical_routing: bool = False,
+                  hierarchy_root_beam: int = 2,
+                  hierarchy_child_beam: int = 4,
+                  hierarchy_operator_aware: bool = True,
+                  turn_index: TurnSearchIndex | None = None,
+                  native_bm25: bool = False) -> SeedResult:
     # session_fanout <= 0 means "every session holding a channel hit".
     if not wide_reservoir:
         return _seed_narrow(store, view, memory_id, ir, turns, dense_search=dense_search,
                             use_rrf=use_rrf, use_postings=use_postings)
-    turn_by_id = {turn.turn_id: turn for turn in turns}
-    turns_by_session: dict[str, list[SourceTurn]] = defaultdict(list)
-    for turn in turns:
-        turns_by_session[turn.session_id].append(turn)
-    turn_terms = {turn.turn_id: content_terms(turn.raw_text) for turn in turns}
+    turn_index = turn_index or TurnSearchIndex(turns)
+    turn_by_id = turn_index.turn_by_id
+    turns_by_session = turn_index.turns_by_session
+    turn_terms = turn_index.turn_terms
     query_terms = content_terms(ir.query)
-    runner = _ChannelRunner(store, memory_id, turns, turn_terms, dense_search)
+    runner = _ChannelRunner(
+        store, memory_id, turns, turn_terms, dense_search, turn_index,
+        native_bm25=native_bm25)
+    hierarchy = None
+    hierarchy_latency_ms = 0.0
+    if hierarchical_routing:
+        route_started = time.perf_counter()
+        hierarchy = route_hierarchy(
+            view, compile_physical_route(
+                ir, max_nodes=max(12, node_budget),
+                root_beam=hierarchy_root_beam,
+                child_beam=hierarchy_child_beam,
+                operator_aware=hierarchy_operator_aware))
+        hierarchy_latency_ms = (time.perf_counter() - route_started) * 1000
 
     views = build_views(ir, max_per_operand=max_views_per_operand) if wide_reservoir else (
         QueryView(stable_id("view", ir.query, "full"), "full_query", ir.query, None, dense=True),)
@@ -395,7 +546,11 @@ def seed_operands(store, view, memory_id: str, ir: QueryIR, turns: Sequence[Sour
     for operand in ir.operands:
         owner_ids = _operand_owner_ids(view, operand)
         operand_nodes[operand.operand_id] = _operand_nodes(
-            view, operand, owner_ids, query_terms, use_postings=use_postings,
+            view, operand, owner_ids, query_terms,
+            # Global postings flatten all levels.  Once the hierarchy is active,
+            # only the parent-scoped postings consumed by route_hierarchy may
+            # choose a child.
+            use_postings=use_postings and not hierarchical_routing,
             limit=per_operand_node_budget)
         channels: dict[str, list[str]] = defaultdict(list)
         for row in views:
@@ -436,6 +591,8 @@ def seed_operands(store, view, memory_id: str, ir: QueryIR, turns: Sequence[Sour
         entries = keep + extra[:max(0, reservoir_limit - len(keep))]
 
     node_sources = dict(operand_nodes)
+    if hierarchy is not None:
+        node_sources["~hierarchy"] = hierarchy.selected_node_ids
     if wide_reservoir:
         node_sources["~lexical"] = _lexical_nodes(view, query_terms,
                                                   limit=max(12, node_budget // 4))
@@ -447,6 +604,13 @@ def seed_operands(store, view, memory_id: str, ir: QueryIR, turns: Sequence[Sour
         "reservoir_size": len(entries), "parity_size": len(parity),
         "reservoir_capped": len(pool) > len(entries),
         "operand_node_budget": per_operand_node_budget,
+        "hierarchical_route": dict(hierarchy.stats) if hierarchy is not None else {},
+        "hierarchical_route_ms": hierarchy_latency_ms,
+        "hierarchical_selected_node_ids": (
+            hierarchy.selected_node_ids if hierarchy is not None else ()),
+        "hierarchical_terminal_node_ids": (
+            hierarchy.terminal_node_ids if hierarchy is not None else ()),
+        "bm25_backend": "immutable_memory_index" if native_bm25 else "sqlite_fts5",
     }
     return SeedResult(node_ids, tuple(row.turn_id for row in entries),
                       {row.turn_id: row.scores for row in entries},

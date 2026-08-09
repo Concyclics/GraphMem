@@ -5,7 +5,7 @@ import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from ..config import GraphMemV5Config, config_hash
 from ..domain import (
@@ -23,6 +23,12 @@ from ..domain import (
     stable_id,
 )
 from ..storage import SQLiteGraphStore
+from .coarsen import (
+    GatedRelationPlan,
+    RecursiveHierarchy,
+    build_parent_gated_relations,
+    build_recursive_hierarchy,
+)
 from .refine import Qwen30BRefiner, RefineCandidate
 from .semantic import QwenSemanticDistiller, ScenePacket
 from .temporal import extract_time_expression, normalize_time, observed_interval
@@ -73,12 +79,15 @@ class GraphBuildPipeline:
     def __init__(self, store: SQLiteGraphStore, *, dataset_hash: str,
                  refiner: Qwen30BRefiner | None = None,
                  distiller: QwenSemanticDistiller | None = None,
-                 predicate_canonicalizer: PredicateCanonicalizer | None = None) -> None:
+                 predicate_canonicalizer: PredicateCanonicalizer | None = None,
+                 coarsen_vector_provider: Callable[[
+                     str, Sequence[GraphNode]], Mapping[str, Sequence[float]]] | None = None) -> None:
         self.store = store
         self.dataset_hash = dataset_hash
         self.refiner = refiner
         self.distiller = distiller
         self.predicate_canonicalizer = predicate_canonicalizer
+        self.coarsen_vector_provider = coarsen_vector_provider
 
     def build(self, memory_id: str, profile: GraphMemV5Config) -> GraphArtifactManifest:
         started = time.perf_counter()
@@ -96,6 +105,12 @@ class GraphBuildPipeline:
         groups = [self._turn_group(turn) for turn in turns]
         group_by_turn = {group.members[0].turn_id: group for group in groups}
         scenes = self._segment(turns, profile)
+        turns_by_session: dict[str, list[SourceTurn]] = defaultdict(list)
+        scenes_by_session: dict[str, list[_SceneSlice]] = defaultdict(list)
+        for turn in turns:
+            turns_by_session[turn.session_id].append(turn)
+        for scene in scenes:
+            scenes_by_session[scene.session_id].append(scene)
         packets = (self.distiller.extract(memory_id, scenes)
                    if profile.scenes.llm_semantic_extraction and self.distiller else ())
         packet_by_scene = {packet.scene_id: packet for packet in packets}
@@ -118,8 +133,8 @@ class GraphBuildPipeline:
             request_sessions = []
             for session in sessions:
                 children = [self._packet_record(packet_by_scene[scene.scene_id])
-                            for scene in scenes if scene.session_id == session.session_id
-                            and scene.scene_id in packet_by_scene]
+                            for scene in scenes_by_session.get(session.session_id, ())
+                            if scene.scene_id in packet_by_scene]
                 if children:
                     requests.append((stable_id("node", memory_id, "routing-card", 1, session.session_id),
                                      children, 128)); request_sessions.append(session.session_id)
@@ -127,16 +142,24 @@ class GraphBuildPipeline:
                 session_compressed = dict(zip(request_sessions,
                     self.distiller.compress_many(memory_id, 1, requests)))
         for session in sessions:
-            session_turns = [turn for turn in turns if turn.session_id == session.session_id]
+            session_turns = turns_by_session.get(session.session_id, ())
             evidence_ids = tuple(group_by_turn[turn.turn_id].evidence_group_id for turn in session_turns)
             card_summary = self._bounded_summary(" ".join(turn.raw_text for turn in session_turns), 80)
             card_attrs: dict[str, Any] = {"session_id": session.session_id, "roles": ("route",)}
             if lean_graph:
                 card_attrs["provenance_scope"] = "route"
+            compact_route = (profile.coarsen.recursive_hierarchy
+                             and profile.coarsen.compact_routing_provenance)
+            if compact_route:
+                card_attrs.update({
+                    "provenance_scope": "route",
+                    "provenance_compact": True,
+                    "provenance_ref_session": session.session_id,
+                })
             if lean_graph:
                 children = [self._packet_record(packet_by_scene[scene.scene_id])
-                            for scene in scenes if scene.session_id == session.session_id
-                            and scene.scene_id in packet_by_scene]
+                            for scene in scenes_by_session.get(session.session_id, ())
+                            if scene.scene_id in packet_by_scene]
                 compiled = self._compile_routing(children, 80, merge_aliases)
                 card_summary = compiled["summary"]; card_attrs.update(compiled)
             if session.session_id in session_compressed:
@@ -146,63 +169,92 @@ class GraphBuildPipeline:
                 node_id=stable_id("node", memory_id, "routing-card", 1, session.session_id),
                 memory_id=memory_id, node_type=NodeType.ROUTING_CARD, level=1,
                 summary=card_summary,
-                evidence_group_id=evidence_ids[0], evidence_group_ids=evidence_ids[1:],
+                evidence_group_id=evidence_ids[0],
+                evidence_group_ids=() if compact_route else evidence_ids[1:],
                 attributes=card_attrs,
             )
             session_cards[session.session_id] = card
             nodes.append(card)
 
         memory_evidence = tuple(group.evidence_group_id for group in groups)
-        memory_card_id = stable_id("node", memory_id, "routing-card", 3)
+        recursive_hierarchy: RecursiveHierarchy | None = None
         l2_cards: list[GraphNode] = []
-        if level >= 5:
-            ordered_cards = list(session_cards.values())
-            for group_index in range(0, len(ordered_cards), profile.coarsen.fanout):
-                children = ordered_cards[group_index:group_index + profile.coarsen.fanout]
-                evidence_ids = tuple(dict.fromkeys(
-                    group_id for child in children for group_id in child.all_evidence_group_ids
-                ))
-                l2_summary = self._bounded_summary(" ".join(child.summary for child in children), 120)
-                l2_attrs: dict[str, Any] = {
-                    "child_session_ids": tuple(child.attributes["session_id"] for child in children),
-                    "roles": ("route", "cross_session"),
-                }
-                if lean_graph:
-                    l2_attrs["provenance_scope"] = "route"
-                l2_id = stable_id("node", memory_id, "routing-card", 2,
-                                  tuple(child.node_id for child in children))
-                if profile.scenes.llm_hierarchy_compression and self.distiller:
-                    compressed = self.distiller.compress(memory_id, 2, l2_id,
-                        [self._node_record(child) for child in children], 160)
-                    l2_summary = str(compressed["summary"]); l2_attrs.update(compressed)
-                elif lean_graph:
-                    compiled = self._compile_routing(
-                        [self._node_record(child) for child in children], 120, merge_aliases)
-                    l2_summary = compiled["summary"]; l2_attrs.update(compiled)
-                l2_cards.append(GraphNode(
-                    l2_id,
-                    memory_id, NodeType.ROUTING_CARD, 2,
-                    l2_summary,
-                    evidence_ids[0], evidence_ids[1:],
-                    attributes=l2_attrs,
-                ))
-            nodes.extend(l2_cards)
-        memory_children = l2_cards or list(session_cards.values())
-        memory_summary = self._bounded_summary(" ".join(card.summary for card in memory_children), 160)
-        memory_attrs: dict[str, Any] = {"roles": ("route", "memory")}
-        if lean_graph:
-            memory_attrs["provenance_scope"] = "route"
-        if profile.scenes.llm_hierarchy_compression and self.distiller:
-            compressed = self.distiller.compress(memory_id, 3, memory_card_id,
-                                                  [self._node_record(x) for x in memory_children], 192)
-            memory_summary = str(compressed["summary"]); memory_attrs.update(compressed)
-        elif lean_graph:
-            compiled = self._compile_routing(
-                [self._node_record(x) for x in memory_children], 160, merge_aliases)
-            memory_summary = compiled["summary"]; memory_attrs.update(compiled)
-        memory_card = GraphNode(memory_card_id, memory_id, NodeType.ROUTING_CARD, 3,
-            memory_summary, memory_evidence[0], memory_evidence[1:], attributes=memory_attrs)
-        nodes.append(memory_card)
+        if profile.coarsen.recursive_hierarchy:
+            coarsen_vectors = (
+                self.coarsen_vector_provider(memory_id, tuple(session_cards.values()))
+                if (profile.coarsen.assignment_method == "hnsw"
+                    and self.coarsen_vector_provider is not None)
+                else None)
+            recursive_hierarchy = build_recursive_hierarchy(
+                memory_id,
+                tuple(session_cards.values()),
+                fanout=profile.coarsen.fanout,
+                max_levels=profile.coarsen.max_levels,
+                summary_words=max(32, profile.coarsen.summary_tokens // 2),
+                max_candidates=profile.edges.max_candidates_per_node,
+                assignment_method=profile.coarsen.assignment_method,
+                vectors=coarsen_vectors,
+                hnsw_dimension=profile.coarsen.hnsw_dimension,
+                hnsw_m=profile.coarsen.hnsw_m,
+                hnsw_ef_construction=profile.coarsen.hnsw_ef_construction,
+            )
+            nodes.extend(recursive_hierarchy.parent_cards)
+            memory_card = recursive_hierarchy.root
+            l2_cards = [row for row in recursive_hierarchy.parent_cards if row.level == 2]
+            hierarchy_cards_for_semantics = (
+                *session_cards.values(), *recursive_hierarchy.parent_cards)
+        else:
+            memory_card_id = stable_id("node", memory_id, "routing-card", 3)
+            if level >= 5:
+                ordered_cards = list(session_cards.values())
+                for group_index in range(0, len(ordered_cards), profile.coarsen.fanout):
+                    children = ordered_cards[group_index:group_index + profile.coarsen.fanout]
+                    evidence_ids = tuple(dict.fromkeys(
+                        group_id for child in children for group_id in child.all_evidence_group_ids
+                    ))
+                    l2_summary = self._bounded_summary(" ".join(child.summary for child in children), 120)
+                    l2_attrs: dict[str, Any] = {
+                        "child_session_ids": tuple(child.attributes["session_id"] for child in children),
+                        "roles": ("route", "cross_session"),
+                    }
+                    if lean_graph:
+                        l2_attrs["provenance_scope"] = "route"
+                    l2_id = stable_id("node", memory_id, "routing-card", 2,
+                                      tuple(child.node_id for child in children))
+                    if profile.scenes.llm_hierarchy_compression and self.distiller:
+                        compressed = self.distiller.compress(memory_id, 2, l2_id,
+                            [self._node_record(child) for child in children], 160)
+                        l2_summary = str(compressed["summary"]); l2_attrs.update(compressed)
+                    elif lean_graph:
+                        compiled = self._compile_routing(
+                            [self._node_record(child) for child in children], 120, merge_aliases)
+                        l2_summary = compiled["summary"]; l2_attrs.update(compiled)
+                    l2_cards.append(GraphNode(
+                        l2_id,
+                        memory_id, NodeType.ROUTING_CARD, 2,
+                        l2_summary,
+                        evidence_ids[0], evidence_ids[1:],
+                        attributes=l2_attrs,
+                    ))
+                nodes.extend(l2_cards)
+            memory_children = l2_cards or list(session_cards.values())
+            memory_summary = self._bounded_summary(" ".join(card.summary for card in memory_children), 160)
+            memory_attrs: dict[str, Any] = {"roles": ("route", "memory")}
+            if lean_graph:
+                memory_attrs["provenance_scope"] = "route"
+            if profile.scenes.llm_hierarchy_compression and self.distiller:
+                compressed = self.distiller.compress(memory_id, 3, memory_card_id,
+                                                      [self._node_record(x) for x in memory_children], 192)
+                memory_summary = str(compressed["summary"]); memory_attrs.update(compressed)
+            elif lean_graph:
+                compiled = self._compile_routing(
+                    [self._node_record(x) for x in memory_children], 160, merge_aliases)
+                memory_summary = compiled["summary"]; memory_attrs.update(compiled)
+            memory_card = GraphNode(memory_card_id, memory_id, NodeType.ROUTING_CARD, 3,
+                memory_summary, memory_evidence[0], memory_evidence[1:], attributes=memory_attrs)
+            nodes.append(memory_card)
+            hierarchy_cards_for_semantics = (
+                *session_cards.values(), *l2_cards, memory_card)
 
         if level >= 1:
             for scene in scenes:
@@ -218,6 +270,14 @@ class GraphBuildPipeline:
                                 # cat1 question needs; they are only useful if the
                                 # same name recurs verbatim in another session.
                                 **({"entities": packet.entities} if packet.entities else {}),
+                                **({
+                                    "information_unit_total": len(packet.information_units),
+                                    "information_unit_covered": len(packet.covered_unit_ids),
+                                    "information_unit_unresolved": len(packet.unresolved_unit_ids),
+                                    "information_unit_missing": len(packet.missing_unit_ids),
+                                    "raw_fallback_turn_ids": packet.raw_fallback_turn_ids,
+                                    "fact_cap": packet.fact_cap,
+                                } if packet.information_units else {}),
                                 "roles": ("scene", "route") if lean_graph else ("scene",),
                                 **({"provenance_scope": "route"} if lean_graph else {})},
                 )
@@ -227,6 +287,14 @@ class GraphBuildPipeline:
                     for turn in scene.turns:
                         evidence_ref = self._turn_evidence_ref(
                             memory_id, scene.scene_id, turn, group_by_turn[turn.turn_id])
+                        if turn.turn_id in packet.raw_fallback_turn_ids:
+                            evidence_ref = replace(evidence_ref, attributes={
+                                **dict(evidence_ref.attributes),
+                                "raw_fallback": True,
+                                "roles": tuple(dict.fromkeys((
+                                    *evidence_ref.attributes.get("roles", ()),
+                                    "raw_fallback", "mandatory_evidence"))),
+                            })
                         nodes.append(evidence_ref)
                         edges.append(self._edge(memory_id, scene_node,
                                                 RelationType.SCENE_CONTAINS, evidence_ref,
@@ -246,33 +314,101 @@ class GraphBuildPipeline:
             if packets:
                 semantic_nodes, semantic_edges = self._semantic_graph(
                     memory_id, packets, turns, group_by_turn, profile, scene_nodes,
-                    (*session_cards.values(), *l2_cards, memory_card)
+                    hierarchy_cards_for_semantics
                 )
                 nodes.extend(semantic_nodes); edges.extend(semantic_edges)
 
         if level >= 3:
-            edges.extend(self._hierarchy_edges(
-                memory_id, memory_card, l2_cards, session_cards, scene_nodes, event_nodes
-            ))
+            if recursive_hierarchy is not None:
+                edges.extend(self._recursive_hierarchy_edges(
+                    memory_id, recursive_hierarchy, session_cards,
+                    scene_nodes, event_nodes))
+            else:
+                edges.extend(self._hierarchy_edges(
+                    memory_id, memory_card, l2_cards, session_cards, scene_nodes, event_nodes
+                ))
             edges.extend(self._typed_edges(memory_id, event_nodes, entity_nodes))
+
+        gated_plan: GatedRelationPlan | None = None
+        if (recursive_hierarchy is not None
+                and profile.edges.parent_gated_relations and level >= 3):
+            node_map = {node.node_id: node for node in nodes}
+            child_map: dict[str, list[str]] = {
+                parent: list(children)
+                for parent, children in recursive_hierarchy.children.items()
+            }
+            for scene in scene_nodes.values():
+                session_id = str(scene.attributes.get("session_id", ""))
+                card = session_cards.get(session_id)
+                if card is not None:
+                    child_map.setdefault(card.node_id, []).append(scene.node_id)
+            for edge in edges:
+                if edge.relation == RelationType.SCENE_CONTAINS:
+                    child_map.setdefault(edge.src_id, []).append(edge.dst_id)
+            gated_plan = build_parent_gated_relations(
+                memory_id, recursive_hierarchy, node_map, child_map,
+                embedding_k=profile.edges.embedding_k,
+                max_candidates_per_node=profile.edges.max_candidates_per_node,
+                low_threshold=profile.edges.low_threshold,
+                high_threshold=profile.edges.high_threshold,
+                refine_mode=profile.edges.refine_mode,
+                candidate_method=profile.edges.relation_candidate_method,
+                vectors=recursive_hierarchy.vectors,
+                hnsw_dimension=profile.coarsen.hnsw_dimension,
+                hnsw_m=profile.coarsen.hnsw_m,
+                hnsw_ef_construction=profile.coarsen.hnsw_ef_construction,
+                cross_session_quota=profile.edges.cross_session_neighbor_quota,
+                typed_restoration=profile.edges.typed_relation_restoration,
+                typed_min_confidence=profile.edges.typed_relation_min_confidence,
+                max_refine_candidates_per_node=(
+                    profile.edges.max_refine_candidates_per_node),
+                max_refine_candidates_per_1000_nodes=(
+                    profile.edges.max_refine_candidates_per_1000_nodes),
+            )
+            for left_id, right_id, score, _gate_level in gated_plan.accepted_pairs:
+                left, right = node_map[left_id], node_map[right_id]
+                relation_group_ids = tuple(dict.fromkeys((
+                    left.evidence_group_id, right.evidence_group_id)))
+                edges.append(GraphEdge(
+                    stable_id("edge", memory_id, left_id,
+                              RelationType.COARSE_RELATED, right_id),
+                    memory_id, left_id, RelationType.COARSE_RELATED, right_id,
+                    relation_group_ids[0], False, score,
+                    "cir_high_confidence", relation_group_ids[1:]))
+            for (left_id, right_id, relation, confidence, _gate_level,
+                 source) in gated_plan.typed_pairs:
+                left, right = node_map[left_id], node_map[right_id]
+                relation_group_ids = tuple(dict.fromkeys((
+                    left.evidence_group_id, right.evidence_group_id)))
+                edges.append(GraphEdge(
+                    stable_id("edge", memory_id, left_id, relation, right_id),
+                    memory_id, left_id, relation, right_id,
+                    relation_group_ids[0], True, confidence, source,
+                    relation_group_ids[1:]))
 
         refine_tokens = {"cached_input_tokens": 0, "uncached_input_tokens": 0,
                          "output_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0}
         truncated: tuple[str, ...] = ()
         if level >= 4 and profile.edges.refine_mode != "none" and self.refiner:
-            candidates = self._ambiguous_candidates(memory_id, scenes, event_nodes, entity_nodes)
+            candidates = (gated_plan.refine_candidates if gated_plan is not None
+                          else self._ambiguous_candidates(
+                              memory_id, scenes, event_nodes, entity_nodes))
             decisions, truncated = self.refiner.refine(memory_id, candidates)
             by_candidate = {candidate.candidate_id: candidate for candidate in candidates}
+            node_map = {node.node_id: node for node in nodes}
             for decision in decisions:
                 if decision.decision == "NONE" or decision.candidate_id not in by_candidate:
                     continue
                 candidate = by_candidate[decision.candidate_id]
                 relation = RelationType(decision.decision)
-                evidence = next(node for node in nodes if node.node_id == candidate.left_id).evidence_group_id
+                left = node_map[candidate.left_id]; right = node_map[candidate.right_id]
+                evidence_groups = tuple(dict.fromkeys((
+                    left.evidence_group_id, right.evidence_group_id)))
                 edges.append(GraphEdge(
                     stable_id("edge", memory_id, candidate.left_id, relation, candidate.right_id),
-                    memory_id, candidate.left_id, relation, candidate.right_id, evidence,
-                    True, decision.confidence, decision.source,
+                    memory_id, candidate.left_id, relation, candidate.right_id,
+                    evidence_groups[0], relation != RelationType.COARSE_RELATED,
+                    decision.confidence, decision.source, evidence_groups[1:],
                 ))
             usage_after = self._usage(memory_id)
             refine_tokens = {key: usage_after[key] - usage_before[key] for key in usage_after}
@@ -285,6 +421,28 @@ class GraphBuildPipeline:
         edges = self._bounded_edges(self._dedup_edges(edges), profile)
         if lean_graph:
             nodes = self._propagate_time_ranges(nodes, edges)
+        method_diagnostics: dict[str, Any] = {
+            "recursive_hierarchy_enabled": recursive_hierarchy is not None,
+            "parent_gated_relations_enabled": gated_plan is not None,
+        }
+        if recursive_hierarchy is not None:
+            method_diagnostics["coarsening"] = dataclass_dict(
+                recursive_hierarchy.stats)
+        if gated_plan is not None:
+            method_diagnostics["cir"] = {
+                "coarse_candidate_pairs": gated_plan.coarse_candidate_pairs,
+                "gated_child_pairs": gated_plan.gated_child_pairs,
+                "score_comparisons": gated_plan.score_comparisons,
+                "accepted_pairs": len(gated_plan.accepted_pairs),
+                "refine_candidates": len(gated_plan.refine_candidates),
+                "refine_candidates_generated": (
+                    gated_plan.refine_candidates_generated),
+                "refine_candidates_dropped": (
+                    gated_plan.refine_candidates_dropped),
+                "levels_with_relations": gated_plan.levels_with_relations,
+                "typed_pairs": len(gated_plan.typed_pairs),
+                "candidate_method": gated_plan.candidate_method,
+            }
         version = self.store.replace_graph(memory_id, nodes, edges, groups)
         checksum = logical_graph_checksum(nodes, edges)
         artifact_id = stable_id("graph-artifact", memory_id, self.dataset_hash,
@@ -294,6 +452,13 @@ class GraphBuildPipeline:
         token_usage.update({
             "truncated_candidates": len(truncated),
             "wall_time_ms": round((time.perf_counter() - started) * 1000),
+            "coarsen_candidate_comparisons": (
+                recursive_hierarchy.stats.cluster_candidate_comparisons
+                if recursive_hierarchy is not None else 0),
+            "coarse_relation_candidates": (
+                gated_plan.coarse_candidate_pairs if gated_plan is not None else 0),
+            "gated_child_candidates": (
+                gated_plan.gated_child_pairs if gated_plan is not None else 0),
         })
         return GraphArtifactManifest(
             graph_artifact_id=artifact_id, memory_id=memory_id,
@@ -305,7 +470,8 @@ class GraphBuildPipeline:
             prompt_hashes={"selective_refine": self.refiner.prompt_hash if self.refiner else "disabled",
                            "semantic_distill": self.distiller.prompt_hash if self.distiller else "disabled"},
             build_token_usage=token_usage,
-            build_diagnostics=self._build_diagnostics(memory_id, nodes, edges, packets),
+            build_diagnostics=self._build_diagnostics(
+                memory_id, nodes, edges, packets, method_diagnostics),
         )
 
     @staticmethod
@@ -526,6 +692,9 @@ class GraphBuildPipeline:
                     event_time=fact.time, confidence=fact.confidence,
                     attributes={"owner_id": owner_id, "predicate": predicate_key, "value_id": value_id,
                     "scope": scope_key, "polarity": fact.polarity, "scene_id": packet.scene_id,
+                    "information_unit_ids": fact.information_unit_ids,
+                    "evidence_spans": tuple({"turn_id": turn_id, "start": start, "end": end}
+                                            for turn_id, start, end in fact.evidence),
                     "roles": ("fact", "predicate", "object")})
                 source_turn = turn_map[refs[0][0]]
                 nodes[fact_id] = fact_node; facts.append((fact_node, owner_id, value_id,
@@ -660,6 +829,9 @@ class GraphBuildPipeline:
                 attrs = {"owner_id": owner_id, "predicate": predicate_key, "value": fact.value,
                          "value_key": value_key, "value_type": fact.value_type, "scope": scope_key,
                          "polarity": fact.polarity, "scene_id": packet.scene_id,
+                         "information_unit_ids": fact.information_unit_ids,
+                         "evidence_spans": tuple({"turn_id": turn_id, "start": start, "end": end}
+                                                 for turn_id, start, end in fact.evidence),
                          "modality": modality,
                          "session_id": source_turn.session_id, "turn_index": source_turn.turn_index,
                          "roles": ("fact", "predicate", "object") +
@@ -980,6 +1152,36 @@ class GraphBuildPipeline:
                 "values": node.attributes.get("values", ()), "scopes": node.attributes.get("scopes", ()),
                 "times": node.attributes.get("times", ())}
 
+    def _recursive_hierarchy_edges(self, memory_id, hierarchy, session_cards,
+                                   scene_nodes, event_nodes):
+        """Materialize a compact, strictly parent-to-child routing tree."""
+        nodes = {
+            node.node_id: node
+            for node in (*session_cards.values(), *hierarchy.parent_cards,
+                         *scene_nodes.values(),
+                         *(event for rows in event_nodes.values() for event in rows))
+        }
+
+        def edge(left, relation, right):
+            groups = tuple(dict.fromkeys((left.evidence_group_id,
+                                         right.evidence_group_id)))
+            return GraphEdge(
+                stable_id("edge", memory_id, left.node_id, relation, right.node_id),
+                memory_id, left.node_id, relation, right.node_id,
+                groups[0], True, 1.0, "recursive_coarsening", groups[1:])
+
+        edges = []
+        for parent_id, child_ids in hierarchy.children.items():
+            parent = nodes[parent_id]
+            for child_id in child_ids:
+                edges.append(edge(parent, RelationType.REFINES_TO, nodes[child_id]))
+        for scene in scene_nodes.values():
+            card = session_cards[str(scene.attributes["session_id"])]
+            edges.append(edge(card, RelationType.REFINES_TO, scene))
+            for event in event_nodes.get(scene.node_id, ()):
+                edges.append(edge(scene, RelationType.SCENE_CONTAINS, event))
+        return edges
+
     def _hierarchy_edges(self, memory_id, memory_card, l2_cards, session_cards, scene_nodes, event_nodes):
         edges = []
         if l2_cards:
@@ -1106,7 +1308,8 @@ class GraphBuildPipeline:
                 totals[key] += int(usage.get(key, 0))
         return totals
 
-    def _build_diagnostics(self, memory_id, nodes, edges, packets):
+    def _build_diagnostics(self, memory_id, nodes, edges, packets,
+                           method_diagnostics: Mapping[str, Any] | None = None):
         import json
         scopes = defaultdict(int); terminal_groups = set(); relations = defaultdict(int)
         semantic_groups = set(); collection_semantics = defaultdict(int)
@@ -1135,6 +1338,15 @@ class GraphBuildPipeline:
                 semantic_turns.update(member.turn_id for member in group.members)
         source_turn_count = max(1, len(self.store.turns(memory_id)))
         facts_per_scene = sorted(len(packet.facts) for packet in packets)
+        unit_total = sum(len(packet.information_units) for packet in packets)
+        unit_covered = sum(len(packet.covered_unit_ids) for packet in packets)
+        unit_unresolved = sum(len(packet.unresolved_unit_ids) for packet in packets)
+        unit_missing = sum(len(packet.missing_unit_ids) for packet in packets)
+        unit_implicit = sum(len(packet.implicitly_covered_unit_ids) for packet in packets)
+        raw_fallback_turns = {
+            turn_id for packet in packets for turn_id in packet.raw_fallback_turn_ids
+        }
+        fact_caps = sorted(packet.fact_cap for packet in packets if packet.fact_cap)
         stage_usage: dict[str, dict[str, Mapping[str, Any]]] = defaultdict(dict)
         for row in self.store._read(
             "SELECT c.stage,c.cache_key,k.usage_json FROM llm_calls c JOIN llm_cache k "
@@ -1155,6 +1367,21 @@ class GraphBuildPipeline:
             "facts_per_scene_mean": (sum(facts_per_scene) / max(1, len(facts_per_scene))),
             "facts_per_scene_p95": (facts_per_scene[max(0, int(len(facts_per_scene) * 0.95) - 1)]
                                     if facts_per_scene else 0),
+            "information_unit_coverage": {
+                "total": unit_total,
+                "covered_by_fact": unit_covered,
+                "explicitly_unresolved": unit_unresolved,
+                "missing": unit_missing,
+                "implicitly_linked": unit_implicit,
+                "accounted_ratio": ((unit_covered + unit_unresolved) / unit_total
+                                    if unit_total else 1.0),
+                "fact_coverage_ratio": (unit_covered / unit_total if unit_total else 1.0),
+                "raw_fallback_turns": len(raw_fallback_turns),
+            },
+            "adaptive_fact_cap": {
+                "mean": (sum(fact_caps) / len(fact_caps) if fact_caps else 0),
+                "max": (max(fact_caps) if fact_caps else 0),
+            },
             "collection_semantics": dict(sorted(collection_semantics.items())),
             "semantic_prompt_hash": (self.distiller.prompt_hash if self.distiller else None),
             "provenance_scope_nodes": dict(sorted(scopes.items())),
@@ -1166,6 +1393,7 @@ class GraphBuildPipeline:
             # a silent degradation looks exactly like an unexplained accuracy drop.
             "build_token_budget": (dict(self.distiller.ledger.snapshot())
                                    if getattr(self.distiller, "ledger", None) else None),
+            "method": dict(method_diagnostics or {}),
         }
 
     @staticmethod

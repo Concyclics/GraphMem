@@ -5,7 +5,17 @@ stable domain/configuration interfaces and a read-only legacy adapter without
 changing the V4/V4.1 execution path.
 """
 
-from .config import CacheIdentity, GraphMemV5Config, config_hash, load_config
+from .config import (
+    CacheIdentity,
+    GraphMemRuntimeConfig,
+    GraphMemV5Config,
+    RetrievalRuntimeConfig,
+    ServingConfig,
+    config_hash,
+    load_config,
+    load_runtime_config,
+    runtime_config_hash,
+)
 from .domain import (
     Conversation,
     CollectionScope,
@@ -50,18 +60,23 @@ __all__ = [
     "GraphArtifactManifest",
     "GraphEdge",
     "GraphMemV5Config",
+    "GraphMemRuntimeConfig",
     "GraphNode",
     "NavigationResult",
     "QueryBudget",
+    "RetrievalRuntimeConfig",
     "RunManifest",
     "SemanticExtractionManifest",
     "RoutingCard",
     "Scene",
     "Session",
     "SourceTurn",
+    "ServingConfig",
     "StateHead",
     "TemporalInterval",
     "config_hash",
     "load_config",
+    "load_runtime_config",
+    "runtime_config_hash",
     "stable_id",
 ]

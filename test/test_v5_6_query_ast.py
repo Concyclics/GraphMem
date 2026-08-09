@@ -240,3 +240,16 @@ def test_divergence_between_legacy_and_ast_is_reported() -> None:
     assert ir.ast_operator == QueryOperator.EXISTS_ALL
     assert ir.ast_diverges is True
     assert root_operator(ir.ast) == QueryOperator.EXISTS_ALL
+
+
+def test_promoted_ast_is_the_single_downstream_contract() -> None:
+    compiled = compile_query(
+        "Do both Alice and Bob have pets?", _view("alice", "bob"))
+    active = compiled.promote_ast()
+
+    assert compiled.ast_diverges is True
+    assert active.operator == QueryOperator.EXISTS_ALL
+    assert active.operands == compiled.ast_operands
+    assert active.proof_obligations == compiled.ast_obligations
+    assert {row.operand_id for row in active.proof_obligations if row.operand_id} <= {
+        row.operand_id for row in active.operands}

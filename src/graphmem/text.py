@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from functools import lru_cache
 
 
 TOKEN_RE = re.compile(r"[\w'-]+", re.UNICODE)
@@ -18,10 +19,18 @@ def terms(text: str) -> tuple[str, ...]:
                  for token in TOKEN_RE.findall(text))
 
 
+@lru_cache(maxsize=8_192)
 def content_terms(text: str) -> frozenset[str]:
+    """Return content tokens, caching immutable graph/query text surfaces.
+
+    Retrieval repeatedly compares the same fact predicates, values and turn
+    text across queries.  Caching here preserves exact token semantics while
+    avoiding millions of duplicate regex/casefold operations per worker.
+    """
     return frozenset(token for token in terms(text) if token not in STOPWORDS and len(token) > 1)
 
 
+@lru_cache(maxsize=8_192)
 def normalize_key(text: str | None) -> str:
     return " ".join(terms(text or ""))
 

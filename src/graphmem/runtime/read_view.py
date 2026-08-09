@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
+import threading
+import time
 from typing import Iterable, Sequence
 
 from ..domain import GraphEdge, GraphNode, NodeType, RelationType
@@ -22,7 +24,13 @@ class AdjacentEdge:
 class GraphReadView:
     """Immutable, relation-specific adjacency compiled from canonical rows."""
 
-    def __init__(self, nodes: Iterable[GraphNode], edges: Iterable[GraphEdge]) -> None:
+    def __init__(self, nodes: Iterable[GraphNode], edges: Iterable[GraphEdge], *,
+                 graph_version: int = 0, graph_checksum: str = "") -> None:
+        # Version metadata travels with the immutable projection.  Query code
+        # can therefore identify the exact snapshot it is using without going
+        # back to SQLite for a second, potentially newer authority value.
+        self.graph_version = graph_version
+        self.graph_checksum = graph_checksum
         self.nodes = {node.node_id: node for node in nodes}
         self.edges = {edge.edge_id: edge for edge in edges}
         forward: dict[RelationType, dict[str, list[AdjacentEdge]]] = defaultdict(
@@ -53,21 +61,36 @@ class GraphReadView:
             node_id: frozenset(str(value) for value in node.attributes.get("roles", ()))
             for node_id, node in self.nodes.items()
         }
-        self.terminal_provenance_bitset = {
-            node_id: frozenset(node.all_evidence_group_ids)
-            for node_id, node in self.nodes.items()
-            if node.attributes.get("provenance_scope", "terminal") == "terminal"
-        }
-        self.routing_provenance_bitset = {
-            node_id: frozenset(node.all_evidence_group_ids)
-            for node_id, node in self.nodes.items()
-            if node.attributes.get("provenance_scope") == "route"
-        }
         self.provenance_bitset = {
             node_id: frozenset(node.all_evidence_group_ids)
             for node_id, node in self.nodes.items()
         }
+        # Terminal/routing projections share the exact immutable frozenset with
+        # the all-node map.  The previous comprehensions allocated two equal
+        # provenance sets for almost every node in every worker.
+        self.terminal_provenance_bitset = {
+            node_id: self.provenance_bitset[node_id]
+            for node_id, node in self.nodes.items()
+            if node.attributes.get("provenance_scope", "terminal") == "terminal"
+        }
+        self.routing_provenance_bitset = {
+            node_id: self.provenance_bitset[node_id]
+            for node_id, node in self.nodes.items()
+            if node.attributes.get("provenance_scope") == "route"
+        }
         self._compile_query_index()
+        # A deterministic, inexpensive weight for byte-bounded snapshot caching.
+        # It deliberately includes serialized attribute/provenance payloads,
+        # which dominate real V5.8 snapshots, rather than counting only objects.
+        self.estimated_bytes = (
+            sum(256 + len(node.summary.encode("utf-8"))
+                + len(repr(node.attributes).encode("utf-8"))
+                + sum(len(item) for item in node.all_evidence_group_ids)
+                for node in self.nodes.values())
+            + sum(192 + sum(len(item) for item in edge.all_evidence_group_ids)
+                  for edge in self.edges.values())
+            + 16 * sum(len(rows) for rows in self.node_term_index.values())
+        )
 
     def _compile_query_index(self) -> None:
         """Compile immutable query postings from V5 canonical attributes.
@@ -94,8 +117,36 @@ class GraphReadView:
         # lexically without giving every fact its own embedding.
         self.fact_term_index: dict[str, list[str]] = defaultdict(list)
         self.fact_owner_predicate_index: dict[tuple[str, str], list[str]] = defaultdict(list)
+        # Generic immutable lexical postings remove the per-query O(|V|) scan
+        # previously performed by retrieval.seeding._lexical_nodes.
+        self.node_term_index: dict[str, list[str]] = defaultdict(list)
+        self.route_term_index: dict[str, list[str]] = defaultdict(list)
+        self.node_terms: dict[str, frozenset[str]] = {}
+        self.route_child_postings_by_parent: dict[
+            str, dict[str, tuple[str, ...]]
+        ] = {}
         for node in self.nodes.values():
             attrs = node.attributes
+            searchable = " ".join(str(value) for value in (
+                node.summary,
+                attrs.get("owner_id", ""), attrs.get("predicate", ""),
+                attrs.get("scope", ""), attrs.get("collection_key", ""),
+                attrs.get("value", ""), " ".join(map(str, attrs.get("owners", ()))),
+                " ".join(map(str, attrs.get("predicates", ()))),
+                " ".join(map(str, attrs.get("values", ()))),
+                " ".join(map(str, attrs.get("scopes", ()))),
+                " ".join(map(str, attrs.get("times", ()))),
+            ))
+            searchable_terms = content_terms(searchable)
+            self.node_terms[node.node_id] = searchable_terms
+            for term in searchable_terms:
+                self.node_term_index[term].append(node.node_id)
+            if ("route" in self.role_bitset.get(node.node_id, ())
+                    or node.node_type in {NodeType.ROUTING_CARD, NodeType.SCENE,
+                                         NodeType.COLLECTION_SCOPE,
+                                         NodeType.COLLECTION_MANIFEST}):
+                for term in searchable_terms:
+                    self.route_term_index[term].append(node.node_id)
             if node.node_type == NodeType.CANONICAL_ENTITY:
                 for alias in (node.summary, *attrs.get("aliases", ())):
                     key = normalize_key(str(alias))
@@ -127,14 +178,60 @@ class GraphReadView:
             elif node.node_type in {NodeType.COLLECTION_SCOPE, NodeType.COLLECTION_MANIFEST}:
                 key = normalize_key(str(attrs.get("collection_key", "")))
                 if key: self.collection_index[key].append(node.node_id)
-                for value in attrs.get("member_value_keys", ()):
+                # Collection manifests persist this field as ``value_keys``.
+                # Older experimental snapshots briefly used
+                # ``member_value_keys``; accept both so a reader can open either
+                # schema without silently compiling an empty value index.
+                values = attrs.get("value_keys", attrs.get("member_value_keys", ()))
+                for value in values:
                     key = normalize_key(str(value))
                     if key: self.manifest_value_index[key].append(node.node_id)
             elif node.node_type == NodeType.ROUTING_CARD:
+                parent_postings: dict[str, tuple[str, ...]] = {}
                 for key, child_ids in dict(attrs.get("child_postings", {})).items():
                     normalized = normalize_key(str(key))
                     if normalized:
-                        self.routing_child_postings[normalized].extend(str(row) for row in child_ids)
+                        children = tuple(str(row) for row in child_ids)
+                        self.routing_child_postings[normalized].extend(children)
+                        parent_postings[normalized] = children
+                self.route_child_postings_by_parent[node.node_id] = parent_postings
+
+        # Directional hierarchy indexes.  REFINES_TO and SCENE_CONTAINS are
+        # control-plane edges; treating their inverse as an ordinary semantic
+        # neighbour lets a query jump back to the root and fan out globally.
+        hierarchy_children: dict[str, list[str]] = defaultdict(list)
+        hierarchy_parents: dict[str, list[str]] = defaultdict(list)
+        for edge in self.edges.values():
+            if edge.relation not in {RelationType.REFINES_TO, RelationType.SCENE_CONTAINS}:
+                continue
+            if edge.src_id not in self.nodes or edge.dst_id not in self.nodes:
+                continue
+            hierarchy_children[edge.src_id].append(edge.dst_id)
+            hierarchy_parents[edge.dst_id].append(edge.src_id)
+        self.hierarchy_children_index = {
+            key: tuple(sorted(set(rows), key=lambda item: (
+                -self.nodes[item].level, item)))
+            for key, rows in hierarchy_children.items()
+        }
+        self.hierarchy_parent_index = {
+            key: tuple(sorted(set(rows), key=lambda item: (
+                self.nodes[item].level, item)))
+            for key, rows in hierarchy_parents.items()
+        }
+        cards = [node for node in self.nodes.values()
+                 if node.node_type == NodeType.ROUTING_CARD]
+        roots = [node.node_id for node in cards
+                 if node.node_id not in self.hierarchy_parent_index]
+        if not roots and cards:
+            highest = max(node.level for node in cards)
+            roots = [node.node_id for node in cards if node.level == highest]
+        self.route_root_ids = tuple(sorted(roots))
+        levels: dict[int, list[str]] = defaultdict(list)
+        for node in cards:
+            levels[node.level].append(node.node_id)
+        self.routing_nodes_by_level = {
+            level: tuple(sorted(rows)) for level, rows in levels.items()
+        }
         self.owner_alias_index = {key: tuple(sorted(value)) for key, value in owner_alias.items()}
         self.predicate_index = tuple(sorted(self.predicate_fact_index))
         for name in (
@@ -142,12 +239,31 @@ class GraphReadView:
             "scope_fact_index", "value_fact_index", "collection_fact_index", "session_fact_index",
             "routing_child_postings", "collection_index",
             "manifest_value_index", "evidence_group_fact_index", "fact_term_index",
-            "fact_owner_predicate_index",
+            "fact_owner_predicate_index", "node_term_index", "route_term_index",
         ):
             value = getattr(self, name)
             setattr(self, name, {key: tuple(sorted(set(rows))) for key, rows in value.items()})
+        self.predicate_term_index = {
+            key: content_terms(key) for key in self.predicate_fact_index
+        }
+        predicates_by_owner: dict[
+            str, list[tuple[str, tuple[str, ...]]]
+        ] = defaultdict(list)
+        for (owner, predicate), fact_ids in self.fact_owner_predicate_index.items():
+            predicates_by_owner[owner].append((predicate, fact_ids))
+        self.fact_predicates_by_owner = {
+            # Preserve the composite index's insertion order: callers truncate
+            # after deduplication, so sorting here could change retrieval output.
+            owner: tuple(rows)
+            for owner, rows in predicates_by_owner.items()
+        }
+        self.collection_node_ids = tuple(
+            node.node_id for node in self.nodes.values()
+            if node.node_type in {NodeType.COLLECTION_SCOPE,
+                                  NodeType.COLLECTION_MANIFEST})
 
-    def _fact_rank(self, node_id: str, owner_ids: frozenset[str], predicate_keys: Sequence[str],
+    def _fact_rank(self, node_id: str, owner_ids: frozenset[str],
+                   predicate_terms: Sequence[frozenset[str]],
                    rank_terms: frozenset[str]) -> tuple[float, str]:
         """Relevance for truncation: owner, predicate, then lexical overlap."""
         node = self.nodes.get(node_id)
@@ -158,14 +274,20 @@ class GraphReadView:
         if owner_ids and str(attrs.get("owner_id", "")) in owner_ids:
             score += 2.0
         predicate = normalize_key(str(attrs.get("predicate", "")))
-        if predicate_keys:
-            predicate_terms = set(content_terms(predicate))
-            score += max((len(predicate_terms & set(content_terms(item))) for item in predicate_keys),
+        if predicate_terms:
+            indexed_terms = self.predicate_term_index.get(predicate)
+            if indexed_terms is None:
+                indexed_terms = content_terms(predicate)
+            score += max((len(indexed_terms & item) for item in predicate_terms),
                          default=0) * 0.75
         if rank_terms:
-            haystack = content_terms(" ".join(str(attrs.get(key, "")) for key in
-                                              ("predicate", "value", "scope", "collection_key"))
-                                     + " " + node.summary)
+            # ``content_terms`` is process-bounded and cached.  Compute this
+            # exact ranking surface lazily instead of storing a second term set
+            # for every node in every cached memory view.
+            haystack = content_terms(
+                " ".join(str(attrs.get(key, "")) for key in
+                         ("predicate", "value", "scope", "collection_key"))
+                + " " + node.summary)
             score += len(rank_terms & haystack) * 0.25
         return (score, node_id)
 
@@ -180,9 +302,8 @@ class GraphReadView:
         predicate_terms = [set(content_terms(normalize_key(item))) for item in predicates
                            if normalize_key(item)]
         rows: list[tuple[float, str]] = []
-        for node in self.nodes.values():
-            if node.node_type not in {NodeType.COLLECTION_SCOPE, NodeType.COLLECTION_MANIFEST}:
-                continue
+        for node_id in self.collection_node_ids:
+            node = self.nodes[node_id]
             attrs = node.attributes
             score = 0.0
             if owners and str(attrs.get("owner_id", "")) in owners:
@@ -204,15 +325,16 @@ class GraphReadView:
         if owner_ids:
             pools.append(set().union(*(set(self.owner_fact_index.get(item, ())) for item in owner_ids)))
         predicate_keys = [normalize_key(item) for item in predicates if normalize_key(item)]
+        predicate_terms = [content_terms(item) for item in predicate_keys]
         if predicate_keys:
             matched = set().union(*(set(self.predicate_fact_index.get(item, ())) for item in predicate_keys))
             # Query compiler candidates can be a normalized stem ("travel") while
             # a fact retains a supported phrase ("travel to").  Token containment
             # is deterministic and avoids an embedding-only predicate join.
             for indexed, fact_ids in self.predicate_fact_index.items():
-                indexed_terms = set(content_terms(indexed))
-                if any(set(content_terms(item)) <= indexed_terms or indexed_terms <= set(content_terms(item))
-                       for item in predicate_keys):
+                indexed_terms = self.predicate_term_index[indexed]
+                if any(item <= indexed_terms or indexed_terms <= item
+                       for item in predicate_terms):
                     matched.update(fact_ids)
             pools.append(matched)
         scope_keys = [normalize_key(item) for item in scopes if normalize_key(item)]
@@ -230,7 +352,7 @@ class GraphReadView:
         # reason related to the query; rank first, then cut.
         owners = frozenset(owner_ids)
         ranked = sorted(result, key=lambda node_id: (
-            -self._fact_rank(node_id, owners, predicate_keys, rank_terms)[0], node_id))
+            -self._fact_rank(node_id, owners, predicate_terms, rank_terms)[0], node_id))
         return tuple(ranked[:limit])
 
     def route_children(self, keys: Sequence[str], *, limit: int = 48) -> tuple[str, ...]:
@@ -238,6 +360,45 @@ class GraphReadView:
         for key in keys:
             rows.extend(self.routing_child_postings.get(normalize_key(key), ()))
         return tuple(dict.fromkeys(rows))[:limit]
+
+    def routing_roots(self) -> tuple[str, ...]:
+        return self.route_root_ids
+
+    def hierarchy_children(self, node_id: str) -> tuple[str, ...]:
+        """Children only; this API never follows a control edge backwards."""
+        return self.hierarchy_children_index.get(node_id, ())
+
+    def hierarchy_parents(self, node_id: str) -> tuple[str, ...]:
+        return self.hierarchy_parent_index.get(node_id, ())
+
+    def parent_posting_children(self, parent_id: str, keys: Sequence[str]) -> tuple[str, ...]:
+        postings = self.route_child_postings_by_parent.get(parent_id, {})
+        rows: list[str] = []
+        for key in keys:
+            normalized = normalize_key(str(key))
+            rows.extend(postings.get(normalized, ()))
+            for term in content_terms(normalized):
+                rows.extend(postings.get(term, ()))
+        return tuple(dict.fromkeys(row for row in rows if row in self.nodes))
+
+    def lexical_nodes(self, query_terms: frozenset[str], *, limit: int = 64,
+                      candidates: Sequence[str] | None = None,
+                      route_only: bool = False) -> tuple[str, ...]:
+        """Rank an inverted-index candidate set without scanning every node."""
+        if not query_terms or limit <= 0:
+            return ()
+        index = self.route_term_index if route_only else self.node_term_index
+        allowed = frozenset(candidates) if candidates is not None else None
+        hits: dict[str, int] = {}
+        for term in query_terms:
+            for node_id in index.get(term, ()):
+                if allowed is not None and node_id not in allowed:
+                    continue
+                hits[node_id] = hits.get(node_id, 0) + 1
+        ranked = sorted(hits, key=lambda node_id: (
+            -hits[node_id] / max(1, len(query_terms)),
+            -float(self.nodes[node_id].confidence), node_id))
+        return tuple(ranked[:limit])
 
     def collection_facts(self, collection_key: str, *, limit: int = 64) -> tuple[str, ...]:
         return self.collection_fact_index.get(normalize_key(collection_key), ())[:limit]
@@ -269,15 +430,17 @@ class GraphReadView:
         phrase ("travel to"), so exact key equality alone under-retrieves.
         """
         predicate_keys = [normalize_key(item) for item in predicates if normalize_key(item)]
+        predicate_terms = [content_terms(item) for item in predicate_keys]
         rows: list[str] = []
         for owner in owner_ids:
-            for (indexed_owner, indexed_predicate), fact_ids in self.fact_owner_predicate_index.items():
-                if indexed_owner != owner:
-                    continue
-                indexed_terms = set(content_terms(indexed_predicate))
+            for indexed_predicate, fact_ids in self.fact_predicates_by_owner.get(
+                    owner, ()):
+                indexed_terms = self.predicate_term_index.get(indexed_predicate)
+                if indexed_terms is None:
+                    indexed_terms = content_terms(indexed_predicate)
                 if not predicate_keys or any(
-                        set(content_terms(item)) <= indexed_terms or indexed_terms <= set(content_terms(item))
-                        for item in predicate_keys):
+                        item <= indexed_terms or indexed_terms <= item
+                        for item in predicate_terms):
                     rows.extend(fact_ids)
         return tuple(dict.fromkeys(rows))[:limit]
 
@@ -341,19 +504,156 @@ class GraphReadView:
 class SQLiteSnapshotRuntime:
     mode = "sqlite_snapshot"
 
-    def __init__(self, store: SQLiteGraphStore) -> None:
+    def __init__(self, store: SQLiteGraphStore, *, max_cached_views: int = 16,
+                 max_cache_bytes: int = 512 * 1024 * 1024) -> None:
         self.store = store
-        self._views: dict[tuple[str, int], GraphReadView] = {}
+        self.max_cached_views = max(1, max_cached_views)
+        self.max_cache_bytes = max(1, max_cache_bytes)
+        self._views: OrderedDict[tuple[str, int], GraphReadView] = OrderedDict()
+        self._view_bytes: dict[tuple[str, int], int] = {}
+        self._cache_bytes = 0
+        self._lock = threading.RLock()
+        self._building: dict[tuple[str, int], threading.Event] = {}
+        self._hits = 0
+        self._misses = 0
+        self._builds = 0
+        self._build_waits = 0
+        self._evictions = 0
+        self._invalidations = 0
+        self._build_ms = 0.0
+
+    def peek(self, memory_id: str, graph_version: int | None = None) -> GraphReadView | None:
+        """Inspect the retained LRU without querying SQLite or compiling a view."""
+        with self._lock:
+            if graph_version is not None:
+                return self._views.get((memory_id, graph_version))
+            for key in reversed(self._views):
+                if key[0] == memory_id:
+                    return self._views[key]
+        return None
+
+    def lru_keys(self) -> tuple[tuple[str, int], ...]:
+        """Oldest-to-newest retained keys for an external admission policy."""
+        with self._lock:
+            return tuple(self._views)
+
+    def touch(self, memory_id: str, graph_version: int) -> GraphReadView | None:
+        """Record an externally validated cache hit without another SQL probe."""
+        key = (memory_id, graph_version)
+        with self._lock:
+            view = self._views.get(key)
+            if view is not None:
+                self._views.move_to_end(key)
+                self._hits += 1
+            return view
+
+    def _retain_locked(self, key: tuple[str, int], view: GraphReadView, *,
+                       accounted_bytes: int | None = None) -> GraphReadView:
+        for old_key in [item for item in self._views if item[0] == key[0]]:
+            old = self._views.pop(old_key)
+            del old
+            self._cache_bytes -= self._view_bytes.pop(old_key)
+            self._invalidations += 1
+        retained_bytes = max(1, int(
+            accounted_bytes if accounted_bytes is not None else view.estimated_bytes))
+        self._views[key] = view
+        self._view_bytes[key] = retained_bytes
+        self._cache_bytes += retained_bytes
+        while (len(self._views) > self.max_cached_views
+               or self._cache_bytes > self.max_cache_bytes) and len(self._views) > 1:
+            evicted_key, _evicted = self._views.popitem(last=False)
+            self._cache_bytes -= self._view_bytes.pop(evicted_key)
+            self._evictions += 1
+        return view
+
+    def install(self, view: GraphReadView, *, memory_id: str | None = None,
+                accounted_bytes: int | None = None) -> GraphReadView:
+        """Atomically retain an already validated immutable compiled view."""
+        resolved_memory = (memory_id or
+                           (next(iter(view.nodes.values())).memory_id
+                            if view.nodes else ""))
+        key = (resolved_memory, view.graph_version)
+        if not key[0]:
+            raise ValueError("cannot install an empty view without a memory id")
+        with self._lock:
+            cached = self._views.get(key)
+            if cached is not None and cached.graph_checksum == view.graph_checksum:
+                self._views.move_to_end(key)
+                return cached
+            return self._retain_locked(
+                key, view, accounted_bytes=accounted_bytes)
 
     def view(self, memory_id: str) -> GraphReadView:
         version = self.store.graph_version(memory_id)
         key = (memory_id, version)
-        if key not in self._views:
-            self._views = {item: view for item, view in self._views.items() if item[0] != memory_id}
-            self._views[key] = GraphReadView(
-                self.store.nodes(memory_id), self.store.edges(memory_id)
+        while True:
+            with self._lock:
+                cached = self._views.get(key)
+                if cached is not None:
+                    self._hits += 1
+                    self._views.move_to_end(key)
+                    return cached
+                event = self._building.get(key)
+                if event is None:
+                    event = threading.Event()
+                    self._building[key] = event
+                    self._misses += 1
+                    owner = True
+                else:
+                    self._build_waits += 1
+                    owner = False
+            if owner:
+                break
+            # Single-flight: concurrent cold requests wait for one compiler
+            # instead of each materializing the same graph and multiplying RAM.
+            event.wait()
+
+        build_started = time.perf_counter()
+        try:
+            (snapshot_version, snapshot_checksum,
+             snapshot_nodes, snapshot_edges) = self.store.graph_snapshot(memory_id)
+            built = GraphReadView(
+                snapshot_nodes, snapshot_edges,
+                graph_version=snapshot_version,
+                graph_checksum=snapshot_checksum,
             )
-        return self._views[key]
+        except BaseException:
+            with self._lock:
+                self._building.pop(key, event).set()
+            raise
+        with self._lock:
+            self._builds += 1
+            self._build_ms += (time.perf_counter() - build_started) * 1000
+            snapshot_key = (memory_id, snapshot_version)
+            # A writer may commit between the optimistic version probe and the
+            # snapshot transaction.  Cache under the version actually read,
+            # never under the earlier probe.
+            cached_snapshot = self._views.get(snapshot_key)
+            if cached_snapshot is not None:
+                self._views.move_to_end(snapshot_key)
+                self._building.pop(key, event).set()
+                return cached_snapshot
+            self._retain_locked(snapshot_key, built)
+            self._building.pop(key, event).set()
+            return built
+
+    def cache_stats(self) -> dict[str, int | float]:
+        with self._lock:
+            return {
+                "views": len(self._views),
+                "estimated_bytes": self._cache_bytes,
+                "accounted_bytes": self._cache_bytes,
+                "inflight_builds": len(self._building),
+                "max_views": self.max_cached_views,
+                "max_bytes": self.max_cache_bytes,
+                "hits": self._hits,
+                "misses": self._misses,
+                "builds": self._builds,
+                "build_waits": self._build_waits,
+                "evictions": self._evictions,
+                "invalidations": self._invalidations,
+                "build_ms": self._build_ms,
+            }
 
     def nodes(self, memory_id: str, node_ids: Sequence[str]) -> Sequence[GraphNode]:
         view = self.view(memory_id)

@@ -11,6 +11,8 @@ data/
 logs/
 runs/
 ref/
+artifacts/
+*.egg-info/
 
 *.out
 *.log

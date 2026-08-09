@@ -94,6 +94,12 @@ def main() -> None:
     )
     parser.add_argument("--workers", type=int, default=64)
     parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument(
+        "--semantic-retries",
+        type=int,
+        default=3,
+        help="retry responses that are valid requests but lack a CORRECT/WRONG label",
+    )
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
@@ -134,34 +140,69 @@ def main() -> None:
             gold,
             str(answer_row.get("prediction") or ""),
         )
-        result = client.chat(
-            question_id=question_id,
-            variant="memory_benchmarks_locomo_judge",
-            stage="judge_locomo",
-            messages=[
-                {"role": "system", "content": prompts.JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            thinking_mode="none",
-            max_tokens=args.max_tokens,
-            json_mode=True,
-            temperature=0.0,
-            seed=0,
-        )
-        result.record.excluded_from_budget = True
-        payload = _parse_json(result.text)
-        label = str(payload.get("label") or "").upper()
-        if label not in {"CORRECT", "WRONG"}:
-            raise ValueError(f"invalid LoCoMo judge label for {question_id}: {label!r}")
-        if result.record.reasoning_tokens != 0:
-            raise RuntimeError(f"judge reasoning_tokens must be 0 for {question_id}")
-        return case, result, payload, label
+        call_records = []
+        last_error: Exception | None = None
+        last_response = ""
+        for attempt in range(max(1, args.semantic_retries)):
+            repair = ""
+            if attempt > 0:
+                repair = (
+                    "\n\nYour previous response omitted or invalidated the required label. "
+                    "Return exactly one JSON object with both fields: "
+                    "{\"label\": \"CORRECT or WRONG\", \"reasoning\": \"brief reason\"}. "
+                    f"Previous response: {last_response[:1000]}"
+                )
+            result = client.chat(
+                question_id=question_id,
+                variant="memory_benchmarks_locomo_judge",
+                stage="judge_locomo" if attempt == 0 else "judge_locomo_semantic_retry",
+                messages=[
+                    {"role": "system", "content": prompts.JUDGE_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt + repair},
+                ],
+                thinking_mode="none",
+                max_tokens=args.max_tokens if attempt == 0 else max(args.max_tokens, 512),
+                json_mode=True,
+                temperature=0.0,
+                seed=0,
+            )
+            result.record.excluded_from_budget = True
+            call_records.append(result.record)
+            last_response = result.text
+            try:
+                payload = _parse_json(result.text)
+                label = str(payload.get("label") or "").upper()
+                if label not in {"CORRECT", "WRONG"}:
+                    raise ValueError(
+                        f"invalid LoCoMo judge label for {question_id}: {label!r}"
+                    )
+                if result.record.reasoning_tokens != 0:
+                    raise RuntimeError(
+                        f"judge reasoning_tokens must be 0 for {question_id}"
+                    )
+                return case, result, payload, label, call_records
+            except (ValueError, json.JSONDecodeError) as error:
+                last_error = error
+        raise RuntimeError(
+            f"LoCoMo judge semantic retries exhausted for {question_id}: {last_error}; "
+            f"last_response={last_response[:500]!r}"
+        ) from last_error
 
+    failures: list[dict[str, str]] = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        futures = [pool.submit(judge, item) for item in selected]
+        futures = {pool.submit(judge, item): item for item in selected}
         for future in as_completed(futures):
-            case, result, payload, label = future.result()
-            _append_jsonl(calls_path, asdict(result.record))
+            source_item = futures[future]
+            try:
+                case, result, payload, label, call_records = future.result()
+            except Exception as error:
+                failure = {"question_id": str(source_item[0]), "error": repr(error)}
+                failures.append(failure)
+                _append_jsonl(args.output_dir / "judge_failures.jsonl", failure)
+                print(f"[judge error] {source_item[0]}: {error}", flush=True)
+                continue
+            for record in call_records:
+                _append_jsonl(calls_path, asdict(record))
             _append_jsonl(
                 eval_path,
                 {
@@ -222,6 +263,9 @@ def main() -> None:
         json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(json.dumps({"accuracy": stats["accuracy"], "questions": len(evaluations)}))
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)} LoCoMo judge calls failed; rerun with --resume")
 
 
 if __name__ == "__main__":

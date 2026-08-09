@@ -6,7 +6,7 @@ from typing import Mapping, Sequence
 
 from graphmem.domain import OperandSpec, ProofObligation, QueryOperator, SourceTurn, stable_id
 from graphmem.retrieval.query_ir import QueryIR
-from graphmem.retrieval.seeding import _interleave, build_views, seed_operands
+from graphmem.retrieval.seeding import TurnSearchIndex, _interleave, build_views, seed_operands
 
 
 def _turn(session_id: str, index: int, text: str) -> SourceTurn:
@@ -73,6 +73,51 @@ def test_build_views_gives_each_operand_its_own_angles() -> None:
     assert {row.text for row in views if row.operand_id == "left"} != {
         row.text for row in views if row.operand_id == "right"}
     assert views == build_views(ir, max_per_operand=6)
+
+
+def test_turn_search_index_uses_postings_and_preserves_exact_ranking() -> None:
+    turns = [_turn("s1", 0, "Alice visited Kyoto in spring"),
+             _turn("s1", 1, "Alice visited Osaka"),
+             _turn("s2", 0, "Bob adopted a cat")]
+    index = TurnSearchIndex(turns)
+
+    ranked = index.exact("Alice Kyoto", limit=8)
+
+    assert ranked[0][0] == turns[0].turn_id
+    assert turns[2].turn_id not in {turn_id for turn_id, _ in ranked}
+    assert index.signature == (3, turns[-1].turn_id, turns[-1].content_hash)
+
+
+def test_turn_search_index_ranks_sessions_without_rebuilding_term_counters() -> None:
+    turns = [_turn("travel", 0, "Kyoto train reservation"),
+             _turn("travel", 1, "Kyoto hotel"),
+             _turn("pets", 0, "adopted a cat")]
+    index = TurnSearchIndex(turns)
+
+    assert index.rank_sessions("Kyoto trip", 1) == ("travel",)
+
+
+def test_native_bm25_is_deterministic_and_avoids_store_fts() -> None:
+    turns = [_turn("travel", 0, "Kyoto Kyoto train reservation"),
+             _turn("travel", 1, "Kyoto hotel"),
+             _turn("pets", 0, "adopted a cat")]
+    index = TurnSearchIndex(turns)
+
+    ranked = index.bm25("Kyoto train", limit=8)
+
+    assert ranked == index.bm25("Kyoto train", limit=8)
+    assert ranked[0][0] == turns[0].turn_id
+
+    class NoFtsStore:
+        def search_turns(self, *_args, **_kwargs):
+            raise AssertionError("native seed fusion must not call SQLite FTS")
+
+    result = seed_operands(
+        NoFtsStore(), _StubView(), "m",
+        _ir("Kyoto train", [_operand("only", "", "train")]), turns,
+        dense_search=None, use_rrf=True, use_postings=False,
+        wide_reservoir=True, turn_index=index, native_bm25=True)
+    assert result.stats["bm25_backend"] == "immutable_memory_index"
 
 
 def test_reservoir_keeps_the_weakest_hit_of_every_channel() -> None:
