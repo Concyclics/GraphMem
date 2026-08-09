@@ -45,6 +45,20 @@ def test_runtime_profiles_load_and_translate_to_online_options(name: str) -> Non
     assert config.query_budget.max_evidence_turns == 32
 
 
+def test_v5_17_accuracy_profile_keeps_wider_evidence_budget() -> None:
+    config = load_runtime_config(
+        ROOT / "configs/v5/runtime_v5_17_accuracy64.json")
+
+    assert config.profile == "v5_17_accuracy64"
+    assert config.query_budget.max_evidence_turns == 64
+    assert config.query_budget.max_evidence_tokens == 12_000
+    options = config.retrieval.navigator_options(compiled_cache_dir=None)
+    assert options["obligation_aware_packing"] is True
+    assert options["precision_aware_packing"] is False
+    assert options["rare_lexical_relations"] is True
+    assert options["queryir_soft_fallback"] is True
+
+
 def test_runtime_profile_matches_report_pareto_worker_configuration() -> None:
     config = load_runtime_config(
         ROOT / "configs/v5/runtime_v5_11_report_8w.json")
