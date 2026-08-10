@@ -381,7 +381,7 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
         ("worker_rss_mib", "(a) RSS"),
         ("worker_pss_mib", "(b) PSS"),
     )
-    fig, axes = plt.subplots(1, 2, figsize=PAPER_FIGSIZE, sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=PAPER_FIGSIZE, sharey=False)
     for axis, (metric_key, panel_title) in zip(axes, metrics):
         for system in ("GraphMem", "Mem0 OSS"):
             for client in clients:
@@ -402,11 +402,14 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
                 )
         max_memory = max(row[metric_key] for row in rows) / 1024.0
         axis.set_xlim(0, max_memory * 1.1)
-        axis.set_ylim(0, 184)
+        axis.set_yscale("log")
+        axis.set_ylim(8.0, 205.0)
+        axis.set_yticks([10, 20, 50, 100, 200])
+        axis.set_yticklabels(["10", "20", "50", "100", "200"])
         axis.set_xlabel("检索 worker 聚合内存（GiB）")
-        axis.set_ylabel("QPS")
+        axis.set_ylabel("QPS（对数轴）")
         axis.set_title(panel_title, fontweight="bold")
-        axis.grid(True, linestyle="--", linewidth=0.65, zorder=0)
+        axis.grid(True, which="both", linestyle="--", linewidth=0.65, zorder=0)
     method_handles = [
         Line2D([0], [0], color=SYSTEM_COLORS["GraphMem"],
                linewidth=2.5, label="GraphMem"),
