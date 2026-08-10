@@ -81,3 +81,58 @@ def test_report_rows_render_missing_mem0_type_and_build_as_pending():
 
     assert "运行中" in render.build_rows(payload)
     assert "运行中" in render.type_accuracy_rows(payload)
+
+
+def test_budget_figures_render_all_formats(tmp_path):
+    lme_types = (
+        "single-session-user", "single-session-assistant",
+        "single-session-preference", "multi-session", "temporal-reasoning",
+        "knowledge-update",
+    )
+    locomo_types = tuple(f"category_{index}" for index in range(1, 5))
+
+    def point(benchmark, setting, accuracy, tokens, method):
+        type_keys = lme_types if benchmark == "longmemeval" else locomo_types
+        row = {
+            "benchmark": benchmark,
+            "retrieval_setting": setting,
+            "accuracy": accuracy,
+            "answer_tokens": {
+                "mean": tokens, "p95": tokens + 10,
+                "p99": tokens + 20, "max": tokens + 30,
+            },
+            "accuracy_by_type": {
+                key: {"questions": 1, "correct": 1, "accuracy": accuracy}
+                for key in type_keys
+            },
+            "build_tokens": {
+                "count": 500 if benchmark == "longmemeval" else 10,
+                "mean": tokens * 10, "p95": tokens * 11,
+                "p99": tokens * 12, "max": tokens * 13,
+            },
+        }
+        if method == "Mem0":
+            row.update({"status": "complete", "questions": 1})
+        return row
+
+    payload = {"graphmem": [], "mem0": []}
+    for benchmark in ("longmemeval", "locomo"):
+        payload["graphmem"].extend((
+            point(benchmark, "32-turn", 0.70, 500, "GraphMem"),
+            point(benchmark, "64-turn", 0.75, 900, "GraphMem"),
+        ))
+        payload["mem0"].extend((
+            point(benchmark, "top-50", 0.60, 600, "Mem0"),
+            point(benchmark, "top-200", 0.65, 1200, "Mem0"),
+        ))
+
+    render.plot_build_tokens(payload, tmp_path)
+    render.plot_budget_accuracy(payload, tmp_path)
+    render.plot_type_accuracy(payload, tmp_path)
+
+    for stem in ("v5_20_build_tokens", "v5_20_budget_accuracy",
+                 "v5_20_type_accuracy"):
+        for suffix in ("pdf", "png", "svg"):
+            path = tmp_path / "figures" / f"{stem}.{suffix}"
+            assert path.exists()
+            assert path.stat().st_size > 0

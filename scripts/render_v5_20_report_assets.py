@@ -95,15 +95,21 @@ def graph_analysis(payload: dict) -> str:
         return (r"\paragraph{结果状态。}四臂回答与 Luna judge 正在并行执行；"
                 r"占位单元格不参与结论。" "\n")
     comparisons = payload.get("comparisons", {})
+    questions = int(payload.get("protocol", {}).get("questions") or 0)
+    hierarchy = comparisons.get("flat_graph->hierarchical", {}).get("overall", {})
+    hierarchy_ci = hierarchy.get("paired_bootstrap_95ci") or (None, None)
+    hierarchy_p = hierarchy.get("mcnemar_exact_p")
+    hierarchy_wording = (
+        "达到统计显著" if hierarchy_p is not None and float(hierarchy_p) < 0.05
+        else "尚未达到 $p<0.05$")
     final = comparisons.get("seed_only->topology_layout", {}).get("overall", {})
-    ci = final.get("paired_bootstrap_95ci") or (None, None)
-    p_value = final.get("mcnemar_exact_p")
-    final_accuracy = payload["arms"]["topology_layout"]["accuracy"]["overall"]
-    final_metrics = payload["arms"]["topology_layout"]["retrieval"]["overall"]
+    final_p = final.get("mcnemar_exact_p")
+    best_accuracy = payload["arms"]["hierarchical"]["accuracy"]["overall"]
+    best_metrics = payload["arms"]["hierarchical"]["retrieval"]["overall"]
+    rerank_groups = comparisons.get(
+        "hierarchical->graph_rerank_layout", {}).get("by_group", {})
     prompt_control = payload.get("audit", {}).get("topology_prompt_control", {})
     strict = prompt_control.get("strict_same_set_accuracy_comparison", {})
-    significant = p_value is not None and float(p_value) < 0.05
-    wording = "达到统计显著" if significant else "尚未达到 $p<0.05$"
     strict_text = ""
     if prompt_control:
         strict_p = strict.get("mcnemar_exact_p")
@@ -115,14 +121,26 @@ def graph_analysis(payload: dict) -> str:
             + (f"（$p={float(strict_p):.3f}$）。" if strict_p is not None else "。")
             + f"其余 {prompt_control.get('changed_set_due_to_prompt_budget', 0)} 题因拓扑标签占用"
               "12K Prompt 预算而发生尾部证据替换，只计入完整机制结果，不计入纯布局结论。")
+    group_text = []
+    for group, label in (("lme_multi_session", "LME Multi-session"),
+                         ("lme_temporal", "LME Temporal"),
+                         ("locomo_multihop", "LoCoMo Multi-hop"),
+                         ("locomo_temporal", "LoCoMo Temporal")):
+        group_text.append(
+            f"{label} {delta(rerank_groups.get(group, {}).get('delta'))} pp")
     return (
-        r"\paragraph{结果解读。}相对无关系扩展，完整的分层图与拓扑证据编排在 200 题上变化 "
-        f"{delta(final.get('delta'))} pp（95\\% CI {delta(ci[0])} 至 "
-        f"{delta(ci[1])}，$p={float(p_value):.3f}$），{wording}；最终准确率为 "
-        f"{pct(final_accuracy.get('accuracy'))}\\%。最终 evidence recall/precision/all-hit 为 "
-        f"{pct(final_metrics.get('turn_recall'))}\\%/"
-        f"{pct(final_metrics.get('turn_precision'))}\\%/"
-        f"{pct(final_metrics.get('turn_all_hit'))}\\%。"
+        r"\paragraph{结果解读。}在 " + str(questions)
+        + r" 题完整分层上，平面关系图加入分层路由后变化 "
+        f"{delta(hierarchy.get('delta'))} pp（95\\% CI "
+        f"{delta(hierarchy_ci[0])} 至 {delta(hierarchy_ci[1])}，"
+        f"$p={float(hierarchy_p):.3f}$），{hierarchy_wording}；分层臂准确率为 "
+        f"{pct(best_accuracy.get('accuracy'))}\\%。其 evidence recall/precision/all-hit 为 "
+        f"{pct(best_metrics.get('turn_recall'))}\\%/"
+        f"{pct(best_metrics.get('turn_precision'))}\\%/"
+        f"{pct(best_metrics.get('turn_all_hit'))}\\%。图重排相对分层路由的分题型变化为 "
+        + "、".join(group_text) + "，说明统一重排会把 LME 收益与 LoCoMo 损失相互抵消。"
+        f"完整图式 Prompt 相对 Seed-only 总体为 {delta(final.get('delta'))} pp"
+        f"（$p={float(final_p):.3f}$）。"
         r"我们仅把逐题显著性检验通过的变化称为准确率提升；访问范围与证据连通性的变化单独报告，"
         r"不以 recall 增大替代最终回答准确率。" + strict_text + "\n")
 
@@ -343,7 +361,7 @@ def budget_analysis(payload: dict) -> str:
                               / float(right["answer_tokens"]["mean"]) - 1)
         matched.append(
             f"{label}相对 Mem0 为 {accuracy_gain:+.1f} pp Accuracy、"
-            f"{token_change:+.1f}\% Answer Token")
+            f"{token_change:+.1f}\\% Answer Token")
     for benchmark, label in (("longmemeval", "LongMemEval"),
                              ("locomo", "LoCoMo")):
         graph_row = graph.get((benchmark, "32-turn"))
@@ -361,7 +379,7 @@ def budget_analysis(payload: dict) -> str:
             f"{label} 的 GraphMem/Mem0 Build mean 为 "
             f"{compact_number(graph_build['mean'])}/"
             f"{compact_number(mem0_build['mean'])}，即 {ratio:.1f}$\\times$ "
-            f"差距（GraphMem 减少 {reduction:.1f}\%）")
+            f"差距（GraphMem 减少 {reduction:.1f}\\%）")
     comparison = ("；" + "；".join(matched) if matched else "")
     build_comparison = ("；" + "；".join(build_matched)
                         if build_matched else "")
@@ -372,20 +390,252 @@ def budget_analysis(payload: dict) -> str:
             r"表中重复展示仅为便于逐行对照，不重复计费。" "\n")
 
 
-def plot_graph(payload: dict, report: Path) -> None:
+def plot_style():
     os.environ.setdefault("MPLCONFIGDIR", "/tmp/graphmem-v520-matplotlib")
     import matplotlib  # noqa: PLC0415
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # noqa: PLC0415
     from matplotlib import font_manager  # noqa: PLC0415
-    font = Path("/usr/local/texlive/2024/texmf-dist/fonts/opentype/public/fandol/FandolHei-Regular.otf")
+    font = Path(
+        "/usr/local/texlive/2024/texmf-dist/fonts/opentype/public/fandol/"
+        "FandolHei-Regular.otf")
     if font.exists():
         font_manager.fontManager.addfont(str(font))
-        plt.rcParams["font.family"] = font_manager.FontProperties(fname=str(font)).get_name()
-    plt.rcParams.update({"font.size": 9, "axes.grid": True, "grid.alpha": 0.2,
-                         "axes.axisbelow": True, "axes.unicode_minus": False})
-    colors = {"navy": "#12304A", "blue": "#2378D7", "teal": "#18A999",
-              "amber": "#F2A93B", "red": "#D84A4A", "gray": "#5F6B76"}
+        family = font_manager.FontProperties(fname=str(font)).get_name()
+        plt.rcParams["font.family"] = family
+    plt.rcParams.update({
+        "font.size": 9, "axes.grid": True, "grid.alpha": 0.2,
+        "axes.axisbelow": True, "axes.unicode_minus": False,
+    })
+    colors = {
+        "navy": "#12304A", "blue": "#2378D7", "blue_light": "#68A9E6",
+        "teal": "#18A999", "amber": "#F2A93B", "amber_dark": "#D98218",
+        "red": "#D84A4A", "gray": "#5F6B76",
+    }
+    return plt, colors
+
+
+def save_budget_figure(figure, report: Path, stem: str) -> None:
+    figures = report / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    for suffix in ("pdf", "png", "svg"):
+        path = figures / f"{stem}.{suffix}"
+        figure.savefig(path, dpi=220, bbox_inches="tight")
+        if suffix == "svg":
+            # Matplotlib leaves spaces at SVG path line breaks.  Normalize the
+            # generated source so repository whitespace checks stay clean.
+            text = path.read_text(encoding="utf-8")
+            path.write_text(
+                "\n".join(line.rstrip() for line in text.splitlines()) + "\n",
+                encoding="utf-8")
+
+
+def finish_axes(axis) -> None:
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+
+
+def plot_build_tokens(payload: dict, report: Path) -> None:
+    plt, colors = plot_style()
+    from matplotlib.patches import Patch  # noqa: PLC0415
+    from matplotlib.ticker import FuncFormatter  # noqa: PLC0415
+
+    graph, mem0 = indexed_results(payload)
+    statistics = ("mean", "p95", "p99", "max")
+    labels = ("Mean", "p95", "p99", "Max")
+    figure, axes = plt.subplots(1, 2, figsize=(12.2, 3.8))
+    for axis, (benchmark, title) in zip(
+            axes, (("longmemeval", "(a) LongMemEval"),
+                   ("locomo", "(b) LoCoMo Cat. 1--4")), strict=True):
+        left = graph.get((benchmark, "32-turn"), {}).get("build_tokens")
+        right = mem0.get((benchmark, "top-50"), {}).get("build_tokens")
+        if not left or not right:
+            axis.text(0.5, 0.5, "实验运行中", transform=axis.transAxes,
+                      ha="center", va="center", color=colors["gray"])
+            axis.set_title(title, fontweight="bold")
+            continue
+        x = list(range(len(statistics)))
+        width = 0.34
+        graph_values = [float(left[key]) for key in statistics]
+        mem0_values = [float(right[key]) for key in statistics]
+        graph_bars = axis.bar(
+            [value - width / 2 for value in x], graph_values, width,
+            color=colors["blue"], edgecolor="white", label="GraphMem")
+        mem0_bars = axis.bar(
+            [value + width / 2 for value in x], mem0_values, width,
+            color=colors["amber"], edgecolor="white", label="Mem0")
+        axis.set_yscale("log")
+        axis.set_xticks(x, labels)
+        axis.yaxis.set_major_formatter(FuncFormatter(
+            lambda value, _: compact_number(value)))
+        axis.set_xlabel("构建开支统计量")
+        axis.set_ylabel("Build Token / owner（log scale）")
+        ratio = mem0_values[0] / graph_values[0]
+        reduction = 100 * (1 - graph_values[0] / mem0_values[0])
+        axis.set_title(
+            f"{title}\nMean：Mem0/GraphMem = {ratio:.1f}×；"
+            f"GraphMem -{reduction:.1f}%",
+            fontweight="bold", fontsize=10.5, pad=7)
+        for bars, values in ((graph_bars, graph_values),
+                             (mem0_bars, mem0_values)):
+            for bar, value in zip(bars, values, strict=True):
+                axis.annotate(
+                    compact_number(value),
+                    (bar.get_x() + bar.get_width() / 2, value),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=7)
+        finish_axes(axis)
+    figure.suptitle("GraphMem 与 Mem0 的构建 Token 开支", color=colors["navy"],
+                    fontsize=14, fontweight="bold")
+    figure.legend(
+        handles=(Patch(facecolor=colors["blue"], label="GraphMem"),
+                 Patch(facecolor=colors["amber"], label="Mem0")),
+        loc="upper center", bbox_to_anchor=(0.5, 0.91), ncol=2,
+        frameon=False)
+    figure.tight_layout(rect=(0, 0, 1, 0.84))
+    save_budget_figure(figure, report, "v5_20_build_tokens")
+    plt.close(figure)
+
+
+def plot_budget_accuracy(payload: dict, report: Path) -> None:
+    plt, colors = plot_style()
+    from matplotlib.lines import Line2D  # noqa: PLC0415
+    from matplotlib.ticker import FuncFormatter  # noqa: PLC0415
+
+    graph, mem0 = indexed_results(payload)
+    statistics = ("mean", "p95", "p99", "max")
+    markers = ("o", "s", "^", "D")
+    series = (
+        ("GraphMem 32-turn", graph, "32-turn", colors["blue"], "--"),
+        ("GraphMem 64-turn", graph, "64-turn", colors["blue"], "-"),
+        ("Mem0 top-50", mem0, "top-50", colors["amber_dark"], "--"),
+        ("Mem0 top-200", mem0, "top-200", colors["amber_dark"], "-"),
+    )
+    figure, axes = plt.subplots(1, 2, figsize=(12.2, 4.15))
+    for axis, (benchmark, title) in zip(
+            axes, (("longmemeval", "(a) LongMemEval"),
+                   ("locomo", "(b) LoCoMo Cat. 1--4")), strict=True):
+        observed = []
+        for label, source, setting, color, linestyle in series:
+            row = source.get((benchmark, setting))
+            if not row or not row.get("answer_tokens") or row.get("accuracy") is None:
+                continue
+            x = [float(row["answer_tokens"][key]) for key in statistics]
+            y = [100 * float(row["accuracy"])] * len(statistics)
+            observed.extend(y)
+            axis.plot(x, y, color=color, linestyle=linestyle, linewidth=1.8,
+                      alpha=0.94, label=label)
+            for token, accuracy, marker in zip(x, y, markers, strict=True):
+                axis.scatter(token, accuracy, marker=marker, s=42,
+                             color=color, edgecolor="white", linewidth=0.7,
+                             zorder=3)
+        if not observed:
+            axis.text(0.5, 0.5, "实验运行中", transform=axis.transAxes,
+                      ha="center", va="center", color=colors["gray"])
+        axis.set_title(title, fontweight="bold")
+        axis.set_xlabel("Answer total Token")
+        axis.set_ylabel("Accuracy（%）")
+        axis.xaxis.set_major_formatter(FuncFormatter(
+            lambda value, _: compact_number(value)))
+        axis.set_ylim(50, 80)
+        finish_axes(axis)
+    series_handles = [
+        Line2D([0], [0], color=color, linestyle=linestyle, linewidth=1.8,
+               label=label)
+        for label, _, _, color, linestyle in series
+    ]
+    marker_handles = [
+        Line2D([0], [0], color=colors["gray"], marker=marker,
+               linestyle="None", markersize=6, label=label)
+        for marker, label in zip(markers, ("Mean", "p95", "p99", "Max"),
+                                 strict=True)
+    ]
+    figure.suptitle("Answer Token 预算--准确率工作点", color=colors["navy"],
+                    fontsize=14, fontweight="bold")
+    figure.legend(series_handles, [item.get_label() for item in series_handles],
+                  loc="upper center", bbox_to_anchor=(0.5, 0.91), ncol=4,
+                  frameon=False, fontsize=8)
+    figure.legend(marker_handles, [item.get_label() for item in marker_handles],
+                  loc="lower center", bbox_to_anchor=(0.5, 0.00), ncol=4,
+                  frameon=False, fontsize=8)
+    figure.tight_layout(rect=(0, 0.09, 1, 0.84))
+    save_budget_figure(figure, report, "v5_20_budget_accuracy")
+    plt.close(figure)
+
+
+def plot_type_accuracy(payload: dict, report: Path) -> None:
+    plt, colors = plot_style()
+    from matplotlib.patches import Patch  # noqa: PLC0415
+
+    graph, mem0 = indexed_results(payload)
+    specifications = (
+        ("longmemeval", "single-session-user", "LME · User"),
+        ("longmemeval", "single-session-assistant", "LME · Assistant"),
+        ("longmemeval", "single-session-preference", "LME · Preference"),
+        ("longmemeval", "multi-session", "LME · Multi-session"),
+        ("longmemeval", "temporal-reasoning", "LME · Temporal"),
+        ("longmemeval", "knowledge-update", "LME · Knowledge-update"),
+        ("locomo", "category_1", "LoCoMo · Cat.1 Multi-hop"),
+        ("locomo", "category_2", "LoCoMo · Cat.2 Temporal"),
+        ("locomo", "category_3", "LoCoMo · Cat.3 Open-domain"),
+        ("locomo", "category_4", "LoCoMo · Cat.4 Single-hop"),
+    )
+    configurations = (
+        (graph, "32-turn", "G32", colors["blue_light"]),
+        (graph, "64-turn", "G64", colors["blue"]),
+        (mem0, "top-50", "M50", colors["amber"]),
+        (mem0, "top-200", "M200", colors["amber_dark"]),
+    )
+    figure, axes = plt.subplots(2, 5, figsize=(13.1, 6.4), sharey=True)
+    for index, (axis, (benchmark, type_key, title)) in enumerate(
+            zip(axes.flat, specifications, strict=True)):
+        rows = [source.get((benchmark, setting), {})
+                for source, setting, _, _ in configurations]
+        accuracies = [
+            (row.get("accuracy_by_type") or {}).get(type_key, {}).get("accuracy")
+            for row in rows
+        ]
+        low_token_configurations = {0, 2}
+        for bar_index, (accuracy, (_, _, label, color)) in enumerate(
+                zip(accuracies, configurations, strict=True)):
+            if accuracy is None:
+                continue
+            value = 100 * float(accuracy)
+            hatch = "////" if bar_index in low_token_configurations else None
+            edgecolor = colors["navy"] if hatch else "white"
+            axis.bar(bar_index, value, width=0.78, color=color,
+                     hatch=hatch, edgecolor=edgecolor, linewidth=0.65)
+            axis.text(bar_index, min(98, value + 2.0), f"{value:.1f}",
+                      ha="center", va="bottom", fontsize=8)
+        axis.set_title(f"({chr(97 + index)}) {title}", fontsize=11,
+                       fontweight="bold", pad=5)
+        axis.set_xticks(range(4), [item[2] for item in configurations],
+                        fontsize=8.5)
+        axis.set_ylim(0, 105)
+        axis.set_yticks((0, 25, 50, 75, 100))
+        axis.tick_params(axis="y", labelsize=8.5)
+        if index % 5 == 0:
+            axis.set_ylabel("Accuracy（%）", fontsize=10)
+        finish_axes(axis)
+    handles = [
+        Patch(facecolor=color, edgecolor="white", label=label)
+        for _, _, label, color in configurations
+    ] + [
+        Patch(facecolor="white", edgecolor=colors["navy"], hatch="////",
+              label="低 Token 配置（32-turn / top-50）")
+    ]
+    figure.suptitle("按题型细分的端到端准确率", color=colors["navy"],
+                    fontsize=16, fontweight="bold")
+    figure.legend(handles=handles, loc="lower center",
+                  bbox_to_anchor=(0.5, 0.005), ncol=5, frameon=False,
+                  fontsize=9)
+    figure.tight_layout(rect=(0, 0.08, 1, 0.92), h_pad=1.7, w_pad=0.7)
+    save_budget_figure(figure, report, "v5_20_type_accuracy")
+    plt.close(figure)
+
+
+def plot_graph(payload: dict, report: Path) -> None:
+    plt, colors = plot_style()
     arms = payload.get("arms", {})
     labels = [label for _, label in ARMS]
     x = list(range(len(labels)))
@@ -393,8 +643,10 @@ def plot_graph(payload: dict, report: Path) -> None:
     if arms:
         for group, label, color, marker in (
                 ("overall", "总体", colors["navy"], "o"),
-                ("structural", "结构题", colors["blue"], "s"),
-                ("temporal", "Temporal", colors["amber"], "^")):
+                ("lme_multi_session", "LME Multi-session", colors["blue"], "s"),
+                ("lme_temporal", "LME Temporal", colors["teal"], "^"),
+                ("locomo_multihop", "LoCoMo Multi-hop", colors["amber"], "D"),
+                ("locomo_temporal", "LoCoMo Temporal", colors["red"], "v")):
             values = [100 * arms[key]["accuracy"][group]["accuracy"]
                       for key, _ in ARMS]
             axes[0].plot(x, values, marker=marker, color=color, label=label,
@@ -423,7 +675,7 @@ def plot_graph(payload: dict, report: Path) -> None:
         for axis in axes:
             axis.text(0.5, 0.5, "实验运行中", transform=axis.transAxes,
                       ha="center", va="center", color=colors["gray"], fontsize=11)
-    axes[0].set_title("(a) 最终回答准确率", fontweight="bold")
+    axes[0].set_title("(a) 四题型与总体准确率", fontweight="bold")
     axes[0].set_ylabel("Accuracy（%）")
     axes[1].set_title("(b) 证据质量", fontweight="bold")
     axes[1].set_ylabel("证据指标（%）")
@@ -469,6 +721,9 @@ def main() -> None:
     for name, content in outputs.items():
         (generated / name).write_text(content, encoding="utf-8")
     plot_graph(graph, args.report)
+    plot_build_tokens(budget, args.report)
+    plot_budget_accuracy(budget, args.report)
+    plot_type_accuracy(budget, args.report)
     sources = {
         "schema_version": "graphmem-v5.20-report-assets-v1",
         "graph_ablation": str(args.graph_ablation) if args.graph_ablation else None,
