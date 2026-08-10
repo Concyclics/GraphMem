@@ -10,11 +10,13 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
-ARMS = ("seed_only", "flat_graph", "hierarchical", "topology_layout")
+ARMS = ("seed_only", "flat_graph", "hierarchical", "graph_rerank_layout",
+        "topology_layout")
 COMPARISONS = (
     ("seed_only", "flat_graph"),
     ("flat_graph", "hierarchical"),
-    ("hierarchical", "topology_layout"),
+    ("hierarchical", "graph_rerank_layout"),
+    ("graph_rerank_layout", "topology_layout"),
     ("seed_only", "topology_layout"),
 )
 
@@ -43,6 +45,12 @@ def group_names(label: str) -> tuple[str, ...]:
 
 def paired(left: dict[str, bool], right: dict[str, bool]) -> dict:
     ids = sorted(set(left) & set(right))
+    if not ids:
+        return {
+            "questions": 0, "gains": 0, "losses": 0,
+            "delta": None, "mcnemar_exact_p": None,
+            "paired_bootstrap_95ci": [None, None],
+        }
     gains = sum(not left[item] and right[item] for item in ids)
     losses = sum(left[item] and not right[item] for item in ids)
     discordant = gains + losses
@@ -53,7 +61,7 @@ def paired(left: dict[str, bool], right: dict[str, bool]) -> dict:
     deltas = [int(right[item]) - int(left[item]) for item in ids]
     rng = random.Random(42)
     boot = sorted(sum(rng.choice(deltas) for _ in deltas) / len(deltas)
-                  for _ in range(10_000)) if deltas else [0.0]
+                  for _ in range(10_000))
     return {
         "questions": len(ids), "gains": gains, "losses": losses,
         "delta": sum(deltas) / len(deltas) if deltas else 0.0,
@@ -85,7 +93,8 @@ def mean_metrics(data: list[dict]) -> dict:
     return payload
 
 
-def summarize_arm(root: Path) -> tuple[dict, dict[str, bool], dict[str, dict[str, bool]]]:
+def summarize_arm(root: Path) -> tuple[
+        dict, dict[str, bool], dict[str, dict[str, bool]], dict[str, dict]]:
     answer_root = root / "answer"
     answers = rows(answer_root / "answers.jsonl")
     answer_by_id = {str(row["question_id"]): row for row in answers}
@@ -120,7 +129,11 @@ def summarize_arm(root: Path) -> tuple[dict, dict[str, bool], dict[str, dict[str
         "manifest": manifest,
         "artifacts": {"root": str(root), "answer": str(answer_root)},
     }
-    return payload, verdicts, dict(verdicts_by_group)
+    prepared = {
+        str(row["question_id"]): row
+        for row in rows(answer_root / "prepared_answers.jsonl")
+    }
+    return payload, verdicts, dict(verdicts_by_group), prepared
 
 
 def main() -> None:
@@ -138,9 +151,10 @@ def main() -> None:
             "answer_model": "Qwen3-30B", "judge_model": "gpt-5.6-luna",
         },
     }
-    verdicts = {}; grouped = {}
+    verdicts = {}; grouped = {}; prepared = {}
     for arm in ARMS:
-        arm_payload, verdicts[arm], grouped[arm] = summarize_arm(args.root / arm)
+        (arm_payload, verdicts[arm], grouped[arm],
+         prepared[arm]) = summarize_arm(args.root / arm)
         payload["arms"][arm] = arm_payload
     all_groups = ("lme_multi_session", "lme_temporal", "locomo_multihop",
                   "locomo_temporal", "structural", "temporal", "overall")
@@ -158,6 +172,7 @@ def main() -> None:
         "seed_only": (False, False, "adaptive"),
         "flat_graph": (True, False, "adaptive"),
         "hierarchical": (True, True, "adaptive"),
+        "graph_rerank_layout": (True, True, "topological_plain"),
         "topology_layout": (True, True, "topological"),
     }
     audit = {}
@@ -174,6 +189,58 @@ def main() -> None:
                 "candidate_answer_injection", False),
             "luna_verdicts_200": len(verdicts[arm]) == 200,
         }
+
+    # ``graph_rerank_layout`` and ``topology_layout`` use the same topology
+    # order; the latter additionally exposes CHAIN/GRAPH/AUX labels and their
+    # reading contract to the model.  Labels consume a small number of prompt
+    # tokens, so the hard 12K ceiling can still evict a tail turn. Report both
+    # the full intent-to-treat comparison and the strict same-evidence-set
+    # subset instead of silently attributing those evictions to prompt design.
+    left_prepared = prepared["graph_rerank_layout"]
+    right_prepared = prepared["topology_layout"]
+    common = sorted(set(left_prepared) & set(right_prepared))
+    same_set_ids = [
+        question_id for question_id in common
+        if set(left_prepared[question_id].get("evidence_turn_ids", ()))
+        == set(right_prepared[question_id].get("evidence_turn_ids", ()))
+    ]
+    same_order_ids = [
+        question_id for question_id in common
+        if left_prepared[question_id].get("evidence_turn_ids", ())
+        == right_prepared[question_id].get("evidence_turn_ids", ())
+    ]
+    jaccards = []
+    for question_id in common:
+        left_ids = set(left_prepared[question_id].get("evidence_turn_ids", ()))
+        right_ids = set(right_prepared[question_id].get("evidence_turn_ids", ()))
+        union = left_ids | right_ids
+        jaccards.append(len(left_ids & right_ids) / len(union) if union else 1.0)
+    strict_left = {
+        question_id: verdicts["graph_rerank_layout"][question_id]
+        for question_id in same_set_ids
+        if question_id in verdicts["graph_rerank_layout"]
+        and question_id in verdicts["topology_layout"]
+    }
+    strict_right = {
+        question_id: verdicts["topology_layout"][question_id]
+        for question_id in strict_left
+    }
+    audit["topology_prompt_control"] = {
+        "questions_compared": len(common),
+        "same_evidence_set": len(same_set_ids),
+        "same_evidence_set_rate": len(same_set_ids) / len(common) if common else None,
+        "same_order": len(same_order_ids),
+        "reordered_same_set": len(set(same_set_ids) - set(same_order_ids)),
+        "changed_set_due_to_prompt_budget": len(common) - len(same_set_ids),
+        "mean_evidence_set_jaccard": (
+            sum(jaccards) / len(jaccards) if jaccards else None),
+        "min_evidence_set_jaccard": min(jaccards) if jaccards else None,
+        "prompt_payload_hash_changed": sum(
+            left_prepared[question_id].get("prompt_payload_hash")
+            != right_prepared[question_id].get("prompt_payload_hash")
+            for question_id in common),
+        "strict_same_set_accuracy_comparison": paired(strict_left, strict_right),
+    }
     payload["audit"] = audit
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",

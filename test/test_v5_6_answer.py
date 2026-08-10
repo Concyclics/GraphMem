@@ -350,6 +350,32 @@ def test_topological_layout_keeps_a_root_to_leaf_chain_contiguous(tmp_path) -> N
     store.close()
 
 
+def test_topological_plain_reorders_without_exposing_graph_labels(tmp_path) -> None:
+    store = _store(tmp_path, ["unbound noise", "root evidence", "leaf evidence"])
+    turns = store.turns("m")
+    units = (
+        EvidenceUnit("leaf", ("need",), ("b2",), (turns[2].turn_id,),
+                     ("edge-1", "edge-2"), 0, True, ("operand",)),
+        EvidenceUnit("root", ("need",), ("b1",), (turns[1].turn_id,),
+                     ("edge-1",), 0, True, ("operand",)),
+    )
+    stage = _stage(
+        store, _FakeClient(),
+        answer_config=AnswerConfig(evidence_order="topological_plain"))
+    result = _result([turn.turn_id for turn in turns], units)
+
+    prepared = stage.prepare("q1", "Which event happened first?", result, QueryBudget())
+    user = prepared.messages[1]["content"]
+    system = prepared.messages[0]["content"]
+
+    assert user.index("root evidence") < user.index("leaf evidence")
+    assert "[CHAIN" not in user and "[GRAPH" not in user and "[AUX" not in user
+    assert "graph-derived blocks" not in system
+    assert prepared.trace["evidence_layout"] == "topological_plain"
+    assert prepared.trace["evidence_chain_turns"] == 2
+    store.close()
+
+
 def test_the_stage_makes_exactly_one_call_and_returns_the_prediction(tmp_path) -> None:
     store = _store(tmp_path, ["I adopted a beagle named Rex."])
     client = _FakeClient("Rex")

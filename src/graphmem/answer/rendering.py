@@ -70,8 +70,10 @@ class AnswerConfig:
     # keeps the navigator/packer rank so the strongest evidence appears first
     # and the weakest tail is the first to be dropped under a token budget.
     # ``adaptive`` is resolved before rendering: temporal queries use the
-    # former and other queries use the latter. ``topological`` is supplied by
-    # AnswerStage after grouping graph-connected proof/operand evidence.
+    # former and other queries use the latter. ``topological_plain`` reorders
+    # the frozen evidence set by graph topology without exposing graph labels
+    # to the answer model; ``topological`` additionally renders those labels
+    # and the matching prompt contract.
     evidence_order: str = "chronological"
     # Materialize relative phrases against the source turn timestamp in the
     # rendered evidence.  This prevents the answer model from re-anchoring
@@ -102,10 +104,11 @@ class AnswerConfig:
         if self.span_window is not None and self.span_window < 0:
             raise ValueError("span_window must be None or non-negative")
         if self.evidence_order not in {
-                "chronological", "relevance", "adaptive", "topological"}:
+                "chronological", "relevance", "adaptive",
+                "topological_plain", "topological"}:
             raise ValueError(
                 "evidence_order must be chronological, relevance, adaptive, "
-                "or topological")
+                "topological_plain, or topological")
         if self.max_output_tokens is not None and self.max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be None or positive")
         if self.sampling_seed < 0:
@@ -216,7 +219,8 @@ def render_evidence(
     prefixes = prefixes_by_turn or {}
     mandatory = set(mandatory_turn_ids)
     source_rows = list(turns)
-    rows = (source_rows if config.evidence_order in {"relevance", "topological"} else
+    rows = (source_rows if config.evidence_order in {
+        "relevance", "topological_plain", "topological"} else
             sorted(source_rows,
                    key=lambda turn: (order.get(turn.session_id, 1 << 30),
                                      turn.session_id, turn.turn_index, turn.turn_id)))

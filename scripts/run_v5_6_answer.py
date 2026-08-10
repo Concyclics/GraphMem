@@ -66,9 +66,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--span-window", type=int, default=-1,
                         help="-1 renders whole turns; >=0 renders cited spans widened by N chars")
     parser.add_argument("--evidence-order",
-                        choices=("chronological", "relevance", "adaptive", "topological"),
+                        choices=("chronological", "relevance", "adaptive",
+                                 "topological_plain", "topological"),
                         default="chronological",
-                        help="render by source time, retrieval rank, or query-directed order")
+                        help=("render by source time, retrieval rank, query-directed order, "
+                              "or graph topology with/without graph labels"))
     parser.add_argument("--no-closed-form", action="store_true")
     parser.add_argument(
         "--candidate-answer-injection", action="store_true",

@@ -217,9 +217,14 @@ class AnswerStage:
         layout_stats = {"chain_count": 0, "chain_turns": 0,
                         "graph_group_count": 0, "graph_turns": 0,
                         "auxiliary_turns": 0}
-        if evidence_order == "topological":
+        if evidence_order in {"topological_plain", "topological"}:
             ordered, prefixes, layout_stats = self._topological_layout(
                 result, ordered, turn_map, session_order)
+            if evidence_order == "topological_plain":
+                # Pure graph-rerank ablation: preserve the topology-derived
+                # order and block statistics, but do not reveal graph labels
+                # or a graph-specific instruction to the answer backbone.
+                prefixes = {}
         rendered = render_evidence(
             [turn_map[turn_id] for turn_id in ordered],
             config=render_config, counter=self.counter,

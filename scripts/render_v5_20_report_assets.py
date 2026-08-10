@@ -12,7 +12,8 @@ ARMS = (
     ("seed_only", "无关系扩展"),
     ("flat_graph", "平面关系图"),
     ("hierarchical", "分层自顶向下"),
-    ("topology_layout", r"分层图 + 拓扑编排"),
+    ("graph_rerank_layout", r"图重排 Layout"),
+    ("topology_layout", r"完整图式 Prompt"),
 )
 GROUPS = ("lme_multi_session", "lme_temporal", "locomo_multihop",
           "locomo_temporal", "structural", "temporal", "overall")
@@ -81,8 +82,21 @@ def graph_analysis(payload: dict) -> str:
     p_value = final.get("mcnemar_exact_p")
     final_accuracy = payload["arms"]["topology_layout"]["accuracy"]["overall"]
     final_metrics = payload["arms"]["topology_layout"]["retrieval"]["overall"]
+    prompt_control = payload.get("audit", {}).get("topology_prompt_control", {})
+    strict = prompt_control.get("strict_same_set_accuracy_comparison", {})
     significant = p_value is not None and float(p_value) < 0.05
     wording = "达到统计显著" if significant else "尚未达到 $p<0.05$"
+    strict_text = ""
+    if prompt_control:
+        strict_p = strict.get("mcnemar_exact_p")
+        strict_text = (
+            f"在严格 Prompt 组织对照中，{prompt_control.get('same_evidence_set', 0)}/"
+            f"{prompt_control.get('questions_compared', 0)} 题的 evidence ID 集合完全相同，"
+            f"其中 {prompt_control.get('reordered_same_set', 0)} 题只改变顺序与图标签；"
+            f"该子集的准确率变化为 {delta(strict.get('delta'))} pp"
+            + (f"（$p={float(strict_p):.3f}$）。" if strict_p is not None else "。")
+            + f"其余 {prompt_control.get('changed_set_due_to_prompt_budget', 0)} 题因拓扑标签占用"
+              "12K Prompt 预算而发生尾部证据替换，只计入完整机制结果，不计入纯布局结论。")
     return (
         r"\paragraph{结果解读。}相对无关系扩展，完整的分层图与拓扑证据编排在 200 题上变化 "
         f"{delta(final.get('delta'))} pp（95\\% CI {delta(ci[0])} 至 "
@@ -92,7 +106,7 @@ def graph_analysis(payload: dict) -> str:
         f"{pct(final_metrics.get('turn_precision'))}\\%/"
         f"{pct(final_metrics.get('turn_all_hit'))}\\%。"
         r"我们仅把逐题显著性检验通过的变化称为准确率提升；访问范围与证据连通性的变化单独报告，"
-        r"不以 recall 增大替代最终回答准确率。" "\n")
+        r"不以 recall 增大替代最终回答准确率。" + strict_text + "\n")
 
 
 def budget_rows(payload: dict) -> str:
