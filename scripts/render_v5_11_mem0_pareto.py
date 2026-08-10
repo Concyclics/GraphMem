@@ -274,7 +274,12 @@ def place_concurrency_labels(fig, axis, points: list[dict[str, Any]]) -> None:
         ])
 
 
-def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
+def plot_pareto(
+    rows: list[dict[str, Any]],
+    base: Path,
+    *,
+    sampling_note: str = "完整在线检索路径；不含回答模型生成",
+) -> None:
     plt = configure_plotting()
     from matplotlib.lines import Line2D
 
@@ -321,9 +326,9 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
                     })
         axis.set_xscale("log")
         axis.set_yscale("log")
-        axis.set_ylim(1.3, 100.0)
-        axis.set_yticks([2, 5, 10, 20, 50, 100])
-        axis.set_yticklabels(["2", "5", "10", "20", "50", "100"])
+        axis.set_ylim(8.0, 205.0)
+        axis.set_yticks([10, 20, 50, 100, 200])
+        axis.set_yticklabels(["10", "20", "50", "100", "200"])
         axis.grid(True, which="both", linestyle="--", linewidth=0.65)
         axis.set_title(panel_title, fontweight="bold")
         axis.set_xlabel("端到端延迟（ms，对数轴）")
@@ -351,7 +356,7 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
     )
     fig.text(0.995, 0.018, "点旁数字 = 并发用户数", ha="right",
              fontsize=13.5, color="#64748B")
-    fig.text(0.005, 0.018, "完整在线检索路径；不含回答模型生成",
+    fig.text(0.005, 0.018, sampling_note,
              ha="left", fontsize=13.5, color="#64748B")
     fig.subplots_adjust(left=0.065, right=0.992, bottom=0.095, top=0.835,
                         wspace=0.16, hspace=0.34)
@@ -363,9 +368,9 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
 
 
 def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
-    """Compare absolute GraphMem and Mem0 memory as worker count scales."""
+    """Compare fixed-load QPS and memory under equal worker budgets."""
     plt = configure_plotting()
-    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
     import numpy as np
 
     workers = (1, 4, 8)
@@ -373,75 +378,86 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
         ("worker_rss_mib", "(a) RSS"),
         ("worker_pss_mib", "(b) PSS"),
     )
-    fig, axes = plt.subplots(1, 2, figsize=PAPER_FIGSIZE, sharey=False)
-    x = np.arange(len(workers), dtype=float)
-    width = 0.36
+    fig, axes = plt.subplots(1, 2, figsize=PAPER_FIGSIZE, sharey=True)
     qps_at_64 = {
         (row["system"], row["workers"]): row["qps"]
         for row in rows if row["clients"] == 64
     }
-    graph_qps = [qps_at_64[("GraphMem", worker)] for worker in workers]
-    mem0_qps = [qps_at_64[("Mem0 OSS", worker)] for worker in workers]
-    legend_handles = None
     for axis, (metric_key, panel_title) in zip(axes, metrics):
-        graph_values = np.array([
-            np.mean([
+        memory = {
+            (system, worker): np.mean([
                 row[metric_key] for row in rows
-                if row["system"] == "GraphMem" and row["workers"] == worker
+                if row["system"] == system and row["workers"] == worker
             ]) / 1024.0
+            for system in ("GraphMem", "Mem0 OSS")
             for worker in workers
-        ])
-        mem0_values = np.array([
-            np.mean([
-                row[metric_key] for row in rows
-                if row["system"] == "Mem0 OSS" and row["workers"] == worker
-            ]) / 1024.0
-            for worker in workers
-        ])
-        graph_bars = axis.bar(
-            x - width / 2, graph_values, width,
-            color=SYSTEM_COLORS["GraphMem"], label="GraphMem",
-            edgecolor="white", linewidth=0.7, zorder=3,
-        )
-        mem0_bars = axis.bar(
-            x + width / 2, mem0_values, width,
-            color=SYSTEM_COLORS["Mem0 OSS"], label="Mem0 OSS",
-            edgecolor="white", linewidth=0.7, zorder=3,
-        )
-        ymax = float(max(max(graph_values), max(mem0_values))) * 1.28
-        for bars, values, qps_values in (
-            (graph_bars, graph_values, graph_qps),
-            (mem0_bars, mem0_values, mem0_qps),
-        ):
-            for bar, value, qps in zip(bars, values, qps_values):
+        }
+        for worker in workers:
+            graph_point = (
+                memory[("GraphMem", worker)],
+                qps_at_64[("GraphMem", worker)],
+            )
+            mem0_point = (
+                memory[("Mem0 OSS", worker)],
+                qps_at_64[("Mem0 OSS", worker)],
+            )
+            axis.plot(
+                [mem0_point[0], graph_point[0]],
+                [mem0_point[1], graph_point[1]],
+                color="#64748B", linewidth=2.4,
+                linestyle=CORE_STYLES[worker]["linestyle"], zorder=2,
+            )
+            axis.scatter(
+                *graph_point, s=88, marker="o",
+                color=SYSTEM_COLORS["GraphMem"], edgecolor="white",
+                linewidth=1.1, zorder=4,
+            )
+            axis.scatter(
+                *mem0_point, s=88, marker="s",
+                color=SYSTEM_COLORS["Mem0 OSS"], edgecolor="white",
+                linewidth=1.1, zorder=4,
+            )
+            mem0_offset = (8, -3) if worker == 1 else (0, -9)
+            mem0_align = "left" if worker == 1 else "center"
+            for point, system, offset, horizontal, vertical in (
+                (graph_point, "G", (0, 9), "center", "bottom"),
+                (mem0_point, "M", mem0_offset, mem0_align, "top"),
+            ):
                 axis.annotate(
-                    f"{value:.2f} GiB\n{qps:.1f} QPS",
-                    (bar.get_x() + bar.get_width() / 2, bar.get_height()),
-                    xytext=(0, 5), textcoords="offset points",
-                    ha="center", va="bottom", fontsize=10.7,
+                    f"{system}{worker}  {point[0]:.2f} GiB, {point[1]:.1f} QPS",
+                    point, xytext=offset, textcoords="offset points",
+                    ha=horizontal, va=vertical, fontsize=9.7,
                     color="#334155", fontweight="bold",
                 )
-        axis.set_xticks(x, [str(worker) for worker in workers])
-        axis.set_ylim(0, ymax)
-        axis.set_xlabel("物理核心数（worker）")
-        axis.set_ylabel("检索 worker 聚合内存（GiB）")
+        axis.set_xlim(0, max(memory.values()) * 1.15)
+        axis.set_ylim(0, 184)
+        axis.set_xlabel("检索 worker 聚合内存（GiB）")
+        axis.set_ylabel("QPS（64 并发）")
         axis.set_title(panel_title, fontweight="bold")
-        axis.grid(True, axis="y", linestyle="--", linewidth=0.65, zorder=0)
-        if legend_handles is None:
-            legend_handles = [
-                Patch(facecolor=SYSTEM_COLORS["GraphMem"], edgecolor="white",
-                      label="GraphMem"),
-                Patch(facecolor=SYSTEM_COLORS["Mem0 OSS"], edgecolor="white",
-                      label="Mem0 OSS"),
-            ]
-    fig.legend(legend_handles, [handle.get_label() for handle in legend_handles],
-               loc="upper center", ncol=2,
+        axis.grid(True, linestyle="--", linewidth=0.65, zorder=0)
+    method_handles = [
+        Line2D([0], [0], marker="o", color="none", markersize=8,
+               markerfacecolor=SYSTEM_COLORS["GraphMem"],
+               markeredgecolor="white", label="GraphMem"),
+        Line2D([0], [0], marker="s", color="none", markersize=8,
+               markerfacecolor=SYSTEM_COLORS["Mem0 OSS"],
+               markeredgecolor="white", label="Mem0 OSS"),
+    ]
+    worker_handles = [
+        Line2D([0], [0], color="#64748B", linewidth=2.4,
+               linestyle=CORE_STYLES[worker]["linestyle"],
+               label=f"{worker} worker")
+        for worker in workers
+    ]
+    fig.legend(method_handles + worker_handles,
+               [handle.get_label() for handle in method_handles + worker_handles],
+               loc="upper center", ncol=5,
                bbox_to_anchor=(0.5, 0.91), frameon=False,
-               handlelength=2.4, columnspacing=1.8)
-    fig.suptitle("GraphMem 与 Mem0：随核心数扩展的常驻内存绝对开支",
+               handlelength=2.4, columnspacing=1.5)
+    fig.suptitle("GraphMem 与 Mem0：QPS–Memory 等核 Pareto 对比（左上更优）",
                  y=0.985, fontsize=21, fontweight="bold")
     fig.text(0.005, 0.018,
-             "柱高为并发 1–256 档的内存均值；柱顶 QPS 固定取 64 并发；仅统计检索 worker",
+             "每条线连接相同 worker 预算下的两种系统；内存为并发 1–256 档均值，QPS 固定取 64 并发",
              ha="left", fontsize=13.5, color="#64748B")
     fig.subplots_adjust(left=0.065, right=0.985, bottom=0.17, top=0.77,
                         wspace=0.22)
