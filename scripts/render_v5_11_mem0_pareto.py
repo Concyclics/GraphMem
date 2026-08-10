@@ -376,6 +376,12 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=PAPER_FIGSIZE, sharey=False)
     x = np.arange(len(workers), dtype=float)
     width = 0.36
+    qps_at_64 = {
+        (row["system"], row["workers"]): row["qps"]
+        for row in rows if row["clients"] == 64
+    }
+    graph_qps = [qps_at_64[("GraphMem", worker)] for worker in workers]
+    mem0_qps = [qps_at_64[("Mem0 OSS", worker)] for worker in workers]
     legend_handles = None
     for axis, (metric_key, panel_title) in zip(axes, metrics):
         graph_values = np.array([
@@ -402,14 +408,17 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
             color=SYSTEM_COLORS["Mem0 OSS"], label="Mem0 OSS",
             edgecolor="white", linewidth=0.7, zorder=3,
         )
-        ymax = float(max(max(graph_values), max(mem0_values))) * 1.18
-        for bars, values in ((graph_bars, graph_values), (mem0_bars, mem0_values)):
-            for bar, value in zip(bars, values):
+        ymax = float(max(max(graph_values), max(mem0_values))) * 1.28
+        for bars, values, qps_values in (
+            (graph_bars, graph_values, graph_qps),
+            (mem0_bars, mem0_values, mem0_qps),
+        ):
+            for bar, value, qps in zip(bars, values, qps_values):
                 axis.annotate(
-                    f"{value:.2f}",
+                    f"{value:.2f} GiB\n{qps:.1f} QPS",
                     (bar.get_x() + bar.get_width() / 2, bar.get_height()),
                     xytext=(0, 5), textcoords="offset points",
-                    ha="center", va="bottom", fontsize=11.5,
+                    ha="center", va="bottom", fontsize=10.7,
                     color="#334155", fontweight="bold",
                 )
         axis.set_xticks(x, [str(worker) for worker in workers])
@@ -432,7 +441,7 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
     fig.suptitle("GraphMem 与 Mem0：随核心数扩展的常驻内存绝对开支",
                  y=0.985, fontsize=21, fontweight="bold")
     fig.text(0.005, 0.018,
-             "柱高为并发 1–256 档的均值；柱上数字单位为 GiB；仅统计检索 worker",
+             "柱高为并发 1–256 档的内存均值；柱顶 QPS 固定取 64 并发；仅统计检索 worker",
              ha="left", fontsize=13.5, color="#64748B")
     fig.subplots_adjust(left=0.065, right=0.985, bottom=0.17, top=0.77,
                         wspace=0.22)
