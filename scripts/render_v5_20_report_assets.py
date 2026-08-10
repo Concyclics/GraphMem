@@ -92,7 +92,7 @@ def graph_analysis(payload: dict) -> str:
         strict_text = (
             f"在严格 Prompt 组织对照中，{prompt_control.get('same_evidence_set', 0)}/"
             f"{prompt_control.get('questions_compared', 0)} 题的 evidence ID 集合完全相同，"
-            f"其中 {prompt_control.get('reordered_same_set', 0)} 题只改变顺序与图标签；"
+            "这些题保持同一拓扑顺序，只增加图路径标签与读取指令；"
             f"该子集的准确率变化为 {delta(strict.get('delta'))} pp"
             + (f"（$p={float(strict_p):.3f}$）。" if strict_p is not None else "。")
             + f"其余 {prompt_control.get('changed_set_due_to_prompt_budget', 0)} 题因拓扑标签占用"
@@ -112,7 +112,8 @@ def graph_analysis(payload: dict) -> str:
 def budget_rows(payload: dict) -> str:
     rows = []
     graphmem = payload.get("graphmem", ())
-    mem0 = payload.get("mem0", ())
+    mem0 = [row for row in payload.get("mem0", ())
+            if row.get("status") == "complete" and row.get("questions")]
     for row in graphmem:
         benchmark = ("LongMemEval" if row.get("benchmark") == "longmemeval"
                      else "LoCoMo Cat. 1--4")
@@ -162,7 +163,36 @@ def budget_analysis(payload: dict) -> str:
             f"{pct(right['accuracy'])}\\%，Answer Token mean 为 "
             f"{number(left['answer_tokens']['mean'])}/{number(right['answer_tokens']['mean'])}；"
             f"64-turn 以 {token_ratio:.2f}$\\times$ Token 换取 {gain:+.1f} pp")
-    return (r"\paragraph{预算曲线。}" + "；".join(chunks) + "。"
+    mem0 = {
+        (row.get("benchmark"), row.get("retrieval_setting")): row
+        for row in payload.get("mem0", ())
+        if row.get("status") == "complete" and row.get("questions")
+    }
+    matched = []
+    graph = {(row.get("benchmark"), row.get("retrieval_setting")): row
+             for row in graphmem}
+    pairs = (
+        (("longmemeval", "32-turn"), ("longmemeval", "top-50"),
+         "LongMemEval 低预算"),
+        (("longmemeval", "64-turn"), ("longmemeval", "top-200"),
+         "LongMemEval 高预算"),
+        (("locomo", "32-turn"), ("locomo", "top-50"),
+         "LoCoMo 低预算"),
+        (("locomo", "64-turn"), ("locomo", "top-200"),
+         "LoCoMo 高预算"),
+    )
+    for graph_key, mem0_key, label in pairs:
+        if graph_key not in graph or mem0_key not in mem0:
+            continue
+        left, right = graph[graph_key], mem0[mem0_key]
+        accuracy_gain = 100 * (float(left["accuracy"]) - float(right["accuracy"]))
+        token_change = 100 * (float(left["answer_tokens"]["mean"])
+                              / float(right["answer_tokens"]["mean"]) - 1)
+        matched.append(
+            f"{label}相对 Mem0 为 {accuracy_gain:+.1f} pp Accuracy、"
+            f"{token_change:+.1f}\% Answer Token")
+    comparison = ("；" + "；".join(matched) if matched else "")
+    return (r"\paragraph{预算曲线。}" + "；".join(chunks) + comparison + "。"
             r"跨方法比较使用实测 Answer Token，而不是把 GraphMem turn 数与 Mem0 top-$k$"
             r"视为相同语义；构建 Token 仍在独立成本表中按 Memory 报告。" "\n")
 
