@@ -5,6 +5,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from graphmem.build.coarsen import (
+    _constrain_child_witnesses,
     admit_llm_refined_relation,
     bounded_relation_view_pairs,
     build_rare_lexical_node_terms,
@@ -334,6 +335,13 @@ def test_relation_mask_recovers_state_pair_below_semantic_gate() -> None:
     assert masked.accepted_pairs
     assert any("state_compatible" in signals
                for signals in masked.accepted_pair_signals.values())
+    assert any(
+        witnesses.get("state_compatible") == ("alice\x1fowns bicycle",)
+        for witnesses in masked.accepted_pair_witnesses.values())
+    assert all(
+        (left, right, str(relation)) in masked.typed_pair_witnesses
+        for left, right, relation, _confidence, _level, _source
+        in masked.typed_pairs)
     assert masked.relation_mask_counts[str(RelationSignal.STATE_COMPATIBLE)] > 0
     assert any(str(RelationType.COREFERENCE) in row.allowed_relations
                for row in masked.refine_candidates)
@@ -357,6 +365,26 @@ def test_relation_mask_recovers_state_pair_below_semantic_gate() -> None:
     assert set(semantic_only.atomic_candidate_signal_counts) == {"scene_similar"}
     assert all(set(signals) == {"scene_similar"} for signals in
                semantic_only.refine_candidate_signals.values())
+
+
+def test_keyed_relation_gate_requires_same_witness_at_every_level() -> None:
+    mask, witnesses = _constrain_child_witnesses(
+        {RelationSignal.SHARED_ENTITY: frozenset({"alice"}),
+         RelationSignal.STATE_COMPATIBLE: frozenset({"alice\x1flives in"})},
+        {RelationSignal.SHARED_ENTITY: frozenset({"bob"}),
+         RelationSignal.STATE_COMPATIBLE: frozenset({"bob\x1flives in"})},
+        (RelationSignal.SHARED_ENTITY, RelationSignal.STATE_COMPATIBLE))
+
+    assert mask == frozenset()
+    assert witnesses == {}
+
+    mask, witnesses = _constrain_child_witnesses(
+        {RelationSignal.SHARED_ENTITY: frozenset({"alice", "bob"})},
+        {RelationSignal.SHARED_ENTITY: frozenset({"bob", "carol"})},
+        (RelationSignal.SHARED_ENTITY, RelationSignal.SCENE_SIMILAR))
+    assert mask == frozenset({RelationSignal.SHARED_ENTITY,
+                              RelationSignal.SCENE_SIMILAR})
+    assert witnesses == {RelationSignal.SHARED_ENTITY: frozenset({"bob"})}
 
 
 def test_multiview_candidates_are_independently_bounded() -> None:

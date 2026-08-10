@@ -95,6 +95,46 @@ TOPOLOGICAL_LAYOUT_APPENDIX = (
     "number, and date in the memory text. Read all blocks needed by the "
     "question, but do not combine facts merely because they share a block."
 )
+AGGREGATION_LEDGER_VERSION = "graphmem-v5.21-aggregation-ledger-v1"
+AGGREGATION_LEDGER_APPENDIX = (
+    " For an aggregation question, the user message may contain an Aggregation "
+    "ledger after the memories. It is a deterministic index over already cited "
+    "source turns, not additional evidence and not a certified answer. Select "
+    "only operands satisfying the exact entity, event, time, polarity, and "
+    "completion constraints. Deduplicate mentions of one occurrence but retain "
+    "distinct occurrences. Never infer numeric zero from a missing operand. "
+    "When the ledger says its result is unavailable, perform the named arithmetic "
+    "yourself only after verifying the complete operand set in the source turns."
+)
+PREFERENCE_SYNTHESIS_VERSION = "graphmem-v5.21-preference-synthesis-v1"
+PREFERENCE_SYNTHESIS_APPENDIX = (
+    " This is a preference, advice, or recommendation request. Treat the "
+    "memories as grounded constraints and examples, not as a requirement that "
+    "the final suggestion must already appear verbatim. You may synthesize a "
+    "new recommendation that is compatible with the user's demonstrated "
+    "preferences, possessions, habits, goals, and negative constraints. Do not "
+    "invent a user preference or personal fact, and do not claim the user has "
+    "already tried or owns a newly suggested item. Prefer a specific, useful "
+    "answer over abstaining merely because no memory states the recommendation "
+    "itself. Keep the connection to the grounded constraints concise."
+)
+
+_PREFERENCE_QUERY_RE = re.compile(
+    r"\b(?:can|could|would) you (?:recommend|suggest|give|help)\b|"
+    r"\bdo you have (?:any|some) (?:\w+\s+){0,3}"
+    r"(?:tips?|advice|suggestions?|recommendations?|ideas?)\b|"
+    r"\b(?:any|some) (?:\w+\s+){0,3}"
+    r"(?:tips?|advice|suggestions?|recommendations?|ideas?)\b|"
+    r"\bwhat (?:should|could) i\b|\bwhat do you think\b|"
+    r"\bdo you think\b|\bcould there be a reason\b",
+    re.I,
+)
+
+
+def is_preference_synthesis_query(question: str) -> bool:
+    """Detect an advice request from its wording, without benchmark labels."""
+
+    return bool(_PREFERENCE_QUERY_RE.search(" ".join(question.split())))
 
 
 def _query_operation_contract(question: str) -> str:
@@ -120,6 +160,9 @@ def build_answer_messages(
     normalize_relative_time: bool = False,
     precision_grounding: bool = False,
     topological_layout: bool = False,
+    aggregation_ledger: str | None = None,
+    aggregation_ledger_contract: bool = False,
+    preference_synthesis: bool = False,
 ) -> list[dict[str, str]]:
     sections = [
         f"Question date: {question_date or 'unknown'}",
@@ -130,6 +173,10 @@ def build_answer_messages(
     if candidate_answer:
         sections += ["", f"Candidate answer (unverified proposal): {candidate_answer}"]
     sections += ["", "Conversation memories:", evidence_text]
+    if aggregation_ledger:
+        # Recency is intentional: aggregation errors persisted when all gold
+        # turns were packed but their operands were scattered through 64 turns.
+        sections += ["", aggregation_ledger]
     if precision_grounding:
         # Repeat the short format contract *after* the long evidence block.  A
         # system-only instruction before 5K-12K evidence was often ignored by
@@ -138,7 +185,9 @@ def build_answer_messages(
     return [
         {"role": "system", "content": prompt_contract(
             normalize_relative_time, precision_grounding,
-            topological_layout)[1]},
+            topological_layout,
+            aggregation_ledger_contract or bool(aggregation_ledger),
+            preference_synthesis)[1]},
         {"role": "user", "content": "\n".join(sections)},
     ]
 
@@ -150,7 +199,9 @@ PROMPT_HASH = hashlib.sha256(
 
 def prompt_contract(normalize_relative_time: bool = False,
                     precision_grounding: bool = False,
-                    topological_layout: bool = False) -> tuple[str, str, str]:
+                    topological_layout: bool = False,
+                    aggregation_ledger: bool = False,
+                    preference_synthesis: bool = False) -> tuple[str, str, str]:
     """Return the exact version/text/hash for an answer configuration."""
 
     version, prompt = (
@@ -163,4 +214,10 @@ def prompt_contract(normalize_relative_time: bool = False,
     if topological_layout:
         version += "+" + TOPOLOGICAL_LAYOUT_VERSION
         prompt += TOPOLOGICAL_LAYOUT_APPENDIX
+    if aggregation_ledger:
+        version += "+" + AGGREGATION_LEDGER_VERSION
+        prompt += AGGREGATION_LEDGER_APPENDIX
+    if preference_synthesis:
+        version += "+" + PREFERENCE_SYNTHESIS_VERSION
+        prompt += PREFERENCE_SYNTHESIS_APPENDIX
     return version, prompt, hashlib.sha256((version + prompt).encode("utf-8")).hexdigest()

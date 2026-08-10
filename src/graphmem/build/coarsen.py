@@ -62,8 +62,16 @@ class GatedRelationPlan:
     atomic_candidate_signal_counts: Mapping[str, int] = field(default_factory=dict)
     accepted_pair_signals: Mapping[
         tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
+    accepted_pair_witnesses: Mapping[
+        tuple[str, str], Mapping[str, tuple[str, ...]]] = field(
+            default_factory=dict)
     refine_candidate_signals: Mapping[
         str, tuple[str, ...]] = field(default_factory=dict)
+    refine_candidate_witnesses: Mapping[
+        str, Mapping[str, tuple[str, ...]]] = field(default_factory=dict)
+    typed_pair_witnesses: Mapping[
+        tuple[str, str, str], Mapping[str, tuple[str, ...]]] = field(
+            default_factory=dict)
 
 
 class RelationSignal(StrEnum):
@@ -95,6 +103,7 @@ def normalize_relation_signals(
 @dataclass(frozen=True, slots=True)
 class RelationFeatures:
     entities: frozenset[str] = frozenset()
+    owner_entities: frozenset[str] = frozenset()
     predicates: frozenset[str] = frozenset()
     predicate_phrases: frozenset[str] = frozenset()
     scopes: frozenset[str] = frozenset()
@@ -871,13 +880,35 @@ def _direct_relation_features(
                 "event_time_range", "times"):
         time_values.extend(_time_scalars(attrs.get(key)))
     time_values.extend(_time_scalars(node.event_time))
-    entities = (_attribute_phrases(
-        node, "owner_id", "owners", "entities", "actor_id", "actor_ids")
-        - GENERIC_ENTITY_KEYS)
+    owner_id_phrases = frozenset(
+        value for value in _attribute_phrases(node, "owner_id")
+        if not re.fullmatch(r"node [0-9a-f]{32}", value))
+    entities = (frozenset({
+        *_attribute_phrases(
+            node, "owners", "entities", "actor", "actors"),
+        *owner_id_phrases,
+    }) - GENERIC_ENTITY_KEYS)
+    role_entities = attrs.get("relation_entity_roles", {})
+    owner_entities: set[str] = set()
+    if isinstance(role_entities, Mapping):
+        raw_owners = role_entities.get("owner", ())
+        if isinstance(raw_owners, (str, bytes)):
+            raw_owners = (raw_owners,)
+        owner_entities.update(
+            normalized for value in raw_owners or ()
+            if (normalized := normalize_key(str(value))))
+    owner_entities.update(_attribute_phrases(node, "owners", "actor", "actors"))
+    owner_entities.update(owner_id_phrases)
     if node.node_type == NodeType.CANONICAL_ENTITY:
-        entities = frozenset({*entities, node.node_id})
+        aliases = _attribute_phrases(node, "aliases")
+        summary = normalize_key(node.summary)
+        entities = frozenset({*entities, *aliases, *((summary,) if summary else ())}
+                             - GENERIC_ENTITY_KEYS)
+        owner_entities.update(entities)
+    owner_entities.difference_update(GENERIC_ENTITY_KEYS)
     return RelationFeatures(
         entities=entities,
+        owner_entities=frozenset(owner_entities),
         predicates=_attribute_terms(node, "predicate", "predicates"),
         predicate_phrases=_attribute_phrases(
             node, "predicate", "predicates"),
@@ -921,7 +952,9 @@ def build_relation_features(
             return _direct_relation_features(node, lexical_rare_terms)
         active.add(node_id)
         direct = _direct_relation_features(node, lexical_rare_terms)
-        entities = set(direct.entities); predicates = set(direct.predicates)
+        entities = set(direct.entities)
+        owner_entities = set(direct.owner_entities)
+        predicates = set(direct.predicates)
         predicate_phrases = set(direct.predicate_phrases)
         scopes = set(direct.scopes); scope_phrases = set(direct.scope_phrases)
         collection_keys = set(direct.collection_keys); values = set(direct.values)
@@ -932,6 +965,7 @@ def build_relation_features(
                 continue
             child = visit(child_id)
             entities.update(child.entities); predicates.update(child.predicates)
+            owner_entities.update(child.owner_entities)
             predicate_phrases.update(child.predicate_phrases)
             scopes.update(child.scopes); scope_phrases.update(child.scope_phrases)
             collection_keys.update(child.collection_keys)
@@ -941,6 +975,8 @@ def build_relation_features(
         active.remove(node_id)
         cached[node_id] = RelationFeatures(
             entities=frozenset(sorted(entities)[:max_values_per_field]),
+            owner_entities=frozenset(sorted(
+                owner_entities)[:max_values_per_field]),
             predicates=frozenset(sorted(predicates)[:max_values_per_field]),
             predicate_phrases=frozenset(sorted(
                 predicate_phrases)[:max_values_per_field]),
@@ -998,6 +1034,8 @@ def relation_signal_scores(
                       else right_features.entities & entity_filter)
     shared_entities = left_entities & right_entities
     shared_all_entities = left_features.entities & right_features.entities
+    shared_owner_entities = (
+        left_features.owner_entities & right_features.owner_entities)
 
     scores: dict[RelationSignal, float] = {}
     semantic = max(-1.0, min(1.0, semantic_similarity))
@@ -1025,9 +1063,14 @@ def relation_signal_scores(
         1, min(len(left_features.predicates), len(right_features.predicates)))
     scope_overlap = len(left_features.scopes & right_features.scopes) / max(
         1, min(len(left_features.scopes), len(right_features.scopes)))
+    # A common principal is an unsafe entity-only bridge, but becomes selective
+    # once it is paired with a predicate for a state key.  The former atomic-only
+    # exception made every LoCoMo speaker a hub at the coarse levels, so no
+    # state-compatible signal could survive the parent corridor even when the
+    # child facts shared the same (owner, predicate) pair.
     atomic_pair = (left.node_type in ATOMIC_RELATION_NODE_TYPES
                    and right.node_type in ATOMIC_RELATION_NODE_TYPES)
-    state_entities = shared_all_entities if atomic_pair else shared_entities
+    state_entities = shared_owner_entities
     if state_entities and predicate_overlap:
         scores[RelationSignal.STATE_COMPATIBLE] = min(
             1.0, 0.65 * predicate_overlap + 0.35 * scope_overlap)
@@ -1058,6 +1101,107 @@ def relation_signal_scores(
         scores[RelationSignal.TEMPORAL_NEAR] = math.exp(
             -gap / (90.0 * 24.0 * 60.0 * 60.0))
     return scores
+
+
+def relation_signal_witnesses(
+    left: GraphNode,
+    right: GraphNode,
+    features: Mapping[str, RelationFeatures],
+    *,
+    eligible_entities: frozenset[str] | None = None,
+) -> dict[RelationSignal, frozenset[str]]:
+    """Return the concrete keys that justify entity/state routing signals.
+
+    A signal bit alone is not a transitive proof: a parent pair may share Alice
+    while a child pair shares Bob.  The top-down gate therefore carries the
+    normalized witness key and intersects it again at every level.  Scene,
+    temporal, collection and lexical signals remain unkeyed in this minimal
+    repair and continue to use their existing bounded score gates.
+    """
+
+    left_features = features[left.node_id]
+    right_features = features[right.node_id]
+    shared_all = left_features.entities & right_features.entities
+    shared_owners = (
+        left_features.owner_entities & right_features.owner_entities)
+    shared_eligible = (shared_all if eligible_entities is None else
+                       shared_all & eligible_entities)
+    result: dict[RelationSignal, frozenset[str]] = {}
+    if shared_eligible:
+        result[RelationSignal.SHARED_ENTITY] = frozenset(
+            sorted(shared_eligible)[:32])
+
+    # Exact predicate phrases are deliberately used for the witness.  Token
+    # overlap may propose a state candidate, but is not strong enough to carry
+    # an identity through multiple hierarchy levels.  Common owners are safe in
+    # this composite key even when they are entity-only hubs.
+    shared_predicates = (
+        left_features.predicate_phrases
+        & right_features.predicate_phrases)
+    if shared_owners and shared_predicates:
+        keys = tuple(
+            f"{entity}\x1f{predicate}"
+            for entity in sorted(shared_owners)[:16]
+            for predicate in sorted(shared_predicates)[:16])
+        if keys:
+            result[RelationSignal.STATE_COMPATIBLE] = frozenset(keys[:64])
+    return result
+
+
+KEYED_RELATION_SIGNALS = frozenset({
+    RelationSignal.SHARED_ENTITY,
+    RelationSignal.STATE_COMPATIBLE,
+})
+
+
+def _merge_relation_witnesses(
+    *rows: Mapping[RelationSignal, Sequence[str]],
+) -> dict[RelationSignal, frozenset[str]]:
+    """Union bounded witness sets when the same endpoint pair is proposed twice."""
+
+    merged: dict[RelationSignal, set[str]] = defaultdict(set)
+    for row in rows:
+        for signal, values in row.items():
+            merged[signal].update(map(str, values))
+    return {
+        signal: frozenset(sorted(values)[:64])
+        for signal, values in merged.items() if values
+    }
+
+
+def _witnesses_cover(
+    superset: Mapping[RelationSignal, Sequence[str]],
+    subset: Mapping[RelationSignal, Sequence[str]],
+) -> bool:
+    return all(set(values).issubset(superset.get(signal, ()))
+               for signal, values in subset.items())
+
+
+def _constrain_child_witnesses(
+    parent: Mapping[RelationSignal, Sequence[str]],
+    local: Mapping[RelationSignal, Sequence[str]],
+    mask: Sequence[RelationSignal],
+) -> tuple[frozenset[RelationSignal], dict[RelationSignal, frozenset[str]]]:
+    """Keep keyed signals only when the identical witness survives one level.
+
+    Unkeyed signals still obey the existing score/mask intersection.  Entity and
+    state signals additionally intersect concrete entity or
+    ``entity\x1fpredicate`` keys, preventing a parent relation justified by one
+    referent from opening a child corridor justified by another.
+    """
+
+    kept: set[RelationSignal] = set()
+    witnesses: dict[RelationSignal, frozenset[str]] = {}
+    for signal in mask:
+        if signal not in KEYED_RELATION_SIGNALS:
+            kept.add(signal)
+            continue
+        common = frozenset(set(parent.get(signal, ()))
+                           & set(local.get(signal, ())))
+        if common:
+            kept.add(signal)
+            witnesses[signal] = common
+    return frozenset(kept), witnesses
 
 
 def relation_mask(
@@ -1387,7 +1531,8 @@ def build_parent_gated_relations(
             ann_vectors[left.node_id], ann_vectors[right.node_id]))))
 
     seed_gates: dict[tuple[str, str], tuple[
-        str, str, float, frozenset[RelationSignal]]] = {}
+        str, str, float, frozenset[RelationSignal],
+        Mapping[RelationSignal, frozenset[str]]]] = {}
     comparisons = 0
     coarse_candidates = 0
     # A relation can originate inside any coarse partition, not only between
@@ -1411,7 +1556,8 @@ def build_parent_gated_relations(
                 per_node_k=embedding_k)
         comparisons += local_comparisons
         local_candidates: dict[tuple[str, str], tuple[
-            float, set[RelationSignal]]] = {}
+            float, set[RelationSignal],
+            Mapping[RelationSignal, frozenset[str]]]] = {}
         for left, right, score in local_pairs:
             pair = tuple(sorted((left, right)))
             if relation_mask_propagation:
@@ -1422,6 +1568,12 @@ def build_parent_gated_relations(
                     rare_lexical_min_shared=rare_lexical_min_shared)
                 mask = set(relation_mask(
                     scores, semantic_threshold=low_threshold) & active_signals)
+                witnesses = relation_signal_witnesses(
+                    nodes[pair[0]], nodes[pair[1]], relation_features,
+                    eligible_entities=eligible_entities)
+                mask = {signal for signal in mask
+                        if signal not in KEYED_RELATION_SIGNALS
+                        or witnesses.get(signal)}
                 if not mask:
                     continue
                 score = _relation_gate_score({signal: scores[signal]
@@ -1431,10 +1583,13 @@ def build_parent_gated_relations(
                 continue
             else:
                 mask = {RelationSignal.SCENE_SIMILAR}
+                witnesses = {}
             previous = local_candidates.get(pair)
             local_candidates[pair] = (
                 max(score, previous[0]) if previous else score,
-                (previous[1] | mask) if previous else mask)
+                (previous[1] | mask) if previous else mask,
+                _merge_relation_witnesses(
+                    previous[2] if previous else {}, witnesses))
         if relation_mask_propagation:
             view_pairs, view_comparisons = bounded_relation_view_pairs(
                 siblings, relation_features,
@@ -1456,46 +1611,71 @@ def build_parent_gated_relations(
                 mask = set(relation_mask(
                     scores, semantic_threshold=low_threshold) & active_signals)
                 mask.add(signal)
+                witnesses = relation_signal_witnesses(
+                    nodes[left], nodes[right], relation_features,
+                    eligible_entities=eligible_entities)
+                mask = {item for item in mask
+                        if item not in KEYED_RELATION_SIGNALS
+                        or witnesses.get(item)}
+                if not mask:
+                    continue
                 score = _relation_gate_score({item: scores.get(item, 0.0)
                                               for item in mask})
                 previous = local_candidates.get(pair)
                 local_candidates[pair] = (
                     max(score, previous[0]) if previous else score,
-                    (previous[1] | mask) if previous else mask)
+                    (previous[1] | mask) if previous else mask,
+                    _merge_relation_witnesses(
+                        previous[2] if previous else {}, witnesses))
         coarse_candidates += len(local_candidates)
-        for pair, (score, mask) in local_candidates.items():
+        for pair, (score, mask, witnesses) in local_candidates.items():
             previous = seed_gates.get(pair)
             seed_gates[pair] = (
                 pair[0], pair[1],
                 max(score, previous[2]) if previous else score,
-                frozenset((set(previous[3]) if previous else set()) | mask))
+                frozenset((set(previous[3]) if previous else set()) | mask),
+                _merge_relation_witnesses(
+                    previous[4] if previous else {}, witnesses))
     gates = list(seed_gates.values())
     gated_children = 0
     accepted: dict[tuple[str, str], tuple[str, str, float, int]] = {}
     accepted_signals: dict[tuple[str, str], set[str]] = defaultdict(set)
+    accepted_witnesses: dict[
+        tuple[str, str], dict[RelationSignal, frozenset[str]]] = {}
     typed: dict[tuple[str, str, RelationType], tuple[
         str, str, RelationType, float, int, str]] = {}
+    typed_witnesses: dict[
+        tuple[str, str, str], dict[RelationSignal, frozenset[str]]] = {}
     refine: dict[str, RefineCandidate] = {}
     refine_signals: dict[str, set[str]] = defaultdict(set)
+    refine_witnesses: dict[
+        str, dict[RelationSignal, frozenset[str]]] = {}
     relation_levels: set[int] = set()
 
     processed: dict[tuple[str, str], tuple[
-        float, frozenset[RelationSignal]]] = {}
+        float, frozenset[RelationSignal],
+        Mapping[RelationSignal, frozenset[str]]]] = {}
     mask_counts: dict[str, int] = defaultdict(int)
     while gates:
         next_gates: dict[tuple[str, str], tuple[
-            str, str, float, frozenset[RelationSignal]]] = {}
-        for left_id, right_id, score, gate_mask in gates:
+            str, str, float, frozenset[RelationSignal],
+            Mapping[RelationSignal, frozenset[str]]]] = {}
+        for left_id, right_id, score, gate_mask, gate_witnesses in gates:
             gate_key = tuple(sorted((left_id, right_id)))
             previous_processed = processed.get(gate_key)
             if (previous_processed is not None
                     and previous_processed[0] >= score
-                    and previous_processed[1].issuperset(gate_mask)):
+                    and previous_processed[1].issuperset(gate_mask)
+                    and _witnesses_cover(
+                        previous_processed[2], gate_witnesses)):
                 continue
             processed[gate_key] = (
                 max(score, previous_processed[0]) if previous_processed else score,
                 frozenset(set(previous_processed[1] if previous_processed else ())
-                          | set(gate_mask)))
+                          | set(gate_mask)),
+                _merge_relation_witnesses(
+                    previous_processed[2] if previous_processed else {},
+                    gate_witnesses))
             for signal in gate_mask:
                 mask_counts[str(signal)] += 1
             left, right = nodes[left_id], nodes[right_id]
@@ -1531,6 +1711,12 @@ def build_parent_gated_relations(
                     if qualified:
                         accepted[pair] = (pair[0], pair[1], score, level)
                         accepted_signals[pair].update(qualified)
+                        accepted_witnesses[pair] = _merge_relation_witnesses(
+                            accepted_witnesses.get(pair, {}), {
+                                signal: gate_witnesses.get(signal, ())
+                                for signal in gate_mask
+                                if str(signal) in qualified
+                            })
                 else:
                     accepted[pair] = (pair[0], pair[1], score, level)
             typed_decision = (classify_typed_relation(left, right, score)
@@ -1542,6 +1728,9 @@ def build_parent_gated_relations(
                     typed[(pair[0], pair[1], relation)] = (
                         pair[0], pair[1], relation, confidence, level,
                         f"{source}|relation_mask:{signal_source}")
+                    typed_key = (pair[0], pair[1], str(relation))
+                    typed_witnesses[typed_key] = _merge_relation_witnesses(
+                        typed_witnesses.get(typed_key, {}), gate_witnesses)
             ambiguous = low_threshold <= score < high_threshold
             left_sessions = _node_sessions(left)
             right_sessions = _node_sessions(right)
@@ -1602,6 +1791,8 @@ def build_parent_gated_relations(
                     priority=uncertainty * bridge_value / 448.0,
                 )
                 refine_signals[candidate_id].update(map(str, gate_mask))
+                refine_witnesses[candidate_id] = _merge_relation_witnesses(
+                    refine_witnesses.get(candidate_id, {}), gate_witnesses)
 
             left_children = [nodes[item] for item in child_map.get(left_id, ()) if item in nodes]
             right_children = [nodes[item] for item in child_map.get(right_id, ()) if item in nodes]
@@ -1612,7 +1803,8 @@ def build_parent_gated_relations(
             # left child so the implementation stays near-linear.
             for left_child in left_children:
                 scored_children: list[tuple[
-                    float, str, frozenset[RelationSignal]]] = []
+                    float, str, frozenset[RelationSignal],
+                    Mapping[RelationSignal, frozenset[str]]]] = []
                 for right_child in right_children:
                     comparisons += 1
                     semantic_score = similarity(left_child, right_child)
@@ -1624,8 +1816,12 @@ def build_parent_gated_relations(
                             rare_lexical_min_shared=rare_lexical_min_shared)
                         local_mask = relation_mask(
                             scores, semantic_threshold=low_threshold) & active_signals
-                        child_mask = frozenset(
-                            set(gate_mask) & set(local_mask))
+                        local_witnesses = relation_signal_witnesses(
+                            left_child, right_child, relation_features,
+                            eligible_entities=eligible_entities)
+                        child_mask, child_witnesses = _constrain_child_witnesses(
+                            gate_witnesses, local_witnesses,
+                            tuple(set(gate_mask) & set(local_mask)))
                         if not child_mask:
                             continue
                         child_score = _relation_gate_score({
@@ -1635,9 +1831,11 @@ def build_parent_gated_relations(
                             continue
                         child_score = semantic_score
                         child_mask = gate_mask
+                        child_witnesses = gate_witnesses
                     scored_children.append((
-                        child_score, right_child.node_id, child_mask))
-                for child_score, right_child_id, child_mask in sorted(
+                        child_score, right_child.node_id, child_mask,
+                        child_witnesses))
+                for child_score, right_child_id, child_mask, child_witnesses in sorted(
                         scored_children, key=lambda row: (-row[0], row[1]))[
                             :max_candidates_per_node]:
                     gated_children += 1
@@ -1646,13 +1844,17 @@ def build_parent_gated_relations(
                     processed_child = processed.get(child_pair)
                     if (processed_child is not None
                             and processed_child[0] >= child_score
-                            and processed_child[1].issuperset(child_mask)):
+                            and processed_child[1].issuperset(child_mask)
+                            and _witnesses_cover(
+                                processed_child[2], child_witnesses)):
                         continue
                     next_gates[child_pair] = (
                         child_pair[0], child_pair[1],
                         max(child_score, previous[2]) if previous else child_score,
                         frozenset((set(previous[3]) if previous else set())
-                                  | set(child_mask)))
+                                  | set(child_mask)),
+                        _merge_relation_witnesses(
+                            previous[4] if previous else {}, child_witnesses))
         # A child may be proposed by several surviving parent gates.  Applying
         # ``k`` independently inside each parent pair still permits a dense
         # union, so cap the complete next-level frontier by endpoint degree.
@@ -1660,10 +1862,11 @@ def build_parent_gated_relations(
         # at most O(k|V_l|) gates survive at level l.
         next_degree: dict[str, int] = defaultdict(int)
         bounded_next: list[tuple[
-            str, str, float, frozenset[RelationSignal]]] = []
+            str, str, float, frozenset[RelationSignal],
+            Mapping[RelationSignal, frozenset[str]]]] = []
         for child_gate in sorted(
                 next_gates.values(), key=lambda row: (-row[2], row[0], row[1])):
-            left_id, right_id, _child_score, _child_mask = child_gate
+            left_id, right_id, _child_score, _child_mask, _child_witnesses = child_gate
             if (next_degree[left_id] >= embedding_k
                     or next_degree[right_id] >= embedding_k):
                 continue
@@ -1828,7 +2031,29 @@ def build_parent_gated_relations(
         accepted_pair_signals={
             pair: tuple(sorted(signals))
             for pair, signals in sorted(accepted_signals.items())},
+        accepted_pair_witnesses={
+            pair: {
+                str(signal): tuple(sorted(values))
+                for signal, values in sorted(
+                    witnesses.items(), key=lambda row: str(row[0]))
+            }
+            for pair, witnesses in sorted(accepted_witnesses.items())},
         refine_candidate_signals={
             candidate_id: tuple(sorted(signals))
             for candidate_id, signals in sorted(refine_signals.items())},
+        refine_candidate_witnesses={
+            candidate_id: {
+                str(signal): tuple(sorted(values))
+                for signal, values in sorted(
+                    witnesses.items(), key=lambda row: str(row[0]))
+            }
+            for candidate_id, witnesses in sorted(refine_witnesses.items())
+            if candidate_id in {row.candidate_id for row in admitted_refine}},
+        typed_pair_witnesses={
+            key: {
+                str(signal): tuple(sorted(values))
+                for signal, values in sorted(
+                    witnesses.items(), key=lambda row: str(row[0]))
+            }
+            for key, witnesses in sorted(typed_witnesses.items())},
     )

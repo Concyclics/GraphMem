@@ -104,6 +104,32 @@ def test_query_embedding_singleflight_collapses_concurrent_misses(tmp_path: Path
     assert index.stats["query_singleflight_waits"] == 7
 
 
+def test_search_items_reuses_existing_graph_node_vectors(tmp_path: Path) -> None:
+    store = _store(tmp_path / "graph.sqlite")
+    relation_store = _store(tmp_path / "relations.sqlite")
+    model_id = GraphMemV5Config().models.embedding_model
+    relation_store.upsert_embeddings("memory-one", model_id, (
+        ("fact:paris", "fact-hash-1", [1.0, 0.0, 0.0]),
+        ("fact:cat", "fact-hash-2", [0.0, 1.0, 0.0]),
+    ))
+    embeddings = _Embeddings()
+    index = QwenEmbeddingIndex(
+        store, GraphMemV5Config(),
+        client=SimpleNamespace(embeddings=embeddings), record_usage=False)
+
+    first = index.search_items(
+        "memory-one", "Where did Alice travel?",
+        ("fact:paris", "fact:cat"), 2, source_store=relation_store)
+    second = index.search_items(
+        "memory-one", "Where did Alice travel?",
+        ("fact:paris", "fact:cat"), 2, source_store=relation_store)
+
+    assert first[0][0] == "fact:paris"
+    assert second == first
+    assert embeddings.calls == 1
+    assert index.stats["item_matrix_entries"] == 1
+
+
 def test_numpy_dense_sidecar_matches_exact_matrix_and_invalidates(tmp_path: Path) -> None:
     store = _store(tmp_path / "graph.sqlite")
     model_id = GraphMemV5Config().models.embedding_model

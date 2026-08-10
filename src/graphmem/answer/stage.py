@@ -30,8 +30,12 @@ from ..domain import (
 from ..storage import SQLiteGraphStore
 from ..tokenization import resolve_token_counter
 from .composer import AnswerDraft, compose
+from .aggregation import AggregationLedger, build_aggregation_ledger
 from ..retrieval.executor import inspect_execution
-from .prompts import PROMPT_HASH, build_answer_messages, prompt_contract
+from .prompts import (
+    PROMPT_HASH, build_answer_messages, is_preference_synthesis_query,
+    prompt_contract,
+)
 from .rendering import (
     AnswerConfig, RenderedEvidence, render_evidence, resolve_evidence_order,
 )
@@ -474,7 +478,18 @@ class AnswerStage:
         evidence_order = resolve_evidence_order(
             self.answer_config.evidence_order, question,
             str(result.trace.get("query_operator") or ""))
+        preference_synthesis = (
+            self.answer_config.preference_synthesis_enabled
+            and is_preference_synthesis_query(question))
         evidence = self.render(result, budget, question=question)
+        turn_map, _session_order = self._turns(result.memory_id)
+        def make_ledger(rendered: RenderedEvidence) -> AggregationLedger | None:
+            if not self.answer_config.aggregation_ledger_enabled:
+                return None
+            return build_aggregation_ledger(
+                question, turn_map, rendered.turn_ids,
+                limit=self.answer_config.aggregation_ledger_limit)
+        ledger = make_ledger(evidence)
         if evidence.mandatory_dropped:
             warnings.append("mandatory_turn_dropped_for_budget")
         if (self.answer_config.deterministic_bypass_enabled
@@ -501,6 +516,47 @@ class AnswerStage:
                         typed_execution.provenance_binding_ids),
                     "reason_codes": list(typed_execution.reason_codes)}})
 
+        if ledger is not None and ledger.result_certified:
+            prompt_version, _prompt_text, prompt_hash = prompt_contract(
+                self.answer_config.normalize_relative_time,
+                self.answer_config.precision_grounding,
+                evidence_order == "topological", True)
+            payload_hash = hashlib.sha256(canonical_json({
+                "operation": ledger.operation,
+                "operands": list(ledger.deterministic_operands),
+                "result": ledger.deterministic_result,
+                "schema_version": ledger.schema_version,
+            }).encode()).hexdigest()
+            return PreparedAnswer(
+                question_id=question_id, memory_id=result.memory_id,
+                messages=(), evidence_turn_ids=evidence.turn_ids,
+                dropped_turn_ids=evidence.dropped_turn_ids,
+                evidence_tokens=evidence.tokens, packing_prompt_tokens=0,
+                closed_form=True, draft_text=ledger.deterministic_result,
+                draft_certified=True, budget_relaxed=False,
+                prompt_hash=prompt_hash, prompt_payload_hash=payload_hash,
+                warnings=tuple(warnings),
+                deterministic_prediction=ledger.deterministic_result,
+                preparation_latency_ms=(time.perf_counter() - started) * 1000,
+                trace={
+                    "prompt_version": prompt_version,
+                    "deterministic_bypass": True,
+                    "deterministic_bypass_source": "aggregation_ledger",
+                    "aggregation_ledger": {
+                        "schema_version": ledger.schema_version,
+                        "operation": ledger.operation,
+                        "candidate_turn_ids": list(ledger.candidate_turn_ids),
+                        "numeric_candidate_count": ledger.numeric_candidate_count,
+                        "result_certified": True,
+                        "deterministic_operands": list(
+                            ledger.deterministic_operands),
+                        "deterministic_result": ledger.deterministic_result,
+                    },
+                    "evidence_order": self.answer_config.evidence_order,
+                    "resolved_evidence_order": evidence_order,
+                    "packed_turns": len(evidence.turn_ids),
+                })
+
         messages = build_answer_messages(
             question=question, question_date=question_date,
             evidence_text=evidence.text,
@@ -510,11 +566,15 @@ class AnswerStage:
                 else None),
             normalize_relative_time=self.answer_config.normalize_relative_time,
             precision_grounding=self.answer_config.precision_grounding,
-            topological_layout=evidence_order == "topological")
+            topological_layout=evidence_order == "topological",
+            aggregation_ledger=(ledger.text if ledger else None),
+            aggregation_ledger_contract=bool(ledger),
+            preference_synthesis=preference_synthesis)
         prompt_version, _prompt_text, prompt_hash = prompt_contract(
             self.answer_config.normalize_relative_time,
             self.answer_config.precision_grounding,
-            evidence_order == "topological")
+            evidence_order == "topological",
+            bool(ledger), preference_synthesis)
         prompt_tokens = self._prompt_tokens(messages)
         relaxed = False
         if prompt_tokens > budget.max_answer_tokens:
@@ -523,6 +583,7 @@ class AnswerStage:
                 result, budget,
                 max_tokens=max(1, budget.max_answer_tokens - overhead),
                 question=question)
+            ledger = make_ledger(evidence)
             messages = build_answer_messages(
                 question=question, question_date=question_date,
                 evidence_text=evidence.text,
@@ -532,7 +593,10 @@ class AnswerStage:
                     else None),
                 normalize_relative_time=self.answer_config.normalize_relative_time,
                 precision_grounding=self.answer_config.precision_grounding,
-                topological_layout=evidence_order == "topological")
+                topological_layout=evidence_order == "topological",
+                aggregation_ledger=(ledger.text if ledger else None),
+                aggregation_ledger_contract=bool(ledger),
+                preference_synthesis=preference_synthesis)
             prompt_tokens = self._prompt_tokens(messages)
             if prompt_tokens > budget.max_answer_tokens:
                 relaxed = True
@@ -583,6 +647,17 @@ class AnswerStage:
                     "safe_to_bypass": typed_execution.safe_to_bypass,
                     "reason_codes": list(typed_execution.reason_codes),
                 } if typed_execution is not None else None),
+                "aggregation_ledger": ({
+                    "schema_version": ledger.schema_version,
+                    "operation": ledger.operation,
+                    "candidate_turn_ids": list(ledger.candidate_turn_ids),
+                    "numeric_candidate_count": ledger.numeric_candidate_count,
+                    "result_certified": ledger.result_certified,
+                    "deterministic_operands": list(
+                        ledger.deterministic_operands),
+                    "deterministic_result": ledger.deterministic_result,
+                } if ledger is not None else None),
+                "preference_synthesis": preference_synthesis,
             })
 
     def complete(self, prepared: PreparedAnswer) -> AnswerResult:

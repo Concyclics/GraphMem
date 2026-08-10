@@ -332,6 +332,8 @@ class RetrievalRuntimeConfig:
     # seed filters with the legacy parse instead of hard-excluding evidence.
     queryir_soft_fallback: bool = False
     queryir_soft_fallback_threshold: float = 0.80
+    exact_lookup_fast_path: bool = False
+    exact_lookup_turn_limit: int = 16
     read_pool_size: int = 1
     snapshot_cache_bytes: int = 256 * 1024 * 1024
     snapshot_cache_memories: int = 8
@@ -369,6 +371,7 @@ class RetrievalRuntimeConfig:
             "snapshot_cache_bytes": self.snapshot_cache_bytes,
             "snapshot_cache_memories": self.snapshot_cache_memories,
             "metadata_cache_memories": self.metadata_cache_memories,
+            "exact_lookup_turn_limit": self.exact_lookup_turn_limit,
             "query_embedding_cache_entries": self.query_embedding_cache_entries,
             "dense_cache_bytes": self.dense_cache_bytes,
             "dense_cache_memories": self.dense_cache_memories,
@@ -419,6 +422,8 @@ class RetrievalRuntimeConfig:
             "native_seed_fusion": self.native_seed_fusion,
             "queryir_soft_fallback": self.queryir_soft_fallback,
             "queryir_soft_fallback_threshold": self.queryir_soft_fallback_threshold,
+            "exact_lookup_fast_path": self.exact_lookup_fast_path,
+            "exact_lookup_turn_limit": self.exact_lookup_turn_limit,
             "read_pool_size": self.read_pool_size,
             "snapshot_cache_bytes": self.snapshot_cache_bytes,
             "snapshot_cache_memories": self.snapshot_cache_memories,

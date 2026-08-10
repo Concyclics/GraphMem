@@ -6,8 +6,9 @@ from dataclasses import replace
 import pytest
 
 from graphmem.answer import (
-    AnswerConfig, AnswerStage, PreparedAnswer, PROMPT_HASH, build_answer_messages,
-    compose, render_evidence, render_turn, resolve_evidence_order,
+    AnswerConfig, AnswerStage, PreparedAnswer, PROMPT_HASH, build_aggregation_ledger,
+    build_answer_messages, compose, is_preference_synthesis_query,
+    prompt_contract, render_evidence, render_turn, resolve_evidence_order,
 )
 from graphmem.domain import (
     AlgebraResult, AnswerMember, Conversation, EvidenceMember, EvidenceUnit, NavigationResult,
@@ -283,6 +284,194 @@ def test_scalar_delta_questions_state_the_arithmetic_contract() -> None:
                                      question_date=None, evidence_text="")
 
     assert "scalar_delta" in messages[1]["content"]
+
+
+def test_aggregation_ledger_is_opt_in_post_evidence_and_separately_hashed() -> None:
+    messages = build_answer_messages(
+        question="How much did I spend in total?", question_date=None,
+        evidence_text="source evidence", aggregation_ledger="Operation: sum")
+
+    assert messages[1]["content"].index("source evidence") < messages[1]["content"].index("Operation: sum")
+    assert "not a certified answer" in messages[0]["content"]
+    assert prompt_contract(False, False, False, True)[2] != prompt_contract()[2]
+
+
+def test_preference_synthesis_is_wording_routed_and_separately_hashed() -> None:
+    assert is_preference_synthesis_query(
+        "I've got some free time tonight, any documentary recommendations?")
+    assert is_preference_synthesis_query(
+        "Do you have any helpful tips for getting around Tokyo?")
+    assert not is_preference_synthesis_query(
+        "What documentary did I watch last Thursday?")
+
+    baseline = build_answer_messages(
+        question="Can you recommend a movie?", question_date=None,
+        evidence_text="I enjoy mysteries.", precision_grounding=True)
+    routed = build_answer_messages(
+        question="Can you recommend a movie?", question_date=None,
+        evidence_text="I enjoy mysteries.", precision_grounding=True,
+        preference_synthesis=True)
+    assert baseline[1] == routed[1]
+    assert baseline[0] != routed[0]
+    assert "may synthesize a new recommendation" in routed[0]["content"]
+    assert prompt_contract(False, True, False, False, True)[2] != (
+        prompt_contract(False, True, False, False, False)[2])
+
+
+def test_aggregation_ledger_indexes_money_operands_without_claiming_closure() -> None:
+    turns = {
+        turn.turn_id: turn for turn in (
+            _turn(0, "I spent $35 on my bicycle tires."),
+            _turn(1, "We talked about a movie from 2021."),
+            _turn(2, "I paid $150 to repair the bicycle."),
+        )
+    }
+    ledger = build_aggregation_ledger(
+        "How much did I spend on the bicycle in total?", turns, tuple(turns))
+
+    assert ledger is not None and ledger.operation == "sum"
+    assert "$35" in ledger.text and "$150" in ledger.text
+    assert "Certified deterministic result: unavailable" in ledger.text
+    assert not ledger.result_certified
+
+
+def test_non_aggregation_question_has_no_ledger() -> None:
+    turn = _turn(0, "My dog is Rex.")
+    assert build_aggregation_ledger(
+        "What is my dog called?", {turn.turn_id: turn}, (turn.turn_id,)) is None
+
+
+def test_count_in_a_week_is_not_misclassified_as_duration_sum() -> None:
+    from graphmem.answer import aggregation_operation
+
+    assert aggregation_operation(
+        "How many fitness classes do I attend in a typical week?") == "count_distinct"
+    assert aggregation_operation("How many days did I travel in total?") == "sum"
+
+
+def test_money_ledger_reserves_terse_direct_currency_operands() -> None:
+    relevant = _turn(0, "The bike helmet cost $120.")
+    noise = tuple(_turn(index + 1, f"Money saving total expense article {index}.")
+                  for index in range(30))
+    turns = {turn.turn_id: turn for turn in (relevant, *noise)}
+
+    ledger = build_aggregation_ledger(
+        "How much money did I spend on bike expenses in total?", turns,
+        tuple(turns), limit=8)
+
+    assert ledger is not None
+    assert relevant.turn_id in ledger.candidate_turn_ids
+
+
+def test_aggregation_feature_keeps_non_aggregation_prompt_byte_identical(tmp_path) -> None:
+    store = _store(tmp_path, ["My dog is named Rex."])
+    result = _result([turn.turn_id for turn in store.turns("m")])
+    baseline = _stage(store, _FakeClient()).prepare(
+        "q1", "What is my dog called?", result, QueryBudget())
+    routed = _stage(
+        store, _FakeClient(),
+        answer_config=AnswerConfig(aggregation_ledger_enabled=True)).prepare(
+            "q1", "What is my dog called?", result, QueryBudget())
+
+    assert routed.messages == baseline.messages
+    assert routed.prompt_hash == baseline.prompt_hash
+    assert routed.prompt_payload_hash == baseline.prompt_payload_hash
+    store.close()
+
+
+def test_ledger_keeps_age_and_schedule_source_turns() -> None:
+    grandparent = _turn(0, "My grandma is 75 and my grandpa is 78.")
+    classes = _turn(1, "I attend Zumba classes on Tuesdays and Thursdays.")
+    rows = {turn.turn_id: turn for turn in (grandparent, classes)}
+
+    ages = build_aggregation_ledger(
+        "What is the average age of my grandparents?", rows, tuple(rows), limit=1)
+    schedule = build_aggregation_ledger(
+        "How many classes do I attend each week?", rows, tuple(rows), limit=2)
+
+    assert ages is not None and grandparent.turn_id in ages.candidate_turn_ids
+    assert schedule is not None
+    assert classes.turn_id in schedule.candidate_turn_ids
+    assert "Tuesdays and Thursdays" in schedule.text
+
+
+def test_money_ledger_leaves_duplicate_resolution_to_the_answer_model() -> None:
+    first = _turn(0, "I installed new bike lights for $40.")
+    repeated = _turn(1, "The new bike lights I installed cost $40.")
+    helmet = _turn(2, "My bicycle helmet cost $120.")
+    rows = {turn.turn_id: turn for turn in (first, repeated, helmet)}
+
+    ledger = build_aggregation_ledger(
+        "How much did I spend on bike expenses in total?", rows, tuple(rows))
+
+    assert ledger is not None
+    assert ledger.text.count("$40") >= 2
+    assert not ledger.result_certified
+    assert "possible_duplicate_group" not in ledger.text
+
+
+def test_ledger_certifies_closed_age_and_weekly_class_arithmetic() -> None:
+    age_turns = (
+        _turn(0, "I just turned 32."),
+        _turn(1, "My mom is 55 and my dad is 58."),
+        _turn(2, "My grandma is 75 and my grandpa is 78."),
+    )
+    ages = {turn.turn_id: turn for turn in age_turns}
+    age_ledger = build_aggregation_ledger(
+        "What is the average age of me, my parents, and my grandparents?",
+        ages, tuple(ages))
+    assert age_ledger is not None
+    assert age_ledger.result_certified
+    assert age_ledger.deterministic_result == "59.6 years"
+
+    money_turns = (
+        _turn(0, "I replaced the bike chain and it cost $25. I installed bike lights for $40."),
+        _turn(1, "The bike lights I installed were $40."),
+        _turn(2, "I bought my bicycle helmet for $120."),
+    )
+    money = {turn.turn_id: turn for turn in money_turns}
+    money_ledger = build_aggregation_ledger(
+        "How much money did I spend on bike expenses in total?", money, tuple(money))
+    assert money_ledger is not None
+    assert not money_ledger.result_certified
+    assert not money_ledger.deterministic_result
+
+    class_turns = (
+        _turn(0, "I attend Hip Hop Abs on Saturdays."),
+        _turn(1, "I take Zumba classes on Tuesdays and Thursdays."),
+        _turn(2, "I take a BodyPump class on Mondays."),
+        _turn(3, "I attend yoga classes on Sundays."),
+    )
+    classes = {turn.turn_id: turn for turn in class_turns}
+    class_ledger = build_aggregation_ledger(
+        "How many fitness classes do I attend in a typical week?",
+        classes, tuple(classes))
+    assert class_ledger is not None
+    assert class_ledger.result_certified
+    assert class_ledger.deterministic_result == "5"
+
+
+def test_certified_aggregation_bypasses_the_answer_model(tmp_path) -> None:
+    store = _store(tmp_path, [
+        "I just turned 32.",
+        "My mom is 55 and my dad is 58.",
+        "My grandma is 75 and my grandpa is 78.",
+    ])
+    client = _FakeClient("wrong")
+    stage = _stage(
+        store, client,
+        answer_config=AnswerConfig(aggregation_ledger_enabled=True))
+    result = _result([turn.turn_id for turn in store.turns("m")])
+
+    answer = stage.answer(
+        "q1", "What is the average age of me, my parents, and my grandparents?",
+        result, QueryBudget())
+
+    assert answer.prediction == "59.6 years"
+    assert answer.finish_reason == "deterministic"
+    assert not client.requests
+    assert answer.trace["deterministic_bypass_source"] == "aggregation_ledger"
+    store.close()
 
 
 # --- stage --------------------------------------------------------------------

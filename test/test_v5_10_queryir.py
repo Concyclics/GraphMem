@@ -15,8 +15,10 @@ from graphmem.domain import (
     TemporalKey,
 )
 from graphmem.retrieval.executor import inspect_execution
+from graphmem.retrieval.navigator import exact_lookup_eligible
 from graphmem.retrieval.query_ir import QueryIR
 from graphmem.retrieval.scheduler import execute
+from graphmem.retrieval.slots import QuerySlots
 from graphmem.runtime import GraphReadView
 
 
@@ -59,6 +61,24 @@ def test_obligation_aware_scheduler_prioritizes_state_relation_in_beam() -> None
     assert directed.proof[0].relation == RelationType.CONTRADICTION_UPDATE
 
 
+def test_exact_lookup_gate_excludes_plural_and_preference_plans() -> None:
+    operand = OperandSpec("o1", owner_aliases=("alice",))
+    obligation = ProofObligation("need-value", "o1", "value")
+    scalar = QueryIR(
+        "Where did Alice buy the camera?", QueryOperator.LOOKUP,
+        (operand,), (obligation,), slots=QuerySlots())
+    plural = QueryIR(
+        "What places did Alice visit?", QueryOperator.LOOKUP,
+        (operand,), (obligation,), slots=QuerySlots(expects_multiple=True))
+    preference = QueryIR(
+        "What book should Alice read?", QueryOperator.LOOKUP,
+        (operand,), (obligation,), slots=QuerySlots())
+
+    assert exact_lookup_eligible(scalar)
+    assert not exact_lookup_eligible(plural)
+    assert not exact_lookup_eligible(preference)
+
+
 def test_relation_mask_metadata_prioritizes_matching_coarse_edge() -> None:
     view = GraphReadView(
         (_node("seed", "Alice"), _node("lexical", "currently"),
@@ -79,6 +99,58 @@ def test_relation_mask_metadata_prioritizes_matching_coarse_edge() -> None:
         preferred_relations=(RelationType.COARSE_RELATED,))
 
     assert result.proof[0].edge_id == "e-masked"
+
+
+def test_relation_witness_prunes_same_type_edge_for_wrong_entity() -> None:
+    nodes = (
+        _node("seed", "current address"),
+        _node("alice", "Alice address history"),
+        _node("bob", "Bob address history"),
+    )
+    edges = (
+        _edge(
+            "e-bob", RelationType.COARSE_RELATED, "bob",
+            'relation_mask:state_compatible|relation_witness:{"state_compatible":["bob\\u001flives in"]}'),
+        _edge(
+            "e-alice", RelationType.COARSE_RELATED, "alice",
+            'relation_mask:state_compatible|relation_witness:{"state_compatible":["alice\\u001flives in"]}'),
+    )
+    ir = QueryIR(
+        "Where does Alice currently live?", QueryOperator.LATEST_STATE,
+        (OperandSpec("o1", owner_aliases=("alice",),
+                     predicate_candidates=("lives in",)),),
+        (ProofObligation("need-history", None, "state_history"),))
+    budget = QueryBudget(
+        max_hops=1, max_visited_nodes=2, max_visited_edges=1,
+        max_frontier=4, max_seed_nodes=1)
+
+    result = execute(
+        GraphReadView(nodes, edges), ir, ("seed",), budget,
+        structured=True, expansion_beam=1,
+        preferred_relations=(RelationType.COARSE_RELATED,))
+
+    assert result.visited_node_ids == ("seed", "alice")
+    assert result.proof[0].edge_id == "e-alice"
+
+
+def test_relation_mask_without_witness_remains_backward_compatible() -> None:
+    view = GraphReadView(
+        (_node("seed", "Alice"), _node("state", "new address")),
+        (_edge("e-state", RelationType.COARSE_RELATED, "state",
+               "relation_mask:state_compatible"),))
+    ir = QueryIR(
+        "Where does Alice currently live?", QueryOperator.LATEST_STATE,
+        (OperandSpec("o1", owner_aliases=("alice",)),),
+        (ProofObligation("need-history", None, "state_history"),))
+    budget = QueryBudget(
+        max_hops=1, max_visited_nodes=2, max_visited_edges=1,
+        max_frontier=2, max_seed_nodes=1)
+
+    result = execute(
+        view, ir, ("seed",), budget, structured=True, expansion_beam=1,
+        preferred_relations=(RelationType.COARSE_RELATED,))
+
+    assert result.visited_node_ids == ("seed", "state")
 
 
 def test_typed_region_arrival_descends_to_fact_on_second_hop() -> None:

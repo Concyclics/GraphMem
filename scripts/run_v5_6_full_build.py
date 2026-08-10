@@ -174,10 +174,12 @@ def main() -> None:
 
     started = time.perf_counter()
     prior_report_rows: list[dict] = []
+    prior_report_summary: dict = {}
     if args.report.exists():
         try:
-            prior_report_rows = list(json.loads(args.report.read_text(
-                encoding="utf-8")).get("rows", ()))
+            prior_payload = json.loads(args.report.read_text(encoding="utf-8"))
+            prior_report_rows = list(prior_payload.get("rows", ()))
+            prior_report_summary = dict(prior_payload.get("summary", {}))
         except (OSError, ValueError, TypeError):
             prior_report_rows = []
     results: list[dict] = []
@@ -343,12 +345,20 @@ def main() -> None:
     diagnostics_by_memory.update({str(row["memory_id"]): row for row in results})
     all_build_rows = [diagnostics_by_memory[memory_id]
                       for memory_id in wanted if memory_id in diagnostics_by_memory]
+    prior_preexisting = int(prior_report_summary.get(
+        "memories_preexisting", len(built)))
+    prior_built = int(prior_report_summary.get("memories_built", 0))
+    cumulative_built = min(
+        max(0, len(wanted) - prior_preexisting), prior_built + len(results))
     report = {
         "config": str(args.config), "config_hash": config_hash(config),
         "target_db": str(args.target_db),
-        "memories_total": len(wanted), "memories_preexisting": len(built),
-        "memories_built": len(results), "failures": failures,
-        "wall_minutes": round((time.perf_counter() - started) / 60, 1),
+        "memories_total": len(wanted),
+        "memories_preexisting": prior_preexisting,
+        "memories_built": cumulative_built, "failures": failures,
+        "wall_minutes": round(
+            float(prior_report_summary.get("wall_minutes", 0.0))
+            + (time.perf_counter() - started) / 60, 1),
         "tokens_per_memory": token_stats["total"],
         "build_token_stats": token_stats,
         "tokens_total": sum(row["total_tokens"] for row in ledger),

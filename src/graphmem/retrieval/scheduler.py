@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from typing import Mapping
 
 from ..domain import ProofStep, QueryBudget, RelationType
-from ..text import content_terms
+from ..text import content_terms, normalize_key
 from .query_ir import QueryIR
 
 
@@ -115,15 +117,98 @@ def _obligation_relation_bonus(ir: QueryIR, relation: RelationType, *,
 
 def _relation_mask_signals(source: str) -> frozenset[str]:
     prefix = "relation_mask:"
-    return (frozenset(source[len(prefix):].split(","))
-            if source.startswith(prefix) else frozenset())
+    for component in source.split("|"):
+        if component.startswith(prefix):
+            return frozenset(filter(None, component[len(prefix):].split(",")))
+    return frozenset()
+
+
+def _relation_witnesses(source: str) -> Mapping[str, tuple[str, ...]]:
+    prefix = "relation_witness:"
+    for component in source.split("|"):
+        if not component.startswith(prefix):
+            continue
+        try:
+            row = json.loads(component[len(prefix):])
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(row, dict):
+            return {}
+        return {
+            str(signal): tuple(map(str, values))
+            for signal, values in row.items()
+            if isinstance(values, list)
+        }
+    return {}
+
+
+def _query_relation_keys(ir: QueryIR) -> tuple[frozenset[str], frozenset[str]]:
+    owners = frozenset(
+        normalized for operand in ir.operands for value in operand.owner_aliases
+        if (normalized := normalize_key(value)))
+    predicates = frozenset(
+        normalized for operand in ir.operands
+        for value in operand.predicate_candidates
+        if (normalized := normalize_key(value)))
+    return owners, predicates
+
+
+def _query_matching_signals(ir: QueryIR, source: str) -> frozenset[str]:
+    """Filter keyed edge signals against their concrete QueryIR witnesses.
+
+    Old graphs have no witness payload and retain their historical behaviour.
+    New graphs reject an entity/state signal only when QueryIR supplied the
+    corresponding constraint and the edge was justified by a different key.
+    """
+
+    signals = set(_relation_mask_signals(source))
+    witnesses = _relation_witnesses(source)
+    if not signals or not witnesses:
+        return frozenset(signals)
+    owners, predicates = _query_relation_keys(ir)
+    query_terms = content_terms(ir.query)
+    if "shared_entity" in signals and owners:
+        entity_keys = {normalize_key(value) for value in
+                       witnesses.get("shared_entity", ())}
+        surface_match = any(
+            bool((key_terms := content_terms(key)))
+            and key_terms.issubset(query_terms)
+            for key in entity_keys)
+        if not owners & entity_keys and not surface_match:
+            signals.discard("shared_entity")
+    if "state_compatible" in signals and (owners or predicates):
+        state_matches = False
+        for witness in witnesses.get("state_compatible", ()):
+            entity, separator, predicate = witness.partition("\x1f")
+            entity_terms = content_terms(entity)
+            entity_ok = (not owners or normalize_key(entity) in owners
+                         or bool(entity_terms and entity_terms.issubset(
+                             query_terms)))
+            predicate_ok = (not predicates or (
+                separator and normalize_key(predicate) in predicates))
+            if entity_ok and predicate_ok:
+                state_matches = True
+                break
+        if not state_matches:
+            signals.discard("state_compatible")
+    return frozenset(signals)
+
+
+def _relation_edge_admissible(ir: QueryIR, source: str) -> bool:
+    original = _relation_mask_signals(source)
+    if not original:
+        return True
+    matched = _query_matching_signals(ir, source)
+    # An edge with an independent unkeyed signal remains a valid corridor.  A
+    # keyed-only edge for another entity/state is pruned before it spends beam.
+    return bool(matched)
 
 
 def _coarse_signal_bonus(ir: QueryIR, source: str, *,
                          rare_lexical_relations: bool = False) -> float:
     """Use V5.14 relation-mask metadata without treating it as a fact claim."""
 
-    signals = set(_relation_mask_signals(source))
+    signals = set(_query_matching_signals(ir, source))
     if not signals:
         return 0.0
     kinds = {row.kind for row in ir.proof_obligations}
@@ -299,6 +384,7 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
             scored = [(destination_priority(row), row) for row in
                       view.neighbors(
                           node_id, relation_allowed, semantic_only=True)
+                      if _relation_edge_admissible(ir, row.edge.source)
                       if (admit_rare_lexical
                           or _relation_mask_signals(row.edge.source)
                           != frozenset({"lexical_rare"}))]

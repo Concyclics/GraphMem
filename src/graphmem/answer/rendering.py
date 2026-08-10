@@ -82,6 +82,15 @@ class AnswerConfig:
     # Opt-in V5.20 answer contract for noisy graph reservoirs.  Kept separate
     # from source-time normalization so prompt-only ablations remain possible.
     precision_grounding: bool = False
+    # Add a query-ranked operand ledger after the evidence for explicit count,
+    # sum, difference, min/max and mean questions.  The ledger never invents a
+    # result when relational operand closure is uncertified.
+    aggregation_ledger_enabled: bool = False
+    aggregation_ledger_limit: int = 24
+    # Route recommendation/advice questions to a contract that treats stored
+    # preferences as constraints for synthesis rather than requiring the final
+    # recommendation itself to appear verbatim in memory.
+    preference_synthesis_enabled: bool = False
     closed_form_enabled: bool = True
     # Keep the algebraic draft available for auditing, but do not place it in
     # the answer prompt unless an experiment explicitly opts in.  A noisy
@@ -113,6 +122,8 @@ class AnswerConfig:
             raise ValueError("max_output_tokens must be None or positive")
         if self.sampling_seed < 0:
             raise ValueError("sampling_seed must be non-negative")
+        if self.aggregation_ledger_limit <= 0:
+            raise ValueError("aggregation_ledger_limit must be positive")
 
 
 @dataclass(frozen=True, slots=True)

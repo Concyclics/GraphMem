@@ -56,6 +56,10 @@ class QwenEmbeddingIndex:
         self._query_lock = threading.RLock()
         self._query_flights: dict[str, _EmbeddingFlight] = {}
         self._memory_cache: OrderedDict[str, tuple[list[str], np.ndarray]] = OrderedDict()
+        self._item_memory_cache: OrderedDict[
+            tuple[int, str, str, tuple[int, str, str]],
+            tuple[list[str], np.ndarray],
+        ] = OrderedDict()
         self._memory_cache_memories = max(1, int(memory_cache_memories))
         self._memory_lock = threading.RLock()
         self._dense_cache = (
@@ -95,6 +99,7 @@ class QwenEmbeddingIndex:
             }
         with self._memory_lock:
             values["memory_matrix_entries"] = len(self._memory_cache)
+            values["item_matrix_entries"] = len(self._item_memory_cache)
         if self._dense_cache is not None:
             values["dense_sidecar"] = self._dense_cache.stats()
         return values
@@ -368,6 +373,72 @@ class QwenEmbeddingIndex:
 
     def search(self, memory_id: str, query: str, limit: int) -> Sequence[tuple[str, float]]:
         return self.search_many(memory_id, ((query, limit),))[0]
+
+    def search_items(
+        self,
+        memory_id: str,
+        query: str,
+        item_ids: Sequence[str],
+        limit: int,
+        *,
+        source_store: SQLiteGraphStore | None = None,
+    ) -> Sequence[tuple[str, float]]:
+        """Search an immutable subset such as CanonicalFacts by dense vector.
+
+        Turn FAISS remains the normal hot path.  Exact lookup additionally uses
+        graph-node embeddings already produced during coarsening; this cached
+        NumPy projection avoids an O(number-of-nodes) Python cosine loop on every
+        request and does not create any new embedding/model cost.
+        """
+        if limit <= 0 or not item_ids:
+            return ()
+        authority = source_store or self.store
+        expected = tuple(sorted(set(str(item) for item in item_ids)))
+        signature = (
+            len(expected), expected[0] if expected else "",
+            expected[-1] if expected else "",
+        )
+        key = (id(authority), memory_id, self.model_id, signature)
+        with self._memory_lock:
+            cached = self._item_memory_cache.get(key)
+            if cached is None:
+                allowed = frozenset(expected)
+                ids: list[str] = []
+                vectors: list[np.ndarray] = []
+                for row in authority._read(
+                    "SELECT item_id,dimension,vector FROM embeddings "
+                    "WHERE memory_id=? AND model_id=? ORDER BY item_id",
+                    (memory_id, self.model_id),
+                ):
+                    item_id = str(row["item_id"])
+                    if item_id not in allowed:
+                        continue
+                    ids.append(item_id)
+                    vectors.append(np.frombuffer(
+                        row["vector"], dtype=np.float32,
+                        count=int(row["dimension"])))
+                matrix = (np.stack(vectors) if vectors
+                          else np.empty((0, 0), dtype=np.float32))
+                if matrix.size:
+                    matrix /= np.maximum(
+                        np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
+                cached = (ids, matrix)
+                self._item_memory_cache[key] = cached
+                self._item_memory_cache.move_to_end(key)
+                while len(self._item_memory_cache) > self._memory_cache_memories:
+                    self._item_memory_cache.popitem(last=False)
+            else:
+                self._item_memory_cache.move_to_end(key)
+        ids, matrix = cached
+        if not ids:
+            return ()
+        vector = self._query_vectors(memory_id, (query,))[0]
+        scores = matrix @ vector
+        count = min(limit, len(ids))
+        indices = np.argpartition(-scores, count - 1)[:count]
+        indices = sorted(
+            indices, key=lambda index: (-float(scores[index]), ids[index]))
+        return tuple((ids[index], float(scores[index])) for index in indices)
 
     def _embed(self, texts: Sequence[str]) -> tuple[list[list[float]], int, float]:
         started = time.perf_counter()

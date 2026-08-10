@@ -83,6 +83,16 @@ def frozen_semantic_request_fingerprint(stage: str, request: Mapping[str, Any]) 
     return hashlib.sha256(canonical_json(material).encode()).hexdigest()
 
 
+def _frozen_semantic_cap_signature(request: Mapping[str, Any]) -> tuple[int, ...]:
+    """Return dynamic per-scene fact caps omitted by the source fingerprint."""
+    try:
+        payload = json.loads(str(request.get("messages", ())[1].get("content", "")))
+    except (IndexError, AttributeError, TypeError, json.JSONDecodeError):
+        return ()
+    scenes = payload.get("s", ()) if isinstance(payload, dict) else ()
+    return tuple(int(row.get("k", 0)) for row in scenes if isinstance(row, dict))
+
+
 def strip_aliases(text: str) -> str:
     """Empty when the model echoed a scene or turn label instead of writing prose."""
     cleaned = " ".join(str(text).split())
@@ -1248,7 +1258,13 @@ class QwenSemanticDistiller:
         """Return a Full-arm response for the same source batch, never the API."""
         with self._frozen_cache_lock:
             if self._frozen_cache_index is None:
-                index: dict[str, Mapping[str, Any]] = {}
+                # One source batch can legitimately have cap-1 and cap-2
+                # responses: the ordinary and abstention Memories share source
+                # bytes but reached different dynamic budget states in the cold
+                # build.  The source fingerprint intentionally ignores ``k``;
+                # retain the cap signature as a deterministic secondary key
+                # instead of declaring those valid frozen responses ambiguous.
+                index: dict[str, dict[tuple[int, ...], Mapping[str, Any]]] = {}
                 rows = self.store._read(
                     "SELECT stage,request_json,response_json,usage_json "
                     "FROM llm_cache WHERE prompt_hash=?",
@@ -1262,14 +1278,28 @@ class QwenSemanticDistiller:
                         "response": json.loads(response_json),
                         "usage": json.loads(usage_json),
                     }
-                    previous = index.setdefault(fingerprint, candidate)
+                    cap_signature = _frozen_semantic_cap_signature(frozen_request)
+                    by_cap = index.setdefault(fingerprint, {})
+                    previous = by_cap.setdefault(cap_signature, candidate)
+                    # Same source *and same cap* producing different bytes is
+                    # true nondeterminism and must still fail closed.
                     if previous != candidate:
                         raise RuntimeError(
                             "ambiguous frozen semantic cache fingerprint "
-                            f"{fingerprint[:16]}")
+                            f"{fingerprint[:16]} at cap {cap_signature}")
                 self._frozen_cache_index = index
             fingerprint = frozen_semantic_request_fingerprint(stage, request)
-            return self._frozen_cache_index.get(fingerprint)
+            by_cap = self._frozen_cache_index.get(fingerprint)
+            if not by_cap:
+                return None
+            requested = _frozen_semantic_cap_signature(request)
+            if requested in by_cap:
+                return by_cap[requested]
+            # Cache timing can change the build ledger's dynamic cap even when
+            # source bytes are identical. Prefer the highest-coverage frozen
+            # response; it was already paid for and accepted by the cold build.
+            best = max(by_cap, key=lambda signature: (sum(signature), signature))
+            return by_cap[best]
 
     @staticmethod
     def _strings(value: Any) -> tuple[str, ...]:

@@ -56,6 +56,26 @@ def test_h6_packs_terminal_proof_units_and_stops_by_certificate(tmp_path: Path) 
     assert all(unit.source_turn_ids for unit in result.proof_units)
 
 
+def test_guarded_exact_lookup_skips_graph_and_caps_evidence(tmp_path: Path) -> None:
+    store = _semantic_store(tmp_path / "graph.sqlite")
+    result = GraphNavigator(
+        store,
+        harness_profile=HarnessProfile.H11_UNIFIED_IR,
+        native_seed_fusion=True,
+        obligation_aware_packing=True,
+        exact_lookup_fast_path=True,
+        exact_lookup_turn_limit=1,
+    ).navigate(
+        "travel", "Where did Alice book the Paris train?",
+        QueryBudget(max_evidence_turns=32, max_evidence_tokens=2_000),
+    )
+
+    assert result.trace["execution_mode"] == "exact_lookup"
+    assert result.trace["exact_lookup"]["confident"] is True
+    assert result.visited_edges == 0
+    assert len(result.retrieved_turn_ids) <= 1
+
+
 def test_intersection_requires_a_witness_from_each_operand() -> None:
     rows = (
         FactBinding("a", "left", "f1", "o1", "volunteer", "", "shelter", None, None, ("g1",)),

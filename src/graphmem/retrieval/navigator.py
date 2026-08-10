@@ -22,6 +22,7 @@ from ..domain import (
     NodeType,
     ProofStep,
     QueryBudget,
+    QueryOperator,
     RelationType,
     SourceTurn,
     stable_id,
@@ -66,6 +67,9 @@ TIME_TERMS = frozenset({
     "before", "after", "first", "last", "later", "earlier", "during", "until",
     "since", "when", "date", "day", "week", "month", "year", "long", "duration",
 })
+PREFERENCE_QUERY_RE = re.compile(
+    r"\b(?:recommend|suggest|likely|prefer|favorite|favourite|should|"
+    r"would\s+(?:like|enjoy)|good\s+fit)\b", re.I)
 
 
 class NavigatorVariant(StrEnum):
@@ -118,6 +122,8 @@ FUSION_DEFAULTS: dict[str, float] = {
 
 
 DenseSearch = Callable[[str, str, int], Sequence[tuple[str, float]]]
+FactDenseSearch = Callable[
+    [str, str, Sequence[str], int], Sequence[tuple[str, float]]]
 
 
 def terms(text: str) -> tuple[str, ...]:
@@ -151,6 +157,105 @@ def question_slots(query: str) -> tuple[str, tuple[str, ...], bool]:
     return "fact", ("subject", "predicate", "object"), negative
 
 
+def exact_lookup_eligible(ir) -> bool:
+    """Whether a plan may take the guarded direct-evidence route.
+
+    ``LOOKUP`` alone is not enough: the compiler deliberately represents some
+    plural or recommendation questions as a lookup.  Those require collection
+    closure or preference synthesis and must retain the normal graph path.
+    Date-qualified scalar questions remain eligible; a date is often the most
+    discriminating lexical key for LoCoMo single-hop evidence.
+    """
+    slots = getattr(ir, "slots", None)
+    return bool(
+        ir.operator == QueryOperator.LOOKUP
+        and len(ir.operands) == 1
+        and not bool(getattr(slots, "expects_multiple", False))
+        and not bool(getattr(slots, "is_count", False))
+        and not bool(getattr(slots, "is_duration", False))
+        and not bool(getattr(slots, "is_latest", False))
+        and not PREFERENCE_QUERY_RE.search(ir.query)
+    )
+
+
+def _weighted_term_coverage(
+    query_terms: frozenset[str], candidate_terms: frozenset[str],
+    turn_index: TurnSearchIndex,
+) -> float:
+    """IDF-weighted query coverage on immutable per-memory postings."""
+    if not query_terms:
+        return 0.0
+    total = max(1, len(turn_index.turns))
+    weights = {
+        term: math.log(1.0 + total / (1.0 + len(turn_index.postings.get(term, ()))))
+        for term in query_terms
+    }
+    denominator = sum(weights.values())
+    return (sum(weight for term, weight in weights.items()
+                if term in candidate_terms) / denominator
+            if denominator else 0.0)
+
+
+def _exact_lookup_ranking(
+    seeded,
+    turn_index: TurnSearchIndex,
+    query: str,
+    direct_fact_turn_scores: Mapping[str, float],
+) -> tuple[dict[str, float], bool, dict[str, object]]:
+    """Score and gate the exact-lookup route without an LLM reranker.
+
+    A high normalized dense score by itself is unsafe because every query has a
+    top dense result.  The route only fires when a source turn covers specific
+    (IDF-weighted) query terms and is corroborated by another retrieval channel
+    or by a CanonicalFact carrying source provenance.  A miss therefore falls
+    back to the ordinary hierarchical traversal rather than losing recall.
+    """
+    query_terms = content_terms(query)
+    entry_by_turn = {row.turn_id: row for row in seeded.reservoir}
+    candidates = tuple(dict.fromkeys((
+        *seeded.source_turn_ids, *direct_fact_turn_scores.keys())))
+    scores: dict[str, float] = {}
+    details: dict[str, tuple[float, int, float]] = {}
+    for turn_id in candidates:
+        turn_terms = turn_index.turn_terms.get(turn_id, frozenset())
+        coverage = _weighted_term_coverage(query_terms, turn_terms, turn_index)
+        entry = entry_by_turn.get(turn_id)
+        support = sum(
+            1 for rank in (entry.ranks.values() if entry is not None else ())
+            if rank <= 16)
+        channel_peak = max(
+            (float(value) for value in entry.scores.values()), default=0.0
+        ) if entry is not None else 0.0
+        fact_score = float(direct_fact_turn_scores.get(turn_id, 0.0))
+        score = (
+            1.40 * coverage
+            + 0.25 * min(3, support)
+            + 0.65 * fact_score
+            + 0.20 * channel_peak
+        )
+        scores[turn_id] = score
+        details[turn_id] = (coverage, support, fact_score)
+    ordered = sorted(scores, key=lambda turn_id: (-scores[turn_id], turn_id))
+    top_id = ordered[0] if ordered else ""
+    coverage, support, fact_score = details.get(top_id, (0.0, 0, 0.0))
+    # The threshold is intentionally a conjunction.  It excludes topical dense
+    # neighbours with no exact lexical support and owner-only fact floods.
+    confident = bool(
+        top_id
+        and coverage >= 0.30
+        and scores[top_id] >= 1.10
+        and (support >= 2 or (support >= 1 and fact_score >= 0.45))
+    )
+    return scores, confident, {
+        "top_turn_id": top_id,
+        "top_score": scores.get(top_id, 0.0),
+        "top_idf_coverage": coverage,
+        "top_channel_support": support,
+        "top_fact_score": fact_score,
+        "scored_turns": len(scores),
+    }
+
+
 class GraphNavigator:
     def __init__(
         self,
@@ -159,6 +264,7 @@ class GraphNavigator:
         variant: NavigatorVariant | str = NavigatorVariant.N5_SET_COVER,
         dense_search: DenseSearch | None = None,
         dense_search_many: DenseSearchMany | None = None,
+        fact_dense_search: FactDenseSearch | None = None,
         harness_profile: HarnessProfile | str | None = None,
         token_counter: TokenCounter | None = None,
         fact_channels: Sequence[str] | None = None,
@@ -246,6 +352,10 @@ class GraphNavigator:
         native_seed_fusion: bool = False,
         queryir_soft_fallback: bool = False,
         queryir_soft_fallback_threshold: float = 0.80,
+        #: Guarded single-fact route: direct source/fact ranking first, graph
+        #: fallback on low confidence, and a bounded evidence pack on success.
+        exact_lookup_fast_path: bool = False,
+        exact_lookup_turn_limit: int = 16,
         #: Optional trusted local directory containing versioned compiled
         #: graph/turn/provenance sidecars.  SQLite remains the authority.
         compiled_cache_dir: str | Path | None = None,
@@ -291,6 +401,7 @@ class GraphNavigator:
         self.variant = NavigatorVariant(variant)
         self.dense_search = dense_search
         self.dense_search_many = dense_search_many
+        self.fact_dense_search = fact_dense_search
         self.harness_profile = HarnessProfile(harness_profile) if harness_profile else None
         # Evidence budgets are only meaningful against the backbone's own
         # vocabulary.  The word-count estimate stays available as a labelled
@@ -318,6 +429,8 @@ class GraphNavigator:
         self.queryir_soft_fallback = queryir_soft_fallback
         self.queryir_soft_fallback_threshold = max(
             0.0, min(1.0, queryir_soft_fallback_threshold))
+        self.exact_lookup_fast_path = exact_lookup_fast_path
+        self.exact_lookup_turn_limit = max(1, exact_lookup_turn_limit)
         self.compiled_sidecar = (
             CompiledMemorySidecar(compiled_cache_dir)
             if compiled_cache_dir is not None else None)
@@ -854,6 +967,89 @@ class GraphNavigator:
                                                for alias in operand.owner_aliases))
             for operand in ir.operands
         }
+        exact_lookup_candidate = bool(
+            self.exact_lookup_fast_path and exact_lookup_eligible(ir))
+        direct_fact_ids: tuple[str, ...] = ()
+        direct_fact_turn_scores: dict[str, float] = {}
+        exact_lookup_scores: dict[str, float] = {}
+        exact_lookup_confident = False
+        exact_lookup_trace: dict[str, object] = {
+            "eligible": exact_lookup_candidate,
+            "confident": False,
+            "direct_fact_count": 0,
+            "direct_fact_turn_count": 0,
+        }
+        if exact_lookup_candidate:
+            query_content = content_terms(query)
+            strict_fact_ids: list[str] = []
+            for operand in ir.operands:
+                operand_owners = tuple(sorted(owners.get(operand.operand_id, ())))
+                # An owner-only posting is not exact: on LoCoMo it expands one
+                # speaker to hundreds of facts.  Require the composite key here;
+                # the lexical fact index below remains the owner-parser fallback.
+                if operand_owners and operand.predicate_candidates:
+                    strict_fact_ids.extend(view.lookup_facts(
+                        owner_ids=operand_owners,
+                        predicates=operand.predicate_candidates,
+                        limit=12,
+                        rank_terms=query_content))
+            lexical_fact_ids = view.facts_for_terms(query_content, limit=16)
+            dense_fact_rows = (
+                self.fact_dense_search(
+                    memory_id, query,
+                    tuple(node.node_id for node in view.nodes.values()
+                          if node.node_type == NodeType.CANONICAL_FACT),
+                    24)
+                if self.fact_dense_search is not None else ())
+            dense_fact_scores = {
+                fact_id: max(
+                    0.0,
+                    1.0 - rank / max(24, len(dense_fact_rows)),
+                ) * 0.8 + max(0.0, min(1.0, float(similarity))) * 0.2
+                for rank, (fact_id, similarity) in enumerate(
+                    dense_fact_rows)
+            }
+            direct_fact_ids = tuple(dict.fromkeys((
+                *(fact_id for fact_id, _score in dense_fact_rows),
+                *strict_fact_ids, *lexical_fact_ids)))
+            strict_fact_set = frozenset(strict_fact_ids)
+            _groups_by_turn, direct_group_turns, _members = (
+                self._evidence_indexes(memory_id, view.graph_version))
+            for fact_id in direct_fact_ids:
+                node = view.nodes.get(fact_id)
+                if node is None:
+                    continue
+                attrs = node.attributes
+                surface = content_terms(
+                    node.summary + " " + " ".join(
+                        str(attrs.get(key, "")) for key in (
+                            "owner_id", "predicate", "value", "scope",
+                            "collection_key")))
+                fact_score = _weighted_term_coverage(
+                    query_content, surface, turn_index)
+                fact_score = max(
+                    fact_score, dense_fact_scores.get(fact_id, 0.0))
+                if fact_id in strict_fact_set:
+                    fact_score += 0.20
+                for group_id in view.terminal_groups_for_nodes((fact_id,)):
+                    for turn_id in direct_group_turns.get(group_id, ()):
+                        direct_fact_turn_scores[turn_id] = max(
+                            direct_fact_turn_scores.get(turn_id, 0.0),
+                            fact_score)
+            exact_lookup_scores, exact_lookup_confident, ranking_trace = (
+                _exact_lookup_ranking(
+                    seeded, turn_index, query, direct_fact_turn_scores))
+            exact_lookup_trace.update({
+                **ranking_trace,
+                "confident": exact_lookup_confident,
+                "direct_fact_count": len(direct_fact_ids),
+                "direct_fact_turn_count": len(direct_fact_turn_scores),
+                "dense_fact_count": len(dense_fact_rows),
+                "direct_fact_turn_ids": tuple(sorted(
+                    direct_fact_turn_scores)),
+                "dense_fact_ids": tuple(
+                    fact_id for fact_id, _score in dense_fact_rows),
+            })
         initial_bindings = bind_facts(view, owners, ir.operands, semantic_seeds)
         initial_closure = evaluate_algebra(ir.operator, initial_bindings, (item.operand_id for item in ir.operands),
                                            distinct_by=ir.distinct_by, collection_complete=False)
@@ -865,7 +1061,12 @@ class GraphNavigator:
         # flag over "the operand has at least one binding" and was measured not to
         # predict correctness at all (rho=+0.103, CI [-0.04,+0.25]), so it is a
         # weak signal being used to switch off the graph.  Settable for ablation.
-        if (self.skip_traversal_on_certificate
+        if exact_lookup_confident:
+            schedule = ScheduleResult(semantic_seeds, (), {}, {
+                "node_cap_reached": False, "edge_cap_reached": False,
+                "hop_cap_reached": False, "frontier_truncated": False,
+            }, {node_id: 0 for node_id in semantic_seeds})
+        elif (self.skip_traversal_on_certificate
                 and profile in {HarnessProfile.H5_ALGEBRA, HarnessProfile.H6_PROOF_PACKING,
                                 HarnessProfile.H8_RESERVOIR,
                                 HarnessProfile.H9_FACT_RESERVOIR}
@@ -895,7 +1096,9 @@ class GraphNavigator:
                                                                  *(ast_profiles
                                                                    if self.h10_traversal else set())})
         stage_times["graph_read_view"] = (time.perf_counter() - tick) * 1000
-        fact_ids = set(semantic_seeds) | set(schedule.visited_node_ids) | set(direct_owner_terminals)
+        fact_ids = (set(semantic_seeds) | set(schedule.visited_node_ids)
+                    | set(direct_owner_terminals)
+                    | (set(direct_fact_ids) if exact_lookup_confident else set()))
         fact_reservoir = None
         if fact_reservoir_enabled:
             # Facts the narrow path already reached are the precision core and are
@@ -1243,7 +1446,9 @@ class GraphNavigator:
             fused = ((w["exact"] * exact + w["bm25"] * bm25 + w["dense"] * dense
                       + w["graph"] * graph + w["binding"] * bscore + operand_gain
                       + w["role"] * role_gain + w["slot"] * slot_gain
-                      + w["session"] * session_score + w["adjacency"] * adjacency_score)
+                      + w["session"] * session_score + w["adjacency"] * adjacency_score
+                      + (exact_lookup_scores.get(turn_id, 0.0)
+                         if exact_lookup_confident else 0.0))
                      if wide_reservoir else
                      (exact + bm25 + dense + w["graph"] * graph + w["binding"] * bscore
                       + operand_gain))
@@ -1274,14 +1479,20 @@ class GraphNavigator:
         # "missing profile" fix cost 11pp of LoCoMo accuracy (0.823 -> 0.714);
         # `rank_mandatory=True` recovers 0.808 by restoring exactly the ordering
         # `_rank_pack` already had.
+        effective_turn_limit = (
+            min(budget.max_evidence_turns, self.exact_lookup_turn_limit)
+            if exact_lookup_confident else budget.max_evidence_turns)
+        effective_budget = replace(
+            budget, max_evidence_turns=effective_turn_limit)
         if self.obligation_aware_packing:
             answer_kind = (algebra_result.answer_kind if algebra_result is not None
                            else str(ir.ast_operator or ir.operator))
             pack_turn_limit = (
-                adaptive_evidence_turn_limit(
-                    answer_kind, len(ir.operands), budget.max_evidence_turns,
-                    query=query)
-                if self.precision_aware_packing else budget.max_evidence_turns)
+                effective_turn_limit if exact_lookup_confident else (
+                    adaptive_evidence_turn_limit(
+                        answer_kind, len(ir.operands), budget.max_evidence_turns,
+                        query=query)
+                    if self.precision_aware_packing else budget.max_evidence_turns))
             pack_budget = replace(budget, max_evidence_turns=pack_turn_limit)
             baseline_floor, _baseline_dropped, _baseline_coverage = self._rank_pack(
                 rows, by_id, pack_budget, self.per_session_quota,
@@ -1299,20 +1510,21 @@ class GraphNavigator:
         elif profile in {HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
                        HarnessProfile.H9_FACT_RESERVOIR}:
             packed, dropped, pack_exhaustion = pack_proof_units(units, rows, by_id,
-                                                                 max_turns=budget.max_evidence_turns,
+                                                                 max_turns=effective_turn_limit,
                                                                  max_tokens=budget.max_evidence_tokens,
                                                                  token_cost=self._turn_tokens,
                                                                  rank_mandatory=self.rank_mandatory)
         else:
             if self.harness_set_cover:
                 kind, required_slots, _negative = question_slots(query)
-                packed, dropped, _cover = self._set_cover(rows, by_id, kind, required_slots, budget)
+                packed, dropped, _cover = self._set_cover(
+                    rows, by_id, kind, required_slots, effective_budget)
             else:
                 packed, dropped, _ = self._rank_pack(
-                    rows, by_id, budget, self.per_session_quota,
+                    rows, by_id, effective_budget, self.per_session_quota,
                     reserved_turn_ids=raw_fallback_set,
                     reserve_limit=self.raw_fallback_reserve)
-            pack_exhaustion = {"turn_cap_reached": len(packed) >= budget.max_evidence_turns,
+            pack_exhaustion = {"turn_cap_reached": len(packed) >= effective_turn_limit,
                                "token_cap_reached": sum(self._turn_tokens(by_id[item]) for item in packed) >= budget.max_evidence_tokens}
         stage_times["evidence_pack"] = (time.perf_counter() - tick) * 1000
         tick = time.perf_counter()
@@ -1377,6 +1589,10 @@ class GraphNavigator:
                    "native_seed_fusion": self.native_seed_fusion,
                    "span_pack_window": self.span_pack_window,
                    "precision_aware_packing": self.precision_aware_packing,
+                   "exact_lookup_fast_path": self.exact_lookup_fast_path,
+                   "exact_lookup": exact_lookup_trace,
+                   "execution_mode": ("exact_lookup" if exact_lookup_confident
+                                      else "hierarchical_graph"),
                    "raw_fallback_reserve": self.raw_fallback_reserve,
                    "raw_fallback_candidates": sum(
                        row.turn_id in raw_fallback_set for row in rows),

@@ -41,6 +41,8 @@ from .canonicalize import PredicateCanonicalizer
 
 WORD_RE = re.compile(r"[\w'-]+", re.UNICODE)
 CAPITAL_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
+ENTITY_MENTION_RE = re.compile(
+    r"\b(?:[A-Z]{2,}|[A-Z][a-z]+)(?:[ '\u2019-]+(?:[A-Z]{2,}|[A-Z][a-z]+)){0,3}\b")
 NON_ENTITY_NAMES = frozenset({
     "the", "this", "that", "these", "those", "there", "then", "when", "what",
     "where", "which", "while", "with", "without", "after", "before", "however",
@@ -55,6 +57,9 @@ EVIDENCE_REF_STOPWORDS = NON_ENTITY_NAMES | frozenset({
     "will", "would", "you", "your", "about", "could", "should", "because", "been",
     "are", "was", "is", "am", "can", "did", "does", "do", "of", "to", "in", "on",
     "at", "it", "my", "me", "we", "our", "a", "an", "i",
+    "how", "why", "who", "no", "not", "use",
+    "all", "last", "take", "one", "individual", "individuals", "option",
+    "metrics", "countries", "chapter",
 })
 TIME_RE = re.compile(
     r"\b(?:\d{1,2}[:/]\d{1,2}(?:[:/]\d{2,4})?|\d{4}|monday|tuesday|wednesday|"
@@ -421,6 +426,11 @@ class GraphBuildPipeline:
                     (left_id, right_id), ())
                 relation_source = ("relation_mask:" + ",".join(signals)
                                    if signals else "cir_high_confidence")
+                witnesses = gated_plan.accepted_pair_witnesses.get(
+                    (left_id, right_id), {})
+                if witnesses:
+                    relation_source += "|relation_witness:" + canonical_json(
+                        witnesses)
                 edges.append(GraphEdge(
                     stable_id("edge", memory_id, left_id,
                               RelationType.COARSE_RELATED, right_id),
@@ -432,6 +442,11 @@ class GraphBuildPipeline:
                 left, right = node_map[left_id], node_map[right_id]
                 relation_group_ids = tuple(dict.fromkeys((
                     left.evidence_group_id, right.evidence_group_id)))
+                typed_witnesses = gated_plan.typed_pair_witnesses.get(
+                    (left_id, right_id, str(relation)), {})
+                if typed_witnesses:
+                    source += "|relation_witness:" + canonical_json(
+                        typed_witnesses)
                 edges.append(GraphEdge(
                     stable_id("edge", memory_id, left_id, relation, right_id),
                     memory_id, left_id, relation, right_id,
@@ -468,17 +483,26 @@ class GraphBuildPipeline:
                 left = node_map[left_id]; right = node_map[right_id]
                 evidence_groups = tuple(dict.fromkeys((
                     left.evidence_group_id, right.evidence_group_id)))
+                refine_source = (
+                    decision.source + "|relation_mask:" + ",".join(
+                        gated_plan.refine_candidate_signals.get(
+                            decision.candidate_id, ()))
+                    if gated_plan is not None and
+                    gated_plan.refine_candidate_signals.get(
+                        decision.candidate_id) else decision.source)
+                refine_witnesses = (
+                    gated_plan.refine_candidate_witnesses.get(
+                        decision.candidate_id, {})
+                    if gated_plan is not None else {})
+                if refine_witnesses:
+                    refine_source += "|relation_witness:" + canonical_json(
+                        refine_witnesses)
                 edges.append(GraphEdge(
                     stable_id("edge", memory_id, left_id, relation, right_id),
                     memory_id, left_id, relation, right_id,
                     evidence_groups[0], relation in DIRECTIONAL_REFINED_RELATIONS,
                     decision.confidence,
-                    (decision.source + "|relation_mask:" + ",".join(
-                        gated_plan.refine_candidate_signals.get(
-                            decision.candidate_id, ()))
-                     if gated_plan is not None and
-                     gated_plan.refine_candidate_signals.get(
-                         decision.candidate_id) else decision.source),
+                    refine_source,
                     evidence_groups[1:],
                 ))
             usage_after = self._usage(memory_id)
@@ -900,10 +924,46 @@ class GraphBuildPipeline:
                 nodes.setdefault(owner_id, GraphNode(
                     owner_id, memory_id, NodeType.CANONICAL_ENTITY, 0, fact.owner,
                     groups[0], groups[1:], entity_id=owner_id,
-                    attributes={"aliases": (fact.owner,), "roles": ("entity", "owner", "route"),
+                    attributes={"aliases": (fact.owner,),
+                                "entities": (owner_key,),
+                                "relation_entity_roles": {"owner": (owner_key,)},
+                                "roles": ("entity", "owner", "route"),
                                 "provenance_scope": "route"}))
                 observed = observed_interval(source_turn.timestamp, source_turn.turn_id)
                 evidence_text = source_turn.raw_text[refs[0][1]:refs[0][2]]
+                relation_entities: dict[str, set[str]] = {
+                    "owner": {owner_key} if owner_key else set(),
+                    "object": set(),
+                }
+                fact_surface = " ".join((
+                    str(fact.predicate), str(fact.value), evidence_text))
+                normalized_surface = f" {self._normal(fact_surface)} "
+                for entity in packet.entities:
+                    entity_key = self._normal(entity)
+                    if (entity_key and entity_key != owner_key
+                            and entity_key not in EVIDENCE_REF_STOPWORDS
+                            and entity_key not in {"am", "pm"}
+                            and f" {entity_key} " in normalized_surface):
+                        relation_entities["object"].add(entity_key)
+                # Frozen extraction caches may predate the scene-entity field.
+                # Recover only source-grounded named phrases from the cited
+                # span/value; never promote an arbitrary full value to an entity.
+                for surface in (str(fact.value), evidence_text):
+                    for match in ENTITY_MENTION_RE.finditer(surface):
+                        mention = match.group(0)
+                        entity_key = self._normal(mention)
+                        if (not entity_key or entity_key == owner_key
+                                or entity_key in EVIDENCE_REF_STOPWORDS
+                                or entity_key in {"am", "pm"}
+                                or (match.end() < len(surface)
+                                    and surface[match.end()] in {"'", "\u2019"})
+                                or (" " not in mention and len(mention) <= 2
+                                    and not mention.isupper())
+                                or len(entity_key) > 64):
+                            continue
+                        relation_entities["object"].add(entity_key)
+                object_entities = tuple(sorted(
+                    relation_entities["object"])[:16])
                 # Modality must describe this fact, not a nearby sentence in the
                 # same turn. Neighbour context caused completed events to inherit
                 # unrelated phrases such as "would love to".
@@ -915,7 +975,14 @@ class GraphBuildPipeline:
                             if profile.edges.temporal_normalization and explicit_time else None)
                 fact_id = stable_id("node", memory_id, "lean-fact", owner_key, predicate_key,
                                     value_key, scope_key, fact.polarity, tuple(refs))
-                attrs = {"owner_id": owner_id, "predicate": predicate_key, "value": fact.value,
+                attrs = {"owner_id": owner_id,
+                         "entities": tuple(filter(None, (
+                             owner_key, *object_entities))),
+                         "relation_entity_roles": {
+                             role: tuple(sorted(values))
+                             for role, values in relation_entities.items()
+                             if values},
+                         "predicate": predicate_key, "value": fact.value,
                          "value_key": value_key, "value_type": fact.value_type, "scope": scope_key,
                          "polarity": fact.polarity, "scene_id": packet.scene_id,
                          "information_unit_ids": fact.information_unit_ids,
@@ -992,7 +1059,11 @@ class GraphBuildPipeline:
                 (f"{modality} " if modality != "asserted" else "") + f"{predicate} " +
                 " ".join(str(row[0].attributes["value"]) for row in ordered[:8]),
                 evidence[0], evidence[1:], attributes={
-                    "owner_id": owner_id, "predicate": predicate, "scope": scope,
+                    "owner_id": owner_id,
+                    "entities": (self._normal(nodes[owner_id].summary),),
+                    "relation_entity_roles": {
+                        "owner": (self._normal(nodes[owner_id].summary),)},
+                    "predicate": predicate, "scope": scope,
                     "collection_key": collection_key,
                     "polarity": polarity, "modality": modality,
                     "member_count": len(ordered),
@@ -1009,7 +1080,11 @@ class GraphBuildPipeline:
                     state_id, memory_id, NodeType.STATE_HEAD, 0,
                     f"{nodes[owner_id].summary} {predicate} {ordered[-1][0].attributes['value']}",
                     evidence[0], evidence[1:], state=str(ordered[-1][0].attributes["value"]),
-                    attributes={"owner_id": owner_id, "predicate": predicate, "scope": scope,
+                    attributes={"owner_id": owner_id,
+                                "entities": (self._normal(nodes[owner_id].summary),),
+                                "relation_entity_roles": {
+                                    "owner": (self._normal(nodes[owner_id].summary),)},
+                                "predicate": predicate, "scope": scope,
                                 "roles": ("prior_state", "current_state"),
                                 "polarity": polarity, "modality": modality,
                                 "provenance_scope": "terminal",

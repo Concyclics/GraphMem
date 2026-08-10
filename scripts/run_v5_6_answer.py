@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from graphmem.answer import AnswerConfig, AnswerStage, prompt_contract  # noqa: E402
+from graphmem.answer.aggregation import AGGREGATION_LEDGER_SCHEMA_VERSION  # noqa: E402
 from graphmem.config import config_hash, load_config  # noqa: E402
 from graphmem.domain import dataclass_dict  # noqa: E402
 from graphmem.embedding import QwenEmbeddingIndex  # noqa: E402
@@ -103,6 +104,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding", action="store_true")
     parser.add_argument("--embedding-db", type=Path,
                         help="read turn vectors from a separate immutable SQLite sidecar")
+    parser.add_argument(
+        "--relation-embedding-db", type=Path,
+        help=("read existing graph-node vectors for exact CanonicalFact search; "
+              "no new build or embedding calls are performed"))
     parser.add_argument("--dense-sidecar-dir", type=Path,
                         help="versioned per-memory FAISS/NumPy turn-vector indexes")
     parser.add_argument("--dense-backend",
@@ -123,13 +128,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--native-seed-fusion", action="store_true")
     parser.add_argument("--queryir-soft-fallback", action="store_true")
     parser.add_argument("--queryir-soft-fallback-threshold", type=float, default=0.80)
+    parser.add_argument(
+        "--exact-lookup-fast-path", action="store_true",
+        help=("guard scalar LOOKUP queries with direct source/fact confidence; "
+              "low-confidence requests retain hierarchical graph traversal"))
+    parser.add_argument(
+        "--exact-lookup-turn-limit", type=int, default=16,
+        help="maximum evidence turns after a high-confidence direct lookup")
     parser.add_argument("--source-time-normalization", action="store_true",
                         help="experimental: materialize source-anchored relative time in evidence")
     parser.add_argument("--precision-grounded-prompt", action="store_true",
                         help="use the opt-in V5.20 direct-evidence answer contract")
+    parser.add_argument("--aggregation-ledger", action="store_true",
+                        help="append a structured operand ledger for aggregation queries")
+    parser.add_argument("--aggregation-ledger-limit", type=int, default=24,
+                        help="maximum packed source turns indexed in an aggregation ledger")
+    parser.add_argument(
+        "--preference-synthesis-prompt", action="store_true",
+        help=("route advice/recommendation wording to a grounded synthesis "
+              "contract without using benchmark labels"))
     parser.add_argument("--obligation-aware-relations", action="store_true")
     parser.add_argument("--graph-hop-decay", type=float, default=1.0)
     parser.add_argument("--expansion-beam", type=int, default=4)
+    parser.add_argument(
+        "--hierarchy-descent-beam", type=int, default=1,
+        help=("number of structurally reranked children retained at each level "
+              "after a relation edge enters a new coarse region"))
     parser.add_argument(
         "--rare-lexical-relations", action="store_true",
         help=("admit lexical_rare-only coarse edges and their QueryIR bonus; "
@@ -227,10 +251,14 @@ def main() -> None:
         evidence_order=args.evidence_order,
         normalize_relative_time=args.source_time_normalization,
         precision_grounding=args.precision_grounded_prompt,
+        aggregation_ledger_enabled=args.aggregation_ledger,
+        aggregation_ledger_limit=args.aggregation_ledger_limit,
+        preference_synthesis_enabled=args.preference_synthesis_prompt,
         max_output_tokens=(args.max_output_tokens or None),
         sampling_seed=args.sampling_seed)
 
     embedding_store = None
+    relation_embedding_store = None
     embedding_options = {
         "record_usage": False,
         "query_cache_path": (args.query_embedding_cache
@@ -244,8 +272,21 @@ def main() -> None:
     else:
         embedding = QwenEmbeddingIndex(
             store, config, **embedding_options) if args.embedding else None
+    if args.relation_embedding_db:
+        relation_embedding_store = SQLiteGraphStore(
+            args.relation_embedding_db, read_only=True)
+        if embedding is None:
+            raise ValueError("--relation-embedding-db requires --embedding")
+    fact_dense_search = (
+        (lambda memory_id, query, item_ids, limit:
+         embedding.search_items(
+             memory_id, query, item_ids, limit,
+             source_store=relation_embedding_store))
+        if embedding is not None and relation_embedding_store is not None
+        else None)
     navigator = GraphNavigator(store, dense_search=embedding.search if embedding else None,
                                dense_search_many=(embedding.search_many if embedding else None),
+                               fact_dense_search=fact_dense_search,
                                harness_profile=HarnessProfile(args.profile),
                                rank_mandatory=args.rank_mandatory,
                                h10_owner_rescue=not args.no_h10_owner_rescue,
@@ -263,8 +304,14 @@ def main() -> None:
                                queryir_soft_fallback=args.queryir_soft_fallback,
                                queryir_soft_fallback_threshold=(
                                    args.queryir_soft_fallback_threshold),
+                               exact_lookup_fast_path=(
+                                   args.exact_lookup_fast_path),
+                               exact_lookup_turn_limit=(
+                                   args.exact_lookup_turn_limit),
                                graph_hop_decay=args.graph_hop_decay,
                                expansion_beam=args.expansion_beam,
+                               hierarchy_descent_beam=(
+                                   args.hierarchy_descent_beam),
                                rare_lexical_relations=(
                                    args.rare_lexical_relations),
                                query_gated_rare_lexical=(
@@ -428,6 +475,10 @@ def main() -> None:
                     "evidence_graph_turns", 0),
                 "evidence_auxiliary_turns": answer.trace.get(
                     "evidence_auxiliary_turns", 0),
+                "execution_mode": result.trace.get(
+                    "execution_mode", "hierarchical_graph"),
+                "exact_lookup": result.trace.get("exact_lookup", {}),
+                "aggregation_ledger": answer.trace.get("aggregation_ledger"),
                 **{key: value for key, value in metric.items() if key != "question_id"},
             }
             pending_checkpoints.append((
@@ -435,7 +486,12 @@ def main() -> None:
             if len(pending_checkpoints) >= batch_size:
                 checkpoint(pending_checkpoints)
 
-        max_in_flight = max(1, args.answer_workers) * 2
+        # One request per worker is already enough to saturate vLLM.  Keeping a
+        # second full wave delayed the first durable checkpoint until 512 slow
+        # navigation calls had completed, even when the first 200+ answers were
+        # already sitting in memory.  Bound at one wave so full-corpus runs
+        # become resumable earlier without reducing model concurrency.
+        max_in_flight = max(1, args.answer_workers)
         for index, question in enumerate(remaining):
             result = navigator.navigate(question.memory_id, question.query, budget)
             metric = navigation_metrics(question, result, store)
@@ -533,11 +589,39 @@ def main() -> None:
         "answer_prompt_hash": prompt_contract(
             answer_config.normalize_relative_time,
             answer_config.precision_grounding,
-            answer_config.evidence_order == "topological")[2],
+            answer_config.evidence_order == "topological",
+            answer_config.aggregation_ledger_enabled,
+            answer_config.preference_synthesis_enabled)[2],
+        "answer_prompt_hashes_observed": sorted({
+            str(row.get("prompt_hash") or "") for row in prepared_rows
+            if str(row.get("prompt_hash") or "")}),
+        "answer_prompt_hash_by_mode": {
+            "default": prompt_contract(
+                answer_config.normalize_relative_time,
+                answer_config.precision_grounding,
+                answer_config.evidence_order == "topological", False)[2],
+            "aggregation": (prompt_contract(
+                answer_config.normalize_relative_time,
+                answer_config.precision_grounding,
+                answer_config.evidence_order == "topological", True)[2]
+                if answer_config.aggregation_ledger_enabled else None),
+            "preference_synthesis": (prompt_contract(
+                answer_config.normalize_relative_time,
+                answer_config.precision_grounding,
+                answer_config.evidence_order == "topological", False, True)[2]
+                if answer_config.preference_synthesis_enabled else None),
+        },
         "span_window": answer_config.span_window,
         "evidence_order": answer_config.evidence_order,
         "source_time_normalization": answer_config.normalize_relative_time,
         "precision_grounded_prompt": answer_config.precision_grounding,
+        "aggregation_ledger": answer_config.aggregation_ledger_enabled,
+        "aggregation_ledger_schema_version": (
+            AGGREGATION_LEDGER_SCHEMA_VERSION
+            if answer_config.aggregation_ledger_enabled else None),
+        "aggregation_ledger_limit": answer_config.aggregation_ledger_limit,
+        "preference_synthesis_prompt": (
+            answer_config.preference_synthesis_enabled),
         "obligation_aware_packing": args.obligation_aware_packing,
         "precision_aware_packing": args.precision_aware_packing,
         "candidate_pool_limit": args.candidate_pool_limit,
@@ -548,10 +632,16 @@ def main() -> None:
         "native_seed_fusion": args.native_seed_fusion,
         "dense_search": embedding is not None,
         "embedding_db": str(args.embedding_db) if args.embedding_db else None,
+        "relation_embedding_db": (
+            str(args.relation_embedding_db)
+            if args.relation_embedding_db else None),
         "queryir_soft_fallback": args.queryir_soft_fallback,
         "queryir_soft_fallback_threshold": args.queryir_soft_fallback_threshold,
+        "exact_lookup_fast_path": args.exact_lookup_fast_path,
+        "exact_lookup_turn_limit": args.exact_lookup_turn_limit,
         "graph_hop_decay": args.graph_hop_decay,
         "expansion_beam": args.expansion_beam,
+        "hierarchy_descent_beam": args.hierarchy_descent_beam,
         "rare_lexical_relations": args.rare_lexical_relations,
         "query_gated_rare_lexical": args.query_gated_rare_lexical,
         "span_pack_window": args.span_pack_window,
@@ -624,6 +714,8 @@ def main() -> None:
     store.close()
     if embedding_store is not None:
         embedding_store.close()
+    if relation_embedding_store is not None:
+        relation_embedding_store.close()
     cache_store.close()
 
 

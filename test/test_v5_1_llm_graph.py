@@ -173,7 +173,52 @@ def test_frozen_semantic_fingerprint_keeps_source_text_but_ignores_fact_cap() ->
             "scene_semantic", request(8, "alpha"))
     assert frozen_semantic_request_fingerprint(
         "scene_semantic", request(4, "alpha")) != frozen_semantic_request_fingerprint(
-            "scene_semantic", request(4, "beta"))
+        "scene_semantic", request(4, "beta"))
+
+
+def test_frozen_semantic_cache_disambiguates_dynamic_fact_caps(tmp_path: Path) -> None:
+    """Same source at different cold-build caps is not response ambiguity."""
+    store = _store(tmp_path / "frozen-caps.sqlite")
+    config = GraphMemV5Config()
+
+    class _Completions:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_request):
+            self.calls += 1
+            content = '{"s":[{"i":"0","f":[{"o":"u","p":"has","v":"x"}]}]}'
+            message = SimpleNamespace(content=content, reasoning_content=None)
+            choice = SimpleNamespace(message=message, finish_reason="stop")
+            usage = SimpleNamespace(prompt_tokens=10, completion_tokens=self.calls)
+            return SimpleNamespace(choices=[choice], usage=usage, model="qwen")
+
+    completions = _Completions()
+    live = QwenSemanticDistiller(
+        store, config, "dataset",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)))
+    for cap in (1, 2):
+        live._call(
+            "m", "scene_semantic",
+            f"contract. This call's schema permits at most {cap} facts per scene; obey each scene's k.",
+            {"s": [{"i": "0", "k": cap, "r": [{"t": "same source"}]}]},
+            1, max_facts=cap)
+
+    frozen = QwenSemanticDistiller(
+        store, config, "dataset",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+            create=lambda **_request: (_ for _ in ()).throw(
+                AssertionError("external call"))))),
+        frozen_cache_only=True)
+    response, usage = frozen._call(
+        "m", "scene_semantic",
+        "contract. This call's schema permits at most 3 facts per scene; obey each scene's k.",
+        {"s": [{"i": "0", "k": 3, "r": [{"t": "same source"}]}]},
+        1, max_facts=3)
+
+    assert response["content"]
+    assert usage["uncached_input_tokens"] == 0
+    assert completions.calls == 2
 
 
 def test_frozen_semantic_replays_full_budget_fallback_without_api(tmp_path: Path) -> None:
