@@ -368,78 +368,58 @@ def plot_pareto(
 
 
 def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
-    """Compare fixed-load QPS and memory under equal worker budgets."""
+    """Plot one QPS-memory curve for each system and worker setting."""
     plt = configure_plotting()
     from matplotlib.lines import Line2D
-    import numpy as np
 
     workers = (1, 4, 8)
+    markers = {"GraphMem": "o", "Mem0 OSS": "s"}
     metrics = (
         ("worker_rss_mib", "(a) RSS"),
         ("worker_pss_mib", "(b) PSS"),
     )
     fig, axes = plt.subplots(1, 2, figsize=PAPER_FIGSIZE, sharey=True)
-    qps_at_64 = {
-        (row["system"], row["workers"]): row["qps"]
-        for row in rows if row["clients"] == 64
-    }
     for axis, (metric_key, panel_title) in zip(axes, metrics):
-        memory = {
-            (system, worker): np.mean([
-                row[metric_key] for row in rows
-                if row["system"] == system and row["workers"] == worker
-            ]) / 1024.0
-            for system in ("GraphMem", "Mem0 OSS")
-            for worker in workers
-        }
-        for worker in workers:
-            graph_point = (
-                memory[("GraphMem", worker)],
-                qps_at_64[("GraphMem", worker)],
-            )
-            mem0_point = (
-                memory[("Mem0 OSS", worker)],
-                qps_at_64[("Mem0 OSS", worker)],
-            )
-            axis.plot(
-                [mem0_point[0], graph_point[0]],
-                [mem0_point[1], graph_point[1]],
-                color="#64748B", linewidth=2.4,
-                linestyle=CORE_STYLES[worker]["linestyle"], zorder=2,
-            )
-            axis.scatter(
-                *graph_point, s=88, marker="o",
-                color=SYSTEM_COLORS["GraphMem"], edgecolor="white",
-                linewidth=1.1, zorder=4,
-            )
-            axis.scatter(
-                *mem0_point, s=88, marker="s",
-                color=SYSTEM_COLORS["Mem0 OSS"], edgecolor="white",
-                linewidth=1.1, zorder=4,
-            )
-            mem0_offset = (8, -3) if worker == 1 else (0, -9)
-            mem0_align = "left" if worker == 1 else "center"
-            for point, system, offset, horizontal, vertical in (
-                (graph_point, "G", (0, 9), "center", "bottom"),
-                (mem0_point, "M", mem0_offset, mem0_align, "top"),
-            ):
-                axis.annotate(
-                    f"{system}{worker}  {point[0]:.2f} GiB, {point[1]:.1f} QPS",
-                    point, xytext=offset, textcoords="offset points",
-                    ha=horizontal, va=vertical, fontsize=9.7,
-                    color="#334155", fontweight="bold",
+        for system in ("GraphMem", "Mem0 OSS"):
+            for worker in workers:
+                group = sorted(
+                    (row for row in rows
+                     if row["system"] == system
+                     and row["workers"] == worker),
+                    key=lambda row: row["clients"],
                 )
-        axis.set_xlim(0, max(memory.values()) * 1.15)
+                axis.plot(
+                    [row[metric_key] / 1024.0 for row in group],
+                    [row["qps"] for row in group],
+                    color=SYSTEM_COLORS[system], linewidth=2.5,
+                    linestyle=CORE_STYLES[worker]["linestyle"],
+                    marker=markers[system], markersize=6.5,
+                    markeredgecolor="white", markeredgewidth=0.9,
+                    zorder=3,
+                )
+                peak = max(group, key=lambda row: row["qps"])
+                prefix = "G" if system == "GraphMem" else "M"
+                axis.annotate(
+                    f"{prefix}{worker}",
+                    (peak[metric_key] / 1024.0, peak["qps"]),
+                    xytext=(0, 7), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=10.5,
+                    color=SYSTEM_COLORS[system], fontweight="bold",
+                )
+        max_memory = max(row[metric_key] for row in rows) / 1024.0
+        axis.set_xlim(0, max_memory * 1.1)
         axis.set_ylim(0, 184)
         axis.set_xlabel("检索 worker 聚合内存（GiB）")
-        axis.set_ylabel("QPS（64 并发）")
+        axis.set_ylabel("QPS")
         axis.set_title(panel_title, fontweight="bold")
         axis.grid(True, linestyle="--", linewidth=0.65, zorder=0)
     method_handles = [
-        Line2D([0], [0], marker="o", color="none", markersize=8,
+        Line2D([0], [0], marker="o", color=SYSTEM_COLORS["GraphMem"],
+               linewidth=2.5, markersize=7,
                markerfacecolor=SYSTEM_COLORS["GraphMem"],
                markeredgecolor="white", label="GraphMem"),
-        Line2D([0], [0], marker="s", color="none", markersize=8,
+        Line2D([0], [0], marker="s", color=SYSTEM_COLORS["Mem0 OSS"],
+               linewidth=2.5, markersize=7,
                markerfacecolor=SYSTEM_COLORS["Mem0 OSS"],
                markeredgecolor="white", label="Mem0 OSS"),
     ]
@@ -454,10 +434,10 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
                loc="upper center", ncol=5,
                bbox_to_anchor=(0.5, 0.91), frameon=False,
                handlelength=2.4, columnspacing=1.5)
-    fig.suptitle("GraphMem 与 Mem0：QPS–Memory 等核 Pareto 对比（左上更优）",
+    fig.suptitle("GraphMem 与 Mem0：不同 worker 配置的 QPS–Memory 曲线（左上更优）",
                  y=0.985, fontsize=21, fontweight="bold")
     fig.text(0.005, 0.018,
-             "每条线连接相同 worker 预算下的两种系统；内存为并发 1–256 档均值，QPS 固定取 64 并发",
+             "每条线对应一个系统–worker 配置；线上 6 个点依次为并发 1、4、16、64、128、256",
              ha="left", fontsize=13.5, color="#64748B")
     fig.subplots_adjust(left=0.065, right=0.985, bottom=0.17, top=0.77,
                         wspace=0.22)
