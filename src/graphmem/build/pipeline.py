@@ -26,6 +26,7 @@ from ..storage import SQLiteGraphStore
 from .coarsen import (
     ATOMIC_RELATION_NODE_TYPES,
     GatedRelationPlan,
+    RelationSignal,
     RecursiveHierarchy,
     admit_llm_refined_relation,
     build_parent_gated_relations,
@@ -375,7 +376,9 @@ class GraphBuildPipeline:
                     memory_id, relation_vector_nodes)
                 relation_semantic_vector_count = len(semantic_vectors)
             if (profile.edges.relation_mask_propagation
-                    and profile.edges.rare_lexical_relation):
+                    and profile.edges.rare_lexical_relation
+                    and str(RelationSignal.LEXICAL_RARE)
+                    in profile.edges.enabled_relation_signals):
                 rare_lexical_terms = build_rare_lexical_node_terms(
                     tuple(node_map.values()), turns,
                     df_share=profile.edges.rare_lexical_df_share)
@@ -408,6 +411,7 @@ class GraphBuildPipeline:
                 lexical_rare_terms=rare_lexical_terms,
                 rare_lexical_min_shared=(
                     profile.edges.rare_lexical_min_shared),
+                enabled_signals=profile.edges.enabled_relation_signals,
             )
             for left_id, right_id, score, _gate_level in gated_plan.accepted_pairs:
                 left, right = node_map[left_id], node_map[right_id]
@@ -468,7 +472,14 @@ class GraphBuildPipeline:
                     stable_id("edge", memory_id, left_id, relation, right_id),
                     memory_id, left_id, relation, right_id,
                     evidence_groups[0], relation in DIRECTIONAL_REFINED_RELATIONS,
-                    decision.confidence, decision.source, evidence_groups[1:],
+                    decision.confidence,
+                    (decision.source + "|relation_mask:" + ",".join(
+                        gated_plan.refine_candidate_signals.get(
+                            decision.candidate_id, ()))
+                     if gated_plan is not None and
+                     gated_plan.refine_candidate_signals.get(
+                         decision.candidate_id) else decision.source),
+                    evidence_groups[1:],
                 ))
             usage_after = self._usage(memory_id)
             refine_tokens = {key: usage_after[key] - usage_before[key] for key in usage_after}
@@ -488,6 +499,8 @@ class GraphBuildPipeline:
             "relation_vector_granularity": (
                 "atomic_summary" if relation_semantic_vector_count
                 else "deterministic_lexical_fallback"),
+            "enabled_relation_signals": tuple(
+                profile.edges.enabled_relation_signals),
         }
         if recursive_hierarchy is not None:
             method_diagnostics["coarsening"] = dataclass_dict(
@@ -513,6 +526,8 @@ class GraphBuildPipeline:
                 "rare_lexical_feature_nodes": len(rare_lexical_terms),
                 "atomic_candidate_source_counts": dict(
                     gated_plan.atomic_candidate_source_counts),
+                "atomic_candidate_signal_counts": dict(
+                    gated_plan.atomic_candidate_signal_counts),
                 "levels_with_relations": gated_plan.levels_with_relations,
                 "typed_pairs": len(gated_plan.typed_pairs),
                 "candidate_method": gated_plan.candidate_method,

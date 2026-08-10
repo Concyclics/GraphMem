@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from graphmem.build import GraphBuildPipeline, QwenSemanticDistiller
-from graphmem.build.semantic import SemanticFact
+from graphmem.build.semantic import SemanticFact, frozen_semantic_request_fingerprint
 from graphmem.config import GraphMemV5Config
 from graphmem.domain import NodeType, QueryBudget, RelationType
 from graphmem.retrieval import GraphDiagnosticProbe
@@ -108,6 +108,97 @@ class FakeCompletions:
         message = SimpleNamespace(content=content, reasoning_content=None)
         return SimpleNamespace(choices=[SimpleNamespace(message=message)], model="qwen30b",
             usage=SimpleNamespace(prompt_tokens=100, completion_tokens=25, total_tokens=125))
+
+
+def test_frozen_semantic_cache_replays_dynamic_fact_cap_without_api(tmp_path: Path) -> None:
+    store = _store(tmp_path / "frozen.sqlite")
+    class _ReplaySeedCompletions:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, **_request):
+            self.calls += 1
+            message = SimpleNamespace(
+                content=json.dumps({"s": []}), reasoning_content=None)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message, finish_reason="stop")],
+                model="qwen30b",
+                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2),
+            )
+
+    completions = _ReplaySeedCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    config = GraphMemV5Config()
+    first = QwenSemanticDistiller(store, config, "dataset", client=client)
+    system4 = "contract. This call's schema permits at most 4 facts per scene; obey each scene's k."
+    payload4 = {"s": [{"i": "0", "k": 4, "r": []}]}
+    response, _ = first._call(
+        "travel", "scene_semantic", system4, payload4, 1, max_facts=4)
+    assert completions.calls == 1
+
+    class _ForbiddenCompletions:
+        def create(self, **_request):
+            raise AssertionError("frozen replay attempted an external API call")
+
+    frozen = QwenSemanticDistiller(
+        store, config, "dataset",
+        client=SimpleNamespace(chat=SimpleNamespace(
+            completions=_ForbiddenCompletions())),
+        frozen_cache_only=True)
+    system8 = "contract. This call's schema permits at most 8 facts per scene; obey each scene's k."
+    payload8 = {"s": [{"i": "0", "k": 8, "r": []}]}
+    replayed, usage = frozen._call(
+        "travel", "scene_semantic", system8, payload8, 1, max_facts=8)
+
+    assert replayed == response
+    assert completions.calls == 1
+    assert usage["uncached_input_tokens"] == 0
+    assert store._read_one(
+        "SELECT cached FROM llm_calls ORDER BY created_at DESC, rowid DESC LIMIT 1"
+    )[0] == 1
+
+
+def test_frozen_semantic_fingerprint_keeps_source_text_but_ignores_fact_cap() -> None:
+    def request(cap: int, text: str) -> dict:
+        return {"model": "qwen", "messages": [
+            {"content": (
+                "contract. This call's schema permits at most "
+                f"{cap} facts per scene; obey each scene's k.")},
+            {"content": json.dumps({
+                "s": [{"i": "0", "k": cap, "r": [{"t": text}]}]})},
+        ]}
+
+    assert frozen_semantic_request_fingerprint(
+        "scene_semantic", request(4, "alpha")) == frozen_semantic_request_fingerprint(
+            "scene_semantic", request(8, "alpha"))
+    assert frozen_semantic_request_fingerprint(
+        "scene_semantic", request(4, "alpha")) != frozen_semantic_request_fingerprint(
+            "scene_semantic", request(4, "beta"))
+
+
+def test_frozen_semantic_replays_full_budget_fallback_without_api(tmp_path: Path) -> None:
+    store = _store(tmp_path / "frozen-fallback.sqlite")
+
+    class _ForbiddenCompletions:
+        def create(self, **_request):
+            raise AssertionError("frozen budget fallback attempted an API call")
+
+    distiller = QwenSemanticDistiller(
+        store, GraphMemV5Config(), "dataset",
+        client=SimpleNamespace(chat=SimpleNamespace(
+            completions=_ForbiddenCompletions())),
+        frozen_cache_only=True, frozen_fallback_calls=1)
+    response, usage = distiller._call(
+        "travel", "scene_semantic", "contract",
+        {"s": [{"i": "0", "k": 8, "r": [{"t": "not cached"}]}]},
+        1, max_facts=8)
+
+    assert response["model"] == "frozen_full_budget_fallback"
+    assert response["content"] == '{"s":[]}'
+    assert usage["total_tokens"] == 0
+    assert store._read_one(
+        "SELECT cached FROM llm_calls ORDER BY created_at DESC, rowid DESC LIMIT 1"
+    )[0] == 1
 
 
 def _semantic_config():

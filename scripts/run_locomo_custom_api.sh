@@ -6,6 +6,7 @@ set -euo pipefail
 #
 # Optional overrides:
 #   MODEL=gpt-5.4-mini RUN_TAG=myrun MAX_QUESTIONS=1986 bash scripts/run_locomo_custom_api.sh
+#   MODEL=gpt-5.6-luna RUN_TAG=myrun-luna bash scripts/run_locomo_custom_api.sh
 #   API_KEY_FILE=~/.secrets/sub2api.key bash scripts/run_locomo_custom_api.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -88,7 +89,7 @@ curl -sS "${BASE_URL%/}/chat/completions" \
   "model": "${MODEL}",
   "reasoning_effort": "${REASONING_EFFORT}",
   "messages": [{"role": "user", "content": "Reply OK."}],
-  "max_tokens": 8
+  "max_completion_tokens": 16
 }
 EOF
 )" >/tmp/locomo_custom_api_smoke.json

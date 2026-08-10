@@ -222,6 +222,11 @@ def main() -> None:
 
     evaluations = _read_jsonl(eval_path)
     calls = _read_jsonl(calls_path)
+    expected_ids = {str(question_id) for question_id, _case, _answer in selected}
+    # ``selected`` contains only the pending suffix on resume, so include rows
+    # already judged when expressing the complete expected contract.
+    expected_ids |= {str(row["question_id"]) for row in evaluations}
+    evaluated_ids = {str(row["question_id"]) for row in evaluations}
     by_category: dict[str, dict[str, Any]] = {}
     for row in evaluations:
         key = str(row["category"])
@@ -246,6 +251,14 @@ def main() -> None:
         "reasoning_effort_field_sent": args.request_profile == "openai",
         "excluded_from_build_and_answer_budgets": True,
         "question_count": len(evaluations),
+        "expected_question_count": len(expected_ids),
+        "unresolved_question_ids": sorted(expected_ids - evaluated_ids),
+        "failure_count": len(expected_ids - evaluated_ids),
+        "request_retry_count": sum(
+            int(row.get("retry_count") or 0) for row in calls),
+        "semantic_retry_count": max(0, len(calls) - len(evaluations)),
+        "temperature": 0.0,
+        "seed": 0,
         "correct": correct,
         "accuracy": correct / len(evaluations) if evaluations else 0.0,
         "by_category": by_category,
@@ -263,7 +276,7 @@ def main() -> None:
         json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(json.dumps({"accuracy": stats["accuracy"], "questions": len(evaluations)}))
-    if failures:
+    if failures or expected_ids != evaluated_ids:
         raise RuntimeError(
             f"{len(failures)} LoCoMo judge calls failed; rerun with --resume")
 

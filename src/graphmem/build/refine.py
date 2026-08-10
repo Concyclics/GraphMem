@@ -73,7 +73,8 @@ class Qwen30BRefiner:
         ).hexdigest()
         if client is None:
             from openai import OpenAI
-            client = OpenAI(base_url=config.models.llm_base_url, api_key="local")
+            client = OpenAI(base_url=config.models.llm_base_url,
+                            api_key="local", max_retries=0)
         self.client = client
 
     def eligible(self, candidate: RefineCandidate) -> bool:

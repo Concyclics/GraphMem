@@ -11,14 +11,19 @@ import time
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
 from openai import APIError, OpenAI, RateLimitError
+
+ROOT = Path(__file__).resolve().parents[1]
+SGAO_MODEL_CHOICES = ("gpt-5.4-mini", "gpt-5.6-luna")
+load_dotenv(ROOT / ".env", override=False)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Parallel LongMemEval-compatible QA judge using official prompts."
     )
-    parser.add_argument("metric_model", choices=["gpt-5.4-mini"])
+    parser.add_argument("metric_model", choices=SGAO_MODEL_CHOICES)
     parser.add_argument("hyp_file", type=Path)
     parser.add_argument("ref_file", type=Path)
     parser.add_argument("--output-file", type=Path)
@@ -78,7 +83,7 @@ def main() -> None:
                     messages=[{"role": "user", "content": prompt}],
                     n=1,
                     temperature=0,
-                    max_tokens=512,
+                    max_completion_tokens=512,
                     reasoning_effort="none",
                 )
                 eval_response = (completion.choices[0].message.content or "").strip()

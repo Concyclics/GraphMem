@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,15 +51,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-answer-tokens", type=int)
     parser.add_argument("--max-output-tokens", type=int, default=0,
                         help="0 omits the API output cap; positive values enable an ablation cap")
+    parser.add_argument("--answer-model",
+                        help="answer backbone; defaults to models.llm_model")
+    parser.add_argument("--answer-base-url",
+                        help="answer endpoint; defaults to models.llm_base_url")
+    parser.add_argument("--answer-api-key-env",
+                        help="environment variable containing the answer endpoint key")
+    parser.add_argument("--answer-request-profile",
+                        choices=("qwen", "openai", "omit"), default="qwen")
+    parser.add_argument("--packing-model",
+                        help="tokenizer model used only to enforce the evidence budget")
     parser.add_argument("--sampling-seed", type=int, default=0,
                         help="explicit seed sent to the answer service")
     parser.add_argument("--span-window", type=int, default=-1,
                         help="-1 renders whole turns; >=0 renders cited spans widened by N chars")
     parser.add_argument("--evidence-order",
-                        choices=("chronological", "relevance", "adaptive"),
+                        choices=("chronological", "relevance", "adaptive", "topological"),
                         default="chronological",
                         help="render by source time, retrieval rank, or query-directed order")
     parser.add_argument("--no-closed-form", action="store_true")
+    parser.add_argument(
+        "--candidate-answer-injection", action="store_true",
+        help=("inject the algebraic draft into the answer prompt; off by default "
+              "because incorrect drafts can anchor the answer model"))
     parser.add_argument("--no-h10-owner-rescue", action="store_true")
     parser.add_argument("--no-h10-traversal", action="store_true")
     parser.add_argument("--no-manifest-collection-key", action="store_true")
@@ -73,6 +88,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-pool-limit", type=int, default=0,
                         help="0 keeps the full id reservoir; positive values expose a bounded "
                              "candidate precision/recall operating point")
+    parser.add_argument("--raw-fallback-reserve", type=int, default=0,
+                        help="reserve at most this many top-scoring raw fallback turns; "
+                             "0 leaves every fallback optional")
     parser.add_argument("--span-pack-window", type=int, default=96,
                         help="character context charged around each selected evidence span")
     parser.add_argument("--embedding", action="store_true")
@@ -100,6 +118,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--queryir-soft-fallback-threshold", type=float, default=0.80)
     parser.add_argument("--source-time-normalization", action="store_true",
                         help="experimental: materialize source-anchored relative time in evidence")
+    parser.add_argument("--precision-grounded-prompt", action="store_true",
+                        help="use the opt-in V5.20 direct-evidence answer contract")
     parser.add_argument("--obligation-aware-relations", action="store_true")
     parser.add_argument("--graph-hop-decay", type=float, default=1.0)
     parser.add_argument("--expansion-beam", type=int, default=4)
@@ -107,6 +127,10 @@ def parse_args() -> argparse.Namespace:
         "--rare-lexical-relations", action="store_true",
         help=("admit lexical_rare-only coarse edges and their QueryIR bonus; "
               "off is the paired control on the same lexical graph"))
+    parser.add_argument(
+        "--query-gated-rare-lexical", action="store_true",
+        help=("admit lexical_rare-only graph bridges only for multi-fact, temporal, "
+              "state-history, or collection QueryIR plans"))
     parser.add_argument("--full", action="store_true",
                         help="score LongMemEval 500 + LoCoMo Cat 1-4 (2,040) instead of the "
                              "frozen 200-question development set")
@@ -177,8 +201,10 @@ def main() -> None:
                      and args.span_window < 0 else
                      (None if args.span_window < 0 else args.span_window)),
         closed_form_enabled=not args.no_closed_form,
+        candidate_answer_injection=args.candidate_answer_injection,
         evidence_order=args.evidence_order,
         normalize_relative_time=args.source_time_normalization,
+        precision_grounding=args.precision_grounded_prompt,
         max_output_tokens=(args.max_output_tokens or None),
         sampling_seed=args.sampling_seed)
 
@@ -207,6 +233,7 @@ def main() -> None:
                                precision_aware_packing=args.precision_aware_packing,
                                candidate_pool_limit=args.candidate_pool_limit,
                                span_pack_window=args.span_pack_window,
+                               raw_fallback_reserve=args.raw_fallback_reserve,
                                obligation_aware_relations=args.obligation_aware_relations,
                                native_seed_fusion=args.native_seed_fusion,
                                queryir_soft_fallback=args.queryir_soft_fallback,
@@ -215,21 +242,47 @@ def main() -> None:
                                graph_hop_decay=args.graph_hop_decay,
                                expansion_beam=args.expansion_beam,
                                rare_lexical_relations=(
-                                   args.rare_lexical_relations))
+                                   args.rare_lexical_relations),
+                               query_gated_rare_lexical=(
+                                   args.query_gated_rare_lexical))
 
-    stage = AnswerStage(store, config, "v5.6-answer", answer_config=answer_config,
-                        require_exact_tokenizer=True, cache_store=cache_store)
+    stage = AnswerStage(
+        store, config, "v5.6-answer", answer_config=answer_config,
+        require_exact_tokenizer=True, cache_store=cache_store,
+        answer_model=args.answer_model, answer_base_url=args.answer_base_url,
+        answer_api_key_env=args.answer_api_key_env,
+        answer_request_profile=args.answer_request_profile,
+        packing_model=args.packing_model)
+    edge_source_cache: dict[str, dict[str, str]] = {}
 
-    def run(row):
+    def traversed_signals(memory_id: str, result) -> dict[str, int]:
+        sources = edge_source_cache.get(memory_id)
+        if sources is None:
+            sources = {edge.edge_id: edge.source for edge in store.edges(memory_id)}
+            edge_source_cache[memory_id] = sources
+        counts: dict[str, int] = {}
+        for step in result.proof:
+            source = sources.get(step.edge_id, "")
+            marker = "relation_mask:"
+            if marker not in source:
+                continue
+            mask = source.split(marker, 1)[1].split("|", 1)[0]
+            for signal in filter(None, mask.split(",")):
+                counts[signal] = counts.get(signal, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def prepare(row):
         question, result, _metric = row
         question_date = str(question.raw.get("question_date") or "") or None
         # result.algebra is populated only by AST-executing profiles; passing it
         # is what lets the closed-form composer emit a count without an LLM.
-        return stage.answer(question.question_id, question.query, result, budget,
-                            question_date=question_date, algebra=result.algebra)
+        return stage.prepare(
+            question.question_id, question.query, result, budget,
+            question_date=question_date, algebra=result.algebra)
 
     answer_path = root / "answers.jsonl"
     retrieval_path = root / "retrieval.jsonl"
+    prepared_path = root / "prepared_answers.jsonl"
 
     def load_rows(path: Path):
         if not path.exists():
@@ -239,28 +292,77 @@ def main() -> None:
 
     completed = set()
     if args.resume:
-        answered = {str(row["question_id"]) for row in load_rows(answer_path)}
-        retrieved = {str(row["dev_question_id"]) for row in load_rows(retrieval_path)}
-        completed = answered & retrieved
+        answer_checkpoint = load_rows(answer_path)
+        retrieval_checkpoint = load_rows(retrieval_path)
+        prepared_checkpoint = load_rows(prepared_path)
+        answered = {str(row["question_id"]) for row in answer_checkpoint}
+        retrieved = {str(row["dev_question_id"]) for row in retrieval_checkpoint}
+        prepared_ids = {str(row["question_id"]) for row in prepared_checkpoint}
+        completed = answered & retrieved & prepared_ids
+        # Three JSONLs cannot be appended atomically.  If a process died after
+        # writing only one or two of them, retain exactly one complete row per
+        # ID and rerun the torn suffix (the answer cache prevents a second API
+        # charge).  Without this compaction, resume silently duplicated answer
+        # rows and inflated Token percentiles.
+        order = [row.question_id for row in questions if row.question_id in completed]
+        for path, key, checkpoint in (
+            (answer_path, "question_id", answer_checkpoint),
+            (retrieval_path, "dev_question_id", retrieval_checkpoint),
+            (prepared_path, "question_id", prepared_checkpoint),
+        ):
+            by_id = {str(row[key]): row for row in checkpoint
+                     if str(row[key]) in completed}
+            path.write_text("".join(
+                json.dumps(by_id[question_id], ensure_ascii=True) + "\n"
+                for question_id in order), encoding="utf-8")
     remaining = [row for row in questions if row.question_id not in completed]
     batch_size = max(1, args.checkpoint_every)
     print(
         f"running {len(remaining)} remaining / {len(questions)} questions with "
         f"{args.profile}; checkpoint batch={batch_size}", flush=True)
-    for start in range(0, len(remaining), batch_size):
-        batch = remaining[start:start + batch_size]
-        navigations = []
-        for question in batch:
-            result = navigator.navigate(question.memory_id, question.query, budget)
-            navigations.append(
-                (question, result, navigation_metrics(question, result, store)))
-        with ThreadPoolExecutor(max_workers=max(1, args.answer_workers)) as pool:
-            answers = list(pool.map(run, navigations))
+    # Submit the entire remaining set to one bounded worker pool and checkpoint
+    # in completion order.  The previous fixed 25-question barrier left 31 of
+    # 32 workers idle whenever one unbounded answer ran to the model's 65K
+    # context limit.  ``as_completed`` preserves exactly the same prompts and
+    # concurrency cap while allowing short questions after that barrier to run.
+    navigations = []
+    for question in remaining:
+        result = navigator.navigate(question.memory_id, question.query, budget)
+        navigations.append(
+            (question, result, navigation_metrics(question, result, store)))
+    prepared = [prepare(row) for row in navigations]
+    pending_checkpoints = []
+    checkpointed = 0
 
-        answer_rows, retrieval_rows = [], []
-        for (question, result, metric), answer in zip(navigations, answers):
+    def checkpoint(rows) -> None:
+        nonlocal checkpointed
+        rows.sort(key=lambda item: item[0])
+        with answer_path.open("a", encoding="utf-8") as handle:
+            handle.writelines(
+                json.dumps(item[1], ensure_ascii=True) + "\n" for item in rows)
+        with retrieval_path.open("a", encoding="utf-8") as handle:
+            handle.writelines(
+                json.dumps(item[2], ensure_ascii=True) + "\n" for item in rows)
+        with prepared_path.open("a", encoding="utf-8") as handle:
+            handle.writelines(
+                json.dumps(item[3], ensure_ascii=True) + "\n" for item in rows)
+        checkpointed += len(rows)
+        rows.clear()
+        print(
+            f"  checkpointed {len(completed) + checkpointed}/{len(questions)}",
+            flush=True)
+
+    with ThreadPoolExecutor(max_workers=max(1, args.answer_workers)) as pool:
+        futures = {
+            pool.submit(stage.complete, item): index
+            for index, item in enumerate(prepared)
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            question, result, metric = navigations[index]
+            answer = future.result()
             raw = question.raw
-            answer_rows.append({
+            answer_row = {
                 "question_id": question.question_id,
                 "question": question.query,
                 "question_type": str(raw.get("question_type")
@@ -271,9 +373,13 @@ def main() -> None:
                 "prediction": answer.prediction,
                 "benchmark": question.benchmark,
                 "stratum": question.stratum,
-            })
+                "answer_model": answer.answer_model,
+                "prompt_payload_hash": answer.prompt_payload_hash,
+                "traversed_relation_signals": traversed_signals(
+                    question.memory_id, result),
+            }
             row_flags = flags.get(question.question_id)
-            retrieval_rows.append({
+            retrieval_row = {
                 "dev_question_id": question.question_id, "stratum": question.stratum,
                 # turn_all_hit is vacuously true where no gold turns are annotated,
                 # so the full-set report must be able to exclude those rows.
@@ -281,26 +387,74 @@ def main() -> None:
                 "is_abstention": bool(row_flags.is_abstention) if row_flags else False,
                 "benchmark": question.benchmark, "configuration": label,
                 "prompt_tokens": answer.prompt_tokens,
+                "api_prompt_tokens": answer.api_prompt_tokens,
                 "evidence_tokens": answer.evidence_tokens,
                 "completion_tokens": answer.completion_tokens,
+                "answer_total_tokens": answer.api_total_tokens,
+                "answer_latency_ms": answer.latency_ms,
+                "answer_cached": answer.cached,
+                "answer_model": answer.answer_model,
+                "prompt_payload_hash": answer.prompt_payload_hash,
+                "traversed_relation_signals": traversed_signals(
+                    question.memory_id, result),
                 "answer_finish_reason": answer.finish_reason,
                 "packed_turns": len(answer.evidence_turn_ids),
                 "closed_form": answer.closed_form,
                 "budget_relaxed": answer.budget_relaxed,
                 "answer_warnings": list(answer.warnings),
                 **{key: value for key, value in metric.items() if key != "question_id"},
-            })
-        with answer_path.open("a", encoding="utf-8") as handle:
-            handle.writelines(
-                json.dumps(row, ensure_ascii=True) + "\n" for row in answer_rows)
-        with retrieval_path.open("a", encoding="utf-8") as handle:
-            handle.writelines(
-                json.dumps(row, ensure_ascii=True) + "\n" for row in retrieval_rows)
-        done = len(completed) + min(start + len(batch), len(remaining))
-        print(f"  checkpointed {done}/{len(questions)}", flush=True)
+            }
+            pending_checkpoints.append((
+                index, answer_row, retrieval_row, prepared[index].to_record()))
+            if len(pending_checkpoints) >= batch_size:
+                checkpoint(pending_checkpoints)
+    if pending_checkpoints:
+        checkpoint(pending_checkpoints)
 
     answer_rows = load_rows(answer_path)
     retrieval_rows = load_rows(retrieval_path)
+    prepared_rows = load_rows(prepared_path)
+    expected_ids = {str(row.question_id) for row in questions}
+    answer_ids = {str(row["question_id"]) for row in answer_rows}
+    retrieval_ids = {str(row["dev_question_id"]) for row in retrieval_rows}
+    prepared_ids = {str(row["question_id"]) for row in prepared_rows}
+    if answer_ids != expected_ids or retrieval_ids != expected_ids \
+            or prepared_ids != expected_ids:
+        raise RuntimeError(
+            "answer artifact incomplete: "
+            f"expected={len(expected_ids)} answers={len(answer_ids)} "
+            f"retrieval={len(retrieval_ids)} prepared={len(prepared_ids)}")
+    if (len(answer_rows) != len(expected_ids)
+            or len(retrieval_rows) != len(expected_ids)
+            or len(prepared_rows) != len(expected_ids)):
+        raise RuntimeError("answer artifacts contain duplicate question IDs")
+    # Completion-order checkpoints are ideal for recovery; canonical question
+    # order is ideal for byte-stable artifacts and dual-model replay.
+    question_order = [str(row.question_id) for row in questions]
+    ordered_payloads = []
+    for path, key, rows in (
+        (answer_path, "question_id", answer_rows),
+        (retrieval_path, "dev_question_id", retrieval_rows),
+        (prepared_path, "question_id", prepared_rows),
+    ):
+        by_id = {str(row[key]): row for row in rows}
+        ordered = [by_id[question_id] for question_id in question_order]
+        path.write_text("".join(
+            json.dumps(row, ensure_ascii=True) + "\n" for row in ordered),
+            encoding="utf-8")
+        ordered_payloads.append(ordered)
+    answer_rows, retrieval_rows, prepared_rows = ordered_payloads
+    prepared_hashes = {str(row["question_id"]): str(
+        row.get("prompt_payload_hash") or "") for row in prepared_rows}
+    prompt_hash_mismatches = [
+        str(row["question_id"]) for row in answer_rows
+        if str(row.get("prompt_payload_hash") or "")
+        != prepared_hashes.get(str(row["question_id"]))
+    ]
+    if prompt_hash_mismatches:
+        raise RuntimeError(
+            "answer/prepared prompt hash mismatch for "
+            f"{len(prompt_hash_mismatches)} questions")
     # Emit benchmark-specific judge inputs for both development and full runs.
     # Previously only the shard merger did this, which made a single-process
     # precision ablation require an ad-hoc filtering step before judging.
@@ -313,18 +467,35 @@ def main() -> None:
             for row in answer_rows if row.get("benchmark") == benchmark),
             encoding="utf-8")
 
+    def token_stats(values):
+        ordered = sorted(int(value) for value in values)
+        def nearest(p):
+            return ordered[max(0, math.ceil(p * len(ordered)) - 1)] if ordered else 0
+        return {
+            "count": len(ordered),
+            "mean": sum(ordered) / max(1, len(ordered)),
+            "p50": nearest(0.50), "p95": nearest(0.95),
+            "p99": nearest(0.99), "max": max(ordered, default=0),
+            "unit": "tokens_per_question",
+            "percentile_method": "nearest_rank",
+        }
+
     tokens = sorted(row["prompt_tokens"] for row in retrieval_rows)
     manifest = {
         "profile": args.profile, "label": label, "questions": len(answer_rows),
         "source_db": str(args.source_db), "config_hash": config_hash(config),
         "answer_prompt_hash": prompt_contract(
-            answer_config.normalize_relative_time)[2],
+            answer_config.normalize_relative_time,
+            answer_config.precision_grounding,
+            answer_config.evidence_order == "topological")[2],
         "span_window": answer_config.span_window,
         "evidence_order": answer_config.evidence_order,
         "source_time_normalization": answer_config.normalize_relative_time,
+        "precision_grounded_prompt": answer_config.precision_grounding,
         "obligation_aware_packing": args.obligation_aware_packing,
         "precision_aware_packing": args.precision_aware_packing,
         "candidate_pool_limit": args.candidate_pool_limit,
+        "raw_fallback_reserve": args.raw_fallback_reserve,
         "obligation_aware_relations": args.obligation_aware_relations,
         "native_seed_fusion": args.native_seed_fusion,
         "dense_search": embedding is not None,
@@ -334,10 +505,16 @@ def main() -> None:
         "graph_hop_decay": args.graph_hop_decay,
         "expansion_beam": args.expansion_beam,
         "rare_lexical_relations": args.rare_lexical_relations,
+        "query_gated_rare_lexical": args.query_gated_rare_lexical,
         "span_pack_window": args.span_pack_window,
         "closed_form_enabled": answer_config.closed_form_enabled,
+        "candidate_answer_injection": answer_config.candidate_answer_injection,
         "max_output_tokens": answer_config.max_output_tokens,
         "sampling_seed": answer_config.sampling_seed,
+        "answer_model": stage.answer_model,
+        "answer_base_url": args.answer_base_url or config.models.llm_base_url,
+        "answer_request_profile": args.answer_request_profile,
+        "packing_model": args.packing_model or config.models.llm_model,
         "output_truncated": sum(
             row.get("answer_finish_reason") == "length" for row in retrieval_rows),
         "budget": dataclass_dict(budget),
@@ -349,6 +526,47 @@ def main() -> None:
             "max": max(tokens, default=0),
             "over_soft_budget": sum(1 for row in tokens if row > budget.max_answer_tokens),
         },
+        "answer_api_tokens": {
+            "prompt": token_stats(row.get("api_prompt_tokens", 0)
+                                  for row in retrieval_rows),
+            "completion": token_stats(row.get("completion_tokens", 0)
+                                      for row in retrieval_rows),
+            "total": token_stats(row.get("answer_total_tokens", 0)
+                                 for row in retrieval_rows),
+        },
+        "answer_api_tokens_by_benchmark": {
+            benchmark: {
+                "prompt": token_stats(row.get("api_prompt_tokens", 0)
+                                      for row in retrieval_rows
+                                      if row.get("benchmark") == benchmark),
+                "completion": token_stats(row.get("completion_tokens", 0)
+                                          for row in retrieval_rows
+                                          if row.get("benchmark") == benchmark),
+                "total": token_stats(row.get("answer_total_tokens", 0)
+                                     for row in retrieval_rows
+                                     if row.get("benchmark") == benchmark),
+            } for benchmark in ("longmemeval", "locomo")
+        },
+        "prepared_answers": str(prepared_path),
+        "prepared_prompt_hashes": len({
+            str(row.get("prompt_payload_hash")) for row in retrieval_rows}),
+        "prompt_identity_audit": {
+            "question_ids_match": True,
+            "prompt_hash_mismatches": len(prompt_hash_mismatches),
+        },
+        "answer_api_usage_sums": {
+            "prompt": sum(int(row.get("api_prompt_tokens") or 0)
+                          for row in retrieval_rows),
+            "completion": sum(int(row.get("completion_tokens") or 0)
+                              for row in retrieval_rows),
+            "total": sum(int(row.get("answer_total_tokens") or 0)
+                         for row in retrieval_rows),
+        },
+        "answer_api_usage_additivity_ok": all(
+            int(row.get("api_prompt_tokens") or 0)
+            + int(row.get("completion_tokens") or 0)
+            == int(row.get("answer_total_tokens") or 0)
+            for row in retrieval_rows),
         "closed_form_rate": sum(row["closed_form"] for row in retrieval_rows) / max(1, len(retrieval_rows)),
         "generated_at": stamp,
     }

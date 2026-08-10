@@ -128,6 +128,8 @@ def main() -> None:
             append_jsonl(args.output_dir / "judge_failures.jsonl", failure)
 
     evaluations=read_jsonl(eval_path); calls=read_jsonl(calls_path)
+    expected_ids = {str(row["question_id"]) for row in read_jsonl(args.answers)}
+    evaluated_ids = {str(row["question_id"]) for row in evaluations}
     by_type={}
     for row in evaluations:
         key=str(row.get("question_type") or "unknown")
@@ -142,6 +144,11 @@ def main() -> None:
         "reasoning_effort_field_sent": args.request_profile == "openai",
         "judge_mode":args.mode, "prompt_commit":PINNED_COMMIT if args.mode=="answer" else None, "prompt_source_sha256":PROMPT_SOURCE_SHA256 if args.mode=="answer" else None,
         "question_count":len(evaluations), "correct":sum(int(row["correct"]) for row in evaluations),
+        "expected_question_count": len(expected_ids),
+        "unresolved_question_ids": sorted(expected_ids - evaluated_ids),
+        "failure_count": len(expected_ids - evaluated_ids),
+        "request_retry_count": sum(int(row.get("retry_count") or 0) for row in calls),
+        "temperature": 0.0, "seed": 0,
         "accuracy":sum(int(row["correct"]) for row in evaluations)/len(evaluations) if evaluations else 0.0,
         "by_question_type":by_type,
         "prompt_cache_miss_tokens":sum(int(row.get("prompt_cache_miss_tokens") or 0) for row in calls),
@@ -153,7 +160,7 @@ def main() -> None:
     (args.output_dir/"judge_token_stats.json").write_text(json.dumps(stats,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
     print(json.dumps({"accuracy":stats["accuracy"],"questions":stats["question_count"]}))
 
-    if failures:
+    if failures or expected_ids != evaluated_ids:
         raise RuntimeError(f"{len(failures)} judge calls failed; rerun with --resume")
 
 if __name__ == "__main__": main()

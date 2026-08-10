@@ -43,6 +43,44 @@ HIERARCHY_PROMPT = """Compress supplied child semantic records for routing. Retu
 #: V5.8 scene summary and entity list leaked them at 68.5% and across the entire
 #: top of the entity frequency table.  Every new free-text field needs this guard.
 ALIAS_RE = re.compile(r"s?\d+(?:t\d+)?", re.I)
+CALL_FACT_CAP_RE = re.compile(
+    r" This call's schema permits at most \d+ facts per scene; obey each scene's k\."
+)
+
+
+def frozen_semantic_request_fingerprint(stage: str, request: Mapping[str, Any]) -> str:
+    """Identify one semantic source batch independently of a dynamic fact cap.
+
+    The build token ledger may halve ``k`` for the last in-flight batch of a
+    Memory.  A cold build and an all-cache replay settle reservations at very
+    different speeds, so using the ordinary cache key alone can turn the same
+    source scenes into a cache miss during a paired relation-edge ablation.
+    Frozen replay deliberately ignores only those dynamic cap fields.  Source
+    text, timestamps, information units, stage, model, and the semantic prompt
+    contract remain part of the identity.
+    """
+    messages = request.get("messages", ())
+    if not isinstance(messages, Sequence) or len(messages) < 2:
+        raise ValueError("semantic request is missing system/user messages")
+    system = CALL_FACT_CAP_RE.sub("", str(messages[0].get("content", "")))
+    try:
+        payload = json.loads(str(messages[1].get("content", "")))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("semantic request user payload is not JSON") from exc
+    if isinstance(payload, dict) and isinstance(payload.get("s"), list):
+        payload = dict(payload)
+        payload["s"] = [
+            ({key: value for key, value in row.items() if key != "k"}
+             if isinstance(row, dict) else row)
+            for row in payload["s"]
+        ]
+    material = {
+        "stage": stage,
+        "model": request.get("model"),
+        "system": system,
+        "payload": payload,
+    }
+    return hashlib.sha256(canonical_json(material).encode()).hexdigest()
 
 
 def strip_aliases(text: str) -> str:
@@ -196,7 +234,9 @@ class QwenSemanticDistiller:
     def __init__(self, store: SQLiteGraphStore, config: GraphMemV5Config,
                  dataset_hash: str, client: Any | None = None, *,
                  request_gate: threading.BoundedSemaphore | None = None,
-                 worker_limit: int = 16) -> None:
+                 worker_limit: int = 16,
+                 frozen_cache_only: bool = False,
+                 frozen_fallback_calls: int = 0) -> None:
         self.store, self.config, self.dataset_hash = store, config, dataset_hash
         if worker_limit < 1:
             raise ValueError("worker_limit must be positive")
@@ -205,6 +245,12 @@ class QwenSemanticDistiller:
         # ModelConfig.max_concurrency is meant to be the global service limit.
         self.request_gate = request_gate
         self.worker_limit = worker_limit
+        self.frozen_cache_only = frozen_cache_only
+        if frozen_fallback_calls < 0:
+            raise ValueError("frozen_fallback_calls cannot be negative")
+        self._frozen_fallback_remaining = frozen_fallback_calls
+        self._frozen_cache_lock = threading.Lock()
+        self._frozen_cache_index: dict[str, Mapping[str, Any]] | None = None
         strict_prompt = STRICT_PROMPT + (
             f" Return at most {config.models.semantic_max_facts_per_scene} highest-routing-value facts per scene.")
         if config.models.semantic_predicate_max_chars:
@@ -271,7 +317,11 @@ class QwenSemanticDistiller:
         self.prompt_hash = hashlib.sha256(prompt_material.encode()).hexdigest()
         if client is None:
             from openai import OpenAI
-            client = OpenAI(base_url=config.models.llm_base_url, api_key="local")
+            # SDK retries are otherwise invisible to llm_calls and make a
+            # nominal "0 retry" build gate unverifiable.  The outer memory
+            # runner is resumable, so fail this call and resume explicitly.
+            client = OpenAI(base_url=config.models.llm_base_url,
+                            api_key="local", max_retries=0)
         self.client = client
 
     def extract(self, memory_id: str, scenes: Sequence[Any]) -> tuple[ScenePacket, ...]:
@@ -1120,6 +1170,45 @@ class QwenSemanticDistiller:
         elif self.config.models.semantic_constrained_json:
             request["response_format"] = {"type": "json_object"}
         cached = self.store.cache_get(key); started = time.perf_counter()
+        if cached is None and self.frozen_cache_only:
+            cached = self._frozen_cache_get(stage, request)
+            if cached is None:
+                # A Full build can deny the final reservation at the 230K hard
+                # ceiling.  There is intentionally no API response to cache for
+                # that source batch; the frozen outcome is an empty response,
+                # which makes _extract_strict_batch emit the same deterministic
+                # ScenePacket fallbacks.  The paired Full report supplies an
+                # exact per-Memory allowance, so any additional miss still
+                # fails closed.
+                with self._frozen_cache_lock:
+                    if self._frozen_fallback_remaining > 0:
+                        self._frozen_fallback_remaining -= 1
+                        cached = {
+                            "response": {
+                                "content": '{"s":[]}',
+                                "model": "frozen_full_budget_fallback",
+                                "finish_reason": "frozen_budget_fallback",
+                            },
+                            "usage": {
+                                "cached_input_tokens": 0,
+                                "uncached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "reasoning_tokens": 0,
+                                "total_tokens": 0,
+                                "frozen_budget_fallback": 1,
+                            },
+                        }
+                if cached is None:
+                    fingerprint = frozen_semantic_request_fingerprint(stage, request)
+                    raise RuntimeError(
+                        "frozen semantic cache miss; refusing external LLM call "
+                        f"for {memory_id}:{stage}:{fingerprint[:16]}")
+            # Materialize an exact-key alias in this control arm.  The payload
+            # is the current deterministic request while response/usage remain
+            # byte-for-byte those frozen by the Full arm.
+            self.store.cache_put(
+                key, stage, request, cached["response"], cached["usage"],
+                self.prompt_hash)
         if cached:
             response = cached["response"]; old = cached["usage"]
             usage = {"cached_input_tokens": int(old.get("uncached_input_tokens", 0)),
@@ -1152,6 +1241,35 @@ class QwenSemanticDistiller:
             response=response, usage=usage, latency_ms=(time.perf_counter()-started)*1000,
             retry_count=retry_count, batch_size=batch_size, prompt_hash=self.prompt_hash)
         return response, usage
+
+    def _frozen_cache_get(
+        self, stage: str, request: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        """Return a Full-arm response for the same source batch, never the API."""
+        with self._frozen_cache_lock:
+            if self._frozen_cache_index is None:
+                index: dict[str, Mapping[str, Any]] = {}
+                rows = self.store._read(
+                    "SELECT stage,request_json,response_json,usage_json "
+                    "FROM llm_cache WHERE prompt_hash=?",
+                    (self.prompt_hash,),
+                )
+                for row_stage, request_json, response_json, usage_json in rows:
+                    frozen_request = json.loads(request_json)
+                    fingerprint = frozen_semantic_request_fingerprint(
+                        str(row_stage), frozen_request)
+                    candidate = {
+                        "response": json.loads(response_json),
+                        "usage": json.loads(usage_json),
+                    }
+                    previous = index.setdefault(fingerprint, candidate)
+                    if previous != candidate:
+                        raise RuntimeError(
+                            "ambiguous frozen semantic cache fingerprint "
+                            f"{fingerprint[:16]}")
+                self._frozen_cache_index = index
+            fingerprint = frozen_semantic_request_fingerprint(stage, request)
+            return self._frozen_cache_index.get(fingerprint)
 
     @staticmethod
     def _strings(value: Any) -> tuple[str, ...]:

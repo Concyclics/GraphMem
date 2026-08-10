@@ -6,8 +6,8 @@ from dataclasses import replace
 import pytest
 
 from graphmem.answer import (
-    AnswerConfig, AnswerStage, PROMPT_HASH, build_answer_messages, compose, render_evidence,
-    render_turn, resolve_evidence_order,
+    AnswerConfig, AnswerStage, PreparedAnswer, PROMPT_HASH, build_answer_messages,
+    compose, render_evidence, render_turn, resolve_evidence_order,
 )
 from graphmem.domain import (
     AlgebraResult, AnswerMember, Conversation, EvidenceMember, EvidenceUnit, NavigationResult,
@@ -248,6 +248,27 @@ def test_source_time_prompt_is_an_explicit_separate_contract() -> None:
     assert "[source-time ...]" in messages[0]["content"]
 
 
+def test_precision_grounded_prompt_is_opt_in_and_separately_hashed() -> None:
+    baseline = build_answer_messages(
+        question="Did Alice surf?", question_date=None, evidence_text="")
+    grounded = build_answer_messages(
+        question="Did Alice surf?", question_date=None, evidence_text="",
+        precision_grounding=True)
+
+    assert "smallest set of memories" not in baseline[0]["content"]
+    assert "smallest set of memories" in grounded[0]["content"]
+    assert "Exact wording" in grounded[0]["content"]
+
+
+def test_topological_layout_prompt_explains_that_chain_labels_are_hints() -> None:
+    messages = build_answer_messages(
+        question="When did Alice move?", question_date=None, evidence_text="",
+        topological_layout=True)
+
+    assert "[CHAIN k step=d]" in messages[0]["content"]
+    assert "navigation hints, not facts" in messages[0]["content"]
+
+
 def test_a_candidate_answer_is_labelled_a_proposal_not_evidence() -> None:
     messages = build_answer_messages(question="how many?", question_date="2023-05-01",
                                      evidence_text="[s1] user: three cats", candidate_answer="3")
@@ -304,6 +325,31 @@ def _stage(store, client, **kwargs) -> AnswerStage:
                        require_exact_tokenizer=False, **kwargs)
 
 
+def test_topological_layout_keeps_a_root_to_leaf_chain_contiguous(tmp_path) -> None:
+    store = _store(tmp_path, ["unbound noise", "root evidence", "leaf evidence"])
+    turns = store.turns("m")
+    units = (
+        EvidenceUnit("leaf", ("need",), ("b2",), (turns[2].turn_id,),
+                     ("edge-1", "edge-2"), 0, True, ("operand",)),
+        EvidenceUnit("root", ("need",), ("b1",), (turns[1].turn_id,),
+                     ("edge-1",), 0, True, ("operand",)),
+    )
+    stage = _stage(
+        store, _FakeClient(),
+        answer_config=AnswerConfig(evidence_order="topological"))
+    result = _result([turn.turn_id for turn in turns], units)
+
+    prepared = stage.prepare("q1", "When did Alice move?", result, QueryBudget())
+    user = prepared.messages[1]["content"]
+
+    assert user.index("[CHAIN 1 step=1]") < user.index("[CHAIN 1 step=2]")
+    assert user.index("[CHAIN 1 step=2]") < user.index("[AUX group=1")
+    assert prepared.trace["evidence_chain_turns"] == 2
+    assert prepared.trace["evidence_graph_turns"] == 0
+    assert prepared.trace["evidence_auxiliary_turns"] == 1
+    store.close()
+
+
 def test_the_stage_makes_exactly_one_call_and_returns_the_prediction(tmp_path) -> None:
     store = _store(tmp_path, ["I adopted a beagle named Rex."])
     client = _FakeClient("Rex")
@@ -319,6 +365,45 @@ def test_the_stage_makes_exactly_one_call_and_returns_the_prediction(tmp_path) -
     assert "max_tokens" not in client.requests[0]
     assert client.requests[0]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
     assert answer.finish_reason == "stop"
+    assert answer.api_prompt_tokens == 100
+    assert answer.api_total_tokens == 103
+    store.close()
+
+
+def test_prepared_answer_round_trip_replays_identical_prompt(tmp_path) -> None:
+    store = _store(tmp_path, ["I adopted a beagle named Rex."])
+    client = _FakeClient("Rex")
+    stage = _stage(store, client)
+    result = _result([turn.turn_id for turn in store.turns("m")])
+
+    prepared = stage.prepare("q1", "What is the dog called?", result, QueryBudget())
+    restored = PreparedAnswer.from_record(prepared.to_record())
+    answer = stage.complete(restored)
+
+    assert restored.prompt_payload_hash == prepared.prompt_payload_hash
+    assert restored.messages == prepared.messages
+    assert answer.prompt_payload_hash == prepared.prompt_payload_hash
+    assert answer.prediction == "Rex"
+    store.close()
+
+
+def test_openai_answer_profile_uses_separate_model_and_no_output_cap(tmp_path) -> None:
+    store = _store(tmp_path, ["I adopted a beagle named Rex."])
+    client = _FakeClient("Rex")
+    stage = _stage(
+        store, client, answer_model="gpt-5.4-mini",
+        answer_request_profile="openai")
+    result = _result([turn.turn_id for turn in store.turns("m")])
+
+    answer = stage.answer("q1", "What is the dog called?", result, QueryBudget())
+
+    request = client.requests[0]
+    assert request["model"] == "gpt-5.4-mini"
+    assert request["reasoning_effort"] == "none"
+    assert "extra_body" not in request
+    assert "max_tokens" not in request
+    assert "max_completion_tokens" not in request
+    assert answer.answer_model == "gpt-5.4-mini"
     store.close()
 
 
@@ -403,7 +488,8 @@ def test_the_answer_call_is_logged_with_its_token_usage(tmp_path) -> None:
 
 def test_a_certified_closed_form_is_reported_as_such(tmp_path) -> None:
     store = _store(tmp_path, ["I have three cats."])
-    stage = _stage(store, _FakeClient("3"))
+    client = _FakeClient("3")
+    stage = _stage(store, client)
     result = _result([turn.turn_id for turn in store.turns("m")])
     algebra = _algebra(answer_kind="count", count=3, scope_complete=True,
                        members=(AnswerMember("k", "v", "v"),))
@@ -411,6 +497,24 @@ def test_a_certified_closed_form_is_reported_as_such(tmp_path) -> None:
     answer = stage.answer("q1", "How many cats?", result, QueryBudget(), algebra=algebra)
 
     assert answer.closed_form and answer.draft_text == "3"
+    assert "Candidate answer" not in client.requests[0]["messages"][1]["content"]
+    store.close()
+
+
+def test_candidate_answer_injection_requires_explicit_opt_in(tmp_path) -> None:
+    store = _store(tmp_path, ["I have three cats."])
+    client = _FakeClient("3")
+    stage = _stage(
+        store, client,
+        answer_config=AnswerConfig(candidate_answer_injection=True))
+    result = _result([turn.turn_id for turn in store.turns("m")])
+    algebra = _algebra(answer_kind="count", count=3, scope_complete=True,
+                       members=(AnswerMember("k", "v", "v"),))
+
+    stage.answer("q1", "How many cats?", result, QueryBudget(), algebra=algebra)
+
+    assert "Candidate answer (unverified proposal): 3" in (
+        client.requests[0]["messages"][1]["content"])
     store.close()
 
 

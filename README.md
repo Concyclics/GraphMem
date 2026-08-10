@@ -75,6 +75,20 @@ pip install -r requirements.txt
 cp .env.example .env   # then fill in your API keys
 ```
 
+The SGAO OpenAI-compatible endpoint supports both verified remote model options:
+
+```bash
+# Default model from .env
+bash scripts/run_locomo_custom_api.sh
+
+# One-run override; the API key remains in the ignored .env file
+MODEL=gpt-5.6-luna bash scripts/run_locomo_custom_api.sh
+```
+
+Set `SGAO_MODEL` in `.env` to `gpt-5.4-mini` or `gpt-5.6-luna` to change the
+repository-wide default. The endpoint and key are read from `SGAO_BASE_URL` and
+`SGAO_API_KEY`; `.env` is ignored by Git and should remain mode `0600`.
+
 ## Data
 
 Benchmark datasets are not bundled in this repo. Place converted JSON files under `data/`, for example:

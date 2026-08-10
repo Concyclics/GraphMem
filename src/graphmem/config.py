@@ -9,6 +9,16 @@ from typing import Any, Mapping
 from .domain import QueryBudget, canonical_json
 
 
+RELATION_SIGNAL_NAMES = frozenset({
+    "scene_similar",
+    "shared_entity",
+    "state_compatible",
+    "collection_related",
+    "temporal_near",
+    "lexical_rare",
+})
+
+
 @dataclass(frozen=True, slots=True)
 class CacheIdentity:
     dataset_hash: str
@@ -216,6 +226,18 @@ class EdgeConfig:
     # propagating one untyped cosine.  Disabled by default so frozen V5.13
     # snapshots and config hashes retain their historical behaviour.
     relation_mask_propagation: bool = False
+    # Fine-grained relation-mask ablation.  Signals are carried together on a
+    # single edge; this allow-list controls proposal, top-down propagation and
+    # materialized provenance rather than filtering duplicate edges afterward.
+    # The complete set preserves the V5.17 behaviour for existing configs.
+    enabled_relation_signals: tuple[str, ...] = (
+        "scene_similar",
+        "shared_entity",
+        "state_compatible",
+        "collection_related",
+        "temporal_near",
+        "lexical_rare",
+    )
     # The 200-question V5.14 audit found that adding entity/state/time postings
     # to the already-unioned lexical+dense atomic candidates improved pair
     # recall by only 0.053pp and changed no all-hit decision.  Keep it as a
@@ -541,6 +563,13 @@ class GraphMemV5Config:
             raise ValueError("invalid predicate cluster scope")
         if self.edges.predicate_cluster_mode not in {"mutual_pair", "agglomerative"}:
             raise ValueError("invalid predicate cluster mode")
+        enabled_signals = tuple(self.edges.enabled_relation_signals)
+        if len(enabled_signals) != len(set(enabled_signals)):
+            raise ValueError("enabled_relation_signals must not contain duplicates")
+        unknown_signals = set(enabled_signals) - RELATION_SIGNAL_NAMES
+        if unknown_signals:
+            raise ValueError(
+                f"enabled_relation_signals contains unknown values: {sorted(unknown_signals)}")
         if self.models.semantic_extraction_mode not in {
                 "legacy_batch", "strict_single", "strict_pair", "strict_batch"}:
             raise ValueError("invalid semantic extraction mode")

@@ -82,6 +82,7 @@ class QwenEmbeddingIndex:
             client = OpenAI(
                 base_url=base_url or config.models.embedding_base_url,
                 api_key="local",
+                max_retries=0,
             )
         self.client = client
 

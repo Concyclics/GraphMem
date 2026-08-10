@@ -13,10 +13,11 @@ from .prompts import PROMPT_HASH, PROMPT_VERSION, build_answer_messages, prompt_
 from .rendering import (
     AnswerConfig, RenderedEvidence, render_evidence, render_turn, resolve_evidence_order,
 )
-from .stage import AnswerResult, AnswerStage
+from .stage import AnswerResult, AnswerStage, PreparedAnswer
 
 __all__ = [
-    "AnswerConfig", "AnswerDraft", "AnswerResult", "AnswerStage", "PROMPT_HASH",
+    "AnswerConfig", "AnswerDraft", "AnswerResult", "AnswerStage", "PreparedAnswer",
+    "PROMPT_HASH",
     "PROMPT_VERSION", "RenderedEvidence", "build_answer_messages", "compose",
     "prompt_contract", "render_evidence", "render_turn", "resolve_evidence_order",
 ]

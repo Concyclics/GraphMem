@@ -16,6 +16,8 @@ from graphmem.retrieval.packer import (
     pack_obligation_aware,
     salient_spans,
 )
+from graphmem.retrieval.navigator import GraphNavigator
+from graphmem.config import QueryBudget
 
 
 def _turn(turn_id: str, session: str, text: str) -> SourceTurn:
@@ -58,6 +60,23 @@ def test_proof_units_carry_real_obligations_and_exact_fact_spans() -> None:
     assert units[0].operand_ids == ("op1",)
     assert units[0].spans == (span,)
 
+
+def test_raw_fallback_reserve_is_bounded_and_uses_upstream_rank() -> None:
+    turns = {
+        f"t{index}": _turn(f"t{index}", f"s{index % 2}", f"evidence {index}")
+        for index in range(8)
+    }
+    rows = tuple(
+        _candidate(turns[f"t{index}"], 10.0 - index)
+        for index in range(8)
+    )
+    budget = QueryBudget(max_evidence_turns=4, max_evidence_tokens=100)
+
+    packed, _dropped, _coverage = GraphNavigator._rank_pack(
+        rows, turns, budget, reserved_turn_ids={"t5", "t6", "t7"},
+        reserve_limit=2)
+
+    assert packed == ("t5", "t6", "t0", "t1")
 
 def test_salient_fallback_keeps_numeric_temporal_and_negative_sentences() -> None:
     turn = _turn(

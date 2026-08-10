@@ -216,6 +216,10 @@ class GraphNavigator:
         #: Admit coarse edges whose only construction signal is lexical_rare.
         #: Mixed masks retain their non-lexical attributes when this is false.
         rare_lexical_relations: bool = False,
+        #: Restrict lexical-only bridges to QueryIR plans that require multiple
+        #: witnesses/endpoints.  Ordinary lookup keeps lexical/dense seeding but
+        #: does not spend its relation beam on same-topic lexical regions.
+        query_gated_rare_lexical: bool = False,
         hierarchy_operator_aware: bool = True,
         read_pool_size: int = 4,
         snapshot_cache_bytes: int = 512 * 1024 * 1024,
@@ -228,6 +232,12 @@ class GraphNavigator:
         precision_aware_packing: bool = False,
         candidate_pool_limit: int = 0,
         span_pack_window: int = 96,
+        #: Keep a bounded number of the highest-scoring raw provenance
+        #: fallbacks in the final pack.  Zero preserves the score-only pack.
+        #: This is deliberately a quota rather than ``mandatory=True``: making
+        #: every fallback mandatory displaced direct LME evidence, while
+        #: removing the floor entirely lost useful cross-session LoCoMo turns.
+        raw_fallback_reserve: int = 0,
         #: Compile QueryIR obligations into relation-specific beam priorities.
         #: Off preserves H0--H10 traversal ordering for clean ablations.
         obligation_aware_relations: bool = False,
@@ -267,6 +277,7 @@ class GraphNavigator:
         self.hierarchy_child_beam = max(1, hierarchy_child_beam)
         self.hierarchy_descent_beam = max(1, hierarchy_descent_beam)
         self.rare_lexical_relations = rare_lexical_relations
+        self.query_gated_rare_lexical = query_gated_rare_lexical
         self.hierarchy_operator_aware = hierarchy_operator_aware
         self.h10_owner_rescue = h10_owner_rescue
         self.h10_traversal = h10_traversal
@@ -301,6 +312,7 @@ class GraphNavigator:
         self.precision_aware_packing = precision_aware_packing
         self.candidate_pool_limit = max(0, candidate_pool_limit)
         self.span_pack_window = max(0, span_pack_window)
+        self.raw_fallback_reserve = max(0, raw_fallback_reserve)
         self.obligation_aware_relations = obligation_aware_relations
         self.native_seed_fusion = native_seed_fusion
         self.queryir_soft_fallback = queryir_soft_fallback
@@ -871,6 +883,8 @@ class GraphNavigator:
                                               self.hierarchy_descent_beam),
                                           rare_lexical_relations=(
                                               self.rare_lexical_relations),
+                                          query_gated_rare_lexical=(
+                                              self.query_gated_rare_lexical),
                                           obligation_aware_relations=(
                                               self.obligation_aware_relations),
                                           structured=profile in {HarnessProfile.H4_SCHEDULER,
@@ -902,9 +916,29 @@ class GraphNavigator:
             fact_ids |= set(fact_reservoir.active)
             stage_times["fact_reservoir"] = (time.perf_counter() - tick) * 1000
         tick = time.perf_counter()
-        paths: dict[str, tuple[str, ...]] = {}
-        for step in schedule.proof:
-            paths.setdefault(step.dst_id, (step.edge_id,))
+        # Reconstruct complete seed-to-node provenance.  The previous map kept
+        # only the final edge for ``step.dst_id``; that was enough to say a fact
+        # was graph-reached, but not enough to topologically arrange its source
+        # turns.  Relax paths in hop order and retain the shortest stable route.
+        node_paths: dict[str, tuple[str, ...]] = {
+            node_id: () for node_id in semantic_seeds
+        }
+        proof_by_hop = sorted(schedule.proof, key=lambda step: (
+            schedule.node_hops.get(step.from_id, 1 << 20),
+            schedule.node_hops.get(step.to_id, 1 << 20),
+            step.edge_id, step.from_id, step.to_id))
+        for step in proof_by_hop:
+            parent = node_paths.get(step.from_id)
+            if parent is None:
+                continue
+            candidate = (*parent, step.edge_id)
+            existing = node_paths.get(step.to_id)
+            if existing is None or (len(candidate), candidate) < (
+                    len(existing), existing):
+                node_paths[step.to_id] = candidate
+        paths = {
+            node_id: path for node_id, path in node_paths.items() if path
+        }
         binding_reasons: dict[str, int] = {}
         if fact_reservoir_enabled and self.binding_discriminant:
             # A wide fact pool scored by the permissive V5.5 rule would
@@ -1036,6 +1070,20 @@ class GraphNavigator:
             for group_id in view.terminal_groups_for_nodes(tuple(fact_ids))
             if group_id in all_group_turns
         }
+        edge_relation = {
+            step.edge_id: str(step.relation) for step in schedule.proof
+        }
+        graph_path_by_turn: dict[str, tuple[str, ...]] = {}
+        for node_id in sorted(fact_ids):
+            path = node_paths.get(node_id, ())
+            if not path:
+                continue
+            for group_id in view.terminal_groups_for_nodes((node_id,)):
+                for turn_id in group_turns.get(group_id, ()):
+                    existing = graph_path_by_turn.get(turn_id)
+                    if existing is None or (len(path), path) < (
+                            len(existing), existing):
+                        graph_path_by_turn[turn_id] = path
         # H10 packs only the witnesses that the recursive algebra selected.
         # Making every candidate binding mandatory produced 95--104 mandatory
         # turns for a 32-turn budget and erased the benefit of evidence ranking.
@@ -1065,6 +1113,7 @@ class GraphNavigator:
             proof_bindings, group_turns, obligations=active_obligations,
             group_members=group_members, fact_spans=fact_spans)
         pack_turn_limit = budget.max_evidence_turns
+        raw_fallback_turn_ids: tuple[str, ...] = ()
         if self.obligation_aware_packing:
             raw_fallback_turn_ids = tuple(dict.fromkeys(
                 turn_id
@@ -1075,8 +1124,7 @@ class GraphNavigator:
             ))
             units = (*units, *(EvidenceUnit(
                 stable_id("raw-fallback-unit", turn_id),
-                (stable_id("raw-fallback-obligation", turn_id),), (),
-                (turn_id,), (), 0, True, (), "", (), True)
+                (), (), (turn_id,), (), 0, False, (), "", (), False)
                 for turn_id in raw_fallback_turn_ids))
         # Hydrate every terminal reached by the structured route, not only the
         # subset already accepted as an algebra result.  The latter is a proof
@@ -1094,14 +1142,30 @@ class GraphNavigator:
                 for group_id in view.terminal_groups_for_nodes(tuple(by_hop[hop])):
                     for turn_id in group_turns.get(group_id, ()):
                         turn_hop.setdefault(turn_id, hop)
-        proof_turn_ids = tuple(dict.fromkeys(turn_id for unit in units for turn_id in unit.source_turn_ids))
+        # A raw fallback is a lossless candidate rescue, not proof that the
+        # QueryIR obligation is satisfied.  The former implementation treated
+        # every unit as mandatory, including fallback turns with no binding;
+        # on a real LME count query 30 irrelevant fallback turns occupied the
+        # first 30 slots and displaced both gold turns at ranks 35/37.  Only an
+        # explicitly mandatory unit may bypass the upstream relevance score.
+        mandatory_turn_ids = tuple(dict.fromkeys(
+            turn_id for unit in units if unit.mandatory
+            for turn_id in unit.source_turn_ids))
         direct_owner_turn_ids = tuple(dict.fromkeys(
             turn_id for group_id in view.terminal_groups_for_nodes(direct_owner_terminals)
             for turn_id in group_turns.get(group_id, ())
         ))
-        candidate_ids = tuple(dict.fromkeys((*seeded.source_turn_ids, *hydrated_turn_ids)))
+        # Raw fallbacks are candidate rescues.  They must exist in the ranked
+        # pool for a bounded reserve to have any effect, but remain optional and
+        # therefore cannot bypass proof relevance without consuming the quota.
+        reserved_fallback_candidates = (
+            raw_fallback_turn_ids if self.raw_fallback_reserve else ())
+        candidate_ids = tuple(dict.fromkeys(
+            (*seeded.source_turn_ids, *hydrated_turn_ids,
+             *reserved_fallback_candidates)))
         hydrated_set = frozenset(hydrated_turn_ids)
-        mandatory = set(proof_turn_ids)
+        raw_fallback_set = frozenset(raw_fallback_turn_ids)
+        mandatory = set(mandatory_turn_ids)
         if self.session_flood_k:
             flooded = frozenset(self.route_sessions(all_turns, query, self.session_flood_k))
             candidate_ids = tuple(dict.fromkeys(
@@ -1188,6 +1252,11 @@ class GraphNavigator:
                                        self._turn_tokens(turn), fused,
                                        tuple(name for name, value in (("exact", exact), ("bm25", bm25), ("dense", dense), ("graph", graph)) if value),
                                        session_score, adjacency_score,
+                                       graph_path_ids=graph_path_by_turn.get(turn_id, ()),
+                                       relation_contributions=tuple(
+                                           edge_relation.get(edge_id, "")
+                                           for edge_id in graph_path_by_turn.get(turn_id, ())
+                                           if edge_relation.get(edge_id, "")),
                                        operand_ids=operand_ids, binding_score=bscore, obligation_gain=len(operand_ids),
                                        mandatory=turn_id in mandatory,
                                        proof_unit_ids=tuple(unit.unit_id for unit in units if turn_id in unit.source_turn_ids)))
@@ -1215,7 +1284,9 @@ class GraphNavigator:
                 if self.precision_aware_packing else budget.max_evidence_turns)
             pack_budget = replace(budget, max_evidence_turns=pack_turn_limit)
             baseline_floor, _baseline_dropped, _baseline_coverage = self._rank_pack(
-                rows, by_id, pack_budget, self.per_session_quota)
+                rows, by_id, pack_budget, self.per_session_quota,
+                reserved_turn_ids=raw_fallback_set,
+                reserve_limit=self.raw_fallback_reserve)
             packed, dropped, pack_exhaustion, packed_units, packed_span_tokens = pack_obligation_aware(
                 units, rows, by_id, query=query, answer_kind=answer_kind,
                 max_turns=pack_turn_limit,
@@ -1237,7 +1308,10 @@ class GraphNavigator:
                 kind, required_slots, _negative = question_slots(query)
                 packed, dropped, _cover = self._set_cover(rows, by_id, kind, required_slots, budget)
             else:
-                packed, dropped, _ = self._rank_pack(rows, by_id, budget, self.per_session_quota)
+                packed, dropped, _ = self._rank_pack(
+                    rows, by_id, budget, self.per_session_quota,
+                    reserved_turn_ids=raw_fallback_set,
+                    reserve_limit=self.raw_fallback_reserve)
             pack_exhaustion = {"turn_cap_reached": len(packed) >= budget.max_evidence_turns,
                                "token_cap_reached": sum(self._turn_tokens(by_id[item]) for item in packed) >= budget.max_evidence_tokens}
         stage_times["evidence_pack"] = (time.perf_counter() - tick) * 1000
@@ -1298,9 +1372,16 @@ class GraphNavigator:
                    "sqlite_read_pool_size": self.read_pool_size,
                    "obligation_aware_packing": self.obligation_aware_packing,
                    "obligation_aware_relations": self.obligation_aware_relations,
+                   "rare_lexical_relations": self.rare_lexical_relations,
+                   "query_gated_rare_lexical": self.query_gated_rare_lexical,
                    "native_seed_fusion": self.native_seed_fusion,
                    "span_pack_window": self.span_pack_window,
                    "precision_aware_packing": self.precision_aware_packing,
+                   "raw_fallback_reserve": self.raw_fallback_reserve,
+                   "raw_fallback_candidates": sum(
+                       row.turn_id in raw_fallback_set for row in rows),
+                   "raw_fallback_packed": sum(
+                       turn_id in raw_fallback_set for turn_id in packed),
                    "adaptive_pack_turn_limit": pack_turn_limit,
                    "candidate_count_before_limit": candidate_count_before_limit,
                    "candidate_pool_limit": self.candidate_pool_limit},
@@ -1603,9 +1684,25 @@ class GraphNavigator:
         return tuple(packed), dropped, coverage
 
     @staticmethod
-    def _rank_pack(rows, by_id, budget, per_session_quota: bool = False):
+    def _rank_pack(
+        rows, by_id, budget, per_session_quota: bool = False, *,
+        reserved_turn_ids=(), reserve_limit: int = 0,
+    ):
         packed: list[str] = []
         tokens_used = 0
+        reserved = frozenset(reserved_turn_ids)
+        # Spend only the explicit fallback allowance.  Rows are already sorted
+        # by mandatory status and fused score, so this chooses the strongest
+        # fallback evidence without recreating the old all-fallback prefix.
+        for row in rows:
+            if len(packed) >= min(max(0, reserve_limit), budget.max_evidence_turns):
+                break
+            if row.turn_id not in reserved:
+                continue
+            if tokens_used + row.token_cost > budget.max_evidence_tokens:
+                continue
+            packed.append(row.turn_id)
+            tokens_used += row.token_cost
         if per_session_quota:
             # Two passes.  The first gives every session present in `rows` a
             # floor, so a session whose turns all rank just below another

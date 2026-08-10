@@ -339,6 +339,25 @@ def test_relation_mask_recovers_state_pair_below_semantic_gate() -> None:
                for row in masked.refine_candidates)
     assert masked.atomic_candidate_source_counts["state"] > 0
 
+    semantic_only = build_parent_gated_relations(
+        "m", hierarchy, nodes, children, embedding_k=4,
+        max_candidates_per_node=8, low_threshold=0.35,
+        high_threshold=0.78, refine_mode="ambiguous_only",
+        typed_restoration=True, relation_mask_propagation=True,
+        atomic_relation_multiview=True, hnsw_dimension=16,
+        atomic_vector_channels=({facts[0].node_id: (1.0, *([0.0] * 15)),
+                                 facts[1].node_id: (0.99, 0.01,
+                                                         *([0.0] * 14))},),
+        relation_view_quotas={"entity": 2, "state": 2, "temporal": 1,
+                              "collection": 1, "lexical": 2,
+                              "semantic": 2},
+        enabled_signals=(RelationSignal.SCENE_SIMILAR,))
+    assert semantic_only.atomic_candidate_source_counts.get("semantic", 0) > 0
+    assert semantic_only.atomic_candidate_source_counts.get("rare_lexical", 0) == 0
+    assert set(semantic_only.atomic_candidate_signal_counts) == {"scene_similar"}
+    assert all(set(signals) == {"scene_similar"} for signals in
+               semantic_only.refine_candidate_signals.values())
+
 
 def test_multiview_candidates_are_independently_bounded() -> None:
     nodes = tuple(replace(
@@ -366,6 +385,27 @@ def test_multiview_candidates_are_independently_bounded() -> None:
     # cannot grow with N for a fixed per-view quota.
     assert max(per_signal_degree.values(), default=0) <= 4
     assert comparisons < len(nodes) * 8 * 8
+
+
+def test_multiview_signal_allow_list_filters_candidate_generation() -> None:
+    nodes = tuple(replace(
+        _card(index, topic=index), node_type=NodeType.CANONICAL_FACT,
+        attributes={**_card(index).attributes,
+                    "owner_id": "shared-entity",
+                    "predicate": "shared-state",
+                    "observed_at": {"start": f"2025-01-{index + 1:02d}"}})
+        for index in range(8))
+    features = build_relation_features({node.node_id: node for node in nodes}, {})
+
+    pairs, _ = bounded_relation_view_pairs(
+        nodes, features, eligible_entities=frozenset({"shared-entity"}),
+        quotas={"entity": 4, "state": 4, "temporal": 4},
+        max_candidates=8, cross_session_only=True,
+        enabled_signals=(RelationSignal.TEMPORAL_NEAR,))
+
+    assert pairs
+    assert {signal for _left, _right, _score, signal in pairs} == {
+        RelationSignal.TEMPORAL_NEAR}
 
 
 def test_rare_lexical_relation_is_one_multi_attribute_edge() -> None:
@@ -416,6 +456,20 @@ def test_rare_lexical_relation_is_one_multi_attribute_edge() -> None:
     assert sum(row[:2] == pair for row in plan.accepted_pairs) == 1
     assert {"lexical_rare", "shared_entity"} <= set(
         plan.accepted_pair_signals[pair])
+
+    no_lexical = build_parent_gated_relations(
+        "m", hierarchy, nodes, children,
+        embedding_k=2, max_candidates_per_node=4,
+        low_threshold=0.35, high_threshold=0.78,
+        refine_mode="ambiguous_only", relation_mask_propagation=True,
+        lexical_rare_terms=lexical, rare_lexical_min_shared=3,
+        relation_view_quotas={"entity": 2, "rare_lexical": 2},
+        enabled_signals=(RelationSignal.SCENE_SIMILAR,
+                         RelationSignal.SHARED_ENTITY))
+    assert all("lexical_rare" not in signals
+               for signals in no_lexical.accepted_pair_signals.values())
+    assert all("lexical_rare" not in signals
+               for signals in no_lexical.refine_candidate_signals.values())
 
 
 def test_undirected_degree_cap_applies_to_both_endpoints() -> None:

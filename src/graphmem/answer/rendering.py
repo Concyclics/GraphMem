@@ -70,13 +70,22 @@ class AnswerConfig:
     # keeps the navigator/packer rank so the strongest evidence appears first
     # and the weakest tail is the first to be dropped under a token budget.
     # ``adaptive`` is resolved before rendering: temporal queries use the
-    # former and other queries use the latter.
+    # former and other queries use the latter. ``topological`` is supplied by
+    # AnswerStage after grouping graph-connected proof/operand evidence.
     evidence_order: str = "chronological"
     # Materialize relative phrases against the source turn timestamp in the
     # rendered evidence.  This prevents the answer model from re-anchoring
     # ``last week/month/year`` against the later question date.
     normalize_relative_time: bool = False
+    # Opt-in V5.20 answer contract for noisy graph reservoirs.  Kept separate
+    # from source-time normalization so prompt-only ablations remain possible.
+    precision_grounding: bool = False
     closed_form_enabled: bool = True
+    # Keep the algebraic draft available for auditing, but do not place it in
+    # the answer prompt unless an experiment explicitly opts in.  A noisy
+    # mechanical proposal can anchor the backbone even when the retrieved
+    # evidence contains the correct answer.
+    candidate_answer_injection: bool = False
     # Remains false until an untouched holdout demonstrates >=99.5% precision
     # and <=0.5% false-complete for each whitelisted operator.
     deterministic_bypass_enabled: bool = False
@@ -92,9 +101,11 @@ class AnswerConfig:
     def __post_init__(self) -> None:
         if self.span_window is not None and self.span_window < 0:
             raise ValueError("span_window must be None or non-negative")
-        if self.evidence_order not in {"chronological", "relevance", "adaptive"}:
+        if self.evidence_order not in {
+                "chronological", "relevance", "adaptive", "topological"}:
             raise ValueError(
-                "evidence_order must be chronological, relevance, or adaptive")
+                "evidence_order must be chronological, relevance, adaptive, "
+                "or topological")
         if self.max_output_tokens is not None and self.max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be None or positive")
         if self.sampling_seed < 0:
@@ -110,6 +121,12 @@ class RenderedEvidence:
     truncated: bool
     #: True when the budget could only be met by dropping a mandatory turn.
     mandatory_dropped: bool = False
+    layout_mode: str = ""
+    chain_count: int = 0
+    chain_turns: int = 0
+    graph_group_count: int = 0
+    graph_turns: int = 0
+    auxiliary_turns: int = 0
 
 
 def _clip_spans(spans: Sequence[EvidenceMember], length: int,
@@ -185,6 +202,7 @@ def render_evidence(
     session_order: Mapping[str, int] | None = None,
     spans_by_turn: Mapping[str, Sequence[EvidenceMember]] | None = None,
     mandatory_turn_ids: Sequence[str] = (),
+    prefixes_by_turn: Mapping[str, str] | None = None,
 ) -> RenderedEvidence:
     """Render turns newest-context-last, dropping optional turns to fit the budget.
 
@@ -195,14 +213,19 @@ def render_evidence(
     """
     order = session_order or {}
     spans = spans_by_turn or {}
+    prefixes = prefixes_by_turn or {}
     mandatory = set(mandatory_turn_ids)
     source_rows = list(turns)
-    rows = (source_rows if config.evidence_order == "relevance" else
+    rows = (source_rows if config.evidence_order in {"relevance", "topological"} else
             sorted(source_rows,
                    key=lambda turn: (order.get(turn.session_id, 1 << 30),
                                      turn.session_id, turn.turn_index, turn.turn_id)))
-    rendered = {turn.turn_id: render_turn(turn, config, spans.get(turn.turn_id, ()))
-                for turn in rows}
+    rendered = {
+        turn.turn_id: " ".join(filter(None, (
+            prefixes.get(turn.turn_id, ""),
+            render_turn(turn, config, spans.get(turn.turn_id, ())),
+        ))) for turn in rows
+    }
     costs = dict(zip(rendered, counter.count_many(list(rendered.values()))))
     # +1 per turn for the joining newline.
     keep = [turn.turn_id for turn in rows]

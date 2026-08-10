@@ -155,6 +155,46 @@ def test_rare_lexical_bridge_is_conditioned_on_multifact_plan_and_descends() -> 
     assert result.proof[0].edge_id == "e-rare"
 
 
+def test_query_gated_rare_lexical_rejects_lookup_but_keeps_multifact() -> None:
+    nodes = (
+        GraphNode("seed", "m", NodeType.SCENE, 0, "anchor", "g:0"),
+        GraphNode("rare", "m", NodeType.SCENE, 0, "same topic", "g:1"),
+        GraphNode("semantic", "m", NodeType.SCENE, 0, "direct match", "g:2"),
+    )
+    edges = (
+        GraphEdge("e-rare", "m", "seed", RelationType.COARSE_RELATED,
+                  "rare", "g:0", False, 0.9,
+                  "relation_mask:lexical_rare"),
+        GraphEdge("e-semantic", "m", "seed", RelationType.COARSE_RELATED,
+                  "semantic", "g:0", False, 0.9,
+                  "relation_mask:scene_similar"),
+    )
+    view = GraphReadView(nodes, edges)
+    budget = QueryBudget(
+        max_hops=1, max_visited_nodes=2, max_visited_edges=1,
+        max_frontier=4, max_seed_nodes=1)
+    common = dict(
+        structured=True, expansion_beam=1, rare_lexical_relations=True,
+        query_gated_rare_lexical=True,
+        preferred_relations=(RelationType.COARSE_RELATED,))
+
+    lookup = execute(
+        view,
+        QueryIR("What is the value?", QueryOperator.LOOKUP,
+                (OperandSpec("o1"),),
+                (ProofObligation("need-value", "o1", "value"),)),
+        ("seed",), budget, **common)
+    multifact = execute(
+        view,
+        QueryIR("What are both values?", QueryOperator.UNION_DISTINCT,
+                (OperandSpec("o1"), OperandSpec("o2")),
+                (ProofObligation("need-collection", None, "collection"),)),
+        ("seed",), budget, **common)
+
+    assert lookup.proof[0].edge_id == "e-semantic"
+    assert multifact.proof[0].edge_id == "e-rare"
+
+
 def test_disabling_rare_lexical_keeps_edges_with_nonlexical_signals() -> None:
     nodes = (
         GraphNode("seed", "m", NodeType.SCENE, 0, "anchor", "g:0"),

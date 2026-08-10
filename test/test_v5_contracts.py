@@ -52,6 +52,19 @@ def test_thinking_cannot_be_enabled() -> None:
         config_from_dict({"models": {"thinking_enabled": True}})
 
 
+def test_relation_signal_allow_list_is_validated() -> None:
+    with pytest.raises(ValueError, match="unknown"):
+        config_from_dict({"edges": {"enabled_relation_signals": ["not-a-signal"]}})
+    with pytest.raises(ValueError, match="duplicates"):
+        config_from_dict({"edges": {
+            "enabled_relation_signals": ["scene_similar", "scene_similar"]}})
+
+    config = config_from_dict({"edges": {
+        "enabled_relation_signals": ["scene_similar", "temporal_near"]}})
+    assert tuple(config.edges.enabled_relation_signals) == (
+        "scene_similar", "temporal_near")
+
+
 def test_query_budget_rejects_unbounded_or_zero_limits() -> None:
     with pytest.raises(ValueError):
         QueryBudget(max_visited_nodes=0)

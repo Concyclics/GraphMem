@@ -59,8 +59,11 @@ class GatedRelationPlan:
     relation_mask_pairs: int = 0
     relation_mask_counts: Mapping[str, int] = field(default_factory=dict)
     atomic_candidate_source_counts: Mapping[str, int] = field(default_factory=dict)
+    atomic_candidate_signal_counts: Mapping[str, int] = field(default_factory=dict)
     accepted_pair_signals: Mapping[
         tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
+    refine_candidate_signals: Mapping[
+        str, tuple[str, ...]] = field(default_factory=dict)
 
 
 class RelationSignal(StrEnum):
@@ -72,6 +75,21 @@ class RelationSignal(StrEnum):
     STATE_COMPATIBLE = "state_compatible"
     COLLECTION_RELATED = "collection_related"
     LEXICAL_RARE = "lexical_rare"
+
+
+def normalize_relation_signals(
+    values: Sequence[str | RelationSignal] | None,
+) -> frozenset[RelationSignal]:
+    """Validate and freeze the relation-mask allow-list.
+
+    ``None`` preserves the historical all-signal behaviour.  An explicit empty
+    sequence is meaningful for diagnostics and must not be treated as the
+    default.
+    """
+
+    if values is None:
+        return frozenset(RelationSignal)
+    return frozenset(RelationSignal(value) for value in values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1101,11 +1119,13 @@ def bounded_relation_view_pairs(
     max_candidates: int,
     cross_session_only: bool,
     rare_lexical_min_shared: int = 3,
+    enabled_signals: Sequence[str | RelationSignal] | None = None,
 ) -> tuple[list[tuple[str, str, float, RelationSignal]], int]:
     """Propose a bounded union of typed and rare-lexical neighbours."""
 
     ordered = tuple(sorted(nodes, key=lambda row: row.node_id))
     by_id = {node.node_id: node for node in ordered}
+    active_signals = normalize_relation_signals(enabled_signals)
     candidates: dict[RelationSignal, dict[str, set[str]]] = {
         signal: defaultdict(set) for signal in (
             RelationSignal.SHARED_ENTITY,
@@ -1113,13 +1133,15 @@ def bounded_relation_view_pairs(
             RelationSignal.TEMPORAL_NEAR,
             RelationSignal.COLLECTION_RELATED,
             RelationSignal.LEXICAL_RARE,
-        )
+        ) if signal in active_signals
     }
 
     def add_posting_candidates(
         signal: RelationSignal,
         postings: Mapping[object, Sequence[str]],
     ) -> None:
+        if signal not in candidates:
+            return
         # Long postings are precisely the hub keys this channel is meant to
         # avoid.  The state/collection views remain useful because their
         # composite keys are much more selective than entity alone.
@@ -1181,19 +1203,21 @@ def bounded_relation_view_pairs(
             continue
         lexical_ranked[left_id].append((count, right_id))
         lexical_ranked[right_id].append((count, left_id))
-    for left_id, rows in lexical_ranked.items():
-        candidates[RelationSignal.LEXICAL_RARE][left_id].update(
-            right_id for _count, right_id in sorted(
-                rows, key=lambda row: (-row[0], row[1]))[:max_candidates])
+    if RelationSignal.LEXICAL_RARE in candidates:
+        for left_id, rows in lexical_ranked.items():
+            candidates[RelationSignal.LEXICAL_RARE][left_id].update(
+                right_id for _count, right_id in sorted(
+                    rows, key=lambda row: (-row[0], row[1]))[:max_candidates])
 
     timed = sorted((min(features[node.node_id].time_points), node.node_id)
                    for node in ordered if features[node.node_id].time_points)
     temporal_window = max(1, min(max_candidates, 8))
-    for index, (_point, node_id) in enumerate(timed):
-        for _other_point, other_id in timed[
-                max(0, index - temporal_window):index + temporal_window + 1]:
-            if other_id != node_id:
-                candidates[RelationSignal.TEMPORAL_NEAR][node_id].add(other_id)
+    if RelationSignal.TEMPORAL_NEAR in candidates:
+        for index, (_point, node_id) in enumerate(timed):
+            for _other_point, other_id in timed[
+                    max(0, index - temporal_window):index + temporal_window + 1]:
+                if other_id != node_id:
+                    candidates[RelationSignal.TEMPORAL_NEAR][node_id].add(other_id)
 
     source_name = {
         RelationSignal.SHARED_ENTITY: "entity",
@@ -1327,6 +1351,7 @@ def build_parent_gated_relations(
     relation_view_quotas: Mapping[str, int] | None = None,
     lexical_rare_terms: Mapping[str, frozenset[str]] | None = None,
     rare_lexical_min_shared: int = 3,
+    enabled_signals: Sequence[str | RelationSignal] | None = None,
 ) -> GatedRelationPlan:
     """Generate fine candidates only below a surviving coarse candidate edge.
 
@@ -1344,6 +1369,7 @@ def build_parent_gated_relations(
             "max_refine_candidates_per_1000_nodes cannot be negative")
     if rare_lexical_min_shared < 1:
         raise ValueError("rare_lexical_min_shared must be positive")
+    active_signals = normalize_relation_signals(enabled_signals)
     all_nodes = tuple(nodes.values())
     view_quotas = dict(relation_view_quotas or {})
     relation_features = (build_relation_features(
@@ -1395,12 +1421,13 @@ def build_parent_gated_relations(
                     eligible_entities=eligible_entities,
                     rare_lexical_min_shared=rare_lexical_min_shared)
                 mask = set(relation_mask(
-                    scores, semantic_threshold=low_threshold))
+                    scores, semantic_threshold=low_threshold) & active_signals)
                 if not mask:
                     continue
                 score = _relation_gate_score({signal: scores[signal]
                                               for signal in mask})
-            elif score < low_threshold:
+            elif (score < low_threshold
+                  or RelationSignal.SCENE_SIMILAR not in active_signals):
                 continue
             else:
                 mask = {RelationSignal.SCENE_SIMILAR}
@@ -1414,7 +1441,8 @@ def build_parent_gated_relations(
                 eligible_entities=eligible_entities, quotas=view_quotas,
                 max_candidates=max_candidates_per_node,
                 cross_session_only=False,
-                rare_lexical_min_shared=rare_lexical_min_shared)
+                rare_lexical_min_shared=rare_lexical_min_shared,
+                enabled_signals=active_signals)
             comparisons += view_comparisons
             for left, right, _view_score, signal in view_pairs:
                 pair = (left, right)
@@ -1426,7 +1454,7 @@ def build_parent_gated_relations(
                     eligible_entities=eligible_entities,
                     rare_lexical_min_shared=rare_lexical_min_shared)
                 mask = set(relation_mask(
-                    scores, semantic_threshold=low_threshold))
+                    scores, semantic_threshold=low_threshold) & active_signals)
                 mask.add(signal)
                 score = _relation_gate_score({item: scores.get(item, 0.0)
                                               for item in mask})
@@ -1448,6 +1476,7 @@ def build_parent_gated_relations(
     typed: dict[tuple[str, str, RelationType], tuple[
         str, str, RelationType, float, int, str]] = {}
     refine: dict[str, RefineCandidate] = {}
+    refine_signals: dict[str, set[str]] = defaultdict(set)
     relation_levels: set[int] = set()
 
     processed: dict[tuple[str, str], tuple[
@@ -1486,7 +1515,6 @@ def build_parent_gated_relations(
                     typed_restoration and (
                         left.node_type not in COARSE_NAVIGATION_NODE_TYPES
                         or right.node_type not in COARSE_NAVIGATION_NODE_TYPES)):
-                accepted[pair] = (pair[0], pair[1], score, level)
                 if relation_mask_propagation:
                     local_semantic = similarity(left, right)
                     comparisons += 1
@@ -1495,18 +1523,25 @@ def build_parent_gated_relations(
                         semantic_similarity=local_semantic,
                         eligible_entities=eligible_entities,
                         rare_lexical_min_shared=rare_lexical_min_shared)
-                    accepted_signals[pair].update(
+                    qualified = {
                         str(signal) for signal in gate_mask
                         if _signal_gate_confidence(
                             signal, local_scores.get(signal, 0.0))
-                        >= high_threshold)
+                        >= high_threshold}
+                    if qualified:
+                        accepted[pair] = (pair[0], pair[1], score, level)
+                        accepted_signals[pair].update(qualified)
+                else:
+                    accepted[pair] = (pair[0], pair[1], score, level)
             typed_decision = (classify_typed_relation(left, right, score)
                               if typed_restoration else None)
             if typed_decision is not None:
                 relation, confidence, source = typed_decision
                 if confidence >= typed_min_confidence:
+                    signal_source = ",".join(sorted(map(str, gate_mask)))
                     typed[(pair[0], pair[1], relation)] = (
-                        pair[0], pair[1], relation, confidence, level, source)
+                        pair[0], pair[1], relation, confidence, level,
+                        f"{source}|relation_mask:{signal_source}")
             ambiguous = low_threshold <= score < high_threshold
             left_sessions = _node_sessions(left)
             right_sessions = _node_sessions(right)
@@ -1566,6 +1601,7 @@ def build_parent_gated_relations(
                     estimated_child_pairs=estimated_pairs,
                     priority=uncertainty * bridge_value / 448.0,
                 )
+                refine_signals[candidate_id].update(map(str, gate_mask))
 
             left_children = [nodes[item] for item in child_map.get(left_id, ()) if item in nodes]
             right_children = [nodes[item] for item in child_map.get(right_id, ()) if item in nodes]
@@ -1587,7 +1623,7 @@ def build_parent_gated_relations(
                             eligible_entities=eligible_entities,
                             rare_lexical_min_shared=rare_lexical_min_shared)
                         local_mask = relation_mask(
-                            scores, semantic_threshold=low_threshold)
+                            scores, semantic_threshold=low_threshold) & active_signals
                         child_mask = frozenset(
                             set(gate_mask) & set(local_mask))
                         if not child_mask:
@@ -1644,17 +1680,22 @@ def build_parent_gated_relations(
     atomic_relation_candidates_generated = 0
     atomic_relation_pairs_proposed = 0
     atomic_source_counts: dict[str, int] = defaultdict(int)
+    atomic_signal_counts: dict[str, int] = defaultdict(int)
     if (typed_restoration
             and (atomic_vector_channels or atomic_relation_multiview)):
         atomic_nodes = tuple(node for node in all_nodes
                              if node.node_type in ATOMIC_RELATION_NODE_TYPES)
         channel_pairs: dict[tuple[str, str], tuple[float, set[str]]] = {}
-        channels: tuple[tuple[str, Mapping[str, Sequence[float]] | None], ...] = (
-            ("lexical", None),
-            *((f"atomic_summary_{index}", channel)
-              for index, channel in enumerate(atomic_vector_channels)),
+        channels: tuple[tuple[
+            str, Mapping[str, Sequence[float]] | None, RelationSignal], ...] = (
+            *(((("lexical", None, RelationSignal.LEXICAL_RARE),)
+               if RelationSignal.LEXICAL_RARE in active_signals else ())),
+            *((f"atomic_summary_{index}", channel,
+               RelationSignal.SCENE_SIMILAR)
+              for index, channel in enumerate(atomic_vector_channels)
+              if RelationSignal.SCENE_SIMILAR in active_signals),
         )
-        for channel_name, channel_vectors in channels:
+        for channel_name, channel_vectors, channel_signal in channels:
             quota_key = ("lexical" if channel_name == "lexical"
                          else "semantic")
             channel_k = (max(0, int(view_quotas.get(
@@ -1679,7 +1720,7 @@ def build_parent_gated_relations(
                     continue
                 pair = tuple(sorted((left_id, right_id)))
                 previous = channel_pairs.get(pair)
-                source = quota_key
+                source = str(channel_signal)
                 channel_pairs[pair] = (
                     max(score, previous[0]) if previous else score,
                     (previous[1] | {source}) if previous else {source})
@@ -1689,26 +1730,29 @@ def build_parent_gated_relations(
                 eligible_entities=eligible_entities, quotas=view_quotas,
                 max_candidates=max_candidates_per_node,
                 cross_session_only=True,
-                rare_lexical_min_shared=rare_lexical_min_shared)
+                rare_lexical_min_shared=rare_lexical_min_shared,
+                enabled_signals=active_signals)
             comparisons += view_comparisons
-            source_by_signal = {
-                RelationSignal.SHARED_ENTITY: "entity",
-                RelationSignal.STATE_COMPATIBLE: "state",
-                RelationSignal.TEMPORAL_NEAR: "temporal",
-                RelationSignal.COLLECTION_RELATED: "collection",
-                RelationSignal.LEXICAL_RARE: "rare_lexical",
-            }
             for left_id, right_id, score, signal in view_pairs:
                 pair = (left_id, right_id)
-                source = source_by_signal[signal]
+                source = str(signal)
                 previous = channel_pairs.get(pair)
                 channel_pairs[pair] = (
                     max(score, previous[0]) if previous else score,
                     (previous[1] | {source}) if previous else {source})
         atomic_relation_pairs_proposed = len(channel_pairs)
+        diagnostic_source = {
+            str(RelationSignal.SCENE_SIMILAR): "semantic",
+            str(RelationSignal.SHARED_ENTITY): "entity",
+            str(RelationSignal.STATE_COMPATIBLE): "state",
+            str(RelationSignal.TEMPORAL_NEAR): "temporal",
+            str(RelationSignal.COLLECTION_RELATED): "collection",
+            str(RelationSignal.LEXICAL_RARE): "rare_lexical",
+        }
         for _pair, (_score, sources) in channel_pairs.items():
             for source in sources:
-                atomic_source_counts[source] += 1
+                atomic_signal_counts[source] += 1
+                atomic_source_counts[diagnostic_source[source]] += 1
         for pair, (score, sources) in sorted(channel_pairs.items()):
             allowed_relations = structurally_allowed_refined_relations(
                 nodes[pair[0]], nodes[pair[1]])
@@ -1729,6 +1773,7 @@ def build_parent_gated_relations(
                 # per-memory call budget first.
                 priority=2.0 + max(-1.0, min(1.0, score)),
             )
+            refine_signals[candidate_id].update(sources)
         atomic_relation_candidates_generated = sum(
             candidate.kind == "atomic_relation_edge"
             for candidate in refine.values())
@@ -1778,7 +1823,12 @@ def build_parent_gated_relations(
         relation_mask_counts=dict(sorted(mask_counts.items())),
         atomic_candidate_source_counts=dict(sorted(
             atomic_source_counts.items())),
+        atomic_candidate_signal_counts=dict(sorted(
+            atomic_signal_counts.items())),
         accepted_pair_signals={
             pair: tuple(sorted(signals))
             for pair, signals in sorted(accepted_signals.items())},
+        refine_candidate_signals={
+            candidate_id: tuple(sorted(signals))
+            for candidate_id, signals in sorted(refine_signals.items())},
     )

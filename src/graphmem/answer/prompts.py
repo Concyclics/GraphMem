@@ -53,6 +53,49 @@ SOURCE_TIME_SYSTEM_PROMPT = ANSWER_SYSTEM_PROMPT.replace(
     "deterministic resolution of a memory phrase and must be used as written. Observation ",
 )
 
+# Query-side precision contract for wide graph reservoirs.  This is an opt-in
+# prompt rather than a replacement for the frozen V5.6/V5.12 contracts: old
+# artifacts must remain replayable under their original prompt hashes.
+GROUNDED_PROMPT_VERSION = "graphmem-v5.20-grounded-answer-v1"
+GROUNDED_PROMPT_APPENDIX = (
+    " First isolate the smallest set of memories that directly supports the "
+    "requested answer; ignore same-topic memories that concern another entity, "
+    "another event, or a different state. Do not treat an assistant suggestion, "
+    "hypothetical example, unaccepted plan, or image caption alone as proof that "
+    "the user performed, owned, preferred, or completed something. Prefer an "
+    "explicit first-person statement or a clearly confirmed fact. Exact wording "
+    "of the requested relation is not required when the statement directly "
+    "entails it, but topical similarity alone is never sufficient. For a count "
+    "or list, silently form a ledger of distinct relevant events or items, keep "
+    "separate recurring occurrences such as two named weekdays, and remove only "
+    "duplicate mentions of the same occurrence. For a duration, date, or order, "
+    "silently identify each endpoint and its date before calculating or sorting. "
+    "When facts conflict, use the newest explicit update for a current-state "
+    "question and the event-time fact for a historical question. Before answering, "
+    "verify the final entity, number, unit, polarity, and date against the direct "
+    "evidence. Do not expose the ledger, evidence review, or calculation steps. "
+    "Return the final answer once, in one or at most two concise sentences."
+)
+GROUNDED_OUTPUT_CONTRACT = (
+    "Output contract: Return only the final answer in one or at most two concise "
+    "sentences. Do not quote or list evidence, show calculations, add a rationale, "
+    "or repeat the conclusion."
+)
+TOPOLOGICAL_LAYOUT_VERSION = "graphmem-v5.20-topological-evidence-v1"
+TOPOLOGICAL_LAYOUT_APPENDIX = (
+    " Evidence is arranged into graph-derived blocks. [CHAIN k step=d] lines "
+    "belong to one QueryIR operand and follow its root-to-leaf relation path; "
+    "[CHAIN k support] lines are nearby evidence for that operand. "
+    "[GRAPH g step=d] lines share a graph traversal branch even when QueryIR "
+    "did not bind them to an operand. [AUX] lines are unbound supporting "
+    "context grouped in a small window around a high-relevance anchor. All "
+    "blocks are ordered by their best query-relevance rank before their "
+    "internal graph/temporal order. These labels are navigation hints, not "
+    "facts or confidence guarantees: verify the exact entity, event, status, "
+    "number, and date in the memory text. Read all blocks needed by the "
+    "question, but do not combine facts merely because they share a block."
+)
+
 
 def _query_operation_contract(question: str) -> str:
     """Name the arithmetic contract when the question form fixes it.
@@ -75,6 +118,8 @@ def build_answer_messages(
     evidence_text: str,
     candidate_answer: str | None = None,
     normalize_relative_time: bool = False,
+    precision_grounding: bool = False,
+    topological_layout: bool = False,
 ) -> list[dict[str, str]]:
     sections = [
         f"Question date: {question_date or 'unknown'}",
@@ -85,9 +130,15 @@ def build_answer_messages(
     if candidate_answer:
         sections += ["", f"Candidate answer (unverified proposal): {candidate_answer}"]
     sections += ["", "Conversation memories:", evidence_text]
+    if precision_grounding:
+        # Repeat the short format contract *after* the long evidence block.  A
+        # system-only instruction before 5K-12K evidence was often ignored by
+        # Qwen, which then emitted evidence lists or degenerated into repetition.
+        sections += ["", GROUNDED_OUTPUT_CONTRACT]
     return [
         {"role": "system", "content": prompt_contract(
-            normalize_relative_time)[1]},
+            normalize_relative_time, precision_grounding,
+            topological_layout)[1]},
         {"role": "user", "content": "\n".join(sections)},
     ]
 
@@ -97,10 +148,19 @@ PROMPT_HASH = hashlib.sha256(
 ).hexdigest()
 
 
-def prompt_contract(normalize_relative_time: bool = False) -> tuple[str, str, str]:
+def prompt_contract(normalize_relative_time: bool = False,
+                    precision_grounding: bool = False,
+                    topological_layout: bool = False) -> tuple[str, str, str]:
     """Return the exact version/text/hash for an answer configuration."""
 
     version, prompt = (
         (SOURCE_TIME_PROMPT_VERSION, SOURCE_TIME_SYSTEM_PROMPT)
         if normalize_relative_time else (PROMPT_VERSION, ANSWER_SYSTEM_PROMPT))
+    if precision_grounding:
+        version = (GROUNDED_PROMPT_VERSION
+                   + ("-source-time" if normalize_relative_time else ""))
+        prompt += GROUNDED_PROMPT_APPENDIX
+    if topological_layout:
+        version += "+" + TOPOLOGICAL_LAYOUT_VERSION
+        prompt += TOPOLOGICAL_LAYOUT_APPENDIX
     return version, prompt, hashlib.sha256((version + prompt).encode("utf-8")).hexdigest()

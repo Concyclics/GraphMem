@@ -150,12 +150,29 @@ def _coarse_signal_bonus(ir: QueryIR, source: str, *,
     return score
 
 
+def _rare_lexical_bridge_needed(ir: QueryIR) -> bool:
+    """Return whether a lexical-only region bridge can satisfy this plan.
+
+    Rare lexical overlap is useful as a cross-region recall channel, but it is
+    not evidence for an ordinary one-fact lookup.  Query gating prevents the
+    much larger lexical-only edge family from consuming the beam for simple
+    questions while preserving it for plans that genuinely need multiple
+    witnesses, endpoints, or collection members.
+    """
+
+    kinds = {row.kind for row in ir.proof_obligations}
+    return bool(len(ir.operands) > 1 or kinds & {
+        "state_history", "time_endpoint", "ordering", "collection",
+    })
+
+
 def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *,
             structured: bool,
             preferred_relations=None, fallback_relations=None,
             expansion_beam: int = 0,
             hierarchy_descent_beam: int = 1,
             rare_lexical_relations: bool = False,
+            query_gated_rare_lexical: bool = False,
             obligation_aware_relations: bool = False) -> ScheduleResult:
     """Deterministic obligation-first traversal; provenance is hydrated later.
 
@@ -180,6 +197,9 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
     if obligation_aware_relations:
         preferred = tuple(dict.fromkeys((*_TYPED_RELATIONS, *preferred)))
     fallback = tuple(fallback_relations) if fallback_relations is not None else DEFAULT_FALLBACK
+    admit_rare_lexical = bool(
+        rare_lexical_relations
+        and (not query_gated_rare_lexical or _rare_lexical_bridge_needed(ir)))
     # ``relation_hop`` and structural descent are deliberately independent.
     # max_hops bounds semantic/cross-region reasoning; it must not strand a
     # selected routing card above Scene/Fact merely because the hierarchy has
@@ -222,7 +242,7 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
                               if obligation_aware_relations else 0.0)
             signal_bonus = _coarse_signal_bonus(
                 ir, row.edge.source,
-                rare_lexical_relations=rare_lexical_relations)
+                rare_lexical_relations=admit_rare_lexical)
             posting_bonus = 0.0
             if structural:
                 parent_node = view.nodes.get(node_id)
@@ -279,7 +299,7 @@ def execute(view, ir: QueryIR, seed_ids: tuple[str, ...], budget: QueryBudget, *
             scored = [(destination_priority(row), row) for row in
                       view.neighbors(
                           node_id, relation_allowed, semantic_only=True)
-                      if (rare_lexical_relations
+                      if (admit_rare_lexical
                           or _relation_mask_signals(row.edge.source)
                           != frozenset({"lexical_rare"}))]
             ordered = sorted(
