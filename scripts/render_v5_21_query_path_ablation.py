@@ -265,6 +265,7 @@ def main() -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    matplotlib.rcParams["svg.hashsalt"] = "graphmem-v5.21-query-path"
     labels = [stages[key]["label"] for key in stage_keys]
     x = range(len(labels))
     colors = {"longmemeval": "#2378D7", "locomo": "#18A999"}
@@ -305,10 +306,21 @@ def main() -> None:
     for axis in axes:
         axis.spines[["top", "right"]].set_visible(False)
     args.output_figure.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(args.output_figure, bbox_inches="tight")
+    fig.savefig(
+        args.output_figure, bbox_inches="tight",
+        metadata={"Creator": "GraphMem", "CreationDate": None,
+                  "ModDate": None})
     fig.savefig(args.output_figure.with_suffix(".png"), dpi=220,
                 bbox_inches="tight")
-    fig.savefig(args.output_figure.with_suffix(".svg"), bbox_inches="tight")
+    svg_path = args.output_figure.with_suffix(".svg")
+    fig.savefig(svg_path, bbox_inches="tight",
+                metadata={"Creator": "GraphMem", "Date": None})
+    # Matplotlib writes multiline path data with one trailing space per line.
+    # Normalize the generated source so report-repository diff checks remain a
+    # useful gate instead of emitting thousands of mechanical warnings.
+    svg_path.write_text("\n".join(
+        line.rstrip() for line in svg_path.read_text(
+            encoding="utf-8").splitlines()) + "\n", encoding="utf-8")
     plt.close(fig)
 
 
