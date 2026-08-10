@@ -51,6 +51,24 @@ def token_quad(stats: dict | None) -> str:
                     ("mean", "p95", "p99", "max"))
 
 
+def compact_number(value) -> str:
+    if value is None:
+        return "运行中"
+    value = float(value)
+    if abs(value) >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if abs(value) >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return number(value)
+
+
+def compact_token_quad(stats: dict | None) -> str:
+    if not stats:
+        return "运行中"
+    return "/".join(compact_number(stats.get(key)) for key in
+                    ("mean", "p95", "p99", "max"))
+
+
 def graph_table(payload: dict) -> str:
     arms = payload.get("arms", {})
     comparisons = payload.get("comparisons", {})
@@ -109,36 +127,170 @@ def graph_analysis(payload: dict) -> str:
         r"不以 recall 增大替代最终回答准确率。" + strict_text + "\n")
 
 
-def budget_rows(payload: dict) -> str:
+def indexed_results(payload: dict) -> tuple[dict, dict]:
+    graph = {
+        (row.get("benchmark"), row.get("retrieval_setting")): row
+        for row in payload.get("graphmem", ())
+    }
+    mem0 = {
+        (row.get("benchmark"), row.get("retrieval_setting")): row
+        for row in payload.get("mem0", ())
+        if row.get("status") == "complete" and row.get("questions")
+    }
+    return graph, mem0
+
+
+def build_rows(payload: dict) -> str:
+    graph, mem0 = indexed_results(payload)
     rows = []
-    graphmem = payload.get("graphmem", ())
-    mem0 = [row for row in payload.get("mem0", ())
-            if row.get("status") == "complete" and row.get("questions")]
-    for row in graphmem:
-        benchmark = ("LongMemEval" if row.get("benchmark") == "longmemeval"
-                     else "LoCoMo Cat. 1--4")
+    for benchmark, label, unit in (
+            ("longmemeval", "LongMemEval", "Memory"),
+            ("locomo", "LoCoMo Cat. 1--4", "Conversation")):
+        left = graph.get((benchmark, "32-turn"))
+        right = mem0.get((benchmark, "top-50"))
+        if (not left or not right or not left.get("build_tokens")
+                or not right.get("build_tokens")):
+            rows.append(" & ".join((label, unit, "运行中", "运行中",
+                                    "运行中", "运行中")) + r" \\")
+            continue
+        graph_build = left["build_tokens"]
+        mem0_build = right["build_tokens"]
+        ratio = float(mem0_build["mean"]) / float(graph_build["mean"])
+        reduction = 100 * (1 - float(graph_build["mean"])
+                           / float(mem0_build["mean"]))
         rows.append(" & ".join((
-            "GraphMem", str(row.get("retrieval_setting")), benchmark,
-            number(row.get("questions")), pct(row.get("accuracy")),
-            token_quad(row.get("answer_tokens")),
-            number(row.get("mean_packed_turns")),
+            label, f"{unit}（{number(graph_build.get('count'))}）",
+            compact_token_quad(graph_build), compact_token_quad(mem0_build),
+            f"{ratio:.1f}$\\times$", f"{reduction:.1f}\\%",
         )) + r" \\")
-    for row in mem0:
-        benchmark = ("LongMemEval" if row.get("benchmark") == "longmemeval"
-                     else "LoCoMo Cat. 1--4")
-        rows.append(" & ".join((
-            "Mem0", str(row.get("retrieval_setting")), benchmark,
-            number(row.get("questions")), pct(row.get("accuracy")),
-            token_quad(row.get("answer_tokens")), "--",
-        )) + r" \\")
-    if not rows:
-        for method, setting in (("GraphMem", "32-turn"), ("GraphMem", "64-turn"),
-                                ("Mem0", "top-50"), ("Mem0", "top-200")):
-            for benchmark in ("LongMemEval", "LoCoMo Cat. 1--4"):
-                rows.append(" & ".join((method, setting, benchmark,
-                                        "运行中", "运行中", "运行中", "运行中"))
-                            + r" \\")
     return "\n".join(rows) + "\n\\bottomrule\n"
+
+
+def budget_rows(payload: dict) -> str:
+    graph, mem0 = indexed_results(payload)
+    pairs = (
+        ("longmemeval", "LongMemEval", "低预算", "32-turn", "top-50",
+         "近似等预算"),
+        ("longmemeval", "LongMemEval", "高预算", "64-turn", "top-200",
+         "近似等预算"),
+        ("locomo", "LoCoMo Cat. 1--4", "等预算", "64-turn", "top-50",
+         "近似等预算"),
+        ("locomo", "LoCoMo Cat. 1--4", "Pareto 支配", "64-turn", "top-200",
+         "更低预算"),
+    )
+    rows = []
+    for benchmark, label, tier, graph_setting, mem0_setting, scope in pairs:
+        left = graph.get((benchmark, graph_setting))
+        right = mem0.get((benchmark, mem0_setting))
+        if not left or not right:
+            rows.append(" & ".join((label, tier, "运行中", "运行中",
+                                    "运行中", "运行中", "运行中")) + r" \\")
+            continue
+        graph_tokens = float(left["answer_tokens"]["mean"])
+        mem0_tokens = float(right["answer_tokens"]["mean"])
+        gain = 100 * (float(left["accuracy"]) - float(right["accuracy"]))
+        rows.append(" & ".join((
+            label, tier, f"{graph_setting} / {mem0_setting}",
+            f"{number(graph_tokens)} / {number(mem0_tokens)}",
+            f"{graph_tokens / mem0_tokens:.2f}$\\times$（{scope}）",
+            f"{pct(left['accuracy'])} / {pct(right['accuracy'])}",
+            f"{gain:+.1f} pp",
+        )) + r" \\")
+    return "\n".join(rows) + "\n\\bottomrule\n"
+
+
+def type_accuracy_rows(payload: dict) -> str:
+    graph, mem0 = indexed_results(payload)
+    specifications = (
+        ("longmemeval", "LongMemEval", "single-session-user", "Single-session User"),
+        ("longmemeval", "", "single-session-assistant", "Single-session Assistant"),
+        ("longmemeval", "", "single-session-preference", "Single-session Preference"),
+        ("longmemeval", "", "multi-session", "Multi-session"),
+        ("longmemeval", "", "temporal-reasoning", "Temporal-reasoning"),
+        ("longmemeval", "", "knowledge-update", "Knowledge-update"),
+        ("locomo", "LoCoMo", "category_1", "Category 1 Multi-hop"),
+        ("locomo", "", "category_2", "Category 2 Temporal"),
+        ("locomo", "", "category_3", "Category 3 Open-domain"),
+        ("locomo", "", "category_4", "Category 4 Single-hop"),
+    )
+    rows = []
+    previous_benchmark = None
+    for benchmark, benchmark_label, key, type_label in specifications:
+        if previous_benchmark is not None and benchmark != previous_benchmark:
+            rows.append(r"\midrule")
+        points = (
+            graph.get((benchmark, "32-turn"), {}),
+            graph.get((benchmark, "64-turn"), {}),
+            mem0.get((benchmark, "top-50"), {}),
+            mem0.get((benchmark, "top-200"), {}),
+        )
+        values = [(point.get("accuracy_by_type") or {}).get(key, {})
+                  for point in points]
+        sample_sizes = {int(value.get("questions")) for value in values
+                        if value.get("questions") is not None}
+        sample = next(iter(sample_sizes)) if len(sample_sizes) == 1 else None
+        accuracies = [value.get("accuracy") for value in values]
+        if benchmark == "longmemeval" and all(value is not None for value in accuracies):
+            matched_delta = (
+                f"{100 * (accuracies[0] - accuracies[2]):+.1f} / "
+                f"{100 * (accuracies[1] - accuracies[3]):+.1f} pp")
+        elif benchmark == "locomo" and all(value is not None for value in accuracies):
+            matched_delta = f"{100 * (accuracies[1] - accuracies[2]):+.1f} pp"
+        else:
+            matched_delta = "运行中"
+        rows.append(" & ".join((
+            benchmark_label, type_label, number(sample),
+            *(pct(value) for value in accuracies), matched_delta,
+        )) + r" \\")
+        previous_benchmark = benchmark
+    return "\n".join(rows) + "\n\\bottomrule\n"
+
+
+def type_accuracy_analysis(payload: dict) -> str:
+    graph, mem0 = indexed_results(payload)
+    required = (
+        graph.get(("longmemeval", "32-turn")),
+        graph.get(("longmemeval", "64-turn")),
+        mem0.get(("longmemeval", "top-50")),
+        mem0.get(("longmemeval", "top-200")),
+        graph.get(("locomo", "64-turn")),
+        mem0.get(("locomo", "top-50")),
+    )
+    if not all(required):
+        return (r"\paragraph{题型结果状态。}逐题类型账本仍在审计；"
+                r"缺失单元格不参与题型结论。" "\n")
+
+    def typed(row: dict, key: str) -> float:
+        return float(row["accuracy_by_type"][key]["accuracy"])
+
+    lme32, lme64, mem50, mem200, locomo64, locomo50 = required
+    lme_temporal_low = 100 * (
+        typed(lme32, "temporal-reasoning")
+        - typed(mem50, "temporal-reasoning"))
+    lme_temporal_high = 100 * (
+        typed(lme64, "temporal-reasoning")
+        - typed(mem200, "temporal-reasoning"))
+    lme_multi_low = 100 * (
+        typed(lme32, "multi-session") - typed(mem50, "multi-session"))
+    lme_multi_high = 100 * (
+        typed(lme64, "multi-session") - typed(mem200, "multi-session"))
+    locomo_deltas = {
+        category: 100 * (typed(locomo64, category) - typed(locomo50, category))
+        for category in ("category_1", "category_2", "category_3", "category_4")
+    }
+    return (
+        r"\paragraph{题型分解。}"
+        f"LongMemEval 的近似等预算增益主要来自 Temporal-reasoning："
+        f"低/高预算分别为 {lme_temporal_low:+.1f}/{lme_temporal_high:+.1f} pp；"
+        f"Multi-session 仅为 {lme_multi_low:+.1f}/{lme_multi_high:+.1f} pp，"
+        r"说明跨会话集合闭包仍是当前弱项。"
+        f"LoCoMo 64-turn 对 top-50 的总体优势并非各题型均匀提升："
+        f"Category 2 Temporal 为 {locomo_deltas['category_2']:+.1f} pp，"
+        f"Category 3 Open-domain 为 {locomo_deltas['category_3']:+.1f} pp，"
+        f"但 Category 1 Multi-hop 与 Category 4 Single-hop 分别为 "
+        f"{locomo_deltas['category_1']:+.1f}/{locomo_deltas['category_4']:+.1f} pp。"
+        r"因此总体提升应解释为时间关系建模的集中收益，而不是所有查询类型上的全面支配；"
+        r"后两类仍是下一轮索引与回答路径优化的直接目标。" "\n")
 
 
 def budget_analysis(payload: dict) -> str:
@@ -169,6 +321,7 @@ def budget_analysis(payload: dict) -> str:
         if row.get("status") == "complete" and row.get("questions")
     }
     matched = []
+    build_matched = []
     graph = {(row.get("benchmark"), row.get("retrieval_setting")): row
              for row in graphmem}
     pairs = (
@@ -176,10 +329,10 @@ def budget_analysis(payload: dict) -> str:
          "LongMemEval 低预算"),
         (("longmemeval", "64-turn"), ("longmemeval", "top-200"),
          "LongMemEval 高预算"),
-        (("locomo", "32-turn"), ("locomo", "top-50"),
-         "LoCoMo 低预算"),
+        (("locomo", "64-turn"), ("locomo", "top-50"),
+         "LoCoMo 近似等预算"),
         (("locomo", "64-turn"), ("locomo", "top-200"),
-         "LoCoMo 高预算"),
+         "LoCoMo Pareto 点"),
     )
     for graph_key, mem0_key, label in pairs:
         if graph_key not in graph or mem0_key not in mem0:
@@ -191,10 +344,32 @@ def budget_analysis(payload: dict) -> str:
         matched.append(
             f"{label}相对 Mem0 为 {accuracy_gain:+.1f} pp Accuracy、"
             f"{token_change:+.1f}\% Answer Token")
+    for benchmark, label in (("longmemeval", "LongMemEval"),
+                             ("locomo", "LoCoMo")):
+        graph_row = graph.get((benchmark, "32-turn"))
+        mem0_row = mem0.get((benchmark, "top-50"))
+        if not graph_row or not mem0_row:
+            continue
+        graph_build = graph_row.get("build_tokens") or {}
+        mem0_build = mem0_row.get("build_tokens") or {}
+        if graph_build.get("mean") is None or mem0_build.get("mean") is None:
+            continue
+        ratio = float(mem0_build["mean"]) / float(graph_build["mean"])
+        reduction = 100 * (1 - float(graph_build["mean"])
+                           / float(mem0_build["mean"]))
+        build_matched.append(
+            f"{label} 的 GraphMem/Mem0 Build mean 为 "
+            f"{compact_number(graph_build['mean'])}/"
+            f"{compact_number(mem0_build['mean'])}，即 {ratio:.1f}$\\times$ "
+            f"差距（GraphMem 减少 {reduction:.1f}\%）")
     comparison = ("；" + "；".join(matched) if matched else "")
-    return (r"\paragraph{预算曲线。}" + "；".join(chunks) + comparison + "。"
+    build_comparison = ("；" + "；".join(build_matched)
+                        if build_matched else "")
+    return (r"\paragraph{预算曲线。}" + "；".join(chunks) + comparison
+            + build_comparison + "。"
             r"跨方法比较使用实测 Answer Token，而不是把 GraphMem turn 数与 Mem0 top-$k$"
-            r"视为相同语义；构建 Token 仍在独立成本表中按 Memory 报告。" "\n")
+            r"视为相同语义；Build Token 在 32/64-turn 或 top-50/top-200 间共享，"
+            r"表中重复展示仅为便于逐行对照，不重复计费。" "\n")
 
 
 def plot_graph(payload: dict, report: Path) -> None:
@@ -285,7 +460,10 @@ def main() -> None:
     outputs = {
         "v5_20_graph_ablation_table.tex": graph_table(graph),
         "v5_20_graph_ablation_analysis.tex": graph_analysis(graph),
+        "v5_20_build_table.tex": build_rows(budget),
         "v5_20_budget_table.tex": budget_rows(budget),
+        "v5_20_type_accuracy_table.tex": type_accuracy_rows(budget),
+        "v5_20_type_accuracy_analysis.tex": type_accuracy_analysis(budget),
         "v5_20_budget_analysis.tex": budget_analysis(budget),
     }
     for name, content in outputs.items():

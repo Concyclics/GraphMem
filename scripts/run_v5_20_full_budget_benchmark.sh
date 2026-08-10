@@ -16,6 +16,7 @@ DENSE="${GRAPH_ROOT}/dense_indexes"
 QUERY_CACHE="${GRAPH_ROOT}/query_embeddings.sqlite"
 MEMORY_BENCHMARKS="${WORKSPACE}/third_party/memory-benchmarks"
 MEM0="${WORKSPACE}/artifacts/report/v5_19/mem0_qwen30_cutoffs.json"
+BUILD_REPORT="${GRAPH_ROOT}/build_report.json"
 
 if [[ -f "${REPO}/.env" ]]; then
   set -a
@@ -28,7 +29,8 @@ export PYTHONHASHSEED=0
 
 for path in "${PYTHON_BIN}" "${LME}" "${LOCOMO}" "${GOLD}" "${CONFIG}" \
             "${GRAPHMEM_TOKENIZER_PATH}" "${GRAPH_DB}" "${DENSE}" \
-            "${QUERY_CACHE}" "${MEMORY_BENCHMARKS}" "${MEM0}"; do
+            "${QUERY_CACHE}" "${MEMORY_BENCHMARKS}" "${MEM0}" \
+            "${BUILD_REPORT}"; do
   [[ -e "${path}" ]] || { echo "missing required path: ${path}" >&2; exit 2; }
 done
 mkdir -p "${ROOT}"
@@ -124,4 +126,5 @@ judge_arm 64
 wait "${judge32_pid}"
 
 "${PYTHON_BIN}" "${REPO}/scripts/summarize_v5_20_budget_benchmark.py" \
-  --root "${ROOT}" --mem0 "${MEM0}" --output "${ROOT}/summary.json"
+  --root "${ROOT}" --mem0 "${MEM0}" --build-report "${BUILD_REPORT}" \
+  --output "${ROOT}/summary.json"
