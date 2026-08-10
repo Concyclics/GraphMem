@@ -368,12 +368,15 @@ def plot_pareto(
 
 
 def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
-    """Plot one QPS-memory curve for each system and worker setting."""
+    """Connect worker-scaling points within each system and concurrency."""
     plt = configure_plotting()
     from matplotlib.lines import Line2D
 
     workers = (1, 4, 8)
-    markers = {"GraphMem": "o", "Mem0 OSS": "s"}
+    clients = (1, 4, 16, 64, 128, 256)
+    client_markers = {
+        1: "o", 4: "s", 16: "^", 64: "D", 128: "P", 256: "X",
+    }
     metrics = (
         ("worker_rss_mib", "(a) RSS"),
         ("worker_pss_mib", "(b) PSS"),
@@ -381,30 +384,21 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=PAPER_FIGSIZE, sharey=True)
     for axis, (metric_key, panel_title) in zip(axes, metrics):
         for system in ("GraphMem", "Mem0 OSS"):
-            for worker in workers:
+            for client in clients:
                 group = sorted(
                     (row for row in rows
                      if row["system"] == system
-                     and row["workers"] == worker),
-                    key=lambda row: row["clients"],
+                     and row["clients"] == client),
+                    key=lambda row: row["workers"],
                 )
                 axis.plot(
                     [row[metric_key] / 1024.0 for row in group],
                     [row["qps"] for row in group],
-                    color=SYSTEM_COLORS[system], linewidth=2.5,
-                    linestyle=CORE_STYLES[worker]["linestyle"],
-                    marker=markers[system], markersize=6.5,
+                    color=SYSTEM_COLORS[system], linewidth=1.9,
+                    linestyle="-", marker=client_markers[client],
+                    markersize=6.5, alpha=0.9,
                     markeredgecolor="white", markeredgewidth=0.9,
                     zorder=3,
-                )
-                peak = max(group, key=lambda row: row["qps"])
-                prefix = "G" if system == "GraphMem" else "M"
-                axis.annotate(
-                    f"{prefix}{worker}",
-                    (peak[metric_key] / 1024.0, peak["qps"]),
-                    xytext=(0, 7), textcoords="offset points",
-                    ha="center", va="bottom", fontsize=10.5,
-                    color=SYSTEM_COLORS[system], fontweight="bold",
                 )
         max_memory = max(row[metric_key] for row in rows) / 1024.0
         axis.set_xlim(0, max_memory * 1.1)
@@ -414,30 +408,25 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
         axis.set_title(panel_title, fontweight="bold")
         axis.grid(True, linestyle="--", linewidth=0.65, zorder=0)
     method_handles = [
-        Line2D([0], [0], marker="o", color=SYSTEM_COLORS["GraphMem"],
-               linewidth=2.5, markersize=7,
-               markerfacecolor=SYSTEM_COLORS["GraphMem"],
-               markeredgecolor="white", label="GraphMem"),
-        Line2D([0], [0], marker="s", color=SYSTEM_COLORS["Mem0 OSS"],
-               linewidth=2.5, markersize=7,
-               markerfacecolor=SYSTEM_COLORS["Mem0 OSS"],
-               markeredgecolor="white", label="Mem0 OSS"),
+        Line2D([0], [0], color=SYSTEM_COLORS["GraphMem"],
+               linewidth=2.5, label="GraphMem"),
+        Line2D([0], [0], color=SYSTEM_COLORS["Mem0 OSS"],
+               linewidth=2.5, label="Mem0 OSS"),
     ]
-    worker_handles = [
-        Line2D([0], [0], color="#64748B", linewidth=2.4,
-               linestyle=CORE_STYLES[worker]["linestyle"],
-               label=f"{worker} worker")
-        for worker in workers
+    client_handles = [
+        Line2D([0], [0], color="#64748B", marker=client_markers[client],
+               linestyle="none", markersize=7, label=f"C={client}")
+        for client in clients
     ]
-    fig.legend(method_handles + worker_handles,
-               [handle.get_label() for handle in method_handles + worker_handles],
-               loc="upper center", ncol=5,
+    fig.legend(method_handles + client_handles,
+               [handle.get_label() for handle in method_handles + client_handles],
+               loc="upper center", ncol=8,
                bbox_to_anchor=(0.5, 0.91), frameon=False,
-               handlelength=2.4, columnspacing=1.5)
-    fig.suptitle("GraphMem 与 Mem0：不同 worker 配置的 QPS–Memory 曲线（左上更优）",
+               handlelength=2.2, columnspacing=1.2)
+    fig.suptitle("GraphMem 与 Mem0：按并发连接 worker 扩展点的 QPS–Memory 曲线",
                  y=0.985, fontsize=21, fontweight="bold")
     fig.text(0.005, 0.018,
-             "每条线对应一个系统–worker 配置；线上 6 个点依次为并发 1、4、16、64、128、256",
+             "每条线固定方法与并发度，并依次连接 1、4、8 worker；颜色区分方法，点型区分并发",
              ha="left", fontsize=13.5, color="#64748B")
     fig.subplots_adjust(left=0.065, right=0.985, bottom=0.17, top=0.77,
                         wspace=0.22)
