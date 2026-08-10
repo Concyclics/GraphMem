@@ -691,11 +691,7 @@ def plot_graph(payload: dict, report: Path) -> None:
     figure.suptitle("图结构如何转化为最终回答准确率", color=colors["navy"],
                     fontsize=14, fontweight="bold")
     figure.tight_layout(rect=(0, 0, 1, 0.92))
-    figures = report / "figures"
-    figures.mkdir(parents=True, exist_ok=True)
-    for suffix in ("pdf", "png", "svg"):
-        figure.savefig(figures / f"v5_20_graph_ablation.{suffix}",
-                       dpi=220, bbox_inches="tight")
+    save_budget_figure(figure, report, "v5_20_graph_ablation")
     plt.close(figure)
 
 
