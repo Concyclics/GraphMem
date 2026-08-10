@@ -17,7 +17,7 @@ import argparse
 import json
 import math
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -327,17 +327,11 @@ def main() -> None:
     print(
         f"running {len(remaining)} remaining / {len(questions)} questions with "
         f"{args.profile}; checkpoint batch={batch_size}", flush=True)
-    # Submit the entire remaining set to one bounded worker pool and checkpoint
-    # in completion order.  The previous fixed 25-question barrier left 31 of
-    # 32 workers idle whenever one unbounded answer ran to the model's 65K
-    # context limit.  ``as_completed`` preserves exactly the same prompts and
-    # concurrency cap while allowing short questions after that barrier to run.
-    navigations = []
-    for question in remaining:
-        result = navigator.navigate(question.memory_id, question.query, budget)
-        navigations.append(
-            (question, result, navigation_metrics(question, result, store)))
-    prepared = [prepare(row) for row in navigations]
+    # Navigation/packing is CPU-bound, while answer generation is GPU-bound.
+    # Stream prepared requests into a bounded answer pool instead of preparing
+    # all 2,040 prompts first: the latter left the GPU idle for the entire
+    # navigation phase.  The bound prevents frozen prompts from accumulating
+    # without limit when the model is slower than the producer.
     pending_checkpoints = []
     checkpointed = 0
 
@@ -360,13 +354,10 @@ def main() -> None:
             flush=True)
 
     with ThreadPoolExecutor(max_workers=max(1, args.answer_workers)) as pool:
-        futures = {
-            pool.submit(stage.complete, item): index
-            for index, item in enumerate(prepared)
-        }
-        for future in as_completed(futures):
-            index = futures[future]
-            question, result, metric = navigations[index]
+        futures = {}
+
+        def finish_future(future) -> None:
+            index, question, result, metric, prepared_answer = futures.pop(future)
             answer = future.result()
             raw = question.raw
             answer_row = {
@@ -423,9 +414,25 @@ def main() -> None:
                 **{key: value for key, value in metric.items() if key != "question_id"},
             }
             pending_checkpoints.append((
-                index, answer_row, retrieval_row, prepared[index].to_record()))
+                index, answer_row, retrieval_row, prepared_answer.to_record()))
             if len(pending_checkpoints) >= batch_size:
                 checkpoint(pending_checkpoints)
+
+        max_in_flight = max(1, args.answer_workers) * 2
+        for index, question in enumerate(remaining):
+            result = navigator.navigate(question.memory_id, question.query, budget)
+            metric = navigation_metrics(question, result, store)
+            prepared_answer = prepare((question, result, metric))
+            future = pool.submit(stage.complete, prepared_answer)
+            futures[future] = (
+                index, question, result, metric, prepared_answer)
+            if len(futures) >= max_in_flight:
+                done, _pending = wait(tuple(futures),
+                                      return_when=FIRST_COMPLETED)
+                for completed_future in done:
+                    finish_future(completed_future)
+        for future in as_completed(tuple(futures)):
+            finish_future(future)
     if pending_checkpoints:
         checkpoint(pending_checkpoints)
 
