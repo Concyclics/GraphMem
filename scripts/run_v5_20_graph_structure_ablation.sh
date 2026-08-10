@@ -75,18 +75,35 @@ run_arm() {
     sleep 5
   done
 
-  "${PYTHON_BIN}" "${REPO}/scripts/evaluate_mem0_judge.py" \
+}
+
+judge_arm() {
+  local arm="$1"
+  local arm_root="${ROOT}/${arm}"
+  while true; do
+    if "${PYTHON_BIN}" "${REPO}/scripts/evaluate_mem0_judge.py" \
     --answers "${arm_root}/answer/answers_longmemeval.jsonl" \
     --output-dir "${arm_root}/answer/judge_lme" \
     --model gpt-5.6-luna --api-key-env SGAO_API_KEY \
-    --request-profile openai --workers 100 --resume
-  "${PYTHON_BIN}" "${REPO}/scripts/evaluate_memory_benchmarks_locomo_judge.py" \
+    --request-profile openai --workers 32 --resume; then
+      break
+    fi
+    echo "${arm} LME judge unavailable; waiting and resuming"
+    sleep 15
+  done
+  while true; do
+    if "${PYTHON_BIN}" "${REPO}/scripts/evaluate_memory_benchmarks_locomo_judge.py" \
     --data "${LOCOMO}" \
     --answers "${arm_root}/answer/answers_locomo.jsonl" \
     --output-dir "${arm_root}/answer/judge_locomo" \
     --memory-benchmarks-repo "${MEMORY_BENCHMARKS}" \
     --model gpt-5.6-luna --api-key-env SGAO_API_KEY \
-    --request-profile openai --workers 100 --resume
+    --request-profile openai --workers 32 --resume; then
+      break
+    fi
+    echo "${arm} LoCoMo judge unavailable; waiting and resuming"
+    sleep 15
+  done
 }
 
 # All arms share one frozen graph, dense vectors, QueryIR, 64-turn/12K pack,
@@ -96,6 +113,15 @@ run_arm seed_only --no-h10-traversal --no-hierarchical-routing \
 run_arm flat_graph --no-hierarchical-routing --evidence-order adaptive
 run_arm hierarchical --evidence-order adaptive
 run_arm topology_layout --evidence-order topological
+
+if [[ "${V520_ANSWERS_ONLY:-0}" == "1" ]]; then
+  echo "all four answer arms complete; judge deferred"
+  exit 0
+fi
+
+for arm in seed_only flat_graph hierarchical topology_layout; do
+  judge_arm "${arm}"
+done
 
 "${PYTHON_BIN}" "${REPO}/scripts/summarize_v5_20_graph_ablation.py" \
   --root "${ROOT}" --output "${ROOT}/summary.json"

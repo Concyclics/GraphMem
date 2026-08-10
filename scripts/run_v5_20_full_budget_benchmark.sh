@@ -80,17 +80,36 @@ answer_arm() {
 judge_arm() {
   local turns="$1"
   local answer_root="${ROOT}/turn${turns}/answer"
-  "${PYTHON_BIN}" "${REPO}/scripts/evaluate_mem0_judge.py" \
-    --answers "${answer_root}/answers_longmemeval.jsonl" \
-    --output-dir "${answer_root}/judge_lme" --model gpt-5.6-luna \
-    --api-key-env SGAO_API_KEY --request-profile openai --workers 128 --resume &
+  judge_lme() {
+    while true; do
+      if "${PYTHON_BIN}" "${REPO}/scripts/evaluate_mem0_judge.py" \
+        --answers "${answer_root}/answers_longmemeval.jsonl" \
+        --output-dir "${answer_root}/judge_lme" --model gpt-5.6-luna \
+        --api-key-env SGAO_API_KEY --request-profile openai \
+        --workers 32 --resume; then
+        break
+      fi
+      echo "turn${turns} LME judge unavailable; waiting and resuming"
+      sleep 15
+    done
+  }
+  judge_locomo() {
+    while true; do
+      if "${PYTHON_BIN}" "${REPO}/scripts/evaluate_memory_benchmarks_locomo_judge.py" \
+        --data "${LOCOMO}" --answers "${answer_root}/answers_locomo.jsonl" \
+        --output-dir "${answer_root}/judge_locomo" \
+        --memory-benchmarks-repo "${MEMORY_BENCHMARKS}" \
+        --model gpt-5.6-luna --api-key-env SGAO_API_KEY \
+        --request-profile openai --workers 32 --resume; then
+        break
+      fi
+      echo "turn${turns} LoCoMo judge unavailable; waiting and resuming"
+      sleep 15
+    done
+  }
+  judge_lme &
   local lme_pid=$!
-  "${PYTHON_BIN}" "${REPO}/scripts/evaluate_memory_benchmarks_locomo_judge.py" \
-    --data "${LOCOMO}" --answers "${answer_root}/answers_locomo.jsonl" \
-    --output-dir "${answer_root}/judge_locomo" \
-    --memory-benchmarks-repo "${MEMORY_BENCHMARKS}" \
-    --model gpt-5.6-luna --api-key-env SGAO_API_KEY \
-    --request-profile openai --workers 128 --resume &
+  judge_locomo &
   local locomo_pid=$!
   wait "${lme_pid}"
   wait "${locomo_pid}"
