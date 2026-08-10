@@ -363,30 +363,34 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
 
 
 def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
-    """Compare absolute GraphMem and Mem0 memory at 8 workers."""
+    """Compare absolute GraphMem and Mem0 memory as worker count scales."""
     plt = configure_plotting()
     from matplotlib.patches import Patch
     import numpy as np
 
-    clients = (1, 4, 16, 64, 128, 256)
-    indexed = {(row["system"], row["clients"]): row for row in rows
-               if row["workers"] == 8}
+    workers = (1, 4, 8)
     metrics = (
         ("worker_rss_mib", "(a) RSS"),
         ("worker_pss_mib", "(b) PSS"),
     )
     fig, axes = plt.subplots(1, 2, figsize=PAPER_FIGSIZE, sharey=False)
-    x = np.arange(len(clients), dtype=float)
+    x = np.arange(len(workers), dtype=float)
     width = 0.36
     legend_handles = None
     for axis, (metric_key, panel_title) in zip(axes, metrics):
         graph_values = np.array([
-            indexed[("GraphMem", client)][metric_key] / 1024.0
-            for client in clients
+            np.mean([
+                row[metric_key] for row in rows
+                if row["system"] == "GraphMem" and row["workers"] == worker
+            ]) / 1024.0
+            for worker in workers
         ])
         mem0_values = np.array([
-            indexed[("Mem0 OSS", client)][metric_key] / 1024.0
-            for client in clients
+            np.mean([
+                row[metric_key] for row in rows
+                if row["system"] == "Mem0 OSS" and row["workers"] == worker
+            ]) / 1024.0
+            for worker in workers
         ])
         graph_bars = axis.bar(
             x - width / 2, graph_values, width,
@@ -408,10 +412,10 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
                     ha="center", va="bottom", fontsize=11.5,
                     color="#334155", fontweight="bold",
                 )
-        axis.set_xticks(x, [str(client) for client in clients])
+        axis.set_xticks(x, [str(worker) for worker in workers])
         axis.set_ylim(0, ymax)
-        axis.set_xlabel("并发用户数")
-        axis.set_ylabel("8-worker 聚合内存（GiB）")
+        axis.set_xlabel("物理核心数（worker）")
+        axis.set_ylabel("检索 worker 聚合内存（GiB）")
         axis.set_title(panel_title, fontweight="bold")
         axis.grid(True, axis="y", linestyle="--", linewidth=0.65, zorder=0)
         if legend_handles is None:
@@ -425,10 +429,10 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
                loc="upper center", ncol=2,
                bbox_to_anchor=(0.5, 0.91), frameon=False,
                handlelength=2.4, columnspacing=1.8)
-    fig.suptitle("GraphMem 与 Mem0：8-core 常驻内存绝对开支",
+    fig.suptitle("GraphMem 与 Mem0：随核心数扩展的常驻内存绝对开支",
                  y=0.985, fontsize=21, fontweight="bold")
     fig.text(0.005, 0.018,
-             "柱上数字单位为 GiB；仅统计 8 个检索 worker 的聚合 RSS/PSS",
+             "柱高为并发 1–256 档的均值；柱上数字单位为 GiB；仅统计检索 worker",
              ha="left", fontsize=13.5, color="#64748B")
     fig.subplots_adjust(left=0.065, right=0.985, bottom=0.17, top=0.77,
                         wspace=0.22)
