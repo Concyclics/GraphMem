@@ -363,9 +363,8 @@ def plot_pareto(rows: list[dict[str, Any]], base: Path) -> None:
 
 
 def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
-    """Show GraphMem memory and its relative saving over Mem0 at 8 workers."""
+    """Compare absolute GraphMem and Mem0 memory at 8 workers."""
     plt = configure_plotting()
-    from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
     import numpy as np
 
@@ -378,7 +377,7 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
     )
     fig, axes = plt.subplots(1, 2, figsize=PAPER_FIGSIZE, sharey=False)
     x = np.arange(len(clients), dtype=float)
-    width = 0.56
+    width = 0.36
     legend_handles = None
     for axis, (metric_key, panel_title) in zip(axes, metrics):
         graph_values = np.array([
@@ -390,67 +389,49 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
             for client in clients
         ])
         graph_bars = axis.bar(
-            x, graph_values, width,
-            color=SYSTEM_COLORS["GraphMem"], label="GraphMem 绝对开支",
+            x - width / 2, graph_values, width,
+            color=SYSTEM_COLORS["GraphMem"], label="GraphMem",
             edgecolor="white", linewidth=0.7, zorder=3,
         )
-        ratios = mem0_values / graph_values
-        ratio_axis = axis.twinx()
-        ratio_axis.plot(
-            x, ratios,
-            color=SYSTEM_COLORS["Mem0 OSS"], marker="o",
-            markersize=8.6, markerfacecolor="white", markeredgewidth=2.1,
-            linewidth=3.0, label="相对 Mem0 节省倍数", zorder=5,
+        mem0_bars = axis.bar(
+            x + width / 2, mem0_values, width,
+            color=SYSTEM_COLORS["Mem0 OSS"], label="Mem0 OSS",
+            edgecolor="white", linewidth=0.7, zorder=3,
         )
-        ymax = float(max(graph_values)) * 1.22
-        ratio_ymax = max(16.5, float(max(ratios)) * 1.16)
-        for index, ratio in enumerate(ratios):
-            axis.text(
-                graph_bars[index].get_x() + graph_bars[index].get_width() / 2,
-                graph_bars[index].get_height() * 0.54,
-                f"{graph_values[index]:.2f}",
-                ha="center", va="center", fontsize=13.5,
-                color="white", fontweight="bold",
-            )
-            ratio_axis.annotate(
-                f"{ratio:.1f}×", (x[index], ratio),
-                xytext=(0, 14), textcoords="offset points",
-                ha="center", va="bottom", fontsize=13.5,
-                color="#9A3412", fontweight="bold",
-            )
+        ymax = float(max(max(graph_values), max(mem0_values))) * 1.18
+        for bars, values in ((graph_bars, graph_values), (mem0_bars, mem0_values)):
+            for bar, value in zip(bars, values):
+                axis.annotate(
+                    f"{value:.2f}",
+                    (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                    xytext=(0, 5), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=11.5,
+                    color="#334155", fontweight="bold",
+                )
         axis.set_xticks(x, [str(client) for client in clients])
         axis.set_ylim(0, ymax)
-        ratio_axis.set_ylim(0, ratio_ymax)
         axis.set_xlabel("并发用户数")
-        axis.set_ylabel("GraphMem 8-worker 聚合内存（GiB）",
-                        color=SYSTEM_COLORS["GraphMem"])
-        ratio_axis.set_ylabel("相对 Mem0 节省倍数（×）",
-                              color=SYSTEM_COLORS["Mem0 OSS"])
-        axis.tick_params(axis="y", colors=SYSTEM_COLORS["GraphMem"])
-        ratio_axis.tick_params(axis="y", colors=SYSTEM_COLORS["Mem0 OSS"])
-        axis.spines["left"].set_color(SYSTEM_COLORS["GraphMem"])
-        ratio_axis.spines["right"].set_color(SYSTEM_COLORS["Mem0 OSS"])
+        axis.set_ylabel("8-worker 聚合内存（GiB）")
         axis.set_title(panel_title, fontweight="bold")
         axis.grid(True, axis="y", linestyle="--", linewidth=0.65, zorder=0)
         if legend_handles is None:
             legend_handles = [
                 Patch(facecolor=SYSTEM_COLORS["GraphMem"], edgecolor="white",
-                      label="GraphMem 绝对开支"),
-                Line2D([0], [0], color=SYSTEM_COLORS["Mem0 OSS"], marker="o",
-                       markerfacecolor="white", linewidth=3.0,
-                       label="Mem0 / GraphMem"),
+                      label="GraphMem"),
+                Patch(facecolor=SYSTEM_COLORS["Mem0 OSS"], edgecolor="white",
+                      label="Mem0 OSS"),
             ]
     fig.legend(legend_handles, [handle.get_label() for handle in legend_handles],
                loc="upper center", ncol=2,
                bbox_to_anchor=(0.5, 0.91), frameon=False,
                handlelength=2.4, columnspacing=1.8)
-    fig.suptitle("GraphMem：8-core 常驻内存与相对 Mem0 节省倍数",
+    fig.suptitle("GraphMem 与 Mem0：8-core 常驻内存绝对开支",
                  y=0.985, fontsize=21, fontweight="bold")
     fig.text(0.005, 0.018,
-             "柱内数字单位为 GiB；折线标注为 Mem0 / GraphMem；仅统计检索 worker",
+             "柱上数字单位为 GiB；仅统计 8 个检索 worker 的聚合 RSS/PSS",
              ha="left", fontsize=13.5, color="#64748B")
-    fig.subplots_adjust(left=0.065, right=0.935, bottom=0.17, top=0.77,
-                        wspace=0.34)
+    fig.subplots_adjust(left=0.065, right=0.985, bottom=0.17, top=0.77,
+                        wspace=0.22)
     save_figure(fig, base, fixed_canvas=True)
     plt.close(fig)
 
