@@ -140,12 +140,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--expected-questions", type=int, default=200)
     args = parser.parse_args()
     payload = {
         "schema_version": "graphmem-v5.20-graph-structure-ablation-v1",
         "root": str(args.root), "arms": {}, "comparisons": {},
         "protocol": {
-            "questions": 200, "evidence_turns": 64,
+            "questions": args.expected_questions, "evidence_turns": 64,
             "evidence_tokens": 12000, "answer_output_tokens": 2000,
             "candidate_answer_injection": False,
             "answer_model": "Qwen3-30B", "judge_model": "gpt-5.6-luna",
@@ -179,7 +180,7 @@ def main() -> None:
     for arm, (traversal, hierarchy, order) in expected.items():
         manifest = payload["arms"][arm]["manifest"]
         audit[arm] = {
-            "questions_200": manifest.get("questions") == 200,
+            "expected_questions": manifest.get("questions") == args.expected_questions,
             "turn_budget_64": manifest.get("budget", {}).get(
                 "max_evidence_turns") == 64,
             "graph_traversal": manifest.get("graph_traversal") == traversal,
@@ -187,7 +188,7 @@ def main() -> None:
             "evidence_order": manifest.get("evidence_order") == order,
             "candidate_answer_injection_off": not manifest.get(
                 "candidate_answer_injection", False),
-            "luna_verdicts_200": len(verdicts[arm]) == 200,
+            "expected_luna_verdicts": len(verdicts[arm]) == args.expected_questions,
         }
 
     # ``graph_rerank_layout`` and ``topology_layout`` use the same topology

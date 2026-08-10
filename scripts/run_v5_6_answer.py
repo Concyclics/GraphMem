@@ -141,6 +141,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--full", action="store_true",
                         help="score LongMemEval 500 + LoCoMo Cat 1-4 (2,040) instead of the "
                              "frozen 200-question development set")
+    parser.add_argument(
+        "--lme-type", action="append", default=[],
+        help=("with --full, retain only this LongMemEval question_type; may be "
+              "repeated, for example multi-session and temporal-reasoning"))
+    parser.add_argument(
+        "--locomo-category", action="append", type=int, default=[],
+        help=("with --full, retain only this LoCoMo category; may be repeated; "
+              "the default remains categories 1-4"))
     parser.add_argument("--shard", type=int, default=0,
                         help="this process handles memories where hash(memory) %% shards == shard")
     parser.add_argument("--shards", type=int, default=1,
@@ -172,7 +180,14 @@ def main() -> None:
     if args.full:
         # FullQuestion proxies attribute access to its DevQuestion, so everything
         # downstream keeps working; the extra flags ride along for the metrics.
-        full_rows = load_full_questions(args.lme, args.locomo, gold)
+        lme_types = tuple(dict.fromkeys(args.lme_type)) or None
+        locomo_categories = (tuple(dict.fromkeys(args.locomo_category))
+                             or (1, 2, 3, 4))
+        full_rows = load_full_questions(
+            args.lme, args.locomo, gold,
+            lme_types=lme_types, locomo_categories=locomo_categories,
+            expect_lme=(None if lme_types else 500),
+            expect_locomo=(None if args.locomo_category else 1540))
         questions = [row.question for row in full_rows]
         flags = {row.question.question_id: row for row in full_rows}
     else:
@@ -510,6 +525,10 @@ def main() -> None:
     tokens = sorted(row["prompt_tokens"] for row in retrieval_rows)
     manifest = {
         "profile": args.profile, "label": label, "questions": len(answer_rows),
+        "question_filters": {
+            "lme_types": list(args.lme_type),
+            "locomo_categories": list(args.locomo_category),
+        },
         "source_db": str(args.source_db), "config_hash": config_hash(config),
         "answer_prompt_hash": prompt_contract(
             answer_config.normalize_relative_time,
