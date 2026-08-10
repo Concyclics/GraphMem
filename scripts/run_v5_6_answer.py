@@ -76,6 +76,11 @@ def parse_args() -> argparse.Namespace:
               "because incorrect drafts can anchor the answer model"))
     parser.add_argument("--no-h10-owner-rescue", action="store_true")
     parser.add_argument("--no-h10-traversal", action="store_true")
+    parser.add_argument(
+        "--no-hierarchical-routing", action="store_true",
+        help=("disable coarse-to-fine seed routing while retaining the same "
+              "QueryIR, candidate reservoirs and answer contract; intended "
+              "for graph-structure ablations"))
     parser.add_argument("--no-manifest-collection-key", action="store_true")
     parser.add_argument("--rank-mandatory", action="store_true",
                         help="order mandatory proof-unit turns by candidate score before the "
@@ -228,6 +233,8 @@ def main() -> None:
                                rank_mandatory=args.rank_mandatory,
                                h10_owner_rescue=not args.no_h10_owner_rescue,
                                h10_traversal=not args.no_h10_traversal,
+                               hierarchical_routing=(
+                                   not args.no_hierarchical_routing),
                                manifest_collection_key=not args.no_manifest_collection_key,
                                obligation_aware_packing=args.obligation_aware_packing,
                                precision_aware_packing=args.precision_aware_packing,
@@ -402,6 +409,17 @@ def main() -> None:
                 "closed_form": answer.closed_form,
                 "budget_relaxed": answer.budget_relaxed,
                 "answer_warnings": list(answer.warnings),
+                "evidence_layout": answer.trace.get("evidence_layout", ""),
+                "evidence_chain_count": answer.trace.get(
+                    "evidence_chain_count", 0),
+                "evidence_chain_turns": answer.trace.get(
+                    "evidence_chain_turns", 0),
+                "evidence_graph_group_count": answer.trace.get(
+                    "evidence_graph_group_count", 0),
+                "evidence_graph_turns": answer.trace.get(
+                    "evidence_graph_turns", 0),
+                "evidence_auxiliary_turns": answer.trace.get(
+                    "evidence_auxiliary_turns", 0),
                 **{key: value for key, value in metric.items() if key != "question_id"},
             }
             pending_checkpoints.append((
@@ -497,6 +515,8 @@ def main() -> None:
         "candidate_pool_limit": args.candidate_pool_limit,
         "raw_fallback_reserve": args.raw_fallback_reserve,
         "obligation_aware_relations": args.obligation_aware_relations,
+        "graph_traversal": not args.no_h10_traversal,
+        "hierarchical_routing": not args.no_hierarchical_routing,
         "native_seed_fusion": args.native_seed_fusion,
         "dense_search": embedding is not None,
         "embedding_db": str(args.embedding_db) if args.embedding_db else None,
