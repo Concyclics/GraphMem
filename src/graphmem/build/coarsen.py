@@ -15,7 +15,7 @@ import numpy as np
 from ..domain import (
     GraphNode, NodeType, RelationType, SourceTurn, canonical_json, stable_id,
 )
-from ..text import content_terms, normalize_key
+from ..text import content_terms, normalize_key, predicate_family
 from .refine import RefineCandidate
 
 
@@ -104,8 +104,14 @@ def normalize_relation_signals(
 class RelationFeatures:
     entities: frozenset[str] = frozenset()
     owner_entities: frozenset[str] = frozenset()
+    object_entities: frozenset[str] = frozenset()
     predicates: frozenset[str] = frozenset()
     predicate_phrases: frozenset[str] = frozenset()
+    # Correlated composite state keys.  Separate sets of owners/predicates lose
+    # which owner asserted which predicate after bottom-up aggregation, and
+    # produce a Cartesian-product hub at coarse levels.
+    state_keys: frozenset[tuple[str, str, str, str]] = frozenset()
+    state_family_mode: bool = False
     scopes: frozenset[str] = frozenset()
     scope_phrases: frozenset[str] = frozenset()
     collection_keys: frozenset[str] = frozenset()
@@ -757,6 +763,57 @@ GENERIC_ENTITY_KEYS = frozenset({
     "friend", "friends", "family", "they", "them", "i", "me", "you",
 })
 
+# Short canonical fact values can be useful object/referent keys even when the
+# surface is lower-case (``dance studio``, ``cooking class``).  The semantic
+# extractor historically exposed only capitalised mentions as entities, which
+# left those values searchable as text but absent from the relation index.  Do
+# not promote conversational answers, quantifiers or pure temporal expressions:
+# they recur across sessions and become routing hubs rather than referents.
+GENERIC_OBJECT_VALUE_KEYS = frozenset({
+    "yes", "no", "not", "never", "none", "all", "one", "two", "first",
+    "second", "last", "future", "past", "appreciate", "ttyl",
+    "today", "tomorrow", "yesterday", "tonight", "the future", "the past",
+    "personal opinion", "personal opinions", "personal preference",
+    "personal preferences", "something", "anything", "everything", "nothing",
+})
+_PURE_TEMPORAL_OBJECT_RE = re.compile(
+    r"(?:(?:last|next|this)\s+(?:night|week|weekend|month|year|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"(?:january|february|march|april|may|june|july|august|september|"
+    r"october|november|december)(?:\s+\d{1,2}(?:st|nd|rd|th)?)?|"
+    r"(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|\d+(?:\.\d+)?)\s+"
+    r"(?:minute|minutes|hour|hours|day|days|week|weeks|month|months|year|years)"
+    r"(?:\s+ago)?|recently)",
+    re.IGNORECASE,
+)
+
+
+def promotable_object_value(value: object) -> str:
+    """Return a conservative relation key for a short fact value.
+
+    This is deliberately deterministic and token-free.  It promotes only a
+    compact noun-like value and leaves long propositions in the ordinary
+    lexical/dense index.  Cross-session DF and degree caps are applied later,
+    so a unique value never creates a relation edge merely by being promoted.
+    """
+
+    normalized = normalize_key(str(value or ""))
+    if (not normalized or len(normalized) > 80
+            or normalized in GENERIC_ENTITY_KEYS
+            or normalized in GENERIC_OBJECT_VALUE_KEYS
+            or _PURE_TEMPORAL_OBJECT_RE.fullmatch(normalized)):
+        return ""
+    terms = content_terms(normalized)
+    if (not terms or len(terms) > 6
+            or not any(character.isalpha() for character in normalized)
+            or all(len(term) <= 2 for term in terms)):
+        return ""
+    # Values composed entirely of conversational scaffolding are not objects.
+    if all(term in RARE_LEXICAL_STOPWORDS for term in terms):
+        return ""
+    return normalized
+
 # These are conversational scaffolding rather than referents.  The core text
 # stoplist is intentionally small because it also serves ordinary retrieval;
 # relation construction needs a stricter vocabulary so greetings and generic
@@ -873,6 +930,8 @@ def _time_scalars(value: object) -> tuple[float, ...]:
 def _direct_relation_features(
     node: GraphNode,
     lexical_rare_terms: Mapping[str, frozenset[str]] | None = None,
+    *,
+    predicate_family_state_relations: bool = False,
 ) -> RelationFeatures:
     attrs = node.attributes
     time_values: list[float] = []
@@ -890,6 +949,7 @@ def _direct_relation_features(
     }) - GENERIC_ENTITY_KEYS)
     role_entities = attrs.get("relation_entity_roles", {})
     owner_entities: set[str] = set()
+    object_entities: set[str] = set()
     if isinstance(role_entities, Mapping):
         raw_owners = role_entities.get("owner", ())
         if isinstance(raw_owners, (str, bytes)):
@@ -897,6 +957,16 @@ def _direct_relation_features(
         owner_entities.update(
             normalized for value in raw_owners or ()
             if (normalized := normalize_key(str(value))))
+        raw_objects = role_entities.get("object", ())
+        if isinstance(raw_objects, (str, bytes)):
+            raw_objects = (raw_objects,)
+        object_entities.update(
+            normalized for value in raw_objects or ()
+            if (normalized := normalize_key(str(value))))
+    promoted_value = promotable_object_value(
+        attrs.get("value_key", attrs.get("value", "")))
+    if promoted_value:
+        object_entities.add(promoted_value)
     owner_entities.update(_attribute_phrases(node, "owners", "actor", "actors"))
     owner_entities.update(owner_id_phrases)
     if node.node_type == NodeType.CANONICAL_ENTITY:
@@ -906,12 +976,31 @@ def _direct_relation_features(
                              - GENERIC_ENTITY_KEYS)
         owner_entities.update(entities)
     owner_entities.difference_update(GENERIC_ENTITY_KEYS)
+    object_entities.difference_update(GENERIC_ENTITY_KEYS)
+    entities = frozenset({*entities, *object_entities})
+    predicate_phrases = _attribute_phrases(
+        node, "predicate", "predicates")
+    state_keys: set[tuple[str, str, str, str]] = set()
+    if (predicate_family_state_relations
+            and node.node_type in ATOMIC_RELATION_NODE_TYPES
+            and len(owner_entities) == 1 and len(predicate_phrases) == 1
+            and owner_entities and predicate_phrases):
+        polarity = normalize_key(str(attrs.get("polarity", "positive"))) or "positive"
+        modality = normalize_key(str(attrs.get("modality", "asserted"))) or "asserted"
+        for owner in sorted(owner_entities)[:16]:
+            for phrase in sorted(predicate_phrases)[:16]:
+                relation = (predicate_family(phrase)
+                            if predicate_family_state_relations else phrase)
+                if relation:
+                    state_keys.add((owner, relation, polarity, modality))
     return RelationFeatures(
         entities=entities,
         owner_entities=frozenset(owner_entities),
+        object_entities=frozenset(object_entities),
         predicates=_attribute_terms(node, "predicate", "predicates"),
-        predicate_phrases=_attribute_phrases(
-            node, "predicate", "predicates"),
+        predicate_phrases=predicate_phrases,
+        state_keys=frozenset(state_keys),
+        state_family_mode=predicate_family_state_relations,
         scopes=_attribute_terms(node, "scope", "scopes", "collection_key"),
         scope_phrases=_attribute_phrases(node, "scope", "scopes"),
         collection_keys=_attribute_phrases(node, "collection_key"),
@@ -929,6 +1018,7 @@ def build_relation_features(
     max_values_per_field: int = 128,
     lexical_rare_terms: Mapping[str, frozenset[str]] | None = None,
     max_rare_terms_per_region: int = 512,
+    predicate_family_state_relations: bool = False,
 ) -> dict[str, RelationFeatures]:
     """Aggregate typed routing features bottom-up through the coarse DAG.
 
@@ -949,13 +1039,20 @@ def build_relation_features(
         if node_id in active:
             # The expected graph is a DAG.  A malformed structural cycle must
             # not recurse forever; retaining direct fields is the safe fallback.
-            return _direct_relation_features(node, lexical_rare_terms)
+            return _direct_relation_features(
+                node, lexical_rare_terms,
+                predicate_family_state_relations=(
+                    predicate_family_state_relations))
         active.add(node_id)
-        direct = _direct_relation_features(node, lexical_rare_terms)
+        direct = _direct_relation_features(
+            node, lexical_rare_terms,
+            predicate_family_state_relations=predicate_family_state_relations)
         entities = set(direct.entities)
         owner_entities = set(direct.owner_entities)
+        object_entities = set(direct.object_entities)
         predicates = set(direct.predicates)
         predicate_phrases = set(direct.predicate_phrases)
+        state_keys = set(direct.state_keys)
         scopes = set(direct.scopes); scope_phrases = set(direct.scope_phrases)
         collection_keys = set(direct.collection_keys); values = set(direct.values)
         times = set(direct.time_points)
@@ -966,7 +1063,9 @@ def build_relation_features(
             child = visit(child_id)
             entities.update(child.entities); predicates.update(child.predicates)
             owner_entities.update(child.owner_entities)
+            object_entities.update(child.object_entities)
             predicate_phrases.update(child.predicate_phrases)
+            state_keys.update(child.state_keys)
             scopes.update(child.scopes); scope_phrases.update(child.scope_phrases)
             collection_keys.update(child.collection_keys)
             values.update(child.values)
@@ -977,9 +1076,14 @@ def build_relation_features(
             entities=frozenset(sorted(entities)[:max_values_per_field]),
             owner_entities=frozenset(sorted(
                 owner_entities)[:max_values_per_field]),
+            object_entities=frozenset(sorted(
+                object_entities)[:max_values_per_field]),
             predicates=frozenset(sorted(predicates)[:max_values_per_field]),
             predicate_phrases=frozenset(sorted(
                 predicate_phrases)[:max_values_per_field]),
+            state_keys=frozenset(sorted(
+                state_keys)[:max_values_per_field]),
+            state_family_mode=predicate_family_state_relations,
             scopes=frozenset(sorted(scopes)[:max_values_per_field]),
             scope_phrases=frozenset(sorted(
                 scope_phrases)[:max_values_per_field]),
@@ -1059,8 +1163,6 @@ def relation_signal_scores(
         scores[RelationSignal.LEXICAL_RARE] = min(
             1.0, len(shared_rare) / (2.0 * rare_lexical_min_shared))
 
-    predicate_overlap = len(left_features.predicates & right_features.predicates) / max(
-        1, min(len(left_features.predicates), len(right_features.predicates)))
     scope_overlap = len(left_features.scopes & right_features.scopes) / max(
         1, min(len(left_features.scopes), len(right_features.scopes)))
     # A common principal is an unsafe entity-only bridge, but becomes selective
@@ -1070,10 +1172,23 @@ def relation_signal_scores(
     # child facts shared the same (owner, predicate) pair.
     atomic_pair = (left.node_type in ATOMIC_RELATION_NODE_TYPES
                    and right.node_type in ATOMIC_RELATION_NODE_TYPES)
-    state_entities = shared_owner_entities
-    if state_entities and predicate_overlap:
-        scores[RelationSignal.STATE_COMPATIBLE] = min(
-            1.0, 0.65 * predicate_overlap + 0.35 * scope_overlap)
+    family_state_mode = (
+        left_features.state_family_mode and right_features.state_family_mode)
+    shared_state_keys = left_features.state_keys & right_features.state_keys
+    if family_state_mode:
+        if shared_state_keys:
+            # The composite key already pins role, predicate identity/family,
+            # polarity and modality.  Scope overlap is only a ranking hint.
+            scores[RelationSignal.STATE_COMPATIBLE] = min(
+                1.0, 0.9 + 0.1 * scope_overlap)
+    else:
+        predicate_overlap = len(
+            left_features.predicates & right_features.predicates) / max(
+                1, min(len(left_features.predicates),
+                       len(right_features.predicates)))
+        if shared_owner_entities and predicate_overlap:
+            scores[RelationSignal.STATE_COMPATIBLE] = min(
+                1.0, 0.65 * predicate_overlap + 0.35 * scope_overlap)
     exact_predicate = bool(
         left_features.predicate_phrases & right_features.predicate_phrases)
     exact_scope = bool(
@@ -1131,20 +1246,29 @@ def relation_signal_witnesses(
         result[RelationSignal.SHARED_ENTITY] = frozenset(
             sorted(shared_eligible)[:32])
 
-    # Exact predicate phrases are deliberately used for the witness.  Token
-    # overlap may propose a state candidate, but is not strong enough to carry
-    # an identity through multiple hierarchy levels.  Common owners are safe in
-    # this composite key even when they are entity-only hubs.
-    shared_predicates = (
-        left_features.predicate_phrases
-        & right_features.predicate_phrases)
-    if shared_owners and shared_predicates:
-        keys = tuple(
-            f"{entity}\x1f{predicate}"
-            for entity in sorted(shared_owners)[:16]
-            for predicate in sorted(shared_predicates)[:16])
-        if keys:
-            result[RelationSignal.STATE_COMPATIBLE] = frozenset(keys[:64])
+    # Carry the same correlated key through every level.  Serializing all four
+    # fields lets QueryIR reject polarity conflicts, while modality remains a
+    # separate graph corridor rather than being merged into asserted history.
+    family_state_mode = (
+        left_features.state_family_mode and right_features.state_family_mode)
+    shared_state_keys = left_features.state_keys & right_features.state_keys
+    if family_state_mode:
+        if shared_state_keys:
+            keys = tuple("\x1f".join(key)
+                         for key in sorted(shared_state_keys)[:64])
+            if keys:
+                result[RelationSignal.STATE_COMPATIBLE] = frozenset(keys[:64])
+    else:
+        shared_predicates = (
+            left_features.predicate_phrases
+            & right_features.predicate_phrases)
+        if shared_owners and shared_predicates:
+            keys = tuple(
+                f"{entity}\x1f{predicate}"
+                for entity in sorted(shared_owners)[:16]
+                for predicate in sorted(shared_predicates)[:16])
+            if keys:
+                result[RelationSignal.STATE_COMPATIBLE] = frozenset(keys[:64])
     return result
 
 
@@ -1306,19 +1430,26 @@ def bounded_relation_view_pairs(
                         candidates[signal][node_id])[:max_candidates])
 
     entity_postings: dict[str, list[str]] = defaultdict(list)
-    state_postings: dict[tuple[str, str], list[str]] = defaultdict(list)
+    state_postings: dict[tuple[str, str, str, str], list[str]] = defaultdict(list)
     collection_postings: dict[tuple[str, str], list[str]] = defaultdict(list)
     rare_lexical_postings: dict[str, list[str]] = defaultdict(list)
     for node in ordered:
         row = features[node.node_id]
         for entity in row.entities & eligible_entities:
             entity_postings[entity].append(node.node_id)
-        # Common principals are safe in a composite state key: unlike the
-        # entity-only view, they cannot create an all-memory posting by
-        # themselves.  Keep the complete normalized predicate phrase/tokens.
-        for entity in sorted(row.entities)[:16]:
-            for predicate in sorted(row.predicates)[:16]:
-                state_postings[(entity, predicate)].append(node.node_id)
+        # The composite key preserves owner/predicate/polarity/modality
+        # correlation across parent aggregation; never rebuild a Cartesian
+        # product from the individual feature sets here.
+        if row.state_family_mode:
+            for state_key in sorted(row.state_keys)[:64]:
+                state_postings[state_key].append(node.node_id)
+        else:
+            for entity in sorted(row.owner_entities)[:16]:
+                for predicate in sorted(row.predicates)[:16]:
+                    # Type widening is local and keeps the historical two-field
+                    # candidate contract when the experiment is disabled.
+                    state_postings[(entity, predicate, "", "")].append(
+                        node.node_id)
         collection_scopes = row.collection_keys or row.scope_phrases
         for scope in sorted(collection_scopes)[:16]:
             for predicate in sorted(row.predicate_phrases)[:16]:
@@ -1496,6 +1627,7 @@ def build_parent_gated_relations(
     lexical_rare_terms: Mapping[str, frozenset[str]] | None = None,
     rare_lexical_min_shared: int = 3,
     enabled_signals: Sequence[str | RelationSignal] | None = None,
+    predicate_family_state_relations: bool = False,
 ) -> GatedRelationPlan:
     """Generate fine candidates only below a surviving coarse candidate edge.
 
@@ -1517,7 +1649,8 @@ def build_parent_gated_relations(
     all_nodes = tuple(nodes.values())
     view_quotas = dict(relation_view_quotas or {})
     relation_features = (build_relation_features(
-        nodes, child_map, lexical_rare_terms=lexical_rare_terms)
+        nodes, child_map, lexical_rare_terms=lexical_rare_terms,
+        predicate_family_state_relations=predicate_family_state_relations)
                          if relation_mask_propagation else {})
     eligible_entities = (_eligible_entity_keys(all_nodes, relation_features)
                          if relation_mask_propagation else frozenset())

@@ -245,11 +245,15 @@ class QwenSemanticDistiller:
                  dataset_hash: str, client: Any | None = None, *,
                  request_gate: threading.BoundedSemaphore | None = None,
                  worker_limit: int = 16,
+                 request_profile: str = "qwen",
                  frozen_cache_only: bool = False,
                  frozen_fallback_calls: int = 0) -> None:
         self.store, self.config, self.dataset_hash = store, config, dataset_hash
         if worker_limit < 1:
             raise ValueError("worker_limit must be positive")
+        if request_profile not in {"qwen", "openai"}:
+            raise ValueError("request_profile must be qwen or openai")
+        self.request_profile = request_profile
         # A full build creates one distiller per Memory.  Without a process-wide
         # gate, ``memory_workers * 16`` requests can reach vLLM even though
         # ModelConfig.max_concurrency is meant to be the global service limit.
@@ -1160,8 +1164,15 @@ class QwenSemanticDistiller:
                                  stage + ":" + hashlib.sha256(serialized.encode()).hexdigest())
         key = identity.key(); request = {"model": self.config.models.llm_model, "messages": [
             {"role": "system", "content": system}, {"role": "user", "content": serialized}],
-            "temperature": 0, "max_tokens": max_tokens or self.config.models.semantic_batch_output_tokens,
-            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+            "temperature": 0}
+        output_tokens = max_tokens or self.config.models.semantic_batch_output_tokens
+        if self.request_profile == "openai":
+            request["max_completion_tokens"] = output_tokens
+            request["reasoning_effort"] = "none"
+        else:
+            request["max_tokens"] = output_tokens
+            request["extra_body"] = {
+                "chat_template_kwargs": {"enable_thinking": False}}
         if self.config.models.semantic_extraction_mode != "legacy_batch":
             request["response_format"] = {"type": "json_schema", "json_schema": {
                 "name": "graphmem_scene_facts", "strict": True,

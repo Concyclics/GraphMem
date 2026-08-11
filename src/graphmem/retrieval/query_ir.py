@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import re
 from typing import TYPE_CHECKING, Sequence
 
 from ..domain import OperandSpec, ProofObligation, QueryOperator, stable_id
@@ -177,6 +178,44 @@ def _predicate_candidates(query: str, owners: tuple[tuple[str, tuple[str, ...]],
     return tuple(value for _, value in sorted(scored, key=lambda row: (-row[0], row[1]))[:4])
 
 
+_TEMPORAL_MEASURE_RE = re.compile(
+    r"\b(?:how\s+long|seconds?|minutes?|hours?|days?|weeks?|months?|years?|"
+    r"elapsed|lapsed|passed)\b", re.I)
+
+
+def _temporal_event_clauses(query: str, slots: QuerySlots) -> tuple[str, ...]:
+    """Split an explicit two-event duration without an extra model call.
+
+    Owner extraction alone yields one operand for first-person questions, so
+    ``between event A and event B`` previously compiled to
+    ``DateDifference(FactSet(o), FactSet(o))``.  The executor can choose two
+    endpoints from that pool, but seeding, binding and proof packing cannot
+    express that both event predicates are required.  Only explicit temporal
+    measurements are split; ordinary phrases such as "discussion between
+    Alice and Bob" remain a single lookup plan.
+    """
+
+    if not slots.is_duration or not _TEMPORAL_MEASURE_RE.search(query):
+        return ()
+    text = query.strip().rstrip("?.!")
+    between = re.search(r"\bbetween\s+(.+?)\s+and\s+(.+)$", text, re.I)
+    if between:
+        left, right = between.group(1), between.group(2)
+    else:
+        relation = re.search(r"\b(before|after)\b", text, re.I)
+        if relation is None:
+            return ()
+        lead = text[:relation.start()].strip()
+        right = text[relation.end():].strip()
+        lead = re.sub(
+            r"^\s*(?:how\s+long|how\s+many\s+\w+|for\s+how\s+long)\s+",
+            "", lead, flags=re.I)
+        left = lead
+    if len(content_terms(left)) < 2 or len(content_terms(right)) < 2:
+        return ()
+    return left, right
+
+
 def compose_operator(slots: QuerySlots, operands: Sequence[OperandSpec]) -> OperatorNode:
     """Build the operator tree from parsed slots.
 
@@ -206,7 +245,7 @@ def compose_operator(slots: QuerySlots, operands: Sequence[OperandSpec]) -> Oper
     if slots.is_existence:
         return ExistsAll(leaves) if multi and (shared or per_owner) else (
             ExistsAll(leaves) if multi else ExistsAll((leaves[0],)))
-    if slots.is_duration or slots.temporal_relation == "between":
+    if slots.is_duration:
         left, right = (leaves[0], leaves[1]) if multi else (leaves[0], leaves[0])
         return DateDifference(left, right)
     if slots.is_count:
@@ -232,18 +271,26 @@ def compose_operator(slots: QuerySlots, operands: Sequence[OperandSpec]) -> Oper
     return Lookup(leaves[0]) if not multi else UnionDistinct(leaves, distinct_by=slots.distinct_by)
 
 
-def _ast_operands(query: str, slots: QuerySlots, owners, predicates, scopes) -> tuple[OperandSpec, ...]:
+def _ast_operands(query: str, slots: QuerySlots, owners, predicates, scopes, *,
+                  event_predicates: Sequence[Sequence[str]] = ()) -> tuple[OperandSpec, ...]:
     """Operand specs with the slots V5.5 never filled in.
 
     These are shadow copies: ``QueryIR.operands`` keeps the legacy shape so the
     reservoir and packer see exactly what they saw before.
     """
     rows = owners or (("", ()),)
+    # When a temporal question names two events but at most one owner, the
+    # events -- not owners -- define the two physical operands.  Multiple
+    # explicit owners already supply two leaves and retain their owner mapping.
+    if len(event_predicates) == 2 and len(rows) <= 1:
+        rows = (rows[0], rows[0])
     exhaustive = slots.is_count or slots.is_list or slots.quantifier in {"both", "each", "all", "every"}
     return tuple(OperandSpec(
         operand_id=stable_id("ast-operand", query, index, alias),
         owner_aliases=(alias,) if alias else (),
-        predicate_candidates=predicates,
+        predicate_candidates=(
+            tuple(event_predicates[index])
+            if len(event_predicates) == len(rows) else predicates),
         scope_candidates=scopes,
         value_type=slots.value_type,
         temporal_constraint=slots.temporal_phrase or None,
@@ -336,7 +383,13 @@ def compile_query(query: str, view: "GraphReadView", *,
     # the legacy alias list stays untouched so H0-H9 execution cannot move.
     ast_owner_rows = (tuple((row.mention_text, row.canonical_entity_ids)
                             for row in resolved_owners) or owners)
-    ast_operands = _ast_operands(query, slots, ast_owner_rows, predicates, scopes)
+    event_clauses = _temporal_event_clauses(query, slots)
+    event_predicates = tuple(
+        _predicate_candidates(clause, owners, view) or predicates
+        for clause in event_clauses)
+    ast_operands = _ast_operands(
+        query, slots, ast_owner_rows, predicates, scopes,
+        event_predicates=event_predicates)
     ast = compose_operator(slots, ast_operands)
     ast_operator = root_operator(ast)
     fallback_reasons: list[str] = []

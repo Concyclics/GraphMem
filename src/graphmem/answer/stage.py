@@ -34,11 +34,31 @@ from .aggregation import AggregationLedger, build_aggregation_ledger
 from ..retrieval.executor import inspect_execution
 from .prompts import (
     PROMPT_HASH, build_answer_messages, is_preference_synthesis_query,
-    prompt_contract,
+    prompt_contract, question_needs_global_date,
 )
 from .rendering import (
     AnswerConfig, RenderedEvidence, render_evidence, resolve_evidence_order,
 )
+from .readout_policy import apply_readout_policy
+
+
+def _aggregation_source_reserve_ids(
+    turns: Mapping[str, SourceTurn], turn_ids: Sequence[str],
+) -> tuple[str, ...]:
+    """Return direct source statements only for generic two-role transcripts.
+
+    Named multi-party datasets use the chat role as transport metadata, so
+    preferring ``role=user`` there would systematically erase one participant.
+    """
+
+    generic_speakers = {"", "assistant", "system", "tool", "user", "human"}
+    rows = [turns[turn_id] for turn_id in turn_ids if turn_id in turns]
+    if any((turn.speaker or "").casefold().strip() not in generic_speakers
+           for turn in rows):
+        return ()
+    return tuple(
+        turn.turn_id for turn in rows
+        if (turn.role or "").casefold().strip() in {"user", "human"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +220,8 @@ class AnswerStage:
             return entry
 
     def render(self, result: NavigationResult, budget: QueryBudget,
-               max_tokens: int | None = None, *, question: str = "") -> RenderedEvidence:
+               max_tokens: int | None = None, *, question: str = "",
+               reserved_turn_ids: Sequence[str] = ()) -> RenderedEvidence:
         turn_map, session_order = self._turns(result.memory_id)
         packed = result.packed_turn_ids or result.retrieved_turn_ids
         spans = {
@@ -210,8 +231,10 @@ class AnswerStage:
             for unit in result.proof_units for unit_span in unit.spans
         }
         mandatory = tuple(dict.fromkeys(
-            turn_id for unit in result.proof_units if unit.mandatory
-            for turn_id in unit.source_turn_ids))
+            (*(
+                turn_id for unit in result.proof_units if unit.mandatory
+                for turn_id in unit.source_turn_ids),
+             *reserved_turn_ids)))
         evidence_order = resolve_evidence_order(
             self.answer_config.evidence_order, question,
             str(result.trace.get("query_operator") or ""))
@@ -221,9 +244,11 @@ class AnswerStage:
         layout_stats = {"chain_count": 0, "chain_turns": 0,
                         "graph_group_count": 0, "graph_turns": 0,
                         "auxiliary_turns": 0}
-        if evidence_order in {"topological_plain", "topological"}:
+        if evidence_order in {
+                "topological_plain", "topological", "topological_recency"}:
             ordered, prefixes, layout_stats = self._topological_layout(
-                result, ordered, turn_map, session_order)
+                result, ordered, turn_map, session_order,
+                strongest_last=evidence_order == "topological_recency")
             if evidence_order == "topological_plain":
                 # Pure graph-rerank ablation: preserve the topology-derived
                 # order and block statistics, but do not reveal graph labels
@@ -248,7 +273,8 @@ class AnswerStage:
     @staticmethod
     def _topological_layout(result: NavigationResult, packed: Sequence[str],
                             turns: Mapping[str, SourceTurn],
-                            session_order: Mapping[str, int]) -> tuple[
+                            session_order: Mapping[str, int], *,
+                            strongest_last: bool = False) -> tuple[
                                 list[str], dict[str, str], dict[str, int]]:
         """Group packed evidence by proof topology without filtering turns.
 
@@ -434,10 +460,17 @@ class AnswerStage:
                 assignments[turn_id] = (
                     anchor_rank, 2, group, turn.turn_index,
                     rank, turn.turn_id)
-                prefixes[turn_id] = (
-                    f"[AUX group={group} anchor-rank={anchor_rank + 1} "
-                    f"rank={rank + 1}]")
+                # Group id and member rank are sufficient to recover both the
+                # local packet and its relevance.  Repeating ``group=`` plus
+                # the identical anchor rank on every member cost hundreds of
+                # prompt tokens at 64 turns without adding topology.
+                prefixes[turn_id] = f"[AUX {group} rank={rank + 1}]"
 
+        if strongest_last:
+            assignments = {
+                turn_id: (-value[0], *value[1:])
+                for turn_id, value in assignments.items()
+            }
         ordered = sorted(
             (turn_id for turn_id in packed if turn_id in assignments),
             key=lambda turn_id: assignments[turn_id])
@@ -488,14 +521,43 @@ class AnswerStage:
                 return None
             return build_aggregation_ledger(
                 question, turn_map, rendered.turn_ids,
-                limit=self.answer_config.aggregation_ledger_limit)
+                limit=self.answer_config.aggregation_ledger_limit,
+                execution_card=self.answer_config.aggregation_execution_card)
         ledger = make_ledger(evidence)
+        focused_prompt = (
+            self.answer_config.focused_prompt_scope == "all"
+            or (ledger is None and not preference_synthesis))
+        effective_question_date_mode = (
+            self.answer_config.question_date_mode
+            if focused_prompt else "always")
+        include_question_date = (
+            effective_question_date_mode == "always"
+            or (effective_question_date_mode == "query_relative"
+                and question_needs_global_date(question)))
+        contextual_question_date = effective_question_date_mode != "always"
+        question_recency_footer = (
+            focused_prompt and self.answer_config.question_recency_footer)
+        compact_topological_contract = (
+            focused_prompt
+            and self.answer_config.compact_topological_contract)
+        aggregation_source_reserve: tuple[str, ...] = ()
+        if (ledger is not None
+                and not self.answer_config.aggregation_execution_card
+                and self.answer_config.aggregation_source_reserve_enabled
+                # Direct source statements improve operand closure for
+                # enumeration, but add distractors to already-local temporal
+                # and arithmetic comparisons.  Keep the reserve on the two
+                # operations for which the full paired gate was positive.
+                and ledger.operation in set(
+                    self.answer_config.aggregation_source_reserve_operations)):
+            aggregation_source_reserve = _aggregation_source_reserve_ids(
+                turn_map, evidence.turn_ids)
         if evidence.mandatory_dropped:
             warnings.append("mandatory_turn_dropped_for_budget")
         if (self.answer_config.deterministic_bypass_enabled
                 and typed_execution is not None
                 and typed_execution.safe_to_bypass):
-            return PreparedAnswer(
+            prepared = PreparedAnswer(
                 question_id=question_id, memory_id=result.memory_id,
                 messages=(), evidence_turn_ids=evidence.turn_ids,
                 dropped_turn_ids=evidence.dropped_turn_ids,
@@ -515,19 +577,24 @@ class AnswerStage:
                     "provenance_binding_ids": list(
                         typed_execution.provenance_binding_ids),
                     "reason_codes": list(typed_execution.reason_codes)}})
+            return apply_readout_policy(
+                prepared, self.counter, self.answer_config.readout_policy)
 
         if ledger is not None and ledger.result_certified:
             prompt_version, _prompt_text, prompt_hash = prompt_contract(
                 self.answer_config.normalize_relative_time,
                 self.answer_config.precision_grounding,
-                evidence_order == "topological", True)
+                evidence_order in {"topological", "topological_recency"}, True,
+                False, self.answer_config.exact_grounding_footer,
+                contextual_question_date,
+                question_recency_footer, compact_topological_contract)
             payload_hash = hashlib.sha256(canonical_json({
                 "operation": ledger.operation,
                 "operands": list(ledger.deterministic_operands),
                 "result": ledger.deterministic_result,
                 "schema_version": ledger.schema_version,
             }).encode()).hexdigest()
-            return PreparedAnswer(
+            prepared = PreparedAnswer(
                 question_id=question_id, memory_id=result.memory_id,
                 messages=(), evidence_turn_ids=evidence.turn_ids,
                 dropped_turn_ids=evidence.dropped_turn_ids,
@@ -556,6 +623,8 @@ class AnswerStage:
                     "resolved_evidence_order": evidence_order,
                     "packed_turns": len(evidence.turn_ids),
                 })
+            return apply_readout_policy(
+                prepared, self.counter, self.answer_config.readout_policy)
 
         messages = build_answer_messages(
             question=question, question_date=question_date,
@@ -566,15 +635,24 @@ class AnswerStage:
                 else None),
             normalize_relative_time=self.answer_config.normalize_relative_time,
             precision_grounding=self.answer_config.precision_grounding,
-            topological_layout=evidence_order == "topological",
+            topological_layout=evidence_order in {
+                "topological", "topological_recency"},
             aggregation_ledger=(ledger.text if ledger else None),
             aggregation_ledger_contract=bool(ledger),
-            preference_synthesis=preference_synthesis)
+            preference_synthesis=preference_synthesis,
+            exact_grounding_footer=(
+                self.answer_config.exact_grounding_footer),
+            include_question_date=include_question_date,
+            question_recency_footer=question_recency_footer,
+            compact_topological_contract=compact_topological_contract)
         prompt_version, _prompt_text, prompt_hash = prompt_contract(
             self.answer_config.normalize_relative_time,
             self.answer_config.precision_grounding,
-            evidence_order == "topological",
-            bool(ledger), preference_synthesis)
+            evidence_order in {"topological", "topological_recency"},
+            bool(ledger), preference_synthesis,
+            self.answer_config.exact_grounding_footer,
+            contextual_question_date,
+            question_recency_footer, compact_topological_contract)
         prompt_tokens = self._prompt_tokens(messages)
         relaxed = False
         if prompt_tokens > budget.max_answer_tokens:
@@ -582,7 +660,13 @@ class AnswerStage:
             evidence = self.render(
                 result, budget,
                 max_tokens=max(1, budget.max_answer_tokens - overhead),
-                question=question)
+                question=question,
+                reserved_turn_ids=tuple(dict.fromkeys((
+                    *((ledger.candidate_turn_ids
+                       if ledger is not None
+                       and not self.answer_config.aggregation_execution_card
+                       else ())),
+                    *aggregation_source_reserve))))
             ledger = make_ledger(evidence)
             messages = build_answer_messages(
                 question=question, question_date=question_date,
@@ -593,10 +677,16 @@ class AnswerStage:
                     else None),
                 normalize_relative_time=self.answer_config.normalize_relative_time,
                 precision_grounding=self.answer_config.precision_grounding,
-                topological_layout=evidence_order == "topological",
+                topological_layout=evidence_order in {
+                    "topological", "topological_recency"},
                 aggregation_ledger=(ledger.text if ledger else None),
                 aggregation_ledger_contract=bool(ledger),
-                preference_synthesis=preference_synthesis)
+                preference_synthesis=preference_synthesis,
+                exact_grounding_footer=(
+                    self.answer_config.exact_grounding_footer),
+                include_question_date=include_question_date,
+                question_recency_footer=question_recency_footer,
+                compact_topological_contract=compact_topological_contract)
             prompt_tokens = self._prompt_tokens(messages)
             if prompt_tokens > budget.max_answer_tokens:
                 relaxed = True
@@ -608,7 +698,7 @@ class AnswerStage:
 
         prompt_payload_hash = hashlib.sha256(
             canonical_json(messages).encode()).hexdigest()
-        return PreparedAnswer(
+        prepared = PreparedAnswer(
             question_id=question_id, memory_id=result.memory_id,
             messages=tuple(dict(row) for row in messages),
             evidence_turn_ids=evidence.turn_ids,
@@ -624,6 +714,12 @@ class AnswerStage:
             preparation_latency_ms=(time.perf_counter() - started) * 1000,
             trace={
                 "prompt_version": prompt_version,
+                "focused_prompt_scope": self.answer_config.focused_prompt_scope,
+                "focused_prompt_applied": focused_prompt,
+                "question_date_mode": effective_question_date_mode,
+                "question_date_included": include_question_date,
+                "question_recency_footer": question_recency_footer,
+                "compact_topological_contract": compact_topological_contract,
                 "span_window": self.answer_config.span_window,
                 "evidence_order": self.answer_config.evidence_order,
                 "resolved_evidence_order": evidence_order,
@@ -650,6 +746,8 @@ class AnswerStage:
                 "aggregation_ledger": ({
                     "schema_version": ledger.schema_version,
                     "operation": ledger.operation,
+                    "execution_card": (
+                        self.answer_config.aggregation_execution_card),
                     "candidate_turn_ids": list(ledger.candidate_turn_ids),
                     "numeric_candidate_count": ledger.numeric_candidate_count,
                     "result_certified": ledger.result_certified,
@@ -657,8 +755,16 @@ class AnswerStage:
                         ledger.deterministic_operands),
                     "deterministic_result": ledger.deterministic_result,
                 } if ledger is not None else None),
+                "aggregation_source_reserve_turns": len(
+                    aggregation_source_reserve),
                 "preference_synthesis": preference_synthesis,
             })
+        prepared = apply_readout_policy(
+            prepared, self.counter, self.answer_config.readout_policy)
+        return replace(
+            prepared,
+            preparation_latency_ms=(time.perf_counter() - started) * 1000,
+        )
 
     def complete(self, prepared: PreparedAnswer) -> AnswerResult:
         """Complete a frozen request with the configured answer backbone."""

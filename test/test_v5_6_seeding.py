@@ -7,6 +7,7 @@ from typing import Mapping, Sequence
 from graphmem.domain import OperandSpec, ProofObligation, QueryOperator, SourceTurn, stable_id
 from graphmem.retrieval.query_ir import QueryIR
 from graphmem.retrieval.seeding import TurnSearchIndex, _interleave, build_views, seed_operands
+from graphmem.retrieval.slots import QuerySlots
 
 
 def _turn(session_id: str, index: int, text: str) -> SourceTurn:
@@ -73,6 +74,49 @@ def test_build_views_gives_each_operand_its_own_angles() -> None:
     assert {row.text for row in views if row.operand_id == "left"} != {
         row.text for row in views if row.operand_id == "right"}
     assert views == build_views(ir, max_per_operand=6)
+
+
+def test_query_relation_view_removes_owners_and_answer_head() -> None:
+    operand = _operand("only", "tim", "suggest")
+    ir = QueryIR(
+        "What city did Tim suggest for the team trip next month?",
+        QueryOperator.LOOKUP, (operand,), (),
+        slots=QuerySlots(content_terms=(
+            "city", "tim", "suggest", "team", "trip", "next", "month")))
+
+    views = build_views(ir, max_per_operand=6, query_relation_view=True)
+    relation = next(row for row in views if row.kind == "query_relation")
+
+    assert relation.text == "suggest team trip next month"
+    assert relation.dense is False
+
+
+def test_relational_view_scoring_keeps_reach_but_demotes_owner_only_exact() -> None:
+    turns = [
+        _turn("s1", 0, "Unrelated photo. [Media shared by Alice; caption: a tree]"),
+        _turn("s2", 0, "Alice volunteered at the shelter"),
+    ]
+    ir = _ir("Where did Alice volunteer?", [
+        _operand("only", "alice", "volunteer")])
+    store = _StubStore()
+    baseline = seed_operands(
+        store, _StubView(), "m", ir, turns, dense_search=None,
+        use_rrf=True, use_postings=False, wide_reservoir=True,
+        native_bm25=True)
+    relational = seed_operands(
+        store, _StubView(), "m", ir, turns, dense_search=None,
+        use_rrf=True, use_postings=False, wide_reservoir=True,
+        native_bm25=True, relational_view_scoring=True)
+
+    assert set(relational.source_turn_ids) == set(baseline.source_turn_ids)
+    assert relational.raw_scores[turns[0].turn_id]["exact"] \
+        < baseline.raw_scores[turns[0].turn_id]["exact"]
+    assert relational.raw_scores[turns[1].turn_id]["exact"] \
+        > relational.raw_scores[turns[0].turn_id]["exact"]
+    by_turn = {row.turn_id: row for row in relational.reservoir}
+    assert by_turn[turns[1].turn_id].relational_consensus \
+        > by_turn[turns[0].turn_id].relational_consensus
+    assert relational.stats["relational_view_scoring"] is True
 
 
 def test_dense_views_use_one_batch_without_changing_per_view_results() -> None:

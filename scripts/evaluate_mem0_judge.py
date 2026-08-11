@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -73,7 +74,14 @@ def main() -> None:
         eval_path.write_text("")
         calls_path.write_text("")
     completed={row["question_id"] for row in read_jsonl(eval_path)} if eval_path.exists() else set()
-    rows=[row for row in read_jsonl(args.answers) if str(row["question_id"]) not in completed]
+    source_rows = read_jsonl(args.answers)
+    # This runner owns the pinned LongMemEval judge contract.  Full GraphMem
+    # answer checkpoints may also contain LoCoMo rows while a run is still in
+    # progress; never send those through the incompatible Mem0 LME prompt.
+    answer_rows = [
+        row for row in source_rows
+        if not row.get("benchmark") or row.get("benchmark") == "longmemeval"]
+    rows=[row for row in answer_rows if str(row["question_id"]) not in completed]
     if args.metadata_jsonl:
         metadata={str(row["question_id"]):row for row in read_jsonl(args.metadata_jsonl)}
         rows=[{**metadata.get(str(row["question_id"]),{}),**row} for row in rows]
@@ -118,6 +126,9 @@ def main() -> None:
             append_jsonl(eval_path, {
                 "question_id":str(row["question_id"]), "question_type":row.get("question_type"),
                 "correct":label=="yes", "verdict":label, "judge_response":result.text,
+                "prediction_sha256": hashlib.sha256(str(
+                    row.get("prediction", row.get("response", ""))).encode(
+                        "utf-8")).hexdigest(),
                 "judge_model":result.record.model, "judge_mode":args.mode,
                 "judge_prompt_commit":PINNED_COMMIT if args.mode=="answer" else None,
                 "judge_prompt_sha256":PROMPT_SOURCE_SHA256 if args.mode=="answer" else None,
@@ -128,7 +139,7 @@ def main() -> None:
             append_jsonl(args.output_dir / "judge_failures.jsonl", failure)
 
     evaluations=read_jsonl(eval_path); calls=read_jsonl(calls_path)
-    expected_ids = {str(row["question_id"]) for row in read_jsonl(args.answers)}
+    expected_ids = {str(row["question_id"]) for row in answer_rows}
     evaluated_ids = {str(row["question_id"]) for row in evaluations}
     by_type={}
     for row in evaluations:
@@ -145,6 +156,7 @@ def main() -> None:
         "judge_mode":args.mode, "prompt_commit":PINNED_COMMIT if args.mode=="answer" else None, "prompt_source_sha256":PROMPT_SOURCE_SHA256 if args.mode=="answer" else None,
         "question_count":len(evaluations), "correct":sum(int(row["correct"]) for row in evaluations),
         "expected_question_count": len(expected_ids),
+        "ignored_non_longmemeval_rows": len(source_rows) - len(answer_rows),
         "unresolved_question_ids": sorted(expected_ids - evaluated_ids),
         "failure_count": len(expected_ids - evaluated_ids),
         "request_retry_count": sum(int(row.get("retry_count") or 0) for row in calls),

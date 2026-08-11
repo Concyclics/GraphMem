@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sqlite3
 import statistics
 import sys
@@ -50,8 +51,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gold", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--profile", help="override the build profile, e.g. b5")
+    parser.add_argument(
+        "--llm-model",
+        help="override the build model without changing the frozen build profile")
+    parser.add_argument(
+        "--llm-base-url",
+        help="override the build-model OpenAI-compatible base URL")
+    parser.add_argument(
+        "--llm-api-key-env", default="",
+        help="environment variable containing the build-model API key")
+    parser.add_argument(
+        "--llm-request-profile", choices=("qwen", "openai"), default="qwen",
+        help="select Qwen-local or OpenAI request fields for semantic extraction")
+    parser.add_argument(
+        "--llm-request-timeout-seconds", type=float, default=120.0,
+        help="fail one external request so the resumable build can recover")
     parser.add_argument("--relation-mask-propagation", action="store_true")
     parser.add_argument("--rare-lexical-relation", action="store_true")
+    parser.add_argument(
+        "--predicate-family-state-relations", action="store_true",
+        help=("join state routing by owner-role + morphological predicate family "
+              "+ polarity + modality instead of exact predicate phrase"))
     parser.add_argument(
         "--enabled-relation-signals",
         help="comma-separated relation signal allow-list; empty disables all signals")
@@ -70,6 +90,11 @@ def parse_args() -> argparse.Namespace:
         help="expect the frozen 100 LongMemEval + 100 LoCoMo question subset")
     parser.add_argument("--require-zero-retries", action="store_true")
     parser.add_argument("--require-complete-diagnostics", action="store_true")
+    parser.add_argument(
+        "--rebuild-missing-diagnostics", action="store_true",
+        help=("when resuming after an interrupted process, rebuild only graph "
+              "versions absent from the existing report so every published "
+              "Memory receives a same-run diagnostic row"))
     parser.add_argument(
         "--frozen-semantic-cache-only", action="store_true",
         help=("never call the semantic LLM; replay Full-arm responses by exact "
@@ -99,11 +124,19 @@ def main() -> None:
             for row in frozen_payload.get("rows", ())
         }
     config = load_config(args.config)
+    if args.llm_model or args.llm_base_url:
+        config = replace(config, models=replace(
+            config.models,
+            llm_model=args.llm_model or config.models.llm_model,
+            llm_base_url=args.llm_base_url or config.models.llm_base_url))
     if args.max_concurrency:
         config = replace(config, models=replace(config.models, max_concurrency=args.max_concurrency))
+    if args.llm_request_timeout_seconds <= 0:
+        raise ValueError("--llm-request-timeout-seconds must be positive")
     if args.profile:
         config = replace(config, profile=args.profile)
-    if args.relation_mask_propagation or args.rare_lexical_relation:
+    if (args.relation_mask_propagation or args.rare_lexical_relation
+            or args.predicate_family_state_relations):
         config = replace(config, edges=replace(
             config.edges,
             relation_mask_propagation=(
@@ -111,7 +144,10 @@ def main() -> None:
                 or config.edges.relation_mask_propagation),
             rare_lexical_relation=(
                 args.rare_lexical_relation
-                or config.edges.rare_lexical_relation)))
+                or config.edges.rare_lexical_relation),
+            predicate_family_state_relations=(
+                args.predicate_family_state_relations
+                or config.edges.predicate_family_state_relations)))
     if args.enabled_relation_signals is not None:
         enabled = tuple(value.strip() for value in
                         args.enabled_relation_signals.split(",") if value.strip())
@@ -162,17 +198,8 @@ def main() -> None:
     if fresh:
         ingest_questions(store, fresh)
 
-    built = {row[0] for row in store._read(
-        "SELECT memory_id FROM graph_versions WHERE graph_checksum != ''")}
     wanted = [row[0] for row in store._read(
         "SELECT memory_id FROM conversations ORDER BY memory_id")]
-    pending = [item for item in wanted if item not in built]
-    if args.max_memories:
-        pending = pending[:args.max_memories]
-    print(f"memories: {len(wanted)} total, {len(built)} already built, {len(pending)} to build",
-          flush=True)
-
-    started = time.perf_counter()
     prior_report_rows: list[dict] = []
     prior_report_summary: dict = {}
     if args.report.exists():
@@ -182,6 +209,32 @@ def main() -> None:
             prior_report_summary = dict(prior_payload.get("summary", {}))
         except (OSError, ValueError, TypeError):
             prior_report_rows = []
+    built = {row[0] for row in store._read(
+        "SELECT memory_id FROM graph_versions WHERE graph_checksum != ''")}
+    if args.rebuild_missing_diagnostics and prior_report_rows:
+        diagnosed = {str(row.get("memory_id") or "")
+                     for row in prior_report_rows}
+        replay = sorted(built - diagnosed)
+        if replay:
+            # Deleting the publication marker is sufficient: ``replace_graph``
+            # atomically replaces every old graph/evidence row for the exact
+            # Memory.  Conversation, frozen semantic cache and vectors remain
+            # untouched.  This is intentionally unavailable without both the
+            # explicit flag and an existing report.
+            with store.transaction() as db:
+                db.executemany(
+                    "DELETE FROM graph_versions WHERE memory_id=?",
+                    ((memory_id,) for memory_id in replay))
+            built.difference_update(replay)
+            print(f"replaying {len(replay)} graph versions missing diagnostics",
+                  flush=True)
+    pending = [item for item in wanted if item not in built]
+    if args.max_memories:
+        pending = pending[:args.max_memories]
+    print(f"memories: {len(wanted)} total, {len(built)} already built, {len(pending)} to build",
+          flush=True)
+
+    started = time.perf_counter()
     results: list[dict] = []
     failures: list[dict] = []
     global_llm_limit = max(1, config.models.max_concurrency)
@@ -196,10 +249,25 @@ def main() -> None:
         flush=True,
     )
 
+    build_api_key = "local"
+    if args.llm_api_key_env:
+        build_api_key = os.environ.get(args.llm_api_key_env, "")
+        if not build_api_key:
+            raise ValueError(
+                f"missing build API key environment variable: {args.llm_api_key_env}")
+
     def build(memory_id: str) -> dict:
+        from openai import OpenAI
+        client = OpenAI(
+            base_url=config.models.llm_base_url,
+            api_key=build_api_key,
+            timeout=args.llm_request_timeout_seconds,
+            max_retries=0)
         distiller = QwenSemanticDistiller(
-            store, config, "v5.6-full", request_gate=request_gate,
+            store, config, "v5.6-full", client=client,
+            request_gate=request_gate,
             worker_limit=per_memory_llm_workers,
+            request_profile=args.llm_request_profile,
             frozen_cache_only=args.frozen_semantic_cache_only,
             frozen_fallback_calls=frozen_fallback_calls.get(memory_id, 0))
         if args.embedding:
@@ -373,10 +441,17 @@ def main() -> None:
             if args.relation_embedding_db else None),
         "relation_mask_propagation": config.edges.relation_mask_propagation,
         "rare_lexical_relation": config.edges.rare_lexical_relation,
+        "predicate_family_state_relations": (
+            config.edges.predicate_family_state_relations),
         "enabled_relation_signals": list(config.edges.enabled_relation_signals),
         "memory_workers": memory_workers,
         "llm_workers_per_memory": per_memory_llm_workers,
         "max_concurrency": global_llm_limit,
+        "llm_model": config.models.llm_model,
+        "llm_base_url": config.models.llm_base_url,
+        "llm_api_key_env": args.llm_api_key_env or None,
+        "llm_request_profile": args.llm_request_profile,
+        "llm_request_timeout_seconds": args.llm_request_timeout_seconds,
         "frozen_semantic_cache_only": args.frozen_semantic_cache_only,
         "frozen_semantic_source_report": (
             str(args.frozen_semantic_source_report)

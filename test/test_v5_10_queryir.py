@@ -133,6 +133,41 @@ def test_relation_witness_prunes_same_type_edge_for_wrong_entity() -> None:
     assert result.proof[0].edge_id == "e-alice"
 
 
+def test_predicate_family_witness_matches_inflection_and_polarity() -> None:
+    nodes = (
+        _node("seed", "Alice event history"),
+        _node("positive", "Alice attended events"),
+        _node("negative", "Alice did not attend events"),
+    )
+    edges = (
+        _edge(
+            "e-negative", RelationType.COARSE_RELATED, "negative",
+            'relation_mask:state_compatible|relation_witness:'
+            '{"state_compatible":["alice\\u001fattend\\u001fnegative\\u001fasserted"]}'),
+        _edge(
+            "e-positive", RelationType.COARSE_RELATED, "positive",
+            'relation_mask:state_compatible|relation_witness:'
+            '{"state_compatible":["alice\\u001fattend\\u001fpositive\\u001fasserted"]}'),
+    )
+    ir = QueryIR(
+        "Which events has Alice attended?", QueryOperator.UNION_DISTINCT,
+        (OperandSpec("o1", owner_aliases=("alice",),
+                     predicate_candidates=("attending events",),
+                     polarity="positive"),),
+        (ProofObligation("binding", "o1", "binding"),))
+    budget = QueryBudget(
+        max_hops=1, max_visited_nodes=2, max_visited_edges=1,
+        max_frontier=4, max_seed_nodes=1)
+
+    result = execute(
+        GraphReadView(nodes, edges), ir, ("seed",), budget,
+        structured=True, expansion_beam=1,
+        preferred_relations=(RelationType.COARSE_RELATED,))
+
+    assert result.visited_node_ids == ("seed", "positive")
+    assert result.proof[0].edge_id == "e-positive"
+
+
 def test_relation_mask_without_witness_remains_backward_compatible() -> None:
     view = GraphReadView(
         (_node("seed", "Alice"), _node("state", "new address")),

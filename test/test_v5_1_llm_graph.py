@@ -76,6 +76,36 @@ def test_process_wide_request_gate_caps_multiple_distillers() -> None:
     assert completions.max_active == 2
 
 
+def test_openai_semantic_profile_uses_gpt_request_contract() -> None:
+    completions = _ConcurrencyProbeCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    config = GraphMemV5Config()
+    distiller = QwenSemanticDistiller(
+        _NoopCallStore(), config, "dataset", client=client,
+        request_profile="openai")
+
+    distiller._call("memory", "probe", "system", {"i": 1}, 1,
+                    max_tokens=321)
+
+    request = completions.requests[0] if hasattr(completions, "requests") else None
+    # The concurrency probe intentionally stores no requests; use a tiny
+    # recording completion to inspect the exact request below.
+    assert request is None
+
+    recording = FakeCompletions()
+    distiller = QwenSemanticDistiller(
+        _NoopCallStore(), config, "dataset",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=recording)),
+        request_profile="openai")
+    distiller._call("memory", "probe", "system", {"i": 1}, 1,
+                    max_tokens=321)
+    request = recording.requests[0]
+    assert request["max_completion_tokens"] == 321
+    assert request["reasoning_effort"] == "none"
+    assert "max_tokens" not in request
+    assert "extra_body" not in request
+
+
 class FakeCompletions:
     def __init__(self) -> None:
         self.calls = 0

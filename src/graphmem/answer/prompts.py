@@ -95,6 +95,30 @@ TOPOLOGICAL_LAYOUT_APPENDIX = (
     "number, and date in the memory text. Read all blocks needed by the "
     "question, but do not combine facts merely because they share a block."
 )
+COMPACT_TOPOLOGICAL_LAYOUT_VERSION = (
+    "graphmem-v5.38-compact-topological-evidence-v1")
+COMPACT_TOPOLOGICAL_LAYOUT_APPENDIX = (
+    " Memories are graph-grouped: [CHAIN] follows one QueryIR path, [GRAPH] "
+    "one traversal branch, and [AUX] contextual support. Blocks are ranked by "
+    "relevance, then graph or time order. Labels are navigation hints only: "
+    "verify the facts and do not merge memories only because they share a block."
+)
+COMPACT_TOPOLOGICAL_LABELS_VERSION = (
+    "graphmem-v5.39-compact-topological-labels-v1")
+COMPACT_TOPOLOGICAL_LABELS_APPENDIX = (
+    " Memories are graph-grouped: [Ck.d] is QueryIR chain k at step d "
+    "([Ck.S] is nearby support), [Gk.d] is graph branch k at step d, and "
+    "[Ak.r] is auxiliary group k at retrieval rank r. Blocks are ranked by "
+    "relevance, then graph or time order. Labels are navigation hints only: "
+    "verify the facts and do not merge memories only because they share a block."
+)
+QUERY_FOCUS_INDEX_VERSION = "graphmem-v5.39-query-focus-index-v1"
+QUERY_FOCUS_INDEX_APPENDIX = (
+    " A Query focus index after the memories repeats short, exact excerpts "
+    "from turns already present in the packed evidence. It is a reading aid, "
+    "not extra evidence or a proposed answer; verify each excerpt in its full "
+    "memory block."
+)
 AGGREGATION_LEDGER_VERSION = "graphmem-v5.21-aggregation-ledger-v1"
 AGGREGATION_LEDGER_APPENDIX = (
     " For an aggregation question, the user message may contain an Aggregation "
@@ -118,6 +142,20 @@ PREFERENCE_SYNTHESIS_APPENDIX = (
     "answer over abstaining merely because no memory states the recommendation "
     "itself. Keep the connection to the grounded constraints concise."
 )
+EXACT_GROUNDING_FOOTER_VERSION = "graphmem-v5.23-exact-grounding-footer-v1"
+EXACT_GROUNDING_FOOTER = (
+    "Final check: require exact entity and relation matches; if any required "
+    "fact is unsupported, answer insufficient information. Return only the answer."
+)
+QUESTION_RECENCY_FOOTER_VERSION = "graphmem-v5.38-question-recency-footer-v1"
+CONTEXTUAL_QUESTION_DATE_VERSION = "graphmem-v5.38-contextual-question-date-v1"
+_QUESTION_DATE_CUE_RE = re.compile(
+    r"\b(?:ago|today|yesterday|tomorrow|now|currently|current|recently|"
+    r"this\s+(?:day|week|month|year)|past\s+(?:\d+\s+)?"
+    r"(?:days?|weeks?|months?|years?)|(?:last|next|previous)\s+"
+    r"(?:day|week|month|year)|as\s+of|so\s+far)\b",
+    re.I,
+)
 
 _PREFERENCE_QUERY_RE = re.compile(
     r"\b(?:can|could|would) you (?:recommend|suggest|give|help)\b|"
@@ -135,6 +173,19 @@ def is_preference_synthesis_query(question: str) -> bool:
     """Detect an advice request from its wording, without benchmark labels."""
 
     return bool(_PREFERENCE_QUERY_RE.search(" ".join(question.split())))
+
+
+def question_needs_global_date(question: str) -> bool:
+    """Whether a relative phrase in the question needs the question timestamp.
+
+    A source turn's relative expressions are already normalized from its own
+    timestamp.  Showing the later global question date for every lookup makes
+    long-context models re-anchor source phrases such as ``next month`` to the
+    wrong conversation.  Keep the global anchor only when the query itself is
+    deictic.
+    """
+
+    return bool(_QUESTION_DATE_CUE_RE.search(" ".join(question.split())))
 
 
 def _query_operation_contract(question: str) -> str:
@@ -163,9 +214,15 @@ def build_answer_messages(
     aggregation_ledger: str | None = None,
     aggregation_ledger_contract: bool = False,
     preference_synthesis: bool = False,
+    exact_grounding_footer: bool = False,
+    include_question_date: bool = True,
+    question_recency_footer: bool = False,
+    compact_topological_contract: bool = False,
+    compact_topological_labels: bool = False,
+    query_focus_index: str | None = None,
 ) -> list[dict[str, str]]:
-    sections = [
-        f"Question date: {question_date or 'unknown'}",
+    sections = ([f"Question date: {question_date or 'unknown'}"]
+                if include_question_date else []) + [
         f"Question: {question}",
         "",
         f"Query operation: {_query_operation_contract(question)}",
@@ -173,6 +230,8 @@ def build_answer_messages(
     if candidate_answer:
         sections += ["", f"Candidate answer (unverified proposal): {candidate_answer}"]
     sections += ["", "Conversation memories:", evidence_text]
+    if query_focus_index:
+        sections += ["", query_focus_index]
     if aggregation_ledger:
         # Recency is intentional: aggregation errors persisted when all gold
         # turns were packed but their operands were scattered through 64 turns.
@@ -182,12 +241,25 @@ def build_answer_messages(
         # system-only instruction before 5K-12K evidence was often ignored by
         # Qwen, which then emitted evidence lists or degenerated into repetition.
         sections += ["", GROUNDED_OUTPUT_CONTRACT]
+    if exact_grounding_footer and not preference_synthesis:
+        sections += ["", EXACT_GROUNDING_FOOTER]
+    if question_recency_footer:
+        sections += [
+            "",
+            f"Answer the original Question now: {question}",
+            "Resolve relative time inside each memory only from that memory's "
+            "own date or [source-time] annotation. Return the concise answer "
+            "once; do not quote evidence or repeat the conclusion.",
+        ]
     return [
         {"role": "system", "content": prompt_contract(
             normalize_relative_time, precision_grounding,
             topological_layout,
             aggregation_ledger_contract or bool(aggregation_ledger),
-            preference_synthesis)[1]},
+            preference_synthesis, exact_grounding_footer,
+            not include_question_date, question_recency_footer,
+            compact_topological_contract, compact_topological_labels,
+            bool(query_focus_index))[1]},
         {"role": "user", "content": "\n".join(sections)},
     ]
 
@@ -201,7 +273,14 @@ def prompt_contract(normalize_relative_time: bool = False,
                     precision_grounding: bool = False,
                     topological_layout: bool = False,
                     aggregation_ledger: bool = False,
-                    preference_synthesis: bool = False) -> tuple[str, str, str]:
+                    preference_synthesis: bool = False,
+                    exact_grounding_footer: bool = False,
+                    contextual_question_date: bool = False,
+                    question_recency_footer: bool = False,
+                    compact_topological_contract: bool = False,
+                    compact_topological_labels: bool = False,
+                    query_focus_index: bool = False,
+                    ) -> tuple[str, str, str]:
     """Return the exact version/text/hash for an answer configuration."""
 
     version, prompt = (
@@ -212,12 +291,31 @@ def prompt_contract(normalize_relative_time: bool = False,
                    + ("-source-time" if normalize_relative_time else ""))
         prompt += GROUNDED_PROMPT_APPENDIX
     if topological_layout:
-        version += "+" + TOPOLOGICAL_LAYOUT_VERSION
-        prompt += TOPOLOGICAL_LAYOUT_APPENDIX
+        if compact_topological_labels:
+            version += "+" + COMPACT_TOPOLOGICAL_LABELS_VERSION
+            prompt += COMPACT_TOPOLOGICAL_LABELS_APPENDIX
+        elif compact_topological_contract:
+            version += "+" + COMPACT_TOPOLOGICAL_LAYOUT_VERSION
+            prompt += COMPACT_TOPOLOGICAL_LAYOUT_APPENDIX
+        else:
+            version += "+" + TOPOLOGICAL_LAYOUT_VERSION
+            prompt += TOPOLOGICAL_LAYOUT_APPENDIX
     if aggregation_ledger:
         version += "+" + AGGREGATION_LEDGER_VERSION
         prompt += AGGREGATION_LEDGER_APPENDIX
     if preference_synthesis:
         version += "+" + PREFERENCE_SYNTHESIS_VERSION
         prompt += PREFERENCE_SYNTHESIS_APPENDIX
+    if exact_grounding_footer:
+        # The text lives after evidence in the user message for recency; adding
+        # the version here still makes the prompt-contract hash configuration
+        # specific and prevents incompatible artifacts from being merged.
+        version += "+" + EXACT_GROUNDING_FOOTER_VERSION
+    if contextual_question_date:
+        version += "+" + CONTEXTUAL_QUESTION_DATE_VERSION
+    if question_recency_footer:
+        version += "+" + QUESTION_RECENCY_FOOTER_VERSION
+    if query_focus_index:
+        version += "+" + QUERY_FOCUS_INDEX_VERSION
+        prompt += QUERY_FOCUS_INDEX_APPENDIX
     return version, prompt, hashlib.sha256((version + prompt).encode("utf-8")).hexdigest()

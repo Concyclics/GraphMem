@@ -46,6 +46,31 @@ VIEW_DENSE_DEPTH = 48
 # they contribute through the semantic seeds rather than through this scoreboard.
 CHANNELS = ("exact", "bm25", "dense")
 
+# A hit from an owner-only view is useful for reachability, but it is not a
+# relation match.  In particular, LoCoMo's synthetic ``[Media shared by X]``
+# wrapper makes every media turn from X an exact owner hit.  Treating the
+# maximum over all views as an untyped score therefore lets one name outrank a
+# complete owner+predicate+scope match.  These weights retain every hit in the
+# reservoir while making the final score reflect how much of the information
+# need the view actually expresses.
+RELATIONAL_VIEW_WEIGHTS: Mapping[str, float] = {
+    "full_query": 1.0,
+    "query_relation": 1.0,
+    "owner": 0.10,
+    "predicate": 0.50,
+    "owner_predicate": 1.0,
+    "predicate_answer_slot": 0.80,
+    "scope_predicate": 1.0,
+    "temporal_event": 0.75,
+}
+
+_ANSWER_HEAD_TERMS = frozenset({
+    "what", "which", "who", "whom", "where", "when", "why", "how",
+    "place", "places", "city", "cities", "country", "countries",
+    "location", "locations", "venue", "restaurant", "person", "people",
+    "date", "day", "time", "reason", "count", "number", "duration",
+})
+
 
 @dataclass(frozen=True, slots=True)
 class QueryView:
@@ -72,6 +97,10 @@ class ReservoirEntry:
     view_ids: tuple[str, ...]
     operand_ids: tuple[str, ...]
     rrf: float
+    # Rank-sensitive agreement across relation-bearing QueryIR views.  The
+    # downstream historical scorer kept only each channel's maximum and lost
+    # this independent corroboration.  Owner-only hits are excluded.
+    relational_consensus: float
     parity: bool
 
 
@@ -218,7 +247,8 @@ def _phrase(*parts: str) -> str:
     return " ".join(part.strip() for part in parts if part and part.strip())
 
 
-def build_views(ir: QueryIR, *, max_per_operand: int) -> tuple[QueryView, ...]:
+def build_views(ir: QueryIR, *, max_per_operand: int,
+                query_relation_view: bool = False) -> tuple[QueryView, ...]:
     """Compose the retrieval angles for a compiled question, deterministically.
 
     Fields that only PR2's compiler fills (scope, answer slot, temporal phrase)
@@ -226,6 +256,20 @@ def build_views(ir: QueryIR, *, max_per_operand: int) -> tuple[QueryView, ...]:
     """
     views: list[QueryView] = [QueryView(stable_id("view", ir.query, "full"), "full_query", ir.query,
                                         None, dense=True)]
+    if query_relation_view and ir.slots is not None:
+        owner_terms = frozenset(
+            term for operand in ir.operands for alias in operand.owner_aliases
+            for term in content_terms(alias))
+        relation_terms = tuple(
+            term for term in ir.slots.content_terms
+            if term not in owner_terms and term not in _ANSWER_HEAD_TERMS)
+        # A unary remainder is normally just an answer head or a temporal word;
+        # it is not strong enough to deserve a separate relational channel.
+        if len(relation_terms) >= 2:
+            text = " ".join(relation_terms)
+            views.append(QueryView(
+                stable_id("view", ir.query, "query_relation"),
+                "query_relation", text, None, dense=False))
     for operand in ir.operands:
         owner = _phrase(*operand.owner_aliases)
         predicates = tuple(operand.predicate_candidates[:2])
@@ -476,7 +520,9 @@ def seed_operands(store, view, memory_id: str, ir: QueryIR, turns: Sequence[Sour
                   hierarchy_child_beam: int = 4,
                   hierarchy_operator_aware: bool = True,
                   turn_index: TurnSearchIndex | None = None,
-                  native_bm25: bool = False) -> SeedResult:
+                  native_bm25: bool = False,
+                  relational_view_scoring: bool = False,
+                  query_relation_view: bool = False) -> SeedResult:
     # session_fanout <= 0 means "every session holding a channel hit".
     if not wide_reservoir:
         return _seed_narrow(store, view, memory_id, ir, turns, dense_search=dense_search,
@@ -501,7 +547,9 @@ def seed_operands(store, view, memory_id: str, ir: QueryIR, turns: Sequence[Sour
                 operator_aware=hierarchy_operator_aware))
         hierarchy_latency_ms = (time.perf_counter() - route_started) * 1000
 
-    views = build_views(ir, max_per_operand=max_views_per_operand) if wide_reservoir else (
+    views = build_views(
+        ir, max_per_operand=max_views_per_operand,
+        query_relation_view=query_relation_view) if wide_reservoir else (
         QueryView(stable_id("view", ir.query, "full"), "full_query", ir.query, None, dense=True),)
 
     # --- per-view channel results -------------------------------------------------
@@ -531,12 +579,22 @@ def seed_operands(store, view, memory_id: str, ir: QueryIR, turns: Sequence[Sour
             if not rows:
                 continue
             normalized = _normalize(dict(rows))
-            for rank, (turn_id, _score) in enumerate(rows, 1):
+            for rank, (turn_id, raw_score) in enumerate(rows, 1):
                 if turn_id not in turn_by_id:
                     continue
                 # Keep the channel's true (normalized) strength, not 1/rank: the
                 # legacy path min-max normalizes and the two scales must agree.
-                scores[turn_id][channel] = max(scores[turn_id][channel], normalized[turn_id])
+                strength = normalized[turn_id]
+                if relational_view_scoring:
+                    weight = RELATIONAL_VIEW_WEIGHTS.get(row.kind, 0.50)
+                    # Exact already has a meaningful coverage scale.  Min-max
+                    # normalization turns a shallow one-term overlap into 1.0
+                    # whenever it happens to be the best overlap in that view.
+                    if channel == "exact":
+                        strength = min(1.0, max(0.0, float(raw_score)))
+                    strength *= weight
+                scores[turn_id][channel] = max(
+                    scores[turn_id][channel], strength)
                 previous = ranks[turn_id].get(channel)
                 ranks[turn_id][channel] = rank if previous is None else min(previous, rank)
                 view_hits[turn_id].append(row.view_id)
@@ -596,6 +654,16 @@ def seed_operands(store, view, memory_id: str, ir: QueryIR, turns: Sequence[Sour
     fused_rrf = _rrf({f"{view_id}:{channel}": ids
                       for view_id, rows in per_view_ranked.items()
                       for channel, ids in rows.items()})
+    view_by_id = {row.view_id: row for row in views}
+    relational_consensus: dict[str, float] = defaultdict(float)
+    for view_id, channel_rows in per_view_ranked.items():
+        query_view = view_by_id.get(view_id)
+        if query_view is None or query_view.kind == "owner":
+            continue
+        weight = RELATIONAL_VIEW_WEIGHTS.get(query_view.kind, 0.50)
+        for ids in channel_rows.values():
+            for rank, turn_id in enumerate(ids, 1):
+                relational_consensus[turn_id] += weight / (60.0 + rank)
     pool = set(scores) | parity
     entries: list[ReservoirEntry] = []
     for turn_id in pool:
@@ -608,7 +676,8 @@ def seed_operands(store, view, memory_id: str, ir: QueryIR, turns: Sequence[Sour
             dict(ranks.get(turn_id, {})),
             tuple(dict.fromkeys(view_hits.get(turn_id, ()))),
             tuple(sorted(operand_of_turn.get(turn_id, ()))),
-            fused_rrf.get(turn_id, 0.0), turn_id in parity,
+            fused_rrf.get(turn_id, 0.0),
+            relational_consensus.get(turn_id, 0.0), turn_id in parity,
         ))
     # Parity members are never evicted; the cap only bounds the extra reach.
     entries.sort(key=lambda row: (not row.parity, -row.rrf, -len(row.operand_ids), row.turn_id))
@@ -638,6 +707,9 @@ def seed_operands(store, view, memory_id: str, ir: QueryIR, turns: Sequence[Sour
         "hierarchical_terminal_node_ids": (
             hierarchy.terminal_node_ids if hierarchy is not None else ()),
         "bm25_backend": "immutable_memory_index" if native_bm25 else "sqlite_fts5",
+        "relational_view_scoring": relational_view_scoring,
+        "query_relation_view": query_relation_view,
+        "view_kinds": dict(Counter(row.kind for row in views)),
     }
     return SeedResult(node_ids, tuple(row.turn_id for row in entries),
                       {row.turn_id: row.scores for row in entries},

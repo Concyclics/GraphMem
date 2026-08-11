@@ -25,7 +25,7 @@ from typing import Mapping, Sequence
 from ..domain import SourceTurn
 
 
-AGGREGATION_LEDGER_SCHEMA_VERSION = "graphmem-v5.21-ranked24-certified-v4"
+AGGREGATION_LEDGER_SCHEMA_VERSION = "graphmem-v5.50-compact-execution-card-v1"
 
 _WORD_RE = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?", re.I)
 _NUMBER_RE = re.compile(
@@ -73,6 +73,16 @@ def aggregation_operation(question: str) -> str | None:
         return "difference"
     if re.search(r"\btotal\b|\baltogether\b|\bcombined\b|\bin all\b", q):
         return "sum"
+    # Endpoint arithmetic is not a sum.  The old fallback classified every
+    # "how many days/weeks/months" query as ``sum`` and explicitly instructed
+    # the answer model to add durations, producing errors such as 3 months
+    # (booking lead time) instead of 5 months (question date minus booking).
+    if (re.search(r"\bhow long\b", q)
+            or re.search(
+                r"\bhow many\s+(?:days?|weeks?|months?|years?|hours?|minutes?)\b"
+                r".*\b(?:ago|since|passed|elapsed|take|took|between|before|after|"
+                r"when|until)\b", q)):
+        return "date_difference"
     if re.search(r"\bhow much\b", q) and re.search(
             r"\b(?:spend|spent|cost|costs|paid|pay|save|saved|earn|earned|budget|"
             r"distance|time|long)\b", q):
@@ -127,6 +137,22 @@ def _numbers(text: str) -> tuple[str, ...]:
             continue
         values.append(value)
     return tuple(dict.fromkeys(values))
+
+
+def _is_authoritative_source(turn: SourceTurn) -> bool:
+    """Treat named participants in multi-party memories as source speakers.
+
+    LoCoMo serializes the two participants through chat ``user``/``assistant``
+    roles even though both named speakers are equally authoritative memory
+    sources.  Using the transport role alone mislabeled half of their facts as
+    suggestions and also excluded their numeric operands from the reserved
+    ledger rows.
+    """
+
+    role = (turn.role or "").casefold().strip()
+    speaker = (turn.speaker or "").casefold().strip()
+    generic = {"", "assistant", "system", "tool", "user", "human"}
+    return role in {"user", "human"} or speaker not in generic
 
 
 def _compact(text: str, anchors: frozenset[str], limit: int = 240) -> str:
@@ -261,6 +287,7 @@ def build_aggregation_ledger(
     packed_turn_ids: Sequence[str],
     *,
     limit: int = 24,
+    execution_card: bool = False,
 ) -> AggregationLedger | None:
     """Index packed turns as candidate operands without claiming scope closure."""
 
@@ -291,7 +318,7 @@ def build_aggregation_ledger(
             math.log((len(rows) + 1) / (document_frequency[term] + 0.5))
             for term in overlap)
         numbers = _numbers(turn.raw_text)
-        role = (turn.role or turn.speaker).casefold()
+        authoritative = _is_authoritative_source(turn)
         # Preserve high-ranked graph evidence, but let rare query anchors pull a
         # later gold operand into the compact ledger. Numeric turns are useful
         # for arithmetic but do not outrank an exact entity/action match.
@@ -306,10 +333,10 @@ def build_aggregation_ledger(
         score = lexical * 2.0
         if operation != "count_distinct" and compatible_number:
             score += 2.5 if wants_money else 1.0
-        score += 0.9 if role in {"user", "human"} else -0.35
+        score += 0.9 if authoritative else -0.35
         score += 0.30 / (rank + 1)
         scored.append((score, rank, turn, numbers,
-                       compatible_number and role in {"user", "human"}))
+                       compatible_number and authoritative))
 
     ordered = sorted(scored, key=lambda row: (-row[0], row[1]))
     # Arithmetic gold often uses a terse source statement ("the helmet was
@@ -332,38 +359,73 @@ def build_aggregation_ledger(
         if operation == "count_distinct" else None)
     deterministic_result = execution[0] if execution else ""
     deterministic_operands = execution[1] if execution else ()
-    lines = [
-        "Aggregation ledger (mechanically indexed candidate operands; source turns remain authoritative):",
-        f"Operation: {operation}",
-    ]
+    rules = {
+        "count_distinct": (
+            "enumerate every distinct qualifying item or completed occurrence; "
+            "exclude plans, suggestions, near-matches, and duplicate mentions; "
+            "then count once"),
+        "sum": (
+            "collect every distinct unit-compatible amount for the exact scope; "
+            "exclude plans, unrelated values, subtotals, and duplicate mentions; "
+            "then add once"),
+        "difference": (
+            "bind the exact two quantities; for remaining or needed, compute "
+            "target minus the latest current amount and preserve the unit"),
+        "date_difference": (
+            "bind the exact start and end events, resolve each from its own date "
+            "or [source-time], then subtract in the requested calendar unit"),
+        "mean": (
+            "bind the complete requested population, use one value per member, "
+            "sum the values, and divide once by the member count"),
+        "minimum": "bind all exact-scope values and return the minimum with its unit",
+        "maximum": "bind all exact-scope values and return the maximum with its unit",
+    }
+    if execution_card:
+        lines = [
+            "Aggregation ledger (compact execution card; source memories are authoritative):",
+            f"Operation: {operation}",
+            "Procedure: " + rules.get(
+                operation, "select the complete exact operand set and apply the operation once"),
+            "Graph proximity finds evidence but does not qualify an operand.",
+            f"Question: {question}",
+        ]
+    else:
+        lines = [
+            "Aggregation ledger (mechanically indexed candidate operands; source turns remain authoritative):",
+            f"Operation: {operation}",
+        ]
     numeric_count = 0
     candidate_ids = []
     for index, (_score, _rank, turn, numbers, _required) in enumerate(selected, 1):
         candidate_ids.append(turn.turn_id)
         numeric_count += bool(numbers)
-        role = (turn.role or turn.speaker or "unknown").casefold()
-        status = ("direct_user_statement" if role in {"user", "human"}
+        if execution_card:
+            continue
+        status = ("source_speaker_statement" if _is_authoritative_source(turn)
                   else "assistant_or_unconfirmed_context")
         numeric = ", ".join(numbers) if numbers else "none"
-        text = _compact(turn.raw_text, query_terms)
+        # The authoritative source turn is already present in the evidence
+        # block.  A short anchor is enough to make this an execution index;
+        # duplicating up to 240 characters for every row displaced seven
+        # complete LME gold bundles at the fixed 12K prompt ceiling.
+        text = _compact(turn.raw_text, query_terms, limit=96)
         lines.append(
-            f"Operand candidate {index}: source={turn.turn_id}; date={turn.timestamp or 'unknown'}; "
-            f"speaker={turn.speaker or role}; status={status}; explicit_numbers=[{numeric}]; "
-            f"text={text}")
-    lines += [
-        "Execution constraints:",
-        "1. Retain only candidates satisfying the question's exact entity, event, time range, polarity, and completion status.",
-        "2. Deduplicate repeated mentions of one occurrence, but keep distinct named items, sessions, dates, and recurring weekdays separate.",
-        "3. Treat assistant suggestions, hypotheticals, and unaccepted plans as context, not completed operands.",
-        "4. Apply the stated operation only after the operand set is closed; calculate arithmetic exactly.",
-        "5. If any required operand or endpoint is absent, answer that the information is insufficient; absence is not numeric zero.",
-    ]
+            f"Candidate {index}: source={turn.turn_id}; status={status}; "
+            f"numbers=[{numeric}]; anchor={text}")
+    if not execution_card:
+        lines += [
+            "Execution: retain exact entity/event/time/polarity matches; deduplicate repeated mentions, not distinct occurrences; exclude unaccepted hypotheticals; then apply the operation exactly.",
+            "If a required operand is absent, report insufficient information; absence is not zero.",
+        ]
+        if operation == "date_difference":
+            lines.append(
+                "Date-difference rule: identify the requested start/end events (or event/question date), subtract endpoints in calendar order, and never add an unrelated duration or booking lead time.")
     if deterministic_result:
         lines += [
             "Certified deterministic operands: " + "; ".join(deterministic_operands),
             "Certified deterministic result: " + deterministic_result,
         ]
-    else:
+    elif not execution_card:
         lines.append(
             "Certified deterministic result: unavailable (operand closure is not certified).")
     return AggregationLedger(

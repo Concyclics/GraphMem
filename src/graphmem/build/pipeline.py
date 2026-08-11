@@ -32,6 +32,7 @@ from .coarsen import (
     build_parent_gated_relations,
     build_rare_lexical_node_terms,
     build_recursive_hierarchy,
+    promotable_object_value,
 )
 from .refine import Qwen30BRefiner, RefineCandidate
 from .semantic import QwenSemanticDistiller, ScenePacket
@@ -58,6 +59,7 @@ EVIDENCE_REF_STOPWORDS = NON_ENTITY_NAMES | frozenset({
     "are", "was", "is", "am", "can", "did", "does", "do", "of", "to", "in", "on",
     "at", "it", "my", "me", "we", "our", "a", "an", "i",
     "how", "why", "who", "no", "not", "use",
+    "never", "appreciate", "ttyl",
     "all", "last", "take", "one", "individual", "individuals", "option",
     "metrics", "countries", "chapter",
 })
@@ -417,6 +419,8 @@ class GraphBuildPipeline:
                 rare_lexical_min_shared=(
                     profile.edges.rare_lexical_min_shared),
                 enabled_signals=profile.edges.enabled_relation_signals,
+                predicate_family_state_relations=(
+                    profile.edges.predicate_family_state_relations),
             )
             for left_id, right_id, score, _gate_level in gated_plan.accepted_pairs:
                 left, right = node_map[left_id], node_map[right_id]
@@ -964,6 +968,16 @@ class GraphBuildPipeline:
                         relation_entities["object"].add(entity_key)
                 object_entities = tuple(sorted(
                     relation_entities["object"])[:16])
+                # Lower-case object phrases are common in LoCoMo (for example
+                # ``dance studio`` and ``cooking class``) and were previously
+                # invisible to entity relation construction.  Promote only the
+                # same conservative short-value contract used by recoarsening,
+                # and retain the source role in node provenance.
+                promoted_object = promotable_object_value(value_key)
+                if promoted_object:
+                    relation_entities["object"].add(promoted_object)
+                    object_entities = tuple(sorted(
+                        relation_entities["object"])[:16])
                 # Modality must describe this fact, not a nearby sentence in the
                 # same turn. Neighbour context caused completed events to inherit
                 # unrelated phrases such as "would love to".

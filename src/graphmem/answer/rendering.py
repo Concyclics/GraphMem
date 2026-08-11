@@ -73,7 +73,9 @@ class AnswerConfig:
     # former and other queries use the latter. ``topological_plain`` reorders
     # the frozen evidence set by graph topology without exposing graph labels
     # to the answer model; ``topological`` additionally renders those labels
-    # and the matching prompt contract.
+    # and the matching prompt contract. ``topological_recency`` preserves each
+    # graph block internally but places the strongest block last so the answer
+    # model sees the best evidence nearest its generation boundary.
     evidence_order: str = "chronological"
     # Materialize relative phrases against the source turn timestamp in the
     # rendered evidence.  This prevents the answer model from re-anchoring
@@ -87,10 +89,45 @@ class AnswerConfig:
     # result when relational operand closure is uncertified.
     aggregation_ledger_enabled: bool = False
     aggregation_ledger_limit: int = 24
+    # Render only an operation-specific execution card instead of duplicating
+    # snippets from every ledger candidate. Candidate IDs remain in the trace
+    # for audit, but do not consume prompt budget or become mandatory evidence.
+    aggregation_execution_card: bool = False
+    # When a generic user/assistant transcript is re-packed to make room for
+    # the aggregation ledger, keep the direct user statements before optional
+    # assistant prose.  This is deliberately disabled for named multi-party
+    # memories (for example LoCoMo), where both transport roles are equally
+    # authoritative speakers.
+    aggregation_source_reserve_enabled: bool = False
+    aggregation_source_reserve_operations: tuple[str, ...] = (
+        "sum", "count_distinct")
     # Route recommendation/advice questions to a contract that treats stored
     # preferences as constraints for synthesis rather than requiring the final
     # recommendation itself to appear verbatim in memory.
     preference_synthesis_enabled: bool = False
+    # Repeat the exact entity/relation and missing-fact guard after the evidence
+    # block.  Long contexts can dilute the equivalent system instruction.
+    exact_grounding_footer: bool = False
+    # ``query_relative`` exposes the global question timestamp only when the
+    # query itself contains a deictic time phrase.  Source-memory relative
+    # expressions remain anchored by source-time normalization.
+    question_date_mode: str = "always"
+    # Repeat the question and source-time rule after long evidence so the model
+    # does not answer a nearby but different relation from an earlier block.
+    question_recency_footer: bool = False
+    # Preserve the graph-layout semantics while reclaiming prompt tokens from
+    # the verbose label glossary.  The saved budget pays for a post-evidence
+    # query reminder without increasing any answer request.
+    compact_topological_contract: bool = False
+    # ``default`` applies the contextual-date/footer/compact-layout rewrite
+    # only when no specialized aggregation or preference contract is active.
+    # Those contracts already own the post-evidence readout semantics.
+    focused_prompt_scope: str = "all"
+    # Apply a validated post-packing readout policy in the core answer path.
+    # ``legacy`` preserves every frozen artifact. ``v5_54`` composes the
+    # label-free V5.43--V5.54 winner routes without depending on offline prompt
+    # materializers.
+    readout_policy: str = "legacy"
     closed_form_enabled: bool = True
     # Keep the algebraic draft available for auditing, but do not place it in
     # the answer prompt unless an experiment explicitly opts in.  A noisy
@@ -109,21 +146,81 @@ class AnswerConfig:
     #: per-turn header so a pathological speaker label cannot eat the budget.
     max_speaker_chars: int = 48
 
+    @classmethod
+    def v5_54(cls, **overrides) -> "AnswerConfig":
+        """Return the measured V5.54 answer contract.
+
+        Retrieval budgets stay outside this answer-only configuration.  The
+        matching query-plane values live in
+        ``configs/v5/runtime_v5_54_accuracy64.json``.
+        """
+
+        values = {
+            "span_window": 96,
+            "evidence_order": "topological",
+            "normalize_relative_time": True,
+            "precision_grounding": False,
+            "aggregation_ledger_enabled": True,
+            "aggregation_ledger_limit": 32,
+            "aggregation_execution_card": False,
+            "aggregation_source_reserve_enabled": True,
+            "aggregation_source_reserve_operations": (
+                "sum", "count_distinct"),
+            "preference_synthesis_enabled": True,
+            "exact_grounding_footer": False,
+            "question_date_mode": "query_relative",
+            "question_recency_footer": True,
+            "compact_topological_contract": True,
+            "focused_prompt_scope": "default",
+            "closed_form_enabled": True,
+            "candidate_answer_injection": False,
+            "deterministic_bypass_enabled": False,
+            "max_output_tokens": 2000,
+            "sampling_seed": 0,
+            "readout_policy": "v5_54",
+        }
+        values.update(overrides)
+        return cls(**values)
+
     def __post_init__(self) -> None:
         if self.span_window is not None and self.span_window < 0:
             raise ValueError("span_window must be None or non-negative")
         if self.evidence_order not in {
                 "chronological", "relevance", "adaptive",
-                "topological_plain", "topological"}:
+                "topological_plain", "topological", "topological_recency"}:
             raise ValueError(
                 "evidence_order must be chronological, relevance, adaptive, "
-                "topological_plain, or topological")
+                "topological_plain, topological, or topological_recency")
         if self.max_output_tokens is not None and self.max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be None or positive")
         if self.sampling_seed < 0:
             raise ValueError("sampling_seed must be non-negative")
         if self.aggregation_ledger_limit <= 0:
             raise ValueError("aggregation_ledger_limit must be positive")
+        if self.question_date_mode not in {"always", "query_relative", "never"}:
+            raise ValueError(
+                "question_date_mode must be always, query_relative, or never")
+        if self.focused_prompt_scope not in {"all", "default"}:
+            raise ValueError("focused_prompt_scope must be all or default")
+        if self.readout_policy not in {"legacy", "v5_54"}:
+            raise ValueError("readout_policy must be legacy or v5_54")
+        if self.readout_policy == "v5_54":
+            required = {
+                "evidence_order": self.evidence_order == "topological",
+                "source_time": self.normalize_relative_time,
+                "aggregation_ledger": self.aggregation_ledger_enabled,
+                "preference_synthesis": self.preference_synthesis_enabled,
+                "query_relative_date": self.question_date_mode == "query_relative",
+                "question_footer": self.question_recency_footer,
+                "compact_topology": self.compact_topological_contract,
+                "default_scope": self.focused_prompt_scope == "default",
+                "no_candidate_injection": not self.candidate_answer_injection,
+            }
+            missing = [name for name, enabled in required.items() if not enabled]
+            if missing:
+                raise ValueError(
+                    "v5_54 readout policy requires its measured base contract: "
+                    + ", ".join(missing))
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,7 +328,8 @@ def render_evidence(
     mandatory = set(mandatory_turn_ids)
     source_rows = list(turns)
     rows = (source_rows if config.evidence_order in {
-        "relevance", "topological_plain", "topological"} else
+        "relevance", "topological_plain", "topological",
+        "topological_recency"} else
             sorted(source_rows,
                    key=lambda turn: (order.get(turn.session_id, 1 << 30),
                                      turn.session_id, turn.turn_index, turn.turn_id)))
@@ -249,7 +347,15 @@ def render_evidence(
     def total(ids: Sequence[str]) -> int:
         return sum(costs[item] + 1 for item in ids)
 
-    optional = [item for item in reversed(keep) if item not in mandatory]
+    # Most relevance-preserving layouts put the strongest block first, so the
+    # historical reverse scan drops the weakest tail. ``topological_recency``
+    # intentionally places the strongest block last for long-context recency;
+    # applying the same reverse scan there silently deletes the evidence the
+    # layout was designed to protect.  Select from the weak prefix in that mode
+    # and retain the final presentation order after membership is decided.
+    drop_order = (keep if config.evidence_order == "topological_recency"
+                  else list(reversed(keep)))
+    optional = [item for item in drop_order if item not in mandatory]
     for turn_id in optional:
         if total(keep) <= max_tokens:
             break
@@ -258,7 +364,10 @@ def render_evidence(
     mandatory_dropped = False
     if total(keep) > max_tokens:
         # Only mandatory turns remain and they still do not fit.
-        for turn_id in [item for item in reversed(keep)]:
+        mandatory_drop_order = (
+            list(keep) if config.evidence_order == "topological_recency"
+            else list(reversed(keep)))
+        for turn_id in mandatory_drop_order:
             if total(keep) <= max_tokens or len(keep) <= 1:
                 break
             keep.remove(turn_id)

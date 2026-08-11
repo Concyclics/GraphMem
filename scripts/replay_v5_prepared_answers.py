@@ -46,6 +46,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepared", type=Path, required=True)
     parser.add_argument("--metadata-answers", type=Path, required=True)
+    parser.add_argument(
+        "--reuse-answers", type=Path,
+        help=("reuse a prior prediction only when its prompt payload hash and "
+              "answer model exactly match the frozen PreparedAnswer"))
+    parser.add_argument(
+        "--reuse-retrieval", type=Path,
+        help=("retrieval JSONL paired with --reuse-answers; supplies the exact "
+              "API usage/latency ledger for reused requests"))
+    parser.add_argument(
+        "--reuse-usage", type=Path,
+        help=("answer_usage.jsonl paired with --reuse-answers; preferred when "
+              "the frozen run stores API usage separately from retrieval"))
+    parser.add_argument(
+        "--metadata-prompt-policy", choices=("exact", "ignore"),
+        default="exact",
+        help=("exact requires metadata and PreparedAnswer prompt hashes to "
+              "match; ignore uses metadata only for question/gold fields when "
+              "replaying a newly prepared retrieval arm"))
     parser.add_argument("--source-db", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
@@ -55,10 +73,19 @@ def main() -> None:
     parser.add_argument("--answer-request-profile",
                         choices=("qwen", "openai", "omit"), default="openai")
     parser.add_argument("--packing-model")
+    parser.add_argument(
+        "--max-output-tokens", type=int, default=0,
+        help="0 omits the API cap; positive values enforce the answer budget")
     parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--checkpoint-every", type=int, default=25)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
+    if args.reuse_retrieval and args.reuse_usage:
+        raise ValueError("use only one of --reuse-retrieval/--reuse-usage")
+    if bool(args.reuse_answers) != bool(
+            args.reuse_retrieval or args.reuse_usage):
+        raise ValueError(
+            "--reuse-answers and one reuse usage source must be supplied together")
 
     args.output_root.mkdir(parents=True, exist_ok=args.resume)
     answer_path = args.output_root / "answers.jsonl"
@@ -80,11 +107,72 @@ def main() -> None:
         if str(metadata[row.question_id].get("prompt_payload_hash") or "")
         != row.prompt_payload_hash
     ]
-    if mismatched_hashes:
+    if mismatched_hashes and args.metadata_prompt_policy == "exact":
         raise ValueError(
             "metadata/prepared prompt hash mismatch for "
             f"{len(mismatched_hashes)} questions; first={mismatched_hashes[0]}")
-    if args.resume:
+    reused = 0
+    if args.reuse_answers:
+        reusable_answers = {
+            str(row["question_id"]): row for row in read_jsonl(args.reuse_answers)}
+        if args.reuse_usage:
+            reusable_usage = {
+                str(row["question_id"]): row
+                for row in read_jsonl(args.reuse_usage)}
+        else:
+            reusable_usage = {
+                str(row["dev_question_id"]): row
+                for row in read_jsonl(args.reuse_retrieval)}
+        for frozen in prepared:
+            question_id = frozen.question_id
+            if question_id in completed:
+                continue
+            prior = reusable_answers.get(question_id)
+            usage = reusable_usage.get(question_id)
+            if prior is None or usage is None:
+                continue
+            if (str(prior.get("prompt_payload_hash") or "")
+                    != frozen.prompt_payload_hash):
+                continue
+            if str(prior.get("answer_model") or "") != args.answer_model:
+                continue
+            base = dict(metadata[question_id])
+            base.update({
+                "prediction": prior.get("prediction", ""),
+                "answer_model": args.answer_model,
+                "prompt_payload_hash": frozen.prompt_payload_hash,
+            })
+            answer_checkpoint.append(base)
+            if args.reuse_usage:
+                usage_row = dict(usage)
+                usage_row.update({
+                    "question_id": question_id,
+                    "benchmark": base.get("benchmark"),
+                    "stratum": base.get("stratum"),
+                    "answer_model": args.answer_model,
+                    "prompt_payload_hash": frozen.prompt_payload_hash,
+                    "reused_from": str(args.reuse_answers),
+                })
+            else:
+                usage_row = {
+                    "question_id": question_id,
+                    "benchmark": base.get("benchmark"),
+                    "stratum": base.get("stratum"),
+                    "answer_model": args.answer_model,
+                    "prompt_payload_hash": frozen.prompt_payload_hash,
+                    "packing_prompt_tokens": int(usage.get("prompt_tokens", 0)),
+                    "api_prompt_tokens": int(usage.get("api_prompt_tokens", 0)),
+                    "completion_tokens": int(usage.get("completion_tokens", 0)),
+                    "total_tokens": int(usage.get("answer_total_tokens", 0)),
+                    "latency_ms": float(usage.get("answer_latency_ms", 0.0)),
+                    "cached": bool(usage.get("answer_cached", False)),
+                    "finish_reason": usage.get("answer_finish_reason", ""),
+                    "reused_from": str(args.reuse_answers),
+                }
+            usage_checkpoint.append(usage_row)
+            completed.add(question_id)
+            reused += 1
+    if args.resume or reused:
         order = [row.question_id for row in prepared if row.question_id in completed]
         for path, checkpoint in ((answer_path, answer_checkpoint),
                                  (usage_path, usage_checkpoint)):
@@ -100,7 +188,8 @@ def main() -> None:
     config = load_config(args.config)
     stage = AnswerStage(
         store, config, "v5-prepared-replay",
-        answer_config=AnswerConfig(max_output_tokens=None),
+        answer_config=AnswerConfig(
+            max_output_tokens=(args.max_output_tokens or None)),
         cache_store=cache, require_exact_tokenizer=True,
         answer_model=args.answer_model, answer_base_url=args.answer_base_url,
         answer_api_key_env=args.answer_api_key_env,
@@ -173,7 +262,11 @@ def main() -> None:
         "answer_model": args.answer_model,
         "config_hash": config_hash(config),
         "answer_request_profile": args.answer_request_profile,
-        "max_output_tokens": None,
+        "metadata_prompt_policy": args.metadata_prompt_policy,
+        "metadata_prompt_hash_mismatches": len(mismatched_hashes),
+        "reused_prompt_identical_questions": sum(
+            bool(row.get("reused_from")) for row in usage),
+        "max_output_tokens": args.max_output_tokens or None,
         "prepared": str(args.prepared),
         "prepared_sha256": hashlib.sha256(
             args.prepared.read_bytes()).hexdigest(),

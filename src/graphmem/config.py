@@ -275,6 +275,11 @@ class EdgeConfig:
     # at most a couple of merges.  "agglomerative" takes the transitive closure
     # of every above-threshold pair.
     predicate_cluster_mode: str = "mutual_pair"
+    # Build state corridors from (owner-role, conservative predicate family,
+    # polarity, modality) instead of an exact extracted predicate phrase.  The
+    # family is morphological only; semantic clustering remains independently
+    # configurable above.  Opt-in preserves checksums of frozen V5.17 graphs.
+    predicate_family_state_relations: bool = False
     portal_degree_cap: int = 2
     relation_degree_caps: Mapping[str, int] = field(default_factory=lambda: {
         "same_event": 4, "same_activity": 8, "state_next": 4,
@@ -328,12 +333,30 @@ class RetrievalRuntimeConfig:
     span_pack_window: int = 96
     obligation_aware_relations: bool = False
     native_seed_fusion: bool = True
+    relational_view_scoring: bool = False
+    query_relation_view: bool = False
+    relational_view_named_speakers_only: bool = False
+    dialogue_response_closure: bool = False
+    dialogue_response_flood_threshold: int = 0
+    proof_priority_bonus: float | None = None
+    proof_priority_flood_threshold: int = 0
+    speaker_owner_bonus: float = 0.0
+    query_witness_bonus: float = 0.0
+    query_witness_seed_count: int = 16
+    query_witness_rare_df: int = 4
+    query_witness_min_shared_terms: int = 2
     # At low compiler confidence, retain the AST operator but union/relax its
     # seed filters with the legacy parse instead of hard-excluding evidence.
     queryir_soft_fallback: bool = False
     queryir_soft_fallback_threshold: float = 0.80
     exact_lookup_fast_path: bool = False
     exact_lookup_turn_limit: int = 16
+    # Rank exact entity/relation/value witnesses inside the normal graph result
+    # without truncating traversal or the evidence budget.
+    exact_lookup_priority: bool = False
+    exact_lookup_priority_min_score: float = 1.50
+    exact_lookup_priority_bonus: float = 1.0
+    exact_lookup_priority_named_speakers_only: bool = False
     read_pool_size: int = 1
     snapshot_cache_bytes: int = 256 * 1024 * 1024
     snapshot_cache_memories: int = 8
@@ -372,6 +395,9 @@ class RetrievalRuntimeConfig:
             "snapshot_cache_memories": self.snapshot_cache_memories,
             "metadata_cache_memories": self.metadata_cache_memories,
             "exact_lookup_turn_limit": self.exact_lookup_turn_limit,
+            "query_witness_seed_count": self.query_witness_seed_count,
+            "query_witness_rare_df": self.query_witness_rare_df,
+            "query_witness_min_shared_terms": self.query_witness_min_shared_terms,
             "query_embedding_cache_entries": self.query_embedding_cache_entries,
             "dense_cache_bytes": self.dense_cache_bytes,
             "dense_cache_memories": self.dense_cache_memories,
@@ -387,6 +413,19 @@ class RetrievalRuntimeConfig:
             raise ValueError("span_pack_window cannot be negative")
         if any(float(value) < 0 for value in self.fusion_weights.values()):
             raise ValueError("fusion weights cannot be negative")
+        if (self.proof_priority_bonus is not None
+                and self.proof_priority_bonus < 0):
+            raise ValueError("proof_priority_bonus must be non-negative")
+        if self.speaker_owner_bonus < 0:
+            raise ValueError("speaker_owner_bonus must be non-negative")
+        if self.query_witness_bonus < 0:
+            raise ValueError("query_witness_bonus must be non-negative")
+        if (self.exact_lookup_priority_min_score < 0
+                or self.exact_lookup_priority_bonus < 0):
+            raise ValueError("exact lookup priority values must be non-negative")
+        if (self.dialogue_response_flood_threshold < 0
+                or self.proof_priority_flood_threshold < 0):
+            raise ValueError("proof flood thresholds must be non-negative")
         if not 0.0 <= self.queryir_soft_fallback_threshold <= 1.0:
             raise ValueError("queryir_soft_fallback_threshold must be in [0, 1]")
         if self.dense_backend not in {"auto", "numpy_exact", "faiss_flat"}:
@@ -420,10 +459,31 @@ class RetrievalRuntimeConfig:
             "span_pack_window": self.span_pack_window,
             "obligation_aware_relations": self.obligation_aware_relations,
             "native_seed_fusion": self.native_seed_fusion,
+            "relational_view_scoring": self.relational_view_scoring,
+            "query_relation_view": self.query_relation_view,
+            "relational_view_named_speakers_only": (
+                self.relational_view_named_speakers_only),
+            "dialogue_response_closure": self.dialogue_response_closure,
+            "dialogue_response_flood_threshold": (
+                self.dialogue_response_flood_threshold),
+            "proof_priority_bonus": self.proof_priority_bonus,
+            "proof_priority_flood_threshold": (
+                self.proof_priority_flood_threshold),
+            "speaker_owner_bonus": self.speaker_owner_bonus,
+            "query_witness_bonus": self.query_witness_bonus,
+            "query_witness_seed_count": self.query_witness_seed_count,
+            "query_witness_rare_df": self.query_witness_rare_df,
+            "query_witness_min_shared_terms": self.query_witness_min_shared_terms,
             "queryir_soft_fallback": self.queryir_soft_fallback,
             "queryir_soft_fallback_threshold": self.queryir_soft_fallback_threshold,
             "exact_lookup_fast_path": self.exact_lookup_fast_path,
             "exact_lookup_turn_limit": self.exact_lookup_turn_limit,
+            "exact_lookup_priority": self.exact_lookup_priority,
+            "exact_lookup_priority_min_score": (
+                self.exact_lookup_priority_min_score),
+            "exact_lookup_priority_bonus": self.exact_lookup_priority_bonus,
+            "exact_lookup_priority_named_speakers_only": (
+                self.exact_lookup_priority_named_speakers_only),
             "read_pool_size": self.read_pool_size,
             "snapshot_cache_bytes": self.snapshot_cache_bytes,
             "snapshot_cache_memories": self.snapshot_cache_memories,

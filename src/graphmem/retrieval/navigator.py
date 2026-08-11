@@ -175,7 +175,14 @@ def exact_lookup_eligible(ir) -> bool:
         and not bool(getattr(slots, "is_duration", False))
         and not bool(getattr(slots, "is_latest", False))
         and not PREFERENCE_QUERY_RE.search(ir.query)
-    )
+)
+
+
+def has_named_multi_party(turns: Sequence[SourceTurn]) -> bool:
+    """Distinguish named dialogue participants from transport-only roles."""
+    generic = {"", "assistant", "system", "tool", "user", "human"}
+    return any((turn.speaker or "").casefold().strip() not in generic
+               for turn in turns)
 
 
 def _weighted_term_coverage(
@@ -238,6 +245,11 @@ def _exact_lookup_ranking(
     ordered = sorted(scores, key=lambda turn_id: (-scores[turn_id], turn_id))
     top_id = ordered[0] if ordered else ""
     coverage, support, fact_score = details.get(top_id, (0.0, 0, 0.0))
+    fact_ordered = tuple(
+        turn_id for turn_id in ordered if turn_id in direct_fact_turn_scores)
+    fact_top_id = fact_ordered[0] if fact_ordered else ""
+    fact_coverage, fact_support, fact_provenance_score = details.get(
+        fact_top_id, (0.0, 0, 0.0))
     # The threshold is intentionally a conjunction.  It excludes topical dense
     # neighbours with no exact lexical support and owner-only fact floods.
     confident = bool(
@@ -253,6 +265,17 @@ def _exact_lookup_ranking(
         "top_channel_support": support,
         "top_fact_score": fact_score,
         "scored_turns": len(scores),
+        # Priority mode is deliberately fact-only.  The earlier implementation
+        # gated on ``top_score`` across every lexical/dense seed and then added
+        # the exact bonus to every seed.  It therefore activated on 11 LoCoMo
+        # questions with zero direct facts and behaved like a second broad
+        # lexical reranker (13 gains / 18 losses on the full benchmark).
+        "fact_top_turn_id": fact_top_id,
+        "fact_top_score": scores.get(fact_top_id, 0.0),
+        "fact_top_idf_coverage": fact_coverage,
+        "fact_top_channel_support": fact_support,
+        "fact_top_provenance_score": fact_provenance_score,
+        "fact_scored_turns": len(fact_ordered),
     }
 
 
@@ -350,12 +373,58 @@ class GraphNavigator:
         #: Use the immutable TurnSearchIndex for every query view instead of a
         #: SQLite FTS call per view.  Kept opt-in for accuracy/latency gating.
         native_seed_fusion: bool = False,
+        #: Preserve owner/predicate views for candidate reach, but weight their
+        #: ranking contribution by relational completeness instead of taking an
+        #: untyped max.  This also keeps exact overlap on its native coverage
+        #: scale rather than inflating the best shallow overlap to 1.0.
+        relational_view_scoring: bool = False,
+        #: Add a deterministic lexical view over the question relation after
+        #: removing explicit owners and the requested answer head.
+        query_relation_view: bool = False,
+        #: The owner-wrapper defect exists in named multi-party transcripts.
+        #: Generic user/assistant memories keep their frozen scoring when this
+        #: guard is enabled; the condition is an input property, not a dataset
+        #: or benchmark label.
+        relational_view_named_speakers_only: bool = False,
+        #: Score rank-sensitive agreement across relation-bearing QueryIR
+        #: views.  Zero preserves the frozen max-per-channel fusion.
+        relational_consensus_bonus: float = 0.0,
+        #: Promote the answer turn paired with a query-relevant dialogue
+        #: question.  LoCoMo frequently annotates a short pronominal response
+        #: ("Luna and Oliver!") whose preceding turn contains the relation
+        #: surface ("What are their names?").  Generic symmetric adjacency is
+        #: too weak for that evidence to survive a 64-turn pack.
+        dialogue_response_closure: bool = False,
+        dialogue_response_flood_threshold: int = 0,
+        #: ``None`` preserves the historical lexicographic mandatory-first
+        #: ordering.  A finite value turns uncertain proof membership into a
+        #: score bonus; proof-unit atomicity/certification still remain hard
+        #: constraints in the packer.
+        proof_priority_bonus: float | None = None,
+        proof_priority_flood_threshold: int = 0,
+        #: QueryIR owner signal for dialogue corpora.  When a question names a
+        #: speaker explicitly, add a bounded score to that speaker's raw turns.
+        #: This is a rerank only: it creates no candidates, edges or Token cost.
+        speaker_owner_bonus: float = 0.0,
+        #: Query-local witness closure.  Broad lexical-only graph edges remain
+        #: disabled; instead, a named speaker's high-ranked turns may promote
+        #: another turn from the same speaker when they share multiple
+        #: memory-rare terms.  The finite bonus changes neither candidate count
+        #: nor the evidence/answer Token budgets.
+        query_witness_bonus: float = 0.0,
+        query_witness_seed_count: int = 16,
+        query_witness_rare_df: int = 4,
+        query_witness_min_shared_terms: int = 2,
         queryir_soft_fallback: bool = False,
         queryir_soft_fallback_threshold: float = 0.80,
         #: Guarded single-fact route: direct source/fact ranking first, graph
         #: fallback on low confidence, and a bounded evidence pack on success.
         exact_lookup_fast_path: bool = False,
         exact_lookup_turn_limit: int = 16,
+        exact_lookup_priority: bool = False,
+        exact_lookup_priority_min_score: float = 1.50,
+        exact_lookup_priority_bonus: float = 1.0,
+        exact_lookup_priority_named_speakers_only: bool = False,
         #: Optional trusted local directory containing versioned compiled
         #: graph/turn/provenance sidecars.  SQLite remains the authority.
         compiled_cache_dir: str | Path | None = None,
@@ -426,11 +495,48 @@ class GraphNavigator:
         self.raw_fallback_reserve = max(0, raw_fallback_reserve)
         self.obligation_aware_relations = obligation_aware_relations
         self.native_seed_fusion = native_seed_fusion
+        self.relational_view_scoring = relational_view_scoring
+        self.query_relation_view = query_relation_view
+        self.relational_view_named_speakers_only = (
+            relational_view_named_speakers_only)
+        if relational_consensus_bonus < 0:
+            raise ValueError("relational_consensus_bonus must be non-negative")
+        self.relational_consensus_bonus = relational_consensus_bonus
+        self.dialogue_response_closure = dialogue_response_closure
+        if dialogue_response_flood_threshold < 0:
+            raise ValueError(
+                "dialogue_response_flood_threshold must be non-negative")
+        self.dialogue_response_flood_threshold = (
+            dialogue_response_flood_threshold)
+        if proof_priority_bonus is not None and proof_priority_bonus < 0:
+            raise ValueError("proof_priority_bonus must be non-negative")
+        self.proof_priority_bonus = proof_priority_bonus
+        if proof_priority_flood_threshold < 0:
+            raise ValueError("proof_priority_flood_threshold must be non-negative")
+        self.proof_priority_flood_threshold = proof_priority_flood_threshold
+        if speaker_owner_bonus < 0:
+            raise ValueError("speaker_owner_bonus must be non-negative")
+        self.speaker_owner_bonus = speaker_owner_bonus
+        if query_witness_bonus < 0:
+            raise ValueError("query_witness_bonus must be non-negative")
+        if min(query_witness_seed_count, query_witness_rare_df,
+               query_witness_min_shared_terms) <= 0:
+            raise ValueError("query witness limits must be positive")
+        self.query_witness_bonus = query_witness_bonus
+        self.query_witness_seed_count = query_witness_seed_count
+        self.query_witness_rare_df = query_witness_rare_df
+        self.query_witness_min_shared_terms = query_witness_min_shared_terms
         self.queryir_soft_fallback = queryir_soft_fallback
         self.queryir_soft_fallback_threshold = max(
             0.0, min(1.0, queryir_soft_fallback_threshold))
         self.exact_lookup_fast_path = exact_lookup_fast_path
         self.exact_lookup_turn_limit = max(1, exact_lookup_turn_limit)
+        self.exact_lookup_priority = exact_lookup_priority
+        self.exact_lookup_priority_min_score = max(
+            0.0, exact_lookup_priority_min_score)
+        self.exact_lookup_priority_bonus = max(0.0, exact_lookup_priority_bonus)
+        self.exact_lookup_priority_named_speakers_only = (
+            exact_lookup_priority_named_speakers_only)
         self.compiled_sidecar = (
             CompiledMemorySidecar(compiled_cache_dir)
             if compiled_cache_dir is not None else None)
@@ -457,6 +563,9 @@ class GraphNavigator:
             str, tuple[int, dict[str, tuple[str, ...]],
                        dict[str, tuple[str, ...]],
                        dict[str, tuple[EvidenceMember, ...]]]
+        ] = OrderedDict()
+        self._query_witness_cache: OrderedDict[
+            str, tuple[int, dict[str, frozenset[str]], Counter[str]]
         ] = OrderedDict()
 
     def _observe_memory(self, memory_id: str) -> int:
@@ -658,6 +767,25 @@ class GraphNavigator:
             while len(self._turn_bundle_cache) > self.metadata_cache_memories:
                 self._turn_bundle_cache.popitem(last=False)
             return cached[1], cached[2], cached[3]
+
+    def _query_witness_features(
+        self, memory_id: str, version: int, turns_: Sequence[SourceTurn],
+    ) -> tuple[dict[str, frozenset[str]], Counter[str]]:
+        """Cache immutable turn terms/DF used by query-local witness closure."""
+
+        with self._metadata_lock:
+            cached = self._query_witness_cache.get(memory_id)
+            if cached is None or cached[0] != version:
+                terms_by_turn = {
+                    turn.turn_id: content_terms(turn.raw_text) for turn in turns_}
+                document_frequency: Counter[str] = Counter(
+                    term for values in terms_by_turn.values() for term in values)
+                cached = (version, terms_by_turn, document_frequency)
+                self._query_witness_cache[memory_id] = cached
+            self._query_witness_cache.move_to_end(memory_id)
+            while len(self._query_witness_cache) > self.metadata_cache_memories:
+                self._query_witness_cache.popitem(last=False)
+            return cached[1], cached[2]
 
     def _evidence_indexes(
         self, memory_id: str, version: int,
@@ -932,6 +1060,9 @@ class GraphNavigator:
         fact_reservoir_enabled = profile in {HarnessProfile.H9_FACT_RESERVOIR,
                                              *ast_profiles}
         execute_ast = profile in ast_profiles
+        named_multi_party = has_named_multi_party(all_turns)
+        relational_view_active = bool(
+            not self.relational_view_named_speakers_only or named_multi_party)
         tick = time.perf_counter()
         seeded = seed_operands(self.store, view, memory_id, ir, all_turns, dense_search=self.dense_search,
                                dense_search_many=self.dense_search_many,
@@ -945,7 +1076,13 @@ class GraphNavigator:
                                hierarchy_child_beam=self.hierarchy_child_beam,
                                hierarchy_operator_aware=self.hierarchy_operator_aware,
                                turn_index=turn_index,
-                               native_bm25=self.native_seed_fusion)
+                               native_bm25=self.native_seed_fusion,
+                               relational_view_scoring=(
+                                   self.relational_view_scoring
+                                   and relational_view_active),
+                               query_relation_view=(
+                                   self.query_relation_view
+                                   and relational_view_active))
         stage_times["seed_fusion"] = (time.perf_counter() - tick) * 1000
         if seeded.stats.get("hierarchical_route_ms"):
             stage_times["hierarchical_route"] = float(
@@ -967,10 +1104,16 @@ class GraphNavigator:
                                                for alias in operand.owner_aliases))
             for operand in ir.operands
         }
+        exact_priority_candidate = bool(
+            self.exact_lookup_priority
+            and (not self.exact_lookup_priority_named_speakers_only
+                 or named_multi_party))
         exact_lookup_candidate = bool(
-            self.exact_lookup_fast_path and exact_lookup_eligible(ir))
+            (self.exact_lookup_fast_path or exact_priority_candidate)
+            and exact_lookup_eligible(ir))
         direct_fact_ids: tuple[str, ...] = ()
         direct_fact_turn_scores: dict[str, float] = {}
+        strict_fact_turn_scores: dict[str, float] = {}
         exact_lookup_scores: dict[str, float] = {}
         exact_lookup_confident = False
         exact_lookup_trace: dict[str, object] = {
@@ -1036,20 +1179,52 @@ class GraphNavigator:
                         direct_fact_turn_scores[turn_id] = max(
                             direct_fact_turn_scores.get(turn_id, 0.0),
                             fact_score)
+                        if fact_id in strict_fact_set:
+                            strict_fact_turn_scores[turn_id] = max(
+                                strict_fact_turn_scores.get(turn_id, 0.0),
+                                fact_score)
             exact_lookup_scores, exact_lookup_confident, ranking_trace = (
                 _exact_lookup_ranking(
                     seeded, turn_index, query, direct_fact_turn_scores))
+            strict_ordered = tuple(sorted(
+                strict_fact_turn_scores,
+                key=lambda turn_id: (
+                    -exact_lookup_scores.get(turn_id, 0.0), turn_id)))
+            strict_top_id = strict_ordered[0] if strict_ordered else ""
             exact_lookup_trace.update({
                 **ranking_trace,
                 "confident": exact_lookup_confident,
                 "direct_fact_count": len(direct_fact_ids),
                 "direct_fact_turn_count": len(direct_fact_turn_scores),
+                "strict_fact_count": len(strict_fact_set),
+                "strict_fact_turn_count": len(strict_fact_turn_scores),
+                "strict_top_turn_id": strict_top_id,
+                "strict_top_score": exact_lookup_scores.get(
+                    strict_top_id, 0.0),
+                "strict_top_provenance_score": strict_fact_turn_scores.get(
+                    strict_top_id, 0.0),
                 "dense_fact_count": len(dense_fact_rows),
                 "direct_fact_turn_ids": tuple(sorted(
                     direct_fact_turn_scores)),
                 "dense_fact_ids": tuple(
                     fact_id for fact_id, _score in dense_fact_rows),
             })
+        exact_lookup_fast_active = bool(
+            self.exact_lookup_fast_path and exact_lookup_confident)
+        exact_lookup_priority_active = bool(
+            exact_priority_candidate
+            and exact_lookup_trace.get("strict_top_turn_id")
+            and float(exact_lookup_trace.get("strict_top_score", 0.0))
+            >= self.exact_lookup_priority_min_score
+            and float(exact_lookup_trace.get(
+                "strict_top_provenance_score", 0.0)) >= 0.45)
+        exact_lookup_trace.update({
+            "fast_path_active": exact_lookup_fast_active,
+            "priority_active": exact_lookup_priority_active,
+            "priority_min_score": self.exact_lookup_priority_min_score,
+            "priority_bonus": self.exact_lookup_priority_bonus,
+            "priority_fact_only": True,
+        })
         initial_bindings = bind_facts(view, owners, ir.operands, semantic_seeds)
         initial_closure = evaluate_algebra(ir.operator, initial_bindings, (item.operand_id for item in ir.operands),
                                            distinct_by=ir.distinct_by, collection_complete=False)
@@ -1061,7 +1236,7 @@ class GraphNavigator:
         # flag over "the operand has at least one binding" and was measured not to
         # predict correctness at all (rho=+0.103, CI [-0.04,+0.25]), so it is a
         # weak signal being used to switch off the graph.  Settable for ablation.
-        if exact_lookup_confident:
+        if exact_lookup_fast_active:
             schedule = ScheduleResult(semantic_seeds, (), {}, {
                 "node_cap_reached": False, "edge_cap_reached": False,
                 "hop_cap_reached": False, "frontier_truncated": False,
@@ -1098,7 +1273,10 @@ class GraphNavigator:
         stage_times["graph_read_view"] = (time.perf_counter() - tick) * 1000
         fact_ids = (set(semantic_seeds) | set(schedule.visited_node_ids)
                     | set(direct_owner_terminals)
-                    | (set(direct_fact_ids) if exact_lookup_confident else set()))
+                    | (set(direct_fact_ids)
+                       if exact_lookup_fast_active else set())
+                    | (set(strict_fact_ids)
+                       if exact_lookup_priority_active else set()))
         fact_reservoir = None
         if fact_reservoir_enabled:
             # Facts the narrow path already reached are the precision core and are
@@ -1364,7 +1542,9 @@ class GraphNavigator:
         reserved_fallback_candidates = (
             raw_fallback_turn_ids if self.raw_fallback_reserve else ())
         candidate_ids = tuple(dict.fromkeys(
-            (*seeded.source_turn_ids, *hydrated_turn_ids,
+             (*seeded.source_turn_ids, *hydrated_turn_ids,
+             *(strict_fact_turn_scores
+               if exact_lookup_priority_active else ()),
              *reserved_fallback_candidates)))
         hydrated_set = frozenset(hydrated_turn_ids)
         raw_fallback_set = frozenset(raw_fallback_turn_ids)
@@ -1400,6 +1580,9 @@ class GraphNavigator:
             base_score[turn_id] = value
             session_best[turn.session_id] = max(session_best[turn.session_id], value)
         adjacency: dict[str, float] = defaultdict(float)
+        dialogue_closure_admitted = bool(
+            self.dialogue_response_closure
+            and len(mandatory) > self.dialogue_response_flood_threshold)
         for turn_id, value in base_score.items():
             turn = by_id[turn_id]
             for distance in (1, 2):
@@ -1407,6 +1590,24 @@ class GraphNavigator:
                     neighbour = by_session_index.get((turn.session_id, index))
                     if neighbour:
                         adjacency[neighbour] = max(adjacency[neighbour], value * (0.35 / distance))
+            if dialogue_closure_admitted:
+                # Query-relevant prompt -> following answer.  The reverse floor
+                # keeps a benchmark's prompt-side evidence annotation with its
+                # answer when the response itself carried the lexical match.
+                following_id = by_session_index.get(
+                    (turn.session_id, turn.turn_index + 1))
+                following = by_id.get(following_id) if following_id else None
+                if (following is not None and following.speaker != turn.speaker
+                        and "?" in turn.raw_text):
+                    adjacency[following.turn_id] = max(
+                        adjacency[following.turn_id], value)
+                previous_id = by_session_index.get(
+                    (turn.session_id, turn.turn_index - 1))
+                previous = by_id.get(previous_id) if previous_id else None
+                if (previous is not None and previous.speaker != turn.speaker
+                        and "?" in previous.raw_text):
+                    adjacency[previous.turn_id] = max(
+                        adjacency[previous.turn_id], value * 0.75)
         # Invert binding provenance once.  The former inner loop rebuilt the
         # union of every binding's evidence turns for every candidate, making
         # ranking O(|candidates| * |bindings| * |evidence|).
@@ -1420,6 +1621,9 @@ class GraphNavigator:
                 for turn_id in group_turns.get(group_id, ()):
                     binding_operands_by_turn[turn_id].add(binding.operand_id)
         rows: list[CandidateScore] = []
+        speaker_owner_matches = 0
+        relational_consensus_matches = 0
+        reservoir_by_turn = {row.turn_id: row for row in seeded.reservoir}
         for turn_id in candidate_ids:
             turn = by_id.get(turn_id)
             if not turn: continue
@@ -1447,11 +1651,32 @@ class GraphNavigator:
                       + w["graph"] * graph + w["binding"] * bscore + operand_gain
                       + w["role"] * role_gain + w["slot"] * slot_gain
                       + w["session"] * session_score + w["adjacency"] * adjacency_score
-                      + (exact_lookup_scores.get(turn_id, 0.0)
-                         if exact_lookup_confident else 0.0))
+                      + (self.exact_lookup_priority_bonus
+                         * exact_lookup_scores.get(turn_id, 0.0)
+                         if (exact_lookup_priority_active
+                             and turn_id in strict_fact_turn_scores) else
+                         exact_lookup_scores.get(turn_id, 0.0)
+                         if exact_lookup_fast_active else 0.0))
                      if wide_reservoir else
                      (exact + bm25 + dense + w["graph"] * graph + w["binding"] * bscore
                       + operand_gain))
+            speaker_terms = content_terms(turn.speaker)
+            speaker_owner_match = bool(
+                self.speaker_owner_bonus
+                and speaker_terms
+                and not speaker_terms <= {"user", "assistant", "system"}
+                and speaker_terms <= query_terms)
+            if speaker_owner_match:
+                fused += self.speaker_owner_bonus
+                speaker_owner_matches += 1
+            reservoir_entry = reservoir_by_turn.get(turn_id)
+            relational_consensus = (
+                reservoir_entry.relational_consensus
+                if reservoir_entry is not None else 0.0)
+            if (self.relational_consensus_bonus
+                    and relational_view_active and relational_consensus):
+                fused += self.relational_consensus_bonus * relational_consensus
+                relational_consensus_matches += 1
             rows.append(CandidateScore(turn_id, turn.session_id, exact, bm25, dense, graph,
                                        role_gain, slot_gain,
                                        self._turn_tokens(turn), fused,
@@ -1462,10 +1687,67 @@ class GraphNavigator:
                                            edge_relation.get(edge_id, "")
                                            for edge_id in graph_path_by_turn.get(turn_id, ())
                                            if edge_relation.get(edge_id, "")),
-                                       operand_ids=operand_ids, binding_score=bscore, obligation_gain=len(operand_ids),
+                                       operand_ids=operand_ids, binding_score=bscore,
+                                       obligation_gain=len(operand_ids),
+                                       relational_consensus_score=relational_consensus,
                                        mandatory=turn_id in mandatory,
                                        proof_unit_ids=tuple(unit.unit_id for unit in units if turn_id in unit.source_turn_ids)))
-        rows.sort(key=lambda row: (-row.mandatory, -row.fused_score, row.turn_id))
+        soften_proof_priority = bool(
+            self.proof_priority_bonus is not None
+            and len(mandatory) > self.proof_priority_flood_threshold)
+        def sort_candidates(values: list[CandidateScore]) -> None:
+            if not soften_proof_priority:
+                values.sort(key=lambda row: (
+                    -row.mandatory, -row.fused_score, row.turn_id))
+            else:
+                values.sort(key=lambda row: (
+                    -(row.fused_score
+                      + self.proof_priority_bonus * bool(row.mandatory)),
+                    row.turn_id))
+
+        sort_candidates(rows)
+        query_witness_matches = 0
+        query_witness_seed_terms = 0
+        if self.query_witness_bonus:
+            explicit_speakers = frozenset(
+                turn.speaker for turn in all_turns
+                if (speaker_terms := content_terms(turn.speaker))
+                and not speaker_terms <= {"user", "assistant", "system"}
+                and speaker_terms <= query_terms)
+            # Owner scope is the precision boundary that distinguishes this
+            # closure from the rejected broad lexical coarse edge.
+            if explicit_speakers:
+                terms_by_turn, document_frequency = (
+                    self._query_witness_features(
+                        memory_id, view.graph_version, all_turns))
+                seed_ids = tuple(
+                    row.turn_id for row in rows[:self.query_witness_seed_count]
+                    if by_id[row.turn_id].speaker in explicit_speakers)
+                rare_seed_terms = frozenset(
+                    term for turn_id in seed_ids
+                    for term in terms_by_turn.get(turn_id, ())
+                    if document_frequency[term] <= self.query_witness_rare_df)
+                query_witness_seed_terms = len(rare_seed_terms)
+                reranked: list[CandidateScore] = []
+                for row in rows:
+                    turn = by_id[row.turn_id]
+                    shared = (rare_seed_terms
+                              & terms_by_turn.get(row.turn_id, ()))
+                    if (turn.speaker not in explicit_speakers
+                            or len(shared) < self.query_witness_min_shared_terms):
+                        reranked.append(row)
+                        continue
+                    strength = sum(math.log(
+                        (len(all_turns) + 1)
+                        / (document_frequency[term] + 1)) for term in shared)
+                    gain = self.query_witness_bonus * min(1.0, strength / 4.0)
+                    reranked.append(replace(
+                        row, fused_score=row.fused_score + gain,
+                        source_channels=tuple(dict.fromkeys((
+                            *row.source_channels, "query_witness")))))
+                    query_witness_matches += 1
+                rows = reranked
+                sort_candidates(rows)
         candidate_count_before_limit = len(rows)
         if self.candidate_pool_limit:
             rows = rows[:self.candidate_pool_limit]
@@ -1481,14 +1763,14 @@ class GraphNavigator:
         # `_rank_pack` already had.
         effective_turn_limit = (
             min(budget.max_evidence_turns, self.exact_lookup_turn_limit)
-            if exact_lookup_confident else budget.max_evidence_turns)
+            if exact_lookup_fast_active else budget.max_evidence_turns)
         effective_budget = replace(
             budget, max_evidence_turns=effective_turn_limit)
         if self.obligation_aware_packing:
             answer_kind = (algebra_result.answer_kind if algebra_result is not None
                            else str(ir.ast_operator or ir.operator))
             pack_turn_limit = (
-                effective_turn_limit if exact_lookup_confident else (
+                effective_turn_limit if exact_lookup_fast_active else (
                     adaptive_evidence_turn_limit(
                         answer_kind, len(ir.operands), budget.max_evidence_turns,
                         query=query)
@@ -1587,11 +1869,35 @@ class GraphNavigator:
                    "rare_lexical_relations": self.rare_lexical_relations,
                    "query_gated_rare_lexical": self.query_gated_rare_lexical,
                    "native_seed_fusion": self.native_seed_fusion,
+                   "relational_consensus_bonus": (
+                       self.relational_consensus_bonus),
+                   "relational_consensus_matches": (
+                       relational_consensus_matches),
+                   "dialogue_response_closure": self.dialogue_response_closure,
+                   "dialogue_response_closure_admitted": dialogue_closure_admitted,
+                   "dialogue_response_flood_threshold": (
+                       self.dialogue_response_flood_threshold),
+                   "proof_priority_bonus": self.proof_priority_bonus,
+                   "proof_priority_softened": soften_proof_priority,
+                   "proof_priority_flood_threshold": (
+                       self.proof_priority_flood_threshold),
+                   "speaker_owner_bonus": self.speaker_owner_bonus,
+                   "speaker_owner_matches": speaker_owner_matches,
+                   "query_witness_bonus": self.query_witness_bonus,
+                   "query_witness_seed_count": self.query_witness_seed_count,
+                   "query_witness_rare_df": self.query_witness_rare_df,
+                   "query_witness_min_shared_terms": (
+                       self.query_witness_min_shared_terms),
+                   "query_witness_matches": query_witness_matches,
+                   "query_witness_seed_terms": query_witness_seed_terms,
                    "span_pack_window": self.span_pack_window,
                    "precision_aware_packing": self.precision_aware_packing,
                    "exact_lookup_fast_path": self.exact_lookup_fast_path,
+                   "exact_lookup_priority": self.exact_lookup_priority,
+                   "exact_lookup_priority_named_speakers_only": (
+                       self.exact_lookup_priority_named_speakers_only),
                    "exact_lookup": exact_lookup_trace,
-                   "execution_mode": ("exact_lookup" if exact_lookup_confident
+                   "execution_mode": ("exact_lookup" if exact_lookup_fast_active
                                       else "hierarchical_graph"),
                    "raw_fallback_reserve": self.raw_fallback_reserve,
                    "raw_fallback_candidates": sum(

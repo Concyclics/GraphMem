@@ -1,0 +1,126 @@
+{
+  "schema_version": "graphmem-v5.54-qwen30b-public-results-v1",
+  "source_summary_sha256": "2fc9bc9ed424080797119af8e1129ad2ce398a2bea6b07bde3eaff1d0169a689",
+  "final_audit_sha256": "f136173d52d72d50130957328515d3f2aa3f5599e5e5b1702f0055a20a5ea80e",
+  "judge_model": "gpt-5.6-luna",
+  "judge_temperature": 0,
+  "judge_seed": 0,
+  "judge_reasoning": "disabled",
+  "answer_completion_token_ceiling": 2000,
+  "percentile_method": "nearest_rank",
+  "token_contract": {
+    "build": "generative API input + output; embedding and judge excluded",
+    "answer": "API prompt + completion",
+    "longmemeval_build_unit": "tokens_per_memory",
+    "locomo_build_unit": "tokens_per_conversation",
+    "answer_unit": "tokens_per_question"
+  },
+  "datasets": {
+    "longmemeval": {
+      "questions": 500,
+      "owners": 500,
+      "scope": "LongMemEval-S cleaned full set"
+    },
+    "locomo": {
+      "questions": 1540,
+      "owners": 10,
+      "scope": "LoCoMo QA Category 1-4; Category 5 excluded"
+    }
+  },
+  "results": [
+    {
+      "system": "GraphMem V5.54",
+      "answer_model": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+      "benchmark": "longmemeval",
+      "retrieval_setting": "32-turn",
+      "questions": 500,
+      "accuracy": 0.74,
+      "build_tokens": {"count": 500, "mean": 189296.646, "p95": 201647, "p99": 208353, "max": 218899},
+      "answer_tokens": {"count": 500, "mean": 6181.214, "p95": 8607, "p99": 9032, "max": 9485}
+    },
+    {
+      "system": "Mem0 baseline",
+      "answer_model": "Qwen3-30B-A3B-Instruct-2507",
+      "benchmark": "longmemeval",
+      "retrieval_setting": "top-50",
+      "questions": 500,
+      "accuracy": 0.568,
+      "build_tokens": {"count": 500, "mean": 2461196.546, "p95": 2709241, "p99": 2892671, "max": 3035246},
+      "answer_tokens": {"count": 500, "mean": 5201.754, "p95": 5764, "p99": 6045, "max": 6997}
+    },
+    {
+      "system": "GraphMem V5.54",
+      "answer_model": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+      "benchmark": "longmemeval",
+      "retrieval_setting": "64-turn",
+      "questions": 500,
+      "accuracy": 0.762,
+      "build_tokens": {"count": 500, "mean": 189296.646, "p95": 201647, "p99": 208353, "max": 218899},
+      "answer_tokens": {"count": 500, "mean": 9112.31, "p95": 10098, "p99": 10222, "max": 10821}
+    },
+    {
+      "system": "Mem0 baseline",
+      "answer_model": "Qwen3-30B-A3B-Instruct-2507",
+      "benchmark": "longmemeval",
+      "retrieval_setting": "top-200",
+      "questions": 500,
+      "accuracy": 0.576,
+      "build_tokens": {"count": 500, "mean": 2461196.546, "p95": 2709241, "p99": 2892671, "max": 3035246},
+      "answer_tokens": {"count": 500, "mean": 11761.066, "p95": 13070, "p99": 13798, "max": 15508}
+    },
+    {
+      "system": "GraphMem V5.54",
+      "answer_model": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+      "benchmark": "locomo",
+      "retrieval_setting": "32-turn",
+      "questions": 1540,
+      "accuracy": 0.7103896103896103,
+      "build_tokens": {"count": 10, "mean": 75243, "p95": 86820, "p99": 86820, "max": 86820},
+      "answer_tokens": {"count": 1540, "mean": 3205.3987012987013, "p95": 3665, "p99": 6035, "max": 6381}
+    },
+    {
+      "system": "Mem0 baseline",
+      "answer_model": "Qwen3-30B-A3B-Instruct-2507",
+      "benchmark": "locomo",
+      "retrieval_setting": "top-50",
+      "questions": 1540,
+      "accuracy": 0.6766233766233766,
+      "build_tokens": {"count": 10, "mean": 5318817.9, "p95": 6202005, "p99": 6202005, "max": 6202005},
+      "answer_tokens": {"count": 1540, "mean": 5513.85, "p95": 8235, "p99": 8462, "max": 8718}
+    },
+    {
+      "system": "GraphMem V5.54",
+      "answer_model": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+      "benchmark": "locomo",
+      "retrieval_setting": "64-turn",
+      "questions": 1540,
+      "accuracy": 0.7935064935064935,
+      "build_tokens": {"count": 10, "mean": 75243, "p95": 86820, "p99": 86820, "max": 86820},
+      "answer_tokens": {"count": 1540, "mean": 5613.466883116883, "p95": 6412, "p99": 8643, "max": 9484}
+    },
+    {
+      "system": "Mem0 baseline",
+      "answer_model": "Qwen3-30B-A3B-Instruct-2507",
+      "benchmark": "locomo",
+      "retrieval_setting": "top-200",
+      "questions": 1540,
+      "accuracy": 0.6831168831168831,
+      "build_tokens": {"count": 10, "mean": 5318817.9, "p95": 6202005, "p99": 6202005, "max": 6202005},
+      "answer_tokens": {"count": 1540, "mean": 13515.101948051948, "p95": 16336, "p99": 16833, "max": 17481}
+    }
+  ],
+  "matched_comparisons": [
+    {"benchmark": "longmemeval", "graphmem": "32-turn", "mem0": "top-50", "accuracy_gain_pp": 17.2, "build_token_saving": 0.923087554178617, "answer_token_saving": -0.1882941792326205},
+    {"benchmark": "longmemeval", "graphmem": "64-turn", "mem0": "top-200", "accuracy_gain_pp": 18.6, "build_token_saving": 0.923087554178617, "answer_token_saving": 0.22521393894056896},
+    {"benchmark": "locomo", "graphmem": "32-turn", "mem0": "top-50", "accuracy_gain_pp": 3.3766233766233777, "build_token_saving": 0.9858534355913933, "answer_token_saving": 0.4186641455065515},
+    {"benchmark": "locomo", "graphmem": "64-turn", "mem0": "top-200", "accuracy_gain_pp": 11.038961038961038, "build_token_saving": 0.9858534355913933, "answer_token_saving": 0.5846522723473794}
+  ],
+  "caveats": {
+    "retrieval_budget_match": "32-turn/top-50 and 64-turn/top-200 are approximate operating-point matches, not equal prompt-token constraints",
+    "graphmem_runtime_precision": "FP8",
+    "mem0_runtime_precision": "BF16",
+    "mem0_model_snapshot": "0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe",
+    "mem0_longmemeval_final_failed_relation_pairs": 10,
+    "graphmem_build_shared_across_turn_budgets": true
+  }
+}

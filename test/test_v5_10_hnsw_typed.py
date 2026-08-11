@@ -13,12 +13,15 @@ from graphmem.build.coarsen import (
     build_parent_gated_relations,
     build_recursive_hierarchy,
     classify_typed_relation,
+    promotable_object_value,
+    relation_signal_witnesses,
     RelationSignal,
 )
 from graphmem.build.pipeline import GraphBuildPipeline
 from graphmem.domain import (
     GraphEdge, GraphNode, NodeType, RelationType, SourceTurn,
 )
+from graphmem.text import predicate_family
 
 
 def _card(index: int, *, topic: int | None = None, negated: bool = False) -> GraphNode:
@@ -413,6 +416,116 @@ def test_multiview_candidates_are_independently_bounded() -> None:
     # cannot grow with N for a fixed per-view quota.
     assert max(per_signal_degree.values(), default=0) <= 4
     assert comparisons < len(nodes) * 8 * 8
+
+
+def test_short_lowercase_fact_values_become_role_preserving_entity_witnesses() -> None:
+    left = replace(
+        _card(1), node_type=NodeType.CANONICAL_FACT,
+        attributes={"session_id": "s:1", "owner_id": "alice",
+                    "relation_entity_roles": {"owner": ("alice",)},
+                    "predicate": "attended class", "value_key": "dance studio"})
+    right = replace(
+        _card(2), node_type=NodeType.CANONICAL_FACT,
+        attributes={"session_id": "s:2", "owner_id": "bob",
+                    "relation_entity_roles": {"owner": ("bob",)},
+                    "predicate": "visited venue", "value_key": "dance studio"})
+    nodes = {row.node_id: row for row in (left, right)}
+    features = build_relation_features(nodes, {})
+
+    assert features[left.node_id].object_entities == frozenset({"dance studio"})
+    assert "dance studio" in features[left.node_id].entities
+    assert features[left.node_id].owner_entities == frozenset({"alice"})
+    assert relation_signal_witnesses(
+        left, right, features,
+        eligible_entities=frozenset({"dance studio"})) == {
+            RelationSignal.SHARED_ENTITY: frozenset({"dance studio"})}
+
+    pairs, _ = bounded_relation_view_pairs(
+        (left, right), features,
+        eligible_entities=frozenset({"dance studio"}),
+        quotas={"entity": 2, "state": 2}, max_candidates=4,
+        cross_session_only=True)
+    assert any(signal == RelationSignal.SHARED_ENTITY for *_, signal in pairs)
+    # The same object plus a predicate is not a state identity when the owners
+    # differ; state postings are keyed by owner, not by arbitrary entities.
+    assert all(signal != RelationSignal.STATE_COMPATIBLE for *_, signal in pairs)
+
+
+def test_object_value_promotion_rejects_temporal_generic_and_long_values() -> None:
+    assert promotable_object_value("cooking class") == "cooking class"
+    assert promotable_object_value("The Witcher 3") == "the witcher 3"
+    assert promotable_object_value("last week") == ""
+    assert promotable_object_value("three months") == ""
+    assert promotable_object_value("never") == ""
+    assert promotable_object_value("all") == ""
+    assert not promotable_object_value("last Friday")
+    assert not promotable_object_value("30 minutes")
+    assert not promotable_object_value("yes")
+    assert not promotable_object_value(
+        "a very long proposition containing many unrelated words from the whole answer")
+
+
+def test_predicate_family_state_key_joins_inflection_not_modality() -> None:
+    assert predicate_family("attended an event") == "attend"
+    assert predicate_family("attending events") == "attend"
+    assert predicate_family("recommended books") == "recommend"
+    assert predicate_family("recommends books") == "recommend"
+
+    asserted = replace(
+        _card(1), node_type=NodeType.CANONICAL_FACT,
+        attributes={"session_id": "s:1",
+                    "relation_entity_roles": {"owner": ("alice",)},
+                    "predicate": "attended event", "polarity": "positive",
+                    "modality": "asserted"})
+    inflected = replace(
+        _card(2), node_type=NodeType.CANONICAL_FACT,
+        attributes={"session_id": "s:2",
+                    "relation_entity_roles": {"owner": ("alice",)},
+                    "predicate": "attending event", "polarity": "positive",
+                    "modality": "asserted"})
+    planned = replace(
+        _card(3), node_type=NodeType.CANONICAL_FACT,
+        attributes={"session_id": "s:3",
+                    "relation_entity_roles": {"owner": ("alice",)},
+                    "predicate": "attend event", "polarity": "positive",
+                    "modality": "planned"})
+    nodes = {node.node_id: node for node in (asserted, inflected, planned)}
+    features = build_relation_features(
+        nodes, {}, predicate_family_state_relations=True)
+
+    assert relation_signal_witnesses(asserted, inflected, features) == {
+        RelationSignal.STATE_COMPATIBLE: frozenset({
+            "alice\x1fattend\x1fpositive\x1fasserted"})}
+    assert RelationSignal.STATE_COMPATIBLE not in relation_signal_witnesses(
+        asserted, planned, features)
+
+
+def test_predicate_family_state_key_is_not_cartesianized_on_scene() -> None:
+    scene = replace(
+        _card(1), node_type=NodeType.SCENE,
+        attributes={"session_id": "s:1", "owners": ("alice", "bob"),
+                    "predicates": ("attended event", "recommended book")})
+    features = build_relation_features(
+        {scene.node_id: scene}, {}, predicate_family_state_relations=True)
+
+    assert features[scene.node_id].state_keys == frozenset()
+    assert features[scene.node_id].state_family_mode is True
+
+    ambiguous_fact = replace(
+        scene, node_id="ambiguous", node_type=NodeType.CANONICAL_FACT,
+        attributes={**scene.attributes, "session_id": "s:2",
+                    "relation_entity_roles": {
+            "owner": ("alice", "bob")}})
+    features = build_relation_features(
+        {scene.node_id: scene, ambiguous_fact.node_id: ambiguous_fact}, {},
+        predicate_family_state_relations=True)
+    assert features[ambiguous_fact.node_id].state_keys == frozenset()
+
+    pairs, _ = bounded_relation_view_pairs(
+        (scene, ambiguous_fact), features, eligible_entities=frozenset(),
+        quotas={"state": 2}, max_candidates=4, cross_session_only=True)
+    assert all(signal != RelationSignal.STATE_COMPATIBLE
+               for *_, signal in pairs)
 
 
 def test_multiview_signal_allow_list_filters_candidate_generation() -> None:

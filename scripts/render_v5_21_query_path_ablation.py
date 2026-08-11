@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Render the full-corpus V5.21 query-path ablation and its report assets."""
+"""Render the full-corpus query-path evolution and its report assets.
+
+The first four rows retain the frozen V5.20--V5.21 incremental ablation.  An
+optional final row attaches the final-audited V5.54 full-system endpoint.  The
+endpoint is deliberately labelled as a cumulative version result rather than
+as the effect of one additional mechanism.
+"""
 from __future__ import annotations
 
 import argparse
@@ -71,6 +77,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-root", type=Path, required=True)
     parser.add_argument("--experiment-root", type=Path, required=True)
+    parser.add_argument(
+        "--latest-root", type=Path,
+        help=("optional V5.54 full answer root containing answers.jsonl and "
+              "judge_{longmemeval,locomo}/paired_verdicts.jsonl"),
+    )
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--output-table", type=Path, required=True)
     parser.add_argument("--output-analysis", type=Path, required=True)
@@ -79,7 +90,7 @@ def main() -> None:
     args = parser.parse_args()
 
     root = args.experiment_root
-    definitions = (
+    definitions = [
         ("baseline", "V5.20 fixed", args.baseline_root,
          args.baseline_root / "judge_lme" / "auto_eval.jsonl",
          args.baseline_root / "judge_locomo" / "auto_eval.jsonl"),
@@ -92,7 +103,13 @@ def main() -> None:
         ("preference", "+ Preference Synthesis", root / "answer_m5_preference",
          root / "answer_m5_preference" / "paired_vs_m4_judge_lme" / "auto_eval.jsonl",
          root / "answer_m5_preference" / "paired_vs_m4_judge_locomo" / "auto_eval.jsonl"),
-    )
+    ]
+    if args.latest_root is not None:
+        definitions.append((
+            "v5_54_full", "V5.54 Full（累计）", args.latest_root,
+            args.latest_root / "judge_longmemeval" / "paired_verdicts.jsonl",
+            args.latest_root / "judge_locomo" / "paired_verdicts.jsonl",
+        ))
     stages: dict[str, dict[str, Any]] = {}
     for key, label, answer_root, lme_judge, locomo_judge in definitions:
         answers = by_id(rows(answer_root / "answers.jsonl"))
@@ -135,12 +152,13 @@ def main() -> None:
         comparisons[f"{left_key}->{right_key}"] = entry
 
     final_comparison = {}
+    final_stage_key = stage_keys[-1]
     for benchmark in ("longmemeval", "locomo"):
-        ids = [item for item, row in stages["preference"]["answers"].items()
+        ids = [item for item, row in stages[final_stage_key]["answers"].items()
                if row.get("benchmark") == benchmark]
         final_comparison[benchmark] = paired(
             stages["baseline"]["verdicts"],
-            stages["preference"]["verdicts"], ids)
+            stages[final_stage_key]["verdicts"], ids)
 
     old_retrieval = rows(args.baseline_root / "retrieval.jsonl")
     new_retrieval = rows(root / "answer_baseline" / "retrieval.jsonl")
@@ -181,12 +199,15 @@ def main() -> None:
             if item not in {"answers", "verdicts"}
         }
     payload = {
-        "schema_version": "graphmem-v5.21-full-query-path-ablation-v1",
+        "schema_version": "graphmem-v5.54-query-path-evolution-v1"
+        if args.latest_root is not None
+        else "graphmem-v5.21-full-query-path-ablation-v1",
         "protocol": {"longmemeval_questions": 500,
                      "locomo_questions": 1540,
                      "answer_model": "Qwen3-30B",
                      "judge_model": "gpt-5.6-luna",
-                     "turn_budget": 64, "evidence_token_budget": 12000},
+                     "turn_budget": 64, "evidence_token_budget": 12000,
+                     "latest_endpoint_is_cumulative": args.latest_root is not None},
         "stages": serializable_stages, "comparisons": comparisons,
         "final_vs_baseline": final_comparison,
         "retrieval_effect": retrieval_effect, "route_audit": route_audit,
@@ -211,9 +232,11 @@ def main() -> None:
                 cells += ["--", "--", "--"]
             else:
                 paired_result = comparison[benchmark]
+                p_value = paired_result["mcnemar_exact_p"]
                 cells += [delta(paired_result["delta"]),
                           f"{paired_result['gains']}/{paired_result['losses']}",
-                          f"{paired_result['mcnemar_exact_p']:.3f}"]
+                          (r"$<0.001$" if p_value < 0.001
+                           else f"{p_value:.3f}")]
         table_rows.append(" & ".join(cells) + r" \\")
     args.output_table.parent.mkdir(parents=True, exist_ok=True)
     args.output_table.write_text("\n".join(table_rows) + "\n\\bottomrule\n",
@@ -223,13 +246,31 @@ def main() -> None:
     witness_locomo = comparisons["baseline->safe_witness"]["locomo"]
     ledger_lme = comparisons["safe_witness->aggregation"]["longmemeval"]
     preference_lme = comparisons["aggregation->preference"]["longmemeval"]
-    final_lme = stages["preference"]["accuracy"]["longmemeval"]
-    final_locomo = stages["preference"]["accuracy"]["locomo"]
+    v521_lme = stages["preference"]["accuracy"]["longmemeval"]
+    v521_locomo = stages["preference"]["accuracy"]["locomo"]
+    final_key = stage_keys[-1]
+    final_lme = stages[final_key]["accuracy"]["longmemeval"]
+    final_locomo = stages[final_key]["accuracy"]["locomo"]
     multi_before = stages["safe_witness"]["by_type"]["multi-session"]
     multi_after = stages["aggregation"]["by_type"]["multi-session"]
     pref_before = stages["aggregation"]["by_type"]["single-session-preference"]
     pref_after = stages["preference"]["by_type"]["single-session-preference"]
     loc_retrieval = retrieval_effect["locomo"]
+    latest_text = ""
+    if args.latest_root is not None:
+        latest_lme = comparisons["preference->v5_54_full"]["longmemeval"]
+        latest_locomo = comparisons["preference->v5_54_full"]["locomo"]
+        latest_text = (
+            f"最新版 V5.54 Full 采用最终审计后的逐题标注，LME/LoCoMo 分别为 "
+            f"{final_lme['correct']}/{final_lme['questions']}（{pct(final_lme['accuracy'])}\\%）"
+            f"与 {final_locomo['correct']}/{final_locomo['questions']}"
+            f"（{pct(final_locomo['accuracy'])}\\%）；相对 V5.21 终点的配对净变化为 "
+            f"{delta(latest_lme['delta'])}/{delta(latest_locomo['delta'])} pp，"
+            f"修复/退化分别为 {latest_lme['gains']}/{latest_lme['losses']} 与 "
+            f"{latest_locomo['gains']}/{latest_locomo['losses']}。该末行汇总 V5.21 "
+            f"之后的 QueryIR、typed execution、layout 与 label-free readout 等累计改动，"
+            f"只用于对齐当前系统终点，不把相对上一行的变化归因于某一个模块。"
+        )
     analysis = (
         r"\paragraph{全量查询路径消融。}所有候选均在 LongMemEval 500 题与 "
         r"LoCoMo Category 1--4 的 1,540 题上运行，不再以 hard 子集决定版本。"
@@ -253,10 +294,12 @@ def main() -> None:
         f"{pref_before['correct']}/{pref_before['questions']}（{pct(pref_before['accuracy'])}\\%）"
         f"提高到 {pref_after['correct']}/{pref_after['questions']}"
         f"（{pct(pref_after['accuracy'])}\\%），{preference_lme['gains']} 修复、"
-        f"{preference_lme['losses']} 退化。最终 LME/LoCoMo 分别为 "
-        f"{final_lme['correct']}/{final_lme['questions']}（{pct(final_lme['accuracy'])}\\%）"
-        f"与 {final_locomo['correct']}/{final_locomo['questions']}"
-        f"（{pct(final_locomo['accuracy'])}\\%）。逐项 $p$ 值如表所示；"
+        f"{preference_lme['losses']} 退化。V5.21 终点的 LME/LoCoMo 分别为 "
+        f"{v521_lme['correct']}/{v521_lme['questions']}（{pct(v521_lme['accuracy'])}\\%）"
+        f"与 {v521_locomo['correct']}/{v521_locomo['questions']}"
+        f"（{pct(v521_locomo['accuracy'])}\\%）。"
+        + latest_text
+        + "逐项 $p$ 值如表所示；"
         "未达到 $p<0.05$ 的小幅变化只作为方向性结果，不作显著提升声明。\n"
     )
     args.output_analysis.parent.mkdir(parents=True, exist_ok=True)
@@ -280,7 +323,12 @@ def main() -> None:
             axes[0].annotate(f"{value:.1f}", (index, value),
                              xytext=(0, 7), textcoords="offset points",
                              ha="center", fontsize=8, color=colors[benchmark])
-    axes[0].set_xticks(list(x), ["Base", "+Witness", "+Ledger", "+Preference"])
+    short_labels = {
+        "baseline": "Base", "safe_witness": "+Witness",
+        "aggregation": "+Ledger", "preference": "+Preference",
+        "v5_54_full": "V5.54 Full",
+    }
+    axes[0].set_xticks(list(x), [short_labels[key] for key in stage_keys])
     axes[0].set_ylabel("Judge accuracy (%)")
     axes[0].set_title("Full-benchmark accuracy")
     axes[0].grid(axis="y", alpha=.25)
@@ -298,11 +346,21 @@ def main() -> None:
         axes[1].bar_label(bars, labels=[f"{value:+.1f}" for value in values],
                           padding=2, fontsize=8)
     axes[1].axhline(0, color="#5F6B76", linewidth=.8)
-    axes[1].set_xticks(positions, ["Witness", "Ledger", "Preference"])
+    transition_labels = {
+        "baseline->safe_witness": "Witness",
+        "safe_witness->aggregation": "Ledger",
+        "aggregation->preference": "Preference",
+        "preference->v5_54_full": "V5.54 cumulative",
+    }
+    axes[1].set_xticks(
+        positions, [transition_labels.get(key, key) for key in transition_keys],
+        rotation=10 if len(positions) > 3 else 0,
+    )
     axes[1].set_ylabel("Paired delta (pp)")
     axes[1].set_title("Incremental effect vs. previous stage")
     axes[1].grid(axis="y", alpha=.25)
-    axes[1].legend(frameon=False, loc="upper right")
+    axes[1].margins(y=.15)
+    axes[1].legend(frameon=False, loc="upper left")
     for axis in axes:
         axis.spines[["top", "right"]].set_visible(False)
     args.output_figure.parent.mkdir(parents=True, exist_ok=True)

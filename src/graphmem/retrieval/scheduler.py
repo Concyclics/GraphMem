@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 from ..domain import ProofStep, QueryBudget, RelationType
-from ..text import content_terms, normalize_key
+from ..text import content_terms, normalize_key, predicate_family
 from .query_ir import QueryIR
 
 
@@ -153,6 +153,18 @@ def _query_relation_keys(ir: QueryIR) -> tuple[frozenset[str], frozenset[str]]:
     return owners, predicates
 
 
+def _query_relation_state_keys(
+    ir: QueryIR,
+) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    owners, predicates = _query_relation_keys(ir)
+    families = frozenset(filter(None, (predicate_family(value)
+                                      for value in predicates)))
+    polarities = frozenset(
+        normalize_key(str(operand.polarity))
+        for operand in ir.operands if operand.polarity)
+    return owners, families, polarities
+
+
 def _query_matching_signals(ir: QueryIR, source: str) -> frozenset[str]:
     """Filter keyed edge signals against their concrete QueryIR witnesses.
 
@@ -166,6 +178,8 @@ def _query_matching_signals(ir: QueryIR, source: str) -> frozenset[str]:
     if not signals or not witnesses:
         return frozenset(signals)
     owners, predicates = _query_relation_keys(ir)
+    _state_owners, predicate_families, polarities = (
+        _query_relation_state_keys(ir))
     query_terms = content_terms(ir.query)
     if "shared_entity" in signals and owners:
         entity_keys = {normalize_key(value) for value in
@@ -179,14 +193,27 @@ def _query_matching_signals(ir: QueryIR, source: str) -> frozenset[str]:
     if "state_compatible" in signals and (owners or predicates):
         state_matches = False
         for witness in witnesses.get("state_compatible", ()):
-            entity, separator, predicate = witness.partition("\x1f")
+            components = witness.split("\x1f")
+            entity = components[0] if components else ""
+            predicate = components[1] if len(components) > 1 else ""
+            witness_polarity = components[2] if len(components) > 2 else ""
             entity_terms = content_terms(entity)
             entity_ok = (not owners or normalize_key(entity) in owners
                          or bool(entity_terms and entity_terms.issubset(
                              query_terms)))
-            predicate_ok = (not predicates or (
-                separator and normalize_key(predicate) in predicates))
-            if entity_ok and predicate_ok:
+            # Four-field witnesses are the predicate-family contract.  Legacy
+            # two-field graphs keep their exact-phrase behaviour.
+            if len(components) > 2:
+                predicate_ok = (not predicate_families
+                                or normalize_key(predicate) in predicate_families)
+                polarity_ok = (not polarities or not witness_polarity
+                               or normalize_key(witness_polarity) in polarities)
+            else:
+                predicate_ok = (not predicates or (
+                    len(components) > 1
+                    and normalize_key(predicate) in predicates))
+                polarity_ok = True
+            if entity_ok and predicate_ok and polarity_ok:
                 state_matches = True
                 break
         if not state_matches:

@@ -220,6 +220,20 @@ def parse_slots(query: str) -> QuerySlots:
         if _has(tokens, words):
             temporal_relation = name
             break
+    # "How many days/weeks passed between ..." asks for an interval, not a
+    # cardinality over events. The unit plus an explicit interval relation is a
+    # deterministic discriminator from ordinary "how many days did I visit"
+    # collection questions.
+    temporal_units = {
+        "second", "seconds", "minute", "minutes", "hour", "hours",
+        "day", "days", "week", "weeks", "month", "months", "year", "years",
+    }
+    temporal_count = bool(
+        is_count and tokens & temporal_units
+        and (temporal_relation or tokens & {"passed", "lapsed", "elapsed"}))
+    if temporal_count:
+        is_duration = True
+        is_count = False
 
     is_latest = _has(tokens, LATEST_WORDS) and ordinal_index is None
     # "latest"/"most recent" are ordinals over time, not a state lookup.

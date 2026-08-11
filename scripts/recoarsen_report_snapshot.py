@@ -25,6 +25,7 @@ from graphmem.build.coarsen import (  # noqa: E402
 from graphmem.build.refine import Qwen30BRefiner  # noqa: E402
 from graphmem.config import load_config  # noqa: E402
 from graphmem.domain import GraphEdge, NodeType, RelationType, stable_id  # noqa: E402
+from graphmem.domain import canonical_json  # noqa: E402
 from graphmem.eval import load_dev_questions, load_gold_turns  # noqa: E402
 from graphmem.eval.fullset import load_full_questions  # noqa: E402
 from graphmem.manifests import combined_dataset_hash  # noqa: E402
@@ -75,6 +76,10 @@ def parse_args() -> argparse.Namespace:
         "--rare-lexical-relation", action="store_true",
         help=("V5.15 ablation: use shared low-session-DF source terms as a "
               "bounded coarse-edge attribute; disabled after the packed-accuracy gate"))
+    parser.add_argument(
+        "--enabled-relation-signals",
+        help=("comma-separated relation signal allow-list; omitted preserves "
+              "the configured/default all-signal behavior"))
     parser.add_argument("--cross-session-quota", type=int, default=2)
     parser.add_argument("--embedding-model",
                         default="Qwen/Qwen3-Embedding-0.6B")
@@ -239,7 +244,8 @@ def recoarsen(memory_id: str, source: SQLiteGraphStore,
               relation_view_quotas=None,
               rare_lexical_relation: bool = False,
               rare_lexical_df_share: float = 0.05,
-              rare_lexical_min_shared: int = 3) -> dict:
+              rare_lexical_min_shared: int = 3,
+              enabled_relation_signals=None) -> dict:
     nodes = list(source.nodes(memory_id))
     edges = list(source.edges(memory_id))
     groups = source.evidence_groups(memory_id)
@@ -322,18 +328,28 @@ def recoarsen(memory_id: str, source: SQLiteGraphStore,
         atomic_relation_multiview=atomic_relation_multiview,
         relation_view_quotas=relation_view_quotas,
         lexical_rare_terms=rare_lexical_terms,
-        rare_lexical_min_shared=rare_lexical_min_shared)
+        rare_lexical_min_shared=rare_lexical_min_shared,
+        enabled_signals=enabled_relation_signals)
     new_relation_edges = []
     for left_id, right_id, score, _level in relation_plan.accepted_pairs:
         signals = relation_plan.accepted_pair_signals.get(
             (left_id, right_id), ())
         source_name = ("relation_mask:" + ",".join(signals)
                        if signals else "report_cir_high_confidence")
+        witnesses = relation_plan.accepted_pair_witnesses.get(
+            (left_id, right_id), {})
+        if witnesses:
+            source_name += "|relation_witness:" + canonical_json(witnesses)
         new_relation_edges.append(relation_edge(
             memory_id, node_map[left_id], node_map[right_id], score,
             source_name))
     for (left_id, right_id, relation, confidence, _level,
          source_name) in relation_plan.typed_pairs:
+        typed_witnesses = relation_plan.typed_pair_witnesses.get(
+            (left_id, right_id, str(relation)), {})
+        if typed_witnesses:
+            source_name += "|relation_witness:" + canonical_json(
+                typed_witnesses)
         new_relation_edges.append(typed_edge(
             memory_id, node_map[left_id], node_map[right_id], relation,
             confidence, source_name))
@@ -363,13 +379,25 @@ def recoarsen(memory_id: str, source: SQLiteGraphStore,
                     RelationType.CONTRADICTION_UPDATE}):
                 left_id, right_id = right_id, left_id
             if relation == RelationType.COARSE_RELATED:
+                source_name = "report_cir_high_confidence"
+                refine_witnesses = relation_plan.refine_candidate_witnesses.get(
+                    decision.candidate_id, {})
+                if refine_witnesses:
+                    source_name += "|relation_witness:" + canonical_json(
+                        refine_witnesses)
                 new_relation_edges.append(relation_edge(
                     memory_id, node_map[left_id], node_map[right_id],
-                    decision.confidence))
+                    decision.confidence, source_name))
             else:
+                source_name = decision.source
+                refine_witnesses = relation_plan.refine_candidate_witnesses.get(
+                    decision.candidate_id, {})
+                if refine_witnesses:
+                    source_name += "|relation_witness:" + canonical_json(
+                        refine_witnesses)
                 new_relation_edges.append(typed_edge(
                     memory_id, node_map[left_id], node_map[right_id], relation,
-                    decision.confidence, decision.source))
+                    decision.confidence, source_name))
             refined_counts[str(relation)] += 1
     materialized_relations = bounded_new_relations(new_relation_edges)
     kept_edges.extend(materialized_relations)
@@ -429,6 +457,11 @@ def main() -> None:
         raise ValueError(
             "atomic_summary_hybrid requires --relation-node-embedding-db")
     args.output.mkdir(parents=True, exist_ok=True)
+    enabled_relation_signals = None
+    if args.enabled_relation_signals is not None:
+        enabled_relation_signals = tuple(
+            value.strip() for value in args.enabled_relation_signals.split(",")
+            if value.strip())
     target_path = args.output / "report_graph.sqlite"
     if target_path.exists() and not args.resume:
         raise SystemExit(
@@ -499,7 +532,8 @@ def main() -> None:
             relation_view_quotas=config.edges.relation_view_quotas,
             rare_lexical_relation=args.rare_lexical_relation,
             rare_lexical_df_share=config.edges.rare_lexical_df_share,
-            rare_lexical_min_shared=config.edges.rare_lexical_min_shared)
+            rare_lexical_min_shared=config.edges.rare_lexical_min_shared,
+            enabled_relation_signals=enabled_relation_signals)
         rows.append(row)
         with checkpoint_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -522,6 +556,9 @@ def main() -> None:
         "relation_mask_propagation": args.relation_mask_propagation,
         "atomic_relation_multiview": args.atomic_relation_multiview,
         "rare_lexical_relation": args.rare_lexical_relation,
+        "enabled_relation_signals": (
+            list(enabled_relation_signals)
+            if enabled_relation_signals is not None else None),
         "relation_view_quotas": dict(config.edges.relation_view_quotas),
         "rare_lexical_df_share": config.edges.rare_lexical_df_share,
         "rare_lexical_min_shared": config.edges.rare_lexical_min_shared,

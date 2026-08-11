@@ -11,12 +11,13 @@ from graphmem.answer import (
     prompt_contract, render_evidence, render_turn, resolve_evidence_order,
 )
 from graphmem.domain import (
-    AlgebraResult, AnswerMember, Conversation, EvidenceMember, EvidenceUnit, NavigationResult,
+    AlgebraResult, AnswerMember, CandidateScore, Conversation, EvidenceMember, EvidenceUnit, NavigationResult,
     QueryBudget, QueryOperator, Session, SourceTurn, StateResult, TemporalEndpoint, TemporalKey,
     stable_id,
 )
 from graphmem.tokenization import HeuristicTokenCounter
 from graphmem.storage import SQLiteGraphStore
+from graphmem.answer.stage import _aggregation_source_reserve_ids
 
 
 def _turn(index: int, text: str, session: str = "s1", speaker: str = "user") -> SourceTurn:
@@ -249,6 +250,30 @@ def test_source_time_prompt_is_an_explicit_separate_contract() -> None:
     assert "[source-time ...]" in messages[0]["content"]
 
 
+def test_contextual_question_date_omits_global_anchor_without_query_cue() -> None:
+    from graphmem.answer import question_needs_global_date
+
+    assert question_needs_global_date("How many trips did I take this year?")
+    assert question_needs_global_date("How many days ago did I visit?")
+    assert question_needs_global_date("What did Alice plan for next month?")
+    assert question_needs_global_date("Where was I living last year?")
+    assert not question_needs_global_date("When did Alice go camping?")
+    messages = build_answer_messages(
+        question="When did Alice go camping?", question_date="2023-10-22",
+        evidence_text="next month", include_question_date=False)
+    assert "Question date:" not in messages[1]["content"]
+
+
+def test_question_recency_footer_repeats_question_after_evidence() -> None:
+    messages = build_answer_messages(
+        question="What degree did I earn?", question_date="2023-10-22",
+        evidence_text="MEMORY_SENTINEL", question_recency_footer=True)
+    user = messages[1]["content"]
+    assert user.index("MEMORY_SENTINEL") < user.rindex(
+        "Answer the original Question now:")
+    assert "source-time" in user
+
+
 def test_precision_grounded_prompt_is_opt_in_and_separately_hashed() -> None:
     baseline = build_answer_messages(
         question="Did Alice surf?", question_date=None, evidence_text="")
@@ -268,6 +293,97 @@ def test_topological_layout_prompt_explains_that_chain_labels_are_hints() -> Non
 
     assert "[CHAIN k step=d]" in messages[0]["content"]
     assert "navigation hints, not facts" in messages[0]["content"]
+
+
+def test_compact_topological_contract_preserves_semantics_and_saves_text() -> None:
+    verbose = build_answer_messages(
+        question="When did Alice move?", question_date=None, evidence_text="",
+        topological_layout=True)
+    compact = build_answer_messages(
+        question="When did Alice move?", question_date=None, evidence_text="",
+        topological_layout=True, compact_topological_contract=True)
+
+    assert "[CHAIN] follows one QueryIR path" in compact[0]["content"]
+    assert "navigation hints only" in compact[0]["content"]
+    assert len(compact[0]["content"]) < len(verbose[0]["content"])
+    assert prompt_contract(False, False, True)[2] != prompt_contract(
+        False, False, True, False, False, False, False, False, True)[2]
+
+
+def test_compact_labels_and_focus_index_are_explicit_prompt_contracts() -> None:
+    messages = build_answer_messages(
+        question="When did Alice move?", question_date=None,
+        evidence_text="[C1.0] source", topological_layout=True,
+        compact_topological_labels=True,
+        query_focus_index="Query focus:\n[F1] exact source")
+
+    assert "[Ck.d] is QueryIR chain" in messages[0]["content"]
+    assert "reading aid, not extra evidence" in messages[0]["content"]
+    assert messages[1]["content"].index("[C1.0]") < (
+        messages[1]["content"].index("Query focus:"))
+    assert prompt_contract(False, False, True)[2] != prompt_contract(
+        False, False, True, False, False, False, False, False, False,
+        True, True)[2]
+
+
+def test_default_focused_prompt_scope_preserves_specialized_contracts(
+        tmp_path) -> None:
+    store = _store(tmp_path, [
+        "I spent $35 on bicycle tires.",
+        "I paid $150 to repair the bicycle.",
+        "I prefer quiet mystery films.",
+    ])
+    result = _result([turn.turn_id for turn in store.turns("m")])
+    common = dict(evidence_order="topological", normalize_relative_time=True)
+    rewrite = dict(
+        question_date_mode="query_relative", question_recency_footer=True,
+        compact_topological_contract=True, focused_prompt_scope="default")
+
+    for question, specialized in (
+        ("How much did I spend on the bicycle in total?",
+         {"aggregation_ledger_enabled": True}),
+        ("Can you recommend a movie?",
+         {"preference_synthesis_enabled": True}),
+    ):
+        baseline = _stage(
+            store, _FakeClient(),
+            answer_config=AnswerConfig(**common, **specialized)).prepare(
+                "baseline", question, result, QueryBudget(),
+                question_date="2023-10-22")
+        routed = _stage(
+            store, _FakeClient(),
+            answer_config=AnswerConfig(
+                **common, **specialized, **rewrite)).prepare(
+                    "routed", question, result, QueryBudget(),
+                    question_date="2023-10-22")
+        assert routed.messages == baseline.messages
+        assert routed.prompt_hash == baseline.prompt_hash
+        assert not routed.trace["focused_prompt_applied"]
+
+    default = _stage(
+        store, _FakeClient(),
+        answer_config=AnswerConfig(**common, **rewrite)).prepare(
+            "default", "What did I spend on bicycle tires?", result,
+            QueryBudget(), question_date="2023-10-22")
+    assert default.trace["focused_prompt_applied"]
+    assert default.trace["compact_topological_contract"]
+    assert "Answer the original Question now:" in default.messages[1]["content"]
+    store.close()
+
+
+def test_exact_grounding_footer_is_after_evidence_and_skips_preferences() -> None:
+    grounded = build_answer_messages(
+        question="Did Alice surf?", question_date=None,
+        evidence_text="MEMORY_SENTINEL", exact_grounding_footer=True)
+    preference = build_answer_messages(
+        question="What should Alice try?", question_date=None,
+        evidence_text="MEMORY_SENTINEL", preference_synthesis=True,
+        exact_grounding_footer=True)
+
+    user = grounded[1]["content"]
+    assert user.index("MEMORY_SENTINEL") < user.index("Final check:")
+    assert "exact entity and relation" in user
+    assert "Final check:" not in preference[1]["content"]
 
 
 def test_a_candidate_answer_is_labelled_a_proposal_not_evidence() -> None:
@@ -335,6 +451,25 @@ def test_aggregation_ledger_indexes_money_operands_without_claiming_closure() ->
     assert not ledger.result_certified
 
 
+def test_aggregation_execution_card_keeps_candidates_trace_only() -> None:
+    turns = {
+        turn.turn_id: turn for turn in (
+            _turn(0, "I spent $35 on my bicycle tires."),
+            _turn(1, "I paid $150 to repair the bicycle."),
+        )
+    }
+    card = build_aggregation_ledger(
+        "How much did I spend on the bicycle in total?", turns, tuple(turns),
+        execution_card=True)
+
+    assert card is not None and card.operation == "sum"
+    assert set(card.candidate_turn_ids) == set(turns)
+    assert "compact execution card" in card.text
+    assert "Question: How much did I spend" in card.text
+    assert "Candidate 1:" not in card.text
+    assert "Certified deterministic result: unavailable" not in card.text
+
+
 def test_non_aggregation_question_has_no_ledger() -> None:
     turn = _turn(0, "My dog is Rex.")
     assert build_aggregation_ledger(
@@ -347,6 +482,12 @@ def test_count_in_a_week_is_not_misclassified_as_duration_sum() -> None:
     assert aggregation_operation(
         "How many fitness classes do I attend in a typical week?") == "count_distinct"
     assert aggregation_operation("How many days did I travel in total?") == "sum"
+    assert aggregation_operation(
+        "How many days did it take me to finish the book?") == "date_difference"
+    assert aggregation_operation(
+        "How long had I been bird watching when I attended the workshop?") == "date_difference"
+    assert aggregation_operation(
+        "How many weeks in total did I spend reading three books?") == "sum"
 
 
 def test_money_ledger_reserves_terse_direct_currency_operands() -> None:
@@ -361,6 +502,38 @@ def test_money_ledger_reserves_terse_direct_currency_operands() -> None:
 
     assert ledger is not None
     assert relevant.turn_id in ledger.candidate_turn_ids
+
+
+def test_named_multi_party_speaker_is_not_treated_as_assistant_context() -> None:
+    named = replace(
+        _turn(0, "I adopted two dogs."),
+        speaker="Maria", role="assistant", timestamp="2023-08-01")
+    rows = {named.turn_id: named}
+
+    ledger = build_aggregation_ledger(
+        "How many dogs did Maria adopt?", rows, (named.turn_id,))
+
+    assert ledger is not None
+    assert "status=source_speaker_statement" in ledger.text
+
+
+def test_aggregation_source_reserve_is_role_safe_across_dataset_shapes() -> None:
+    direct = _turn(0, "I bought the coffee table.")
+    assistant = replace(
+        _turn(1, "Here is a long list of unrelated furniture advice."),
+        speaker="assistant", role="assistant")
+    generic = {turn.turn_id: turn for turn in (direct, assistant)}
+
+    assert _aggregation_source_reserve_ids(
+        generic, (assistant.turn_id, direct.turn_id)) == (direct.turn_id,)
+
+    # LoCoMo represents both named people through user/assistant transport
+    # roles.  Reserving only the user side would introduce a speaker bias.
+    maria = replace(direct, speaker="Maria", role="user")
+    caroline = replace(assistant, speaker="Caroline", role="assistant")
+    named = {turn.turn_id: turn for turn in (maria, caroline)}
+    assert not _aggregation_source_reserve_ids(
+        named, (maria.turn_id, caroline.turn_id))
 
 
 def test_aggregation_feature_keeps_non_aggregation_prompt_byte_identical(tmp_path) -> None:
@@ -532,7 +705,7 @@ def test_topological_layout_keeps_a_root_to_leaf_chain_contiguous(tmp_path) -> N
     user = prepared.messages[1]["content"]
 
     assert user.index("[CHAIN 1 step=1]") < user.index("[CHAIN 1 step=2]")
-    assert user.index("[CHAIN 1 step=2]") < user.index("[AUX group=1")
+    assert user.index("[CHAIN 1 step=2]") < user.index("[AUX 1")
     assert prepared.trace["evidence_chain_turns"] == 2
     assert prepared.trace["evidence_graph_turns"] == 0
     assert prepared.trace["evidence_auxiliary_turns"] == 1
@@ -562,6 +735,119 @@ def test_topological_plain_reorders_without_exposing_graph_labels(tmp_path) -> N
     assert "graph-derived blocks" not in system
     assert prepared.trace["evidence_layout"] == "topological_plain"
     assert prepared.trace["evidence_chain_turns"] == 2
+    store.close()
+
+
+def test_topological_recency_places_strongest_block_last(tmp_path) -> None:
+    # Source chronology deliberately puts the strong chain first; the recency
+    # layout must override chronology and move its whole block to the end.
+    store = _store(tmp_path, ["strong root", "strong leaf", "weak auxiliary"])
+    turns = store.turns("m")
+    units = (
+        EvidenceUnit("leaf", ("need",), ("b2",), (turns[1].turn_id,),
+                     ("edge-1", "edge-2"), 0, True, ("operand",)),
+        EvidenceUnit("root", ("need",), ("b1",), (turns[0].turn_id,),
+                     ("edge-1",), 0, True, ("operand",)),
+    )
+    stage = _stage(
+        store, _FakeClient(),
+        answer_config=AnswerConfig(evidence_order="topological_recency"))
+    result = replace(
+        _result([turn.turn_id for turn in turns], units),
+        candidate_scores=tuple(
+            CandidateScore(turn.turn_id, turn.session_id, 0, 0, 0, 0,
+                           0, 0, 1, float(3 - index), ())
+            for index, turn in enumerate(turns)))
+    prepared = stage.prepare(
+        "q1", "When did Alice move?", result, QueryBudget())
+    user = prepared.messages[1]["content"]
+
+    assert user.index("weak auxiliary") < user.index("strong root")
+    assert user.index("strong root") < user.index("strong leaf")
+    assert prepared.trace["evidence_layout"] == "topological_recency"
+    store.close()
+
+
+def test_topological_recency_budget_drops_weak_prefix_not_strong_tail() -> None:
+    turns = [
+        _turn(0, "weak evidence " * 20, "weak-session"),
+        _turn(0, "strong answer " * 20, "strong-session"),
+    ]
+    single_cost = COUNTER.count(render_turn(
+        turns[0], AnswerConfig(evidence_order="topological_recency"))) + 1
+    rendered = render_evidence(
+        turns,
+        config=AnswerConfig(evidence_order="topological_recency"),
+        counter=COUNTER,
+        max_tokens=single_cost,
+    )
+    assert rendered.turn_ids == (turns[1].turn_id,)
+    assert rendered.dropped_turn_ids == (turns[0].turn_id,)
+
+
+def test_v5_54_answer_config_freezes_the_measured_contract() -> None:
+    config = AnswerConfig.v5_54()
+
+    assert config.readout_policy == "v5_54"
+    assert config.evidence_order == "topological"
+    assert config.normalize_relative_time
+    assert config.aggregation_ledger_enabled
+    assert config.aggregation_ledger_limit == 32
+    assert config.aggregation_source_reserve_enabled
+    assert config.preference_synthesis_enabled
+    assert config.question_date_mode == "query_relative"
+    assert config.question_recency_footer
+    assert config.compact_topological_contract
+    assert config.focused_prompt_scope == "default"
+    assert not config.candidate_answer_injection
+    assert config.max_output_tokens == 2000
+
+
+def test_v5_54_policy_is_in_core_and_freezes_the_evidence_set(tmp_path) -> None:
+    store = _store(tmp_path, [
+        "I joined the running club in April 2023.",
+        "I won the spring race in May 2023.",
+        "The unrelated book club met in June 2023.",
+    ])
+    result = _result([turn.turn_id for turn in store.turns("m")])
+    winner = AnswerConfig.v5_54()
+    budget = QueryBudget(max_evidence_turns=64, max_evidence_tokens=12000)
+    baseline = _stage(
+        store, _FakeClient(),
+        answer_config=replace(winner, readout_policy="legacy")).prepare(
+            "base", "When did I win the spring race?", result, budget,
+            question_date="2024-01-01")
+    prepared = _stage(
+        store, _FakeClient(), answer_config=winner).prepare(
+            "winner", "When did I win the spring race?", result, budget,
+            question_date="2024-01-01")
+
+    assert prepared.trace["readout_policy"] == "v5_54"
+    assert "anonymous_typed" in prepared.trace["readout_policy_route"]
+    assert prepared.trace["typed_readout_kind"] == "temporal"
+    assert set(prepared.evidence_turn_ids) == set(baseline.evidence_turn_ids)
+    assert prepared.packing_prompt_tokens <= baseline.packing_prompt_tokens
+    assert "Candidate answer" not in prepared.messages[-1]["content"]
+    store.close()
+
+
+def test_v5_54_modal_route_replaces_strict_lookup_with_grounded_inference(
+        tmp_path) -> None:
+    store = _store(tmp_path, [
+        "I hike every weekend and enjoy difficult mountain trails.",
+        "I prefer outdoor activities to staying indoors.",
+    ])
+    result = _result([turn.turn_id for turn in store.turns("m")])
+    prepared = _stage(
+        store, _FakeClient(), answer_config=AnswerConfig.v5_54()).prepare(
+            "q", "Which sport would I likely enjoy?", result,
+            QueryBudget(max_evidence_turns=64, max_evidence_tokens=12000))
+
+    assert prepared.trace["inference_synthesis"]
+    assert "inference" in prepared.trace["readout_policy_route"]
+    assert "Inference Question:" in prepared.messages[-1]["content"]
+    assert "infer from stated facts and ordinary knowledge" in (
+        prepared.messages[0]["content"])
     store.close()
 
 

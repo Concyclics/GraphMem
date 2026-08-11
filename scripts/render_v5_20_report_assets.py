@@ -435,7 +435,7 @@ def finish_axes(axis) -> None:
     axis.spines["right"].set_visible(False)
 
 
-def plot_build_tokens(payload: dict, report: Path) -> None:
+def plot_build_tokens(payload: dict, report: Path, prefix: str = "v5_20") -> None:
     plt, colors = plot_style()
     from matplotlib.patches import Patch  # noqa: PLC0415
     from matplotlib.ticker import FuncFormatter  # noqa: PLC0415
@@ -493,11 +493,12 @@ def plot_build_tokens(payload: dict, report: Path) -> None:
         loc="upper center", bbox_to_anchor=(0.5, 0.91), ncol=2,
         frameon=False)
     figure.tight_layout(rect=(0, 0, 1, 0.84))
-    save_budget_figure(figure, report, "v5_20_build_tokens")
+    save_budget_figure(figure, report, f"{prefix}_build_tokens")
     plt.close(figure)
 
 
-def plot_budget_accuracy(payload: dict, report: Path) -> None:
+def plot_budget_accuracy(
+        payload: dict, report: Path, prefix: str = "v5_20") -> None:
     plt, colors = plot_style()
     from matplotlib.lines import Line2D  # noqa: PLC0415
     from matplotlib.ticker import FuncFormatter  # noqa: PLC0415
@@ -529,6 +530,10 @@ def plot_budget_accuracy(payload: dict, report: Path) -> None:
                 axis.scatter(token, accuracy, marker=marker, s=42,
                              color=color, edgecolor="white", linewidth=0.7,
                              zorder=3)
+            axis.annotate(
+                f"{y[0]:.1f}%", (x[0], y[0]), xytext=(0, 7),
+                textcoords="offset points", ha="center", va="bottom",
+                fontsize=7.5, color=color)
         if not observed:
             axis.text(0.5, 0.5, "实验运行中", transform=axis.transAxes,
                       ha="center", va="center", color=colors["gray"])
@@ -537,7 +542,7 @@ def plot_budget_accuracy(payload: dict, report: Path) -> None:
         axis.set_ylabel("Accuracy（%）")
         axis.xaxis.set_major_formatter(FuncFormatter(
             lambda value, _: compact_number(value)))
-        axis.set_ylim(50, 80)
+        axis.set_ylim(50, 84)
         finish_axes(axis)
     series_handles = [
         Line2D([0], [0], color=color, linestyle=linestyle, linewidth=1.8,
@@ -559,11 +564,12 @@ def plot_budget_accuracy(payload: dict, report: Path) -> None:
                   loc="lower center", bbox_to_anchor=(0.5, 0.00), ncol=4,
                   frameon=False, fontsize=8)
     figure.tight_layout(rect=(0, 0.09, 1, 0.84))
-    save_budget_figure(figure, report, "v5_20_budget_accuracy")
+    save_budget_figure(figure, report, f"{prefix}_budget_accuracy")
     plt.close(figure)
 
 
-def plot_type_accuracy(payload: dict, report: Path) -> None:
+def plot_type_accuracy(
+        payload: dict, report: Path, prefix: str = "v5_20") -> None:
     plt, colors = plot_style()
     from matplotlib.patches import Patch  # noqa: PLC0415
 
@@ -630,11 +636,11 @@ def plot_type_accuracy(payload: dict, report: Path) -> None:
                   bbox_to_anchor=(0.5, 0.005), ncol=5, frameon=False,
                   fontsize=9)
     figure.tight_layout(rect=(0, 0.08, 1, 0.92), h_pad=1.7, w_pad=0.7)
-    save_budget_figure(figure, report, "v5_20_type_accuracy")
+    save_budget_figure(figure, report, f"{prefix}_type_accuracy")
     plt.close(figure)
 
 
-def plot_graph(payload: dict, report: Path) -> None:
+def plot_graph(payload: dict, report: Path, prefix: str = "v5_20") -> None:
     plt, colors = plot_style()
     arms = payload.get("arms", {})
     labels = [label for _, label in ARMS]
@@ -691,7 +697,7 @@ def plot_graph(payload: dict, report: Path) -> None:
     figure.suptitle("图结构如何转化为最终回答准确率", color=colors["navy"],
                     fontsize=14, fontweight="bold")
     figure.tight_layout(rect=(0, 0, 1, 0.92))
-    save_budget_figure(figure, report, "v5_20_graph_ablation")
+    save_budget_figure(figure, report, f"{prefix}_graph_ablation")
     plt.close(figure)
 
 
@@ -700,34 +706,37 @@ def main() -> None:
     parser.add_argument("--graph-ablation", type=Path)
     parser.add_argument("--budget-benchmark", type=Path)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--asset-prefix", default="v5_20")
     args = parser.parse_args()
     graph = read(args.graph_ablation)
     budget = read(args.budget_benchmark)
     generated = args.report / "generated"
     generated.mkdir(parents=True, exist_ok=True)
+    prefix = str(args.asset_prefix)
     outputs = {
-        "v5_20_graph_ablation_table.tex": graph_table(graph),
-        "v5_20_graph_ablation_analysis.tex": graph_analysis(graph),
-        "v5_20_build_table.tex": build_rows(budget),
-        "v5_20_budget_table.tex": budget_rows(budget),
-        "v5_20_type_accuracy_table.tex": type_accuracy_rows(budget),
-        "v5_20_type_accuracy_analysis.tex": type_accuracy_analysis(budget),
-        "v5_20_budget_analysis.tex": budget_analysis(budget),
+        f"{prefix}_graph_ablation_table.tex": graph_table(graph),
+        f"{prefix}_graph_ablation_analysis.tex": graph_analysis(graph),
+        f"{prefix}_build_table.tex": build_rows(budget),
+        f"{prefix}_budget_table.tex": budget_rows(budget),
+        f"{prefix}_type_accuracy_table.tex": type_accuracy_rows(budget),
+        f"{prefix}_type_accuracy_analysis.tex": type_accuracy_analysis(budget),
+        f"{prefix}_budget_analysis.tex": budget_analysis(budget),
     }
     for name, content in outputs.items():
         (generated / name).write_text(content, encoding="utf-8")
-    plot_graph(graph, args.report)
-    plot_build_tokens(budget, args.report)
-    plot_budget_accuracy(budget, args.report)
-    plot_type_accuracy(budget, args.report)
+    plot_graph(graph, args.report, prefix)
+    plot_build_tokens(budget, args.report, prefix)
+    plot_budget_accuracy(budget, args.report, prefix)
+    plot_type_accuracy(budget, args.report, prefix)
     sources = {
-        "schema_version": "graphmem-v5.20-report-assets-v1",
+        "schema_version": "graphmem-report-assets-v1",
+        "asset_prefix": prefix,
         "graph_ablation": str(args.graph_ablation) if args.graph_ablation else None,
         "budget_benchmark": str(args.budget_benchmark) if args.budget_benchmark else None,
         "graph_loaded": bool(graph), "budget_loaded": bool(budget),
         "missing_values_render_as_zero": False,
     }
-    (generated / "v5_20_report_sources.json").write_text(
+    (generated / f"{prefix}_report_sources.json").write_text(
         json.dumps(sources, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(sources, ensure_ascii=False, indent=2))
 

@@ -61,6 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--warm-all-affinity", action="store_true",
                         help="prewarm every workload memory on each affinity replica")
+    parser.add_argument(
+        "--trace-requests",
+        action="store_true",
+        help=("write request-level JSONL with question, latency and stage timing "
+              "for tail-latency diagnosis"),
+    )
     return parser.parse_args()
 
 
@@ -160,6 +166,7 @@ def main() -> None:
             service_latencies: list[float] = []
             queue_latencies: list[float] = []
             result_counts: list[int] = []
+            request_trace: list[dict] = []
             counts = {"completed": 0, "failed": 0, "timed_out": 0,
                       "rejected": 0, "wrong_memory": 0}
             errors: list[str] = []
@@ -169,11 +176,23 @@ def main() -> None:
 
             def client(client_id: int) -> None:
                 rng = random.Random(710_000 + trial * 10_000 + client_id)
+                sequence = 0
                 barrier.wait()
                 while time.monotonic() < stop_at_box[0]:
                     memory_id = rng.choices(memories, weights=weights, k=1)[0]
                     row = rng.choice(by_memory[memory_id])
                     submitted = time.monotonic()
+                    trace_base = {
+                        "trial": trial,
+                        "client_id": client_id,
+                        "sequence": sequence,
+                        "memory_id": memory_id,
+                        "question_id": row["question_id"],
+                        "benchmark": row["benchmark"],
+                        "stratum": row["stratum"],
+                        "affinity_shards": list(pool.affinity_shards(memory_id)),
+                        "submitted_offset_ms": (submitted - started) * 1000,
+                    }
                     try:
                         result = pool.submit(
                             memory_id,
@@ -182,30 +201,76 @@ def main() -> None:
                             tenant_id=f"user-{client_id}",
                             deadline_monotonic=submitted + args.request_timeout,
                         ).result(timeout=args.request_timeout + 5)
-                        elapsed_ms = (time.monotonic() - submitted) * 1000
+                        completed_at = time.monotonic()
+                        elapsed_ms = (completed_at - submitted) * 1000
                         service_ms = float(result.stage_latency_ms.get("total", 0.0))
+                        queue_ms = max(0.0, elapsed_ms - service_ms)
                         with lock:
                             latencies.append(elapsed_ms)
                             service_latencies.append(service_ms)
-                            queue_latencies.append(max(0.0, elapsed_ms - service_ms))
+                            queue_latencies.append(queue_ms)
                             result_counts.append(len(result.retrieved_turn_ids))
                             counts["completed"] += 1
                             counts["wrong_memory"] += int(result.memory_id != memory_id)
+                            if args.trace_requests:
+                                request_trace.append({
+                                    **trace_base,
+                                    "status": "completed",
+                                    "completed_offset_ms": (
+                                        completed_at - started) * 1000,
+                                    "latency_ms": elapsed_ms,
+                                    "service_ms": service_ms,
+                                    "queue_ms": queue_ms,
+                                    "result_count": len(result.retrieved_turn_ids),
+                                    "visited_nodes": result.visited_nodes,
+                                    "visited_edges": result.visited_edges,
+                                    "candidate_count": int(
+                                        result.trace.get("candidate_count", 0)),
+                                    "query_operator": str(
+                                        result.trace.get("query_operator", "")),
+                                    "stage_latency_ms": dict(
+                                        result.stage_latency_ms),
+                                })
                     except AdmissionRejected as error:
                         with lock:
                             counts["rejected"] += 1
+                            if args.trace_requests:
+                                request_trace.append({
+                                    **trace_base,
+                                    "status": "rejected",
+                                    "latency_ms": (
+                                        time.monotonic() - submitted) * 1000,
+                                    "error": f"{type(error).__name__}: {error}",
+                                })
                             if len(errors) < 10:
                                 errors.append(f"{type(error).__name__}: {error}")
                     except (RequestDeadlineExceeded, TimeoutError) as error:
                         with lock:
                             counts["timed_out"] += 1
+                            if args.trace_requests:
+                                request_trace.append({
+                                    **trace_base,
+                                    "status": "timed_out",
+                                    "latency_ms": (
+                                        time.monotonic() - submitted) * 1000,
+                                    "error": f"{type(error).__name__}: {error}",
+                                })
                             if len(errors) < 10:
                                 errors.append(f"{type(error).__name__}: {error}")
                     except BaseException as error:
                         with lock:
                             counts["failed"] += 1
+                            if args.trace_requests:
+                                request_trace.append({
+                                    **trace_base,
+                                    "status": "failed",
+                                    "latency_ms": (
+                                        time.monotonic() - submitted) * 1000,
+                                    "error": f"{type(error).__name__}: {error}",
+                                })
                             if len(errors) < 10:
                                 errors.append(f"{type(error).__name__}: {error}")
+                    sequence += 1
 
             threads = []
             started = time.monotonic()
@@ -216,12 +281,33 @@ def main() -> None:
                 for future in as_completed(threads):
                     future.result()
             elapsed = time.monotonic() - started
+            trace_path = None
+            if args.trace_requests:
+                trace_dir = args.output / "request_traces"
+                trace_dir.mkdir(parents=True, exist_ok=True)
+                phase = "warmup" if trial < 0 else f"trial_{trial}"
+                trace_path = trace_dir / f"clients_{clients}_{phase}.jsonl"
+                ordered_trace = sorted(
+                    request_trace,
+                    key=lambda item: (
+                        float(item["submitted_offset_ms"]),
+                        int(item["client_id"]),
+                        int(item["sequence"]),
+                    ),
+                )
+                with trace_path.open("w", encoding="utf-8") as trace_file:
+                    for trace_row in ordered_trace:
+                        print(json.dumps(trace_row, ensure_ascii=False),
+                              file=trace_file)
             return {
                 "trial": trial,
                 "duration_requested_sec": duration,
                 "duration_measured_sec": elapsed,
                 **counts,
                 "errors": errors,
+                "request_trace": (str(trace_path.resolve())
+                                  if trace_path is not None else None),
+                "request_trace_rows": len(request_trace),
                 "qps": counts["completed"] / max(elapsed, 1e-9),
                 "latency_ms": latency_summary(latencies),
                 "service_ms": latency_summary(service_latencies),
@@ -299,6 +385,7 @@ def main() -> None:
                                   if query_embedding_cache else None),
         "worker_readiness": worker_readiness,
         "warm_all_affinity": args.warm_all_affinity,
+        "trace_requests": args.trace_requests,
         "duration_sec": args.duration,
         "warmup_sec": args.warmup,
         "repetitions": args.repetitions,

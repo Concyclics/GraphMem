@@ -212,6 +212,9 @@ def main() -> None:
                     "correct": label == "CORRECT",
                     "label": label,
                     "reasoning": str(payload.get("reasoning") or ""),
+                    "prediction_sha256": hashlib.sha256(str(
+                        answers[str(case["question_id"])].get(
+                            "prediction", "")).encode("utf-8")).hexdigest(),
                     "judge_model": result.record.model,
                     "judge_prompt_commit": PINNED_COMMIT,
                     "judge_prompt_sha256": PROMPT_SHA256,

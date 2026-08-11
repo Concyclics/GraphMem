@@ -9,6 +9,7 @@ import pytest
 from graphmem.build import GraphBuildPipeline, QwenSemanticDistiller
 from graphmem.domain import FactBinding, QueryBudget, QueryOperator
 from graphmem.retrieval import GraphNavigator, HarnessProfile
+from graphmem.retrieval.navigator import has_named_multi_party
 from graphmem.retrieval.algebra import evaluate
 from graphmem.retrieval.query_ir import compile_query
 from graphmem.runtime import GraphReadView
@@ -74,6 +75,62 @@ def test_guarded_exact_lookup_skips_graph_and_caps_evidence(tmp_path: Path) -> N
     assert result.trace["exact_lookup"]["confident"] is True
     assert result.visited_edges == 0
     assert len(result.retrieved_turn_ids) <= 1
+
+
+def test_exact_lookup_priority_preserves_normal_graph_route(tmp_path: Path) -> None:
+    store = _semantic_store(tmp_path / "graph.sqlite")
+    result = GraphNavigator(
+        store,
+        harness_profile=HarnessProfile.H11_UNIFIED_IR,
+        native_seed_fusion=True,
+        obligation_aware_packing=True,
+        exact_lookup_priority=True,
+        exact_lookup_priority_min_score=0.0,
+        exact_lookup_turn_limit=1,
+    ).navigate(
+        "travel", "What did Alice visit?",
+        QueryBudget(max_evidence_turns=32, max_evidence_tokens=2_000),
+    )
+
+    assert result.trace["execution_mode"] == "hierarchical_graph"
+    assert result.trace["exact_lookup"]["priority_active"] is True
+    assert result.trace["exact_lookup"]["strict_fact_count"] > 0
+    assert result.trace["exact_lookup"]["strict_fact_turn_count"] > 0
+    assert result.trace["exact_lookup"]["fast_path_active"] is False
+    assert result.trace["adaptive_pack_turn_limit"] == 32
+    assert len(result.retrieved_turn_ids) <= 32
+
+
+def test_exact_lookup_priority_does_not_activate_without_direct_fact(
+        tmp_path: Path) -> None:
+    store = _semantic_store(tmp_path / "graph.sqlite")
+    result = GraphNavigator(
+        store,
+        harness_profile=HarnessProfile.H11_UNIFIED_IR,
+        native_seed_fusion=True,
+        obligation_aware_packing=True,
+        exact_lookup_priority=True,
+        exact_lookup_priority_min_score=0.0,
+    ).navigate(
+        "travel", "What is zephyrquartz?",
+        QueryBudget(max_evidence_turns=32, max_evidence_tokens=2_000),
+    )
+
+    exact = result.trace["exact_lookup"]
+    assert exact["direct_fact_count"] == 0
+    assert exact["fact_scored_turns"] == 0
+    assert exact.get("strict_fact_count", 0) == 0
+    assert exact["priority_active"] is False
+
+
+def test_exact_lookup_priority_named_speaker_shape_gate(tmp_path: Path) -> None:
+    store = _semantic_store(tmp_path / "graph.sqlite")
+    turns = store.turns("travel")
+    assert has_named_multi_party(turns)
+    generic = tuple(replace(
+        turn, speaker=("user" if index % 2 == 0 else "assistant"))
+        for index, turn in enumerate(turns))
+    assert not has_named_multi_party(generic)
 
 
 def test_intersection_requires_a_witness_from_each_operand() -> None:

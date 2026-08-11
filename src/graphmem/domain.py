@@ -726,6 +726,7 @@ class CandidateScore:
     relation_path_score: float = 0.0
     obligation_gain: float = 0.0
     provenance_novelty: float = 0.0
+    relational_consensus_score: float = 0.0
     mandatory: bool = False
     proof_unit_ids: tuple[str, ...] = ()
 

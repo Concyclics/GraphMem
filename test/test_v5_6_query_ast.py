@@ -119,6 +119,27 @@ def test_duration_between_two_events_is_a_date_difference() -> None:
     assert len(operand_ids(node)) == 2
 
 
+def test_first_person_duration_between_events_compiles_two_predicate_operands() -> None:
+    ir = compile_query(
+        "How many days passed between attending the Holiday Market and buying my iPad?",
+        _view(predicates=("attend holiday market", "buy ipad", "visit museum")))
+
+    assert isinstance(ir.ast, DateDifference)
+    assert len(ir.ast_operands) == 2
+    assert ir.ast_operands[0].predicate_candidates == ("attend holiday market",)
+    assert ir.ast_operands[1].predicate_candidates == ("buy ipad",)
+    assert len(operand_ids(ir.ast)) == 2
+
+
+def test_non_temporal_between_phrase_does_not_create_event_operands() -> None:
+    ir = compile_query(
+        "What was the topic of discussion between John and Tim?",
+        _view("john", "tim", predicates=("discussion topic",)))
+
+    assert not isinstance(ir.ast, DateDifference)
+    assert len(ir.ast_operands) == 2
+
+
 def test_how_long_does_not_become_a_count() -> None:
     """Both open with 'how'; only one of them is a count."""
     assert parse_slots("How long did Alice stay?").is_count is False

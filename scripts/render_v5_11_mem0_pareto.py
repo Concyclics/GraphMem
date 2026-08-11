@@ -367,13 +367,17 @@ def plot_pareto(
     plt.close(fig)
 
 
-def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
+def plot_memory(
+    rows: list[dict[str, Any]],
+    base: Path,
+    *,
+    clients: tuple[int, ...] = (1, 4, 16, 64, 128, 256),
+) -> None:
     """Connect worker-scaling points within each system and concurrency."""
     plt = configure_plotting()
     from matplotlib.lines import Line2D
 
     workers = (1, 4, 8)
-    clients = (1, 4, 16, 64, 128, 256)
     client_markers = {
         1: "o", 4: "s", 16: "^", 64: "D", 128: "P", 256: "X",
     }
@@ -423,7 +427,7 @@ def plot_memory(rows: list[dict[str, Any]], base: Path) -> None:
     ]
     fig.legend(method_handles + client_handles,
                [handle.get_label() for handle in method_handles + client_handles],
-               loc="upper center", ncol=8,
+               loc="upper center", ncol=len(clients) + 2,
                bbox_to_anchor=(0.5, 0.91), frameon=False,
                handlelength=2.2, columnspacing=1.2)
     fig.suptitle("GraphMem 与 Mem0：按并发连接 worker 扩展点的 QPS–Memory 曲线",
@@ -528,7 +532,9 @@ def write_tex_table(path: Path, pairs: list[dict[str, Any]]) -> None:
             f"{row['qps_speedup']:.2f}$\\times$ & "
             f"{row['graphmem_p95_ms']:.0f} ms & {row['mem0_p95_ms']:.0f} ms & "
             f"{row['p95_reduction'] * 100:.1f}\\% \\\\")
-        if index in (5, 11):
+        if index + 1 < len(pairs) and (
+            pairs[index + 1]["workers"] != row["workers"]
+        ):
             lines.append("\\midrule")
     lines.extend(["\\bottomrule", "\\end{tabular}", ""])
     path.write_text("\n".join(lines), encoding="utf-8")
