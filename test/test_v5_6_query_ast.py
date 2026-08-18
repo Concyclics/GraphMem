@@ -200,6 +200,24 @@ def test_question_without_any_owner_still_compiles() -> None:
     assert len(operand_ids(node)) == 1
 
 
+@pytest.mark.parametrize("query", [
+    "What should I serve for dinner this weekend with my homegrown ingredients?",
+    "I've been having trouble with the battery life on my phone lately. Any tips?",
+])
+def test_advice_query_uses_unbound_semantic_retrieval(query: str) -> None:
+    view = _view("for", "my", predicates=(
+        "should be inclusive", "has been doing", "has been flying"))
+
+    ir = compile_query(query, view).promote_ast()
+
+    assert ir.slots is not None and ir.slots.is_advice
+    assert len(ir.operands) == 1
+    assert isinstance(ir.ast, Lookup)
+    assert ir.compile_confidence == 1.0
+    assert ir.operands[0].owner_aliases == ()
+    assert ir.operands[0].predicate_candidates == ()
+
+
 def test_operator_divergence_lowers_compile_confidence_and_softens_filters() -> None:
     compiled = compile_query(
         "Did both Alice and Bob have pets?",

@@ -19,9 +19,11 @@ class PredicateCanonicalizer:
     """Conservative mutual-nearest predicate clustering within compatible fact slots."""
 
     def __init__(self, store: SQLiteGraphStore, config: GraphMemV5Config,
-                 client: Any | None = None) -> None:
+                 client: Any | None = None,
+                 request_model_id: str | None = None) -> None:
         self.store = store; self.config = config
         self.model_id = config.models.embedding_model
+        self.request_model_id = request_model_id or self.model_id
         self.index_model_id = self.model_id + ":predicate-v1"
         if client is None:
             from openai import OpenAI
@@ -94,31 +96,47 @@ class PredicateCanonicalizer:
             else:
                 pending.append((predicate, item_id, content_hash))
         if pending:
-            started = time.perf_counter()
-            # 3 attempts backed off by 0.25/0.5s survive a dropped packet but not
-            # a server that is briefly busy or restarting, which is what a
-            # multi-hour corpus build actually meets: a sweep died on
-            # APIConnectionError after the endpoint came straight back.
-            attempts = 6
-            for attempt in range(attempts):
-                try:
-                    response = self.client.embeddings.create(
-                        model=self.model_id, input=[row[0] for row in pending])
-                    break
-                except Exception:
-                    if attempt == attempts - 1:
-                        raise
-                    time.sleep(min(8.0, 0.5 * (2 ** attempt)))
-            latency = (time.perf_counter() - started) * 1000
-            ordered = sorted(response.data, key=lambda row: row.index)
+            def embed_batch(batch):
+                started = time.perf_counter()
+                # A restored vLLM service may expose an 8K aggregate embedding
+                # context. Split only deterministic context-overflow failures;
+                # transient transport/server failures retain bounded backoff.
+                attempts = 6
+                for attempt in range(attempts):
+                    try:
+                        response = self.client.embeddings.create(
+                            model=self.request_model_id,
+                            input=[row[0] for row in batch])
+                        latency = (time.perf_counter() - started) * 1000
+                        usage = getattr(response, "usage", None)
+                        tokens = int(getattr(usage, "prompt_tokens", 0) or
+                                     getattr(usage, "total_tokens", 0) or 0)
+                        return (sorted(response.data, key=lambda row: row.index),
+                                tokens, latency)
+                    except Exception as error:
+                        status_code = getattr(error, "status_code", None)
+                        message = str(error).casefold()
+                        if (len(batch) > 1 and status_code == 400
+                                and ("maximum context length" in message
+                                     or "context length" in message)):
+                            midpoint = len(batch) // 2
+                            left, left_tokens, left_latency = embed_batch(
+                                batch[:midpoint])
+                            right, right_tokens, right_latency = embed_batch(
+                                batch[midpoint:])
+                            return (left + right, left_tokens + right_tokens,
+                                    left_latency + right_latency)
+                        if attempt == attempts - 1:
+                            raise
+                        time.sleep(min(8.0, 0.5 * (2 ** attempt)))
+                raise RuntimeError("predicate embedding retry exhausted")
+
+            ordered, tokens, latency = embed_batch(pending)
             inserts = []
             for (predicate, item_id, content_hash), item in zip(pending, ordered):
                 vector = np.asarray(item.embedding, dtype=np.float32)
                 rows[predicate] = vector; inserts.append((item_id, content_hash, vector))
             self.store.upsert_embeddings(memory_id, self.index_model_id, inserts)
-            usage = getattr(response, "usage", None)
-            tokens = int(getattr(usage, "prompt_tokens", 0) or
-                         getattr(usage, "total_tokens", 0) or 0)
             self.store.log_embedding_call(
                 stable_id("embedding-call", memory_id, "predicate", *(row[2] for row in pending)),
                 memory_id, self.index_model_id, len(pending), tokens, latency)

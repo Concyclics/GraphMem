@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..domain import AlgebraResult, EvidenceCertificate
+from ..domain import AlgebraResult, EvidenceCertificate, TruthValue
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +39,7 @@ def compose(result: AlgebraResult | None,
             certificate: EvidenceCertificate | None = None) -> AnswerDraft | None:
     """Return a closed-form draft, or ``None`` when the operator has no such form."""
     if result is None or result.answer_kind not in {
-            "count", "list", "group", "existence", "date_difference", "state", "ordinal"}:
+            "count", "sum", "list", "group", "existence", "date_difference", "state", "ordinal"}:
         return None
     kind = result.answer_kind
     certified = bool(result.scope_complete and not result.degradations
@@ -59,6 +59,12 @@ def compose(result: AlgebraResult | None,
             return None
         total = result.count if result.count is not None else len(result.members)
         text = str(total)
+    elif kind == "sum":
+        if not certified or result.numeric_total is None:
+            return None
+        total = result.numeric_total
+        rendered = str(int(total)) if float(total).is_integer() else str(total)
+        text = f"{rendered} {result.unit}".strip()
     elif kind == "list":
         text = _members_text(result)
     elif kind == "group":
@@ -66,11 +72,18 @@ def compose(result: AlgebraResult | None,
                 for owner, values in sorted(result.groups.items())]
         text = "; ".join(rows)
     elif kind == "existence":
+        truth = result.truth_value
+        if truth == TruthValue.UNKNOWN:
+            return None
         # An unclosed scope cannot prove absence, so only a positive witness set
         # may answer here.
-        if not result.members and not certified:
+        if truth == TruthValue.FALSE and not certified:
             return None
-        text = "yes" if result.members else "no"
+        if truth is None and not result.members and not certified:
+            return None
+        text = ("no" if truth == TruthValue.FALSE
+                else "yes" if truth == TruthValue.TRUE
+                else "yes" if result.members else "no")
     elif kind == "date_difference":
         endpoints = sorted(result.temporal_endpoints, key=lambda row: row.key.sort_key)
         if len(endpoints) < 2:

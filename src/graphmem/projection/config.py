@@ -100,6 +100,11 @@ class ProjectionConfig:
     #: since otherwise collection_key degenerates to value_type (4.4 distinct
     #: per memory) and this over-merges.
     chain_includes_predicate: bool = True
+    #: ``graph_enumerated`` preserves the original projection contract.
+    #: ``atomic_covered`` additionally requires every source scene represented
+    #: by a member to have no missing/unresolved atomic extraction unit before
+    #: deterministic execution may treat the manifest as closed.
+    closure_policy: str = "graph_enumerated"
 
     def normalize_predicate(self, predicate: str) -> str:
         if self.predicate_normalization == "raw":
@@ -119,6 +124,8 @@ class ProjectionConfig:
             raise ValueError("span_min_chars must be positive")
         if self.predicate_normalization not in {"raw", "head", "head_stem"}:
             raise ValueError("invalid predicate normalization")
+        if self.closure_policy not in {"graph_enumerated", "atomic_covered"}:
+            raise ValueError("invalid manifest closure_policy")
 
     @property
     def any_enabled(self) -> bool:
@@ -166,4 +173,13 @@ ARMS: dict[str, ProjectionConfig] = {
                            chain_includes_predicate=False),
     "R2": ProjectionConfig(collection_manifest=True, chain_includes_scope=False,
                            chain_includes_predicate=False),
+    # Fresh V5.57 build: conservative head-stem collections avoid the measured
+    # over-merge of category/value-type keys, content-equal facts receive
+    # cross-session joins, and only atomically covered member scenes authorize
+    # a closed-world readout.
+    "R3": ProjectionConfig(collection_manifest=True, value_lattice=True,
+                           predicate_normalization="head_stem",
+                           chain_includes_scope=False,
+                           chain_includes_predicate=True,
+                           closure_policy="atomic_covered"),
 }

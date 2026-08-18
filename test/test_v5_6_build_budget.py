@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import threading
 
 import pytest
 
 from graphmem.build.budget import BuildTokenLedger
-from graphmem.build.semantic import strict_scene_schema
+from graphmem.build.semantic import QwenSemanticDistiller, strict_scene_schema
 from graphmem.config import GraphMemV5Config, ModelConfig, config_hash
 
 
@@ -68,6 +69,71 @@ def test_settling_releases_the_reservation_so_a_cheap_call_frees_room() -> None:
     ledger.settle(800, 100)  # the call was far cheaper than its upper bound
 
     assert ledger.reserve(800)[0]
+
+
+def test_strict_reservation_waits_for_actual_cost_before_falling_back() -> None:
+    """An in-flight upper bound must not make a later batch disappear."""
+    ledger = BuildTokenLedger("m", 100)
+    assert ledger.reserve(70)[0]
+    started = threading.Event()
+    finished = threading.Event()
+    result: list[tuple[bool, bool]] = []
+
+    def waiter() -> None:
+        started.set()
+        result.append(ledger.reserve(60, wait_for_capacity=True))
+        finished.set()
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    assert started.wait(timeout=1)
+    assert not finished.wait(timeout=0.05)
+
+    ledger.settle(70, 40)
+    assert finished.wait(timeout=1)
+    assert result == [(True, False)]
+    ledger.settle(60, 60)
+    thread.join(timeout=1)
+
+
+def test_strict_waiter_refuses_when_actual_cost_consumes_the_room() -> None:
+    ledger = BuildTokenLedger("m", 100)
+    assert ledger.reserve(70)[0]
+    started = threading.Event()
+    result: list[tuple[bool, bool]] = []
+
+    def waiter() -> None:
+        started.set()
+        result.append(ledger.reserve(60, wait_for_capacity=True))
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    assert started.wait(timeout=1)
+    ledger.settle(70, 70)
+    thread.join(timeout=1)
+
+    assert result == [(False, False)]
+    assert ledger.snapshot()["skipped_scenes"] == 1
+
+
+def test_cancelling_a_failed_call_wakes_a_strict_waiter() -> None:
+    ledger = BuildTokenLedger("m", 100)
+    assert ledger.reserve(70)[0]
+    started = threading.Event()
+    result: list[tuple[bool, bool]] = []
+
+    def waiter() -> None:
+        started.set()
+        result.append(ledger.reserve(60, wait_for_capacity=True))
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    assert started.wait(timeout=1)
+    ledger.cancel(70)
+    thread.join(timeout=1)
+
+    assert result == [(True, False)]
+    ledger.cancel(60)
 
 
 def test_the_snapshot_reports_utilization_and_degradation() -> None:
@@ -153,3 +219,22 @@ def test_the_estimate_carries_a_safety_margin() -> None:
     from graphmem.build.semantic import ESTIMATE_SAFETY
 
     assert ESTIMATE_SAFETY > 1.0
+
+
+def test_operational_reservation_override_is_conservative_without_config_mutation() -> None:
+    config = GraphMemV5Config(models=ModelConfig(
+        semantic_request_reservation_safety=1.0))
+    distiller = QwenSemanticDistiller(
+        None, config, "dataset", client=object(),
+        request_reservation_safety_override=1.5)
+
+    estimate = distiller._strict_request_estimate(
+        "system", {"payload": "x" * 1000}, 5120)
+
+    assert distiller.request_reservation_safety == 1.5
+    assert config.models.semantic_request_reservation_safety == 1.0
+    assert estimate > 5120 * 1.5
+    with pytest.raises(ValueError, match="reservation safety override"):
+        QwenSemanticDistiller(
+            None, config, "dataset", client=object(),
+            request_reservation_safety_override=0.9)

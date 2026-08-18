@@ -101,6 +101,28 @@ def test_exact_lookup_priority_preserves_normal_graph_route(tmp_path: Path) -> N
     assert len(result.retrieved_turn_ids) <= 32
 
 
+def test_advice_plan_keeps_graph_retrieval_without_false_fact_proof(
+        tmp_path: Path) -> None:
+    store = _semantic_store(tmp_path / "graph.sqlite")
+    result = GraphNavigator(
+        store,
+        harness_profile=HarnessProfile.H11_UNIFIED_IR,
+        native_seed_fusion=True,
+        obligation_aware_packing=True,
+        hierarchical_routing=True,
+    ).navigate(
+        "travel", "Can you suggest some useful travel accessories?",
+        QueryBudget(max_evidence_turns=32, max_evidence_tokens=2_000),
+    )
+
+    assert result.trace["execution_mode"] == "hierarchical_graph"
+    assert result.trace["advice_semantic_fusion"] is True
+    assert result.trace["fact_reservoir"] == {}
+    assert result.trace["binding_reasons"] == {
+        "advice_semantic_binding_skipped": 1}
+    assert not any(row.mandatory for row in result.candidate_scores)
+
+
 def test_exact_lookup_priority_does_not_activate_without_direct_fact(
         tmp_path: Path) -> None:
     store = _semantic_store(tmp_path / "graph.sqlite")

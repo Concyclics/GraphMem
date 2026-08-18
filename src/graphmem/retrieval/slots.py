@@ -60,6 +60,20 @@ _INDIRECT_FRAME = re.compile(
     r"^\s*(?:do|does|did|can|could|would|will)\s+(?:you|we|i)\s+"
     r"(?:know|recall|remember|tell\s+me|say)\s*(?:me\s+)?(?:about\s+)?", re.I)
 _POLITE_FRAME = re.compile(r"^\s*(?:please\s+)?(?:tell\s+me|remind\s+me|list)\s*(?:about\s+)?", re.I)
+# Open-ended advice is a synthesis request, not a request for one graph
+# predicate whose wording happens to overlap the question.  Keep this wording
+# router shared by retrieval and answer rendering so the two stages cannot
+# silently disagree about whether a question is a recommendation.
+ADVICE_QUERY_RE = re.compile(
+    r"\b(?:can|could|would) you (?:recommend|suggest|give|help)\b|"
+    r"\bdo you have (?:any|some) (?:\w+\s+){0,3}"
+    r"(?:tips?|advice|suggestions?|recommendations?|ideas?)\b|"
+    r"\b(?:any|some) (?:\w+\s+){0,3}"
+    r"(?:tips?|advice|suggestions?|recommendations?|ideas?)\b|"
+    r"\bwhat (?:should|could) i\b|\bwhat do you think\b|"
+    r"\bdo you think\b|\bcould there be a reason\b",
+    re.I,
+)
 # Plural answer heads mean a list is expected even when only one owner is named.
 PLURAL_HINTS = {
     "places", "cities", "countries", "locations", "venues", "restaurants", "people",
@@ -106,10 +120,13 @@ class QuerySlots:
     polarity: str = "positive"
     negation: bool = False
     is_count: bool = False
+    is_sum: bool = False
+    is_unit_rate: bool = False
     is_existence: bool = False
     is_duration: bool = False
     is_latest: bool = False
     is_list: bool = False
+    is_advice: bool = False
     possessive: bool = False
     expects_multiple: bool = False
     indirect: bool = False
@@ -145,6 +162,12 @@ def _strip_frames(query: str) -> tuple[str, bool]:
 def _has(tokens: frozenset[str], words) -> bool:
     """Whole-token membership, so 'now' never matches inside 'know'."""
     return bool(tokens & set(words))
+
+
+def is_advice_query(query: str) -> bool:
+    """Detect an open-ended advice/recommendation request from its wording."""
+
+    return bool(ADVICE_QUERY_RE.search(" ".join(query.split())))
 
 
 def _question_terms(row: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
@@ -187,17 +210,42 @@ def parse_slots(query: str) -> QuerySlots:
 
     leading = row[0] if row else ""
     is_count = ("how" in tokens and _has(tokens, COUNT_HEADS)) or leading == "count"
+    # A per-item price is a quotient, not a sum.  Detect it before the broad
+    # "how much did I spend" rule so a total plus an item count is divided once
+    # instead of instructing the answer model to add unrelated currency values.
+    is_unit_rate = bool(
+        "how" in tokens and "much" in tokens
+        and tokens & {"each", "per"}
+        and tokens & {"spent", "spend", "paid", "pay", "cost", "costs", "price"}
+    )
+    # A total expenditure is a numeric reduction over several facts, not the
+    # number of facts and not a scalar price lookup.
+    is_sum = (not is_unit_rate) and (bool(
+        (tokens & {"sum", "total", "altogether", "combined"})
+        and tokens & {
+            "amount", "amounts", "spent", "spend", "paid", "pay",
+            "cost", "costs", "sum", "total",
+        }
+    ) or bool(
+        "how" in tokens and "much" in tokens
+        and tokens & {"spent", "spend", "paid", "pay", "altogether", "total"}
+    ))
     is_duration = "how" in tokens and _has(tokens, DURATION_WORDS)
+    is_advice = is_advice_query(query)
     # "How long" is a duration question, not a count one, even though both open
     # with "how".
     if is_duration:
+        is_count = False
+    if is_sum or is_unit_rate:
         is_count = False
 
     quantifier = next((word for word in ("both", "each", "either", "every", "all", "any",
                                          "respectively") if word in tokens), "")
     # An existence question leads with an auxiliary verb; "Did they both ..." has
     # to reach EXISTS_ALL rather than being captured by the quantifier.
-    is_existence = leading in EXIST_LEADS and not is_count and not is_duration
+    is_existence = (
+        leading in EXIST_LEADS and not is_count and not is_sum
+        and not is_duration and not is_advice)
 
     ordinal_index: int | None = None
     ordinal_order = "ascending"
@@ -241,9 +289,12 @@ def parse_slots(query: str) -> QuerySlots:
         is_latest = False
 
     negation = _has(tokens, NEGATION_WORDS)
-    is_list = (leading in LIST_HEADS or "list" in tokens) and not is_count and not is_duration
+    is_list = ((leading in LIST_HEADS or "list" in tokens)
+               and not is_count and not is_sum and not is_duration)
     # A plural answer head asks for a set even with a single owner named.
-    expects_multiple = bool(tokens & PLURAL_HINTS) or quantifier in {"all", "every", "both", "each"}
+    expects_multiple = (bool(tokens & PLURAL_HINTS)
+                        or quantifier in {"all", "every", "both", "each"}
+                        or is_unit_rate)
 
     answer_slot = next((name for name, words in ANSWER_SLOTS if _has(tokens, words)), "")
     value_type = next((name for name, words in VALUE_TYPES if _has(tokens, words)), None)
@@ -271,8 +322,11 @@ def parse_slots(query: str) -> QuerySlots:
         ordinal_index=ordinal_index, ordinal_order=ordinal_order,
         temporal_relation=temporal_relation, temporal_phrase=temporal_phrase,
         distinct_by=distinct_by, polarity="negative" if negation else "positive",
-        negation=negation, is_count=is_count, is_existence=is_existence,
+        negation=negation, is_count=is_count, is_sum=is_sum,
+        is_unit_rate=is_unit_rate,
+        is_existence=is_existence,
         is_duration=is_duration, is_latest=is_latest, is_list=is_list,
+        is_advice=is_advice,
         possessive=possessive, expects_multiple=expects_multiple, indirect=indirect,
         temporal_key=temporal_key,
         content_terms=content_terms, head_terms=head_terms, action_terms=action_terms,

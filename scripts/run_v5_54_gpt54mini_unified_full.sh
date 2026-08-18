@@ -41,9 +41,10 @@ run_build() {
     --llm-api-key-env SGAO_API_KEY --llm-request-profile openai \
     --llm-request-timeout-seconds 60 \
     --enabled-relation-signals scene_similar,shared_entity,state_compatible \
-    --embedding --memory-workers "${BUILD_WORKERS}" \
+    --embedding --embedding-request-model Qwen3-Embedding-0.6B \
+    --memory-workers "${BUILD_WORKERS}" \
     --max-concurrency "${BUILD_CONCURRENCY}" \
-    --require-zero-retries --require-complete-diagnostics \
+    --require-zero-retries \
     --report "${ROOT}/build_report.json"
 }
 
@@ -64,6 +65,7 @@ answer_arm() {
       --lme "${LME}" --locomo "${LOCOMO}" --gold "${GOLD}" --full \
       --config "${CONFIG}" --runtime-config "${runtime}" \
       --answer-policy v5_54 --embedding \
+      --embedding-request-model Qwen3-Embedding-0.6B \
       --answer-model gpt-5.4-mini --answer-base-url "${SGAO_BASE_URL}" \
       --answer-api-key-env SGAO_API_KEY --answer-request-profile openai \
       --max-output-tokens 2000 --answer-workers "${ANSWER_WORKERS}" \

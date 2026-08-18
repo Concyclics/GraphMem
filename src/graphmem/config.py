@@ -327,6 +327,17 @@ class RetrievalRuntimeConfig:
     hierarchy_operator_aware: bool = True
     obligation_aware_packing: bool = True
     precision_aware_packing: bool = False
+    # Preserve a bounded graph-precision head, then fill from a source-facing
+    # coverage rank that is insensitive to projection fan-out.
+    dual_lane_packing: bool = False
+    # Named dialogue and temporal/state queries benefit from the dual lane,
+    # while anonymous exact/collection/count queries retain more complete
+    # witnesses under the legacy relevance order.  This gate uses only input
+    # transcript shape and compiled QueryIR operator.
+    dual_lane_operator_aware: bool = False
+    dual_lane_precision_head: int = 32
+    dual_lane_rrf_k: int = 60
+    dual_lane_proof_reserve: bool = False
     # 0 keeps the full id-only reservoir. Positive values expose a genuine
     # candidate precision/recall operating point before evidence packing.
     candidate_pool_limit: int = 0
@@ -395,6 +406,8 @@ class RetrievalRuntimeConfig:
             "snapshot_cache_memories": self.snapshot_cache_memories,
             "metadata_cache_memories": self.metadata_cache_memories,
             "exact_lookup_turn_limit": self.exact_lookup_turn_limit,
+            "dual_lane_precision_head": self.dual_lane_precision_head,
+            "dual_lane_rrf_k": self.dual_lane_rrf_k,
             "query_witness_seed_count": self.query_witness_seed_count,
             "query_witness_rare_df": self.query_witness_rare_df,
             "query_witness_min_shared_terms": self.query_witness_min_shared_terms,
@@ -455,6 +468,11 @@ class RetrievalRuntimeConfig:
             "hierarchy_operator_aware": self.hierarchy_operator_aware,
             "obligation_aware_packing": self.obligation_aware_packing,
             "precision_aware_packing": self.precision_aware_packing,
+            "dual_lane_packing": self.dual_lane_packing,
+            "dual_lane_operator_aware": self.dual_lane_operator_aware,
+            "dual_lane_precision_head": self.dual_lane_precision_head,
+            "dual_lane_rrf_k": self.dual_lane_rrf_k,
+            "dual_lane_proof_reserve": self.dual_lane_proof_reserve,
             "candidate_pool_limit": self.candidate_pool_limit,
             "span_pack_window": self.span_pack_window,
             "obligation_aware_relations": self.obligation_aware_relations,
@@ -607,6 +625,10 @@ class GraphMemV5Config:
     storage: StorageConfig = field(default_factory=StorageConfig)
     coarsen: CoarsenConfig = field(default_factory=CoarsenConfig)
     edges: EdgeConfig = field(default_factory=EdgeConfig)
+    # Deterministic post-extraction structure published as part of the same
+    # graph snapshot. P0 preserves all historical builds; newer profiles can
+    # add manifests/content joins without another generative call.
+    projection_profile: str = "P0"
     query_budget: QueryBudget = field(default_factory=QueryBudget)
 
     def __post_init__(self) -> None:
@@ -628,6 +650,11 @@ class GraphMemV5Config:
             raise ValueError("invalid predicate cluster scope")
         if self.edges.predicate_cluster_mode not in {"mutual_pair", "agglomerative"}:
             raise ValueError("invalid predicate cluster mode")
+        from .projection.config import ARMS
+        if self.projection_profile not in ARMS:
+            raise ValueError(
+                f"invalid projection_profile {self.projection_profile!r}; "
+                f"choose from {sorted(ARMS)}")
         enabled_signals = tuple(self.edges.enabled_relation_signals)
         if len(enabled_signals) != len(set(enabled_signals)):
             raise ValueError("enabled_relation_signals must not contain duplicates")
@@ -759,6 +786,7 @@ def config_from_dict(payload: Mapping[str, Any]) -> GraphMemV5Config:
         storage=_section(StorageConfig, value.get("storage")),
         coarsen=_section(CoarsenConfig, value.get("coarsen")),
         edges=_section(EdgeConfig, value.get("edges")),
+        projection_profile=str(value.get("projection_profile", "P0")),
         query_budget=_section(QueryBudget, value.get("query_budget")),
     )
 

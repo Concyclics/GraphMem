@@ -91,6 +91,20 @@ def test_query_relation_view_removes_owners_and_answer_head() -> None:
     assert relation.dense is False
 
 
+def test_advice_view_uses_only_the_whole_semantic_question() -> None:
+    ir = QueryIR(
+        "My phone battery is weak. Any tips?", QueryOperator.LOOKUP,
+        (OperandSpec("only"),), (),
+        slots=QuerySlots(
+            is_advice=True,
+            content_terms=("phone", "battery", "weak", "tips")))
+
+    views = build_views(ir, max_per_operand=6, query_relation_view=True)
+
+    assert [(row.kind, row.text, row.dense) for row in views] == [
+        ("full_query", ir.query, True)]
+
+
 def test_relational_view_scoring_keeps_reach_but_demotes_owner_only_exact() -> None:
     turns = [
         _turn("s1", 0, "Unrelated photo. [Media shared by Alice; caption: a tree]"),

@@ -256,7 +256,8 @@ def build_views(ir: QueryIR, *, max_per_operand: int,
     """
     views: list[QueryView] = [QueryView(stable_id("view", ir.query, "full"), "full_query", ir.query,
                                         None, dense=True)]
-    if query_relation_view and ir.slots is not None:
+    if (query_relation_view and ir.slots is not None
+            and not ir.slots.is_advice):
         owner_terms = frozenset(
             term for operand in ir.operands for alias in operand.owner_aliases
             for term in content_terms(alias))

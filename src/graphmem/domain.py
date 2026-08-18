@@ -111,12 +111,21 @@ class QueryOperator(StrEnum):
     INTERSECTION_DISTINCT = "intersection_distinct"
     GROUP_BY_OWNER = "group_by_owner"
     COUNT_DISTINCT = "count_distinct"
+    SUM = "sum"
     EXISTS_ALL = "exists_all"
     ARGMIN_TIME = "argmin_time"
     ARGMAX_TIME = "argmax_time"
     DATE_DIFFERENCE = "date_difference"
     LATEST_STATE = "latest_state"
     ORDINAL = "ordinal"
+
+
+class TruthValue(StrEnum):
+    """Three-valued truth for open-world memory queries."""
+
+    TRUE = "true"
+    FALSE = "false"
+    UNKNOWN = "unknown"
 
 
 class CertificateStatus(StrEnum):
@@ -835,6 +844,9 @@ class AlgebraResult:
     scope_complete: bool = False
     answer_kind: str = "lookup"
     degradations: tuple[str, ...] = ()
+    numeric_total: float | None = None
+    unit: str = ""
+    truth_value: TruthValue | None = None
 
 
 @dataclass(frozen=True, slots=True)

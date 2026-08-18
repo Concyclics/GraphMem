@@ -247,13 +247,23 @@ class QwenSemanticDistiller:
                  worker_limit: int = 16,
                  request_profile: str = "qwen",
                  frozen_cache_only: bool = False,
-                 frozen_fallback_calls: int = 0) -> None:
+                 frozen_fallback_calls: int = 0,
+                 request_reservation_safety_override: float | None = None) -> None:
         self.store, self.config, self.dataset_hash = store, config, dataset_hash
         if worker_limit < 1:
             raise ValueError("worker_limit must be positive")
         if request_profile not in {"qwen", "openai"}:
             raise ValueError("request_profile must be qwen or openai")
         self.request_profile = request_profile
+        configured_safety = config.models.semantic_request_reservation_safety
+        if (request_reservation_safety_override is not None
+                and not configured_safety <= request_reservation_safety_override <= 2.0):
+            raise ValueError(
+                "request reservation safety override must be between the "
+                "configured value and 2.0")
+        self.request_reservation_safety = (
+            configured_safety if request_reservation_safety_override is None
+            else request_reservation_safety_override)
         # A full build creates one distiller per Memory.  Without a process-wide
         # gate, ``memory_workers * 16`` requests can reach vLLM even though
         # ModelConfig.max_concurrency is meant to be the global service limit.
@@ -414,7 +424,7 @@ class QwenSemanticDistiller:
         """
         input_chars = len(system) + len(canonical_json(payload))
         estimate = int(input_chars / CHARS_PER_TOKEN) + 64 + max_tokens
-        return int(estimate * self.config.models.semantic_request_reservation_safety)
+        return int(estimate * self.request_reservation_safety)
 
     def _strict_estimate(
         self, batch: Sequence[Any], system: str,
@@ -541,7 +551,11 @@ class QwenSemanticDistiller:
         strict_prompt = strict_base + (
             f" This call's schema permits at most {max_facts} facts per scene; obey each scene's k.")
         estimate = self._strict_estimate(batch, strict_prompt, payload, output_cap)
-        allowed, degrade = self._ledger().reserve(estimate)
+        ledger = self._ledger()
+        allowed, degrade = ledger.reserve(
+            estimate,
+            wait_for_capacity=self.config.models.semantic_hard_request_reservation,
+        )
         if not allowed:
             # Budget exhausted: keep the scenes in the graph with deterministic
             # summaries rather than dropping the tail of the conversation.
@@ -554,14 +568,18 @@ class QwenSemanticDistiller:
                 batch, units_by_scene, fact_caps)
             strict_prompt = strict_base + (
                 f" This call's schema permits at most {max_facts} facts per scene; obey each scene's k.")
-        response, usage = self._call(
-            memory_id, "scene_semantic", strict_prompt, payload, len(batch),
-            max_facts=max_facts,
-            max_information_units=max(
-                (len(value) for value in units_by_scene.values()), default=0),
-            max_turn_index=max(
-                (len(value) for value in turn_aliases.values()), default=1) - 1)
-        self._ledger().settle(estimate, int(usage.get("total_tokens", 0)))
+        try:
+            response, usage = self._call(
+                memory_id, "scene_semantic", strict_prompt, payload, len(batch),
+                max_facts=max_facts,
+                max_information_units=max(
+                    (len(value) for value in units_by_scene.values()), default=0),
+                max_turn_index=max(
+                    (len(value) for value in turn_aliases.values()), default=1) - 1)
+        except BaseException:
+            ledger.cancel(estimate)
+            raise
+        ledger.settle(estimate, int(usage.get("total_tokens", 0)))
         rows = self._strict_rows(response, scene_aliases, turn_aliases)
         by_scene = {str(row.get("i")): row for row in rows}
         packets = {
@@ -610,15 +628,23 @@ class QwenSemanticDistiller:
                     }
                 retry_estimate = self._strict_estimate(
                     (scene,), strict_prompt, retry_payload, retry_cap)
-                if not self._ledger().reserve(retry_estimate)[0]:
+                retry_allowed = ledger.reserve(
+                    retry_estimate,
+                    wait_for_capacity=self.config.models.semantic_hard_request_reservation,
+                )[0]
+                if not retry_allowed:
                     continue
-                repaired, retry_usage = self._call(
-                    memory_id, "scene_semantic_retry", strict_prompt, retry_payload, 1,
-                    max_tokens=retry_cap, retry_count=1,
-                    max_facts=fact_caps[scene.scene_id],
-                    max_information_units=len(units_by_scene[scene.scene_id]),
-                    max_turn_index=max(0, len(retry_turns.get("0", ())) - 1))
-                self._ledger().settle(retry_estimate, int(retry_usage.get("total_tokens", 0)))
+                try:
+                    repaired, retry_usage = self._call(
+                        memory_id, "scene_semantic_retry", strict_prompt, retry_payload, 1,
+                        max_tokens=retry_cap, retry_count=1,
+                        max_facts=fact_caps[scene.scene_id],
+                        max_information_units=len(units_by_scene[scene.scene_id]),
+                        max_turn_index=max(0, len(retry_turns.get("0", ())) - 1))
+                except BaseException:
+                    ledger.cancel(retry_estimate)
+                    raise
+                ledger.settle(retry_estimate, int(retry_usage.get("total_tokens", 0)))
                 for row in self._strict_rows(repaired, retry_aliases, retry_turns):
                     candidate = self._validate_scene(
                         scene, row, units=units_by_scene[scene.scene_id],
@@ -1131,7 +1157,7 @@ class QwenSemanticDistiller:
                 "hard_request_reservation": (
                     self.config.models.semantic_hard_request_reservation),
                 "request_reservation_safety": (
-                    self.config.models.semantic_request_reservation_safety),
+                    self.request_reservation_safety),
                 "max_information_units": max_information_units,
                 "max_turn_index": max_turn_index,
             })

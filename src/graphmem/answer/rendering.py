@@ -90,9 +90,19 @@ class AnswerConfig:
     aggregation_ledger_enabled: bool = False
     aggregation_ledger_limit: int = 24
     # Render only an operation-specific execution card instead of duplicating
-    # snippets from every ledger candidate. Candidate IDs remain in the trace
-    # for audit, but do not consume prompt budget or become mandatory evidence.
+    # snippets from every ledger candidate. A bounded worksheet over the best
+    # already-packed direct turns is added by the readout policy.
     aggregation_execution_card: bool = False
+    # Add the V5.60 bounded source-backed operand worksheet to compact
+    # aggregation cards.  The full-set prototype was not a no-regression
+    # winner, so this remains an explicit experiment instead of silently
+    # changing the validated V5.54 policy.
+    aggregation_operand_worksheet_enabled: bool = False
+    # V5.63 exposes the worksheet only when its operands pass a deterministic
+    # completeness gate.  This avoids the V5.60 regression where a partial
+    # worksheet looked authoritative and displaced the correct full-context
+    # answer.  ``False`` preserves the original all-or-nothing experiment.
+    aggregation_operand_worksheet_selective: bool = False
     # When a generic user/assistant transcript is re-packed to make room for
     # the aggregation ledger, keep the direct user statements before optional
     # assistant prose.  This is deliberately disabled for named multi-party
@@ -100,11 +110,14 @@ class AnswerConfig:
     # authoritative speakers.
     aggregation_source_reserve_enabled: bool = False
     aggregation_source_reserve_operations: tuple[str, ...] = (
-        "sum", "count_distinct")
+        "sum", "count_distinct", "unit_rate")
     # Route recommendation/advice questions to a contract that treats stored
     # preferences as constraints for synthesis rather than requiring the final
     # recommendation itself to appear verbatim in memory.
     preference_synthesis_enabled: bool = False
+    # ``domain_idf`` replaces a dense-dominated preference anchor with a
+    # domain-scoped IDF reading index over direct packed user turns.
+    preference_focus_strategy: str = "legacy"
     # Repeat the exact entity/relation and missing-fact guard after the evidence
     # block.  Long contexts can dilute the equivalent system instruction.
     exact_grounding_footer: bool = False
@@ -119,6 +132,17 @@ class AnswerConfig:
     # the verbose label glossary.  The saved budget pays for a post-evidence
     # query reminder without increasing any answer request.
     compact_topological_contract: bool = False
+    # Repeat bounded, query-centered excerpts from the *full text* of turns
+    # that are already present in the evidence pack.  Relation spans can point
+    # at the beginning of a long list while the requested item is near its
+    # tail; this reading index repairs that presentation loss without adding a
+    # turn or changing retrieval coverage.
+    query_focus_index_enabled: bool = False
+    query_focus_index_limit: int = 4
+    query_focus_excerpt_chars: int = 360
+    # Allow Query Focus for explicit date-difference surfaces (ago/before/
+    # between/passed/take), while retaining the temporal exclusion elsewhere.
+    temporal_query_focus_enabled: bool = False
     # ``default`` applies the contextual-date/footer/compact-layout rewrite
     # only when no specialized aggregation or preference contract is active.
     # Those contracts already own the post-evidence readout semantics.
@@ -128,6 +152,14 @@ class AnswerConfig:
     # label-free V5.43--V5.54 winner routes without depending on offline prompt
     # materializers.
     readout_policy: str = "legacy"
+    # Compile a bounded, deterministic binding index after the validated
+    # readout policy.  It quotes only already-packed evidence and never changes
+    # the evidence set/order.  Kept opt-in until paired full-set validation.
+    answer_plan_enabled: bool = False
+    answer_plan_max_candidates: int = 5
+    answer_plan_excerpt_chars: int = 440
+    answer_plan_kinds: tuple[str, ...] = (
+        "date_difference", "temporal_order")
     closed_form_enabled: bool = True
     # Keep the algebraic draft available for auditing, but do not place it in
     # the answer prompt unless an experiment explicitly opts in.  A noisy
@@ -163,9 +195,10 @@ class AnswerConfig:
             "aggregation_ledger_enabled": True,
             "aggregation_ledger_limit": 32,
             "aggregation_execution_card": False,
+            "aggregation_operand_worksheet_enabled": False,
             "aggregation_source_reserve_enabled": True,
             "aggregation_source_reserve_operations": (
-                "sum", "count_distinct"),
+                "sum", "count_distinct", "unit_rate"),
             "preference_synthesis_enabled": True,
             "exact_grounding_footer": False,
             "question_date_mode": "query_relative",
@@ -182,6 +215,31 @@ class AnswerConfig:
         values.update(overrides)
         return cls(**values)
 
+    @classmethod
+    def v5_63(cls, **overrides) -> "AnswerConfig":
+        """Return the validated selective-accuracy extension of V5.54.
+
+        The extension keeps the same 64-turn retrieval budget and permits at
+        most the readout policy's existing +500-token allowance per request.
+        """
+
+        values = {
+            # Only the paired-positive temporal surface is enabled.  Broad
+            # lookup Query Focus had small regressions and remains off.
+            "query_focus_index_enabled": False,
+            "temporal_query_focus_enabled": True,
+            # The paired-positive temporal arm used 480-character excerpts.
+            # Shortening them to 360 changed the 64-turn re-pack boundary and
+            # lost endpoint context even though the same focus turns were
+            # selected.
+            "query_focus_excerpt_chars": 480,
+            "preference_focus_strategy": "domain_idf",
+            "aggregation_operand_worksheet_enabled": True,
+            "aggregation_operand_worksheet_selective": True,
+        }
+        values.update(overrides)
+        return cls.v5_54(**values)
+
     def __post_init__(self) -> None:
         if self.span_window is not None and self.span_window < 0:
             raise ValueError("span_window must be None or non-negative")
@@ -197,6 +255,28 @@ class AnswerConfig:
             raise ValueError("sampling_seed must be non-negative")
         if self.aggregation_ledger_limit <= 0:
             raise ValueError("aggregation_ledger_limit must be positive")
+        if self.answer_plan_max_candidates <= 0:
+            raise ValueError("answer_plan_max_candidates must be positive")
+        if self.answer_plan_excerpt_chars < 80:
+            raise ValueError("answer_plan_excerpt_chars must be at least 80")
+        if self.query_focus_index_limit <= 0:
+            raise ValueError("query_focus_index_limit must be positive")
+        if self.query_focus_excerpt_chars < 120:
+            raise ValueError("query_focus_excerpt_chars must be at least 120")
+        if self.preference_focus_strategy not in {"legacy", "domain_idf"}:
+            raise ValueError(
+                "preference_focus_strategy must be legacy or domain_idf")
+        if (self.aggregation_operand_worksheet_selective
+                and not self.aggregation_operand_worksheet_enabled):
+            raise ValueError(
+                "selective aggregation worksheet requires worksheet enabled")
+        allowed_plan_kinds = {
+            "date_difference", "relative_time", "age_projection",
+            "latest_state", "temporal_lookup", "temporal_order"}
+        unknown_plan_kinds = set(self.answer_plan_kinds) - allowed_plan_kinds
+        if unknown_plan_kinds:
+            raise ValueError(
+                f"unsupported answer_plan_kinds: {sorted(unknown_plan_kinds)}")
         if self.question_date_mode not in {"always", "query_relative", "never"}:
             raise ValueError(
                 "question_date_mode must be always, query_relative, or never")

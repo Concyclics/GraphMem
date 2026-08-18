@@ -28,7 +28,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from graphmem.build import GraphBuildPipeline, QwenSemanticDistiller  # noqa: E402
+from graphmem.build import (  # noqa: E402
+    GraphBuildPipeline, QwenSemanticDistiller,
+    reset_unpublished_llm_attempts,
+)
 from graphmem.build.canonicalize import PredicateCanonicalizer  # noqa: E402
 from graphmem.config import config_hash, load_config  # noqa: E402
 from graphmem.embedding import QwenEmbeddingIndex  # noqa: E402
@@ -66,6 +69,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--llm-request-timeout-seconds", type=float, default=120.0,
         help="fail one external request so the resumable build can recover")
+    parser.add_argument(
+        "--semantic-request-reservation-safety-override", type=float,
+        help=("operational recovery margin for exact token-gate offenders; "
+              "does not alter graph semantics or the declared config hash"))
     parser.add_argument("--relation-mask-propagation", action="store_true")
     parser.add_argument("--rare-lexical-relation", action="store_true")
     parser.add_argument(
@@ -78,6 +85,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--embedding", action="store_true",
         help="index every source turn with the configured embedding model")
+    parser.add_argument(
+        "--embedding-request-model",
+        help=("served-model alias sent to the embedding endpoint; storage and "
+              "cache identity remain the configured embedding model"))
     parser.add_argument(
         "--relation-embedding-db", type=Path,
         help=("separate cache for RoutingCard and atomic-summary vectors; "
@@ -200,6 +211,10 @@ def main() -> None:
 
     wanted = [row[0] for row in store._read(
         "SELECT memory_id FROM conversations ORDER BY memory_id")]
+    checkpoint_path = args.report.with_name(
+        f"{args.report.stem}_rows.jsonl")
+    progress_path = args.report.with_name(
+        f"{args.report.stem}_progress.json")
     prior_report_rows: list[dict] = []
     prior_report_summary: dict = {}
     if args.report.exists():
@@ -209,8 +224,38 @@ def main() -> None:
             prior_report_summary = dict(prior_payload.get("summary", {}))
         except (OSError, ValueError, TypeError):
             prior_report_rows = []
+    if checkpoint_path.exists():
+        try:
+            prior_report_rows.extend(
+                json.loads(line) for line in checkpoint_path.read_text(
+                    encoding="utf-8").splitlines() if line.strip())
+        except (OSError, ValueError, TypeError):
+            raise RuntimeError(
+                f"invalid build-row checkpoint: {checkpoint_path}")
+    prior_wall_seconds = float(prior_report_summary.get(
+        "wall_minutes", 0.0)) * 60.0
+    if progress_path.exists():
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            prior_wall_seconds = max(
+                prior_wall_seconds, float(progress.get("wall_seconds", 0.0)))
+        except (OSError, ValueError, TypeError):
+            raise RuntimeError(f"invalid build progress checkpoint: {progress_path}")
     built = {row[0] for row in store._read(
         "SELECT memory_id FROM graph_versions WHERE graph_checksum != ''")}
+    recovery_path = args.report.with_name(
+        f"{args.report.stem}_recovery.jsonl")
+    recovered_attempts = ()
+    if not args.rebuild_missing_diagnostics:
+        recovered_attempts = reset_unpublished_llm_attempts(store)
+        if recovered_attempts:
+            recovery_path.parent.mkdir(parents=True, exist_ok=True)
+            with recovery_path.open("a", encoding="utf-8") as handle:
+                for row in recovered_attempts:
+                    handle.write(json.dumps(row, sort_keys=True) + "\n")
+            print(
+                f"reset {len(recovered_attempts)} unpublished partial LLM "
+                f"attempts; audit={recovery_path}", flush=True)
     if args.rebuild_missing_diagnostics and prior_report_rows:
         diagnosed = {str(row.get("memory_id") or "")
                      for row in prior_report_rows}
@@ -269,16 +314,23 @@ def main() -> None:
             worker_limit=per_memory_llm_workers,
             request_profile=args.llm_request_profile,
             frozen_cache_only=args.frozen_semantic_cache_only,
-            frozen_fallback_calls=frozen_fallback_calls.get(memory_id, 0))
+            frozen_fallback_calls=frozen_fallback_calls.get(memory_id, 0),
+            request_reservation_safety_override=(
+                args.semantic_request_reservation_safety_override))
         if args.embedding:
-            QwenEmbeddingIndex(store, config, batch_size=128).index_memory(
-                memory_id)
+            QwenEmbeddingIndex(
+                store, config, batch_size=128,
+                request_model_id=args.embedding_request_model,
+            ).index_memory(memory_id)
         relation_index = (QwenEmbeddingIndex(
-            relation_store, config, batch_size=128)
+            relation_store, config, batch_size=128,
+            request_model_id=args.embedding_request_model)
                           if relation_store is not None else None)
         pipeline = GraphBuildPipeline(
             store, dataset_hash="v5.6-full", distiller=distiller,
-            predicate_canonicalizer=PredicateCanonicalizer(store, config),
+            predicate_canonicalizer=PredicateCanonicalizer(
+                store, config,
+                request_model_id=args.embedding_request_model),
             coarsen_vector_provider=(
                 relation_index.embed_graph_nodes if relation_index else None),
             relation_vector_provider=(
@@ -289,6 +341,7 @@ def main() -> None:
         diagnostics = dict(manifest.build_diagnostics)
         method = dict(diagnostics.get("method", {}))
         cir = dict(method.get("cir", {}))
+        projection = dict(method.get("projection", {}))
         budget_diagnostics = dict(diagnostics.get("build_token_budget") or {})
         return {"memory_id": memory_id,
                 "input_tokens": int(usage.get("uncached_input_tokens", 0)),
@@ -339,23 +392,42 @@ def main() -> None:
                     "atomic_candidate_signal_counts": dict(
                         cir.get("atomic_candidate_signal_counts", {})),
                     "accepted_pairs": int(cir.get("accepted_pairs", 0)),
-                }}
+                },
+                "projection_diagnostics": projection}
 
-    with ThreadPoolExecutor(max_workers=memory_workers) as pool:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    with (checkpoint_path.open("a", encoding="utf-8") as checkpoint_handle,
+          ThreadPoolExecutor(max_workers=memory_workers) as pool):
         futures = {pool.submit(build, item): item for item in pending}
-        for index, future in enumerate(as_completed(futures), 1):
+        for future in as_completed(futures):
             memory_id = futures[future]
             try:
-                results.append(future.result())
+                result = future.result()
             except Exception as error:  # noqa: BLE001 - one bad memory must not end the run
                 failures.append({"memory_id": memory_id, "error": repr(error)[:400]})
                 print(f"[build error] {memory_id}: {error!r}"[:300], flush=True)
                 continue
-            if index % 10 == 0:
-                elapsed = time.perf_counter() - started
-                rate = index / max(elapsed, 1e-9)
-                print(f"  built {index}/{len(pending)}  {elapsed/60:.1f}m elapsed, "
-                      f"~{(len(pending)-index)/max(rate,1e-9)/60:.0f}m left", flush=True)
+            results.append(result)
+            # The graph was already atomically published.  Persist its complete
+            # diagnostic row before accepting another completion so an API or
+            # process restart never forces a valid graph to be rebuilt merely
+            # because the final aggregate report was not reached.
+            checkpoint_handle.write(
+                json.dumps(result, sort_keys=True) + "\n")
+            checkpoint_handle.flush()
+            elapsed = time.perf_counter() - started
+            total_elapsed = prior_wall_seconds + elapsed
+            progress_tmp = progress_path.with_suffix(".tmp")
+            progress_tmp.write_text(json.dumps({
+                "wall_seconds": total_elapsed,
+                "diagnostic_rows": len(prior_report_rows) + len(results),
+            }, sort_keys=True) + "\n", encoding="utf-8")
+            progress_tmp.replace(progress_path)
+            completed = len(results)
+            if completed % 10 == 0:
+                rate = completed / max(elapsed, 1e-9)
+                print(f"  built {completed}/{len(pending)}  {elapsed/60:.1f}m elapsed, "
+                      f"~{(len(pending)-completed)/max(rate,1e-9)/60:.0f}m left", flush=True)
 
     def nearest_stats(values, unit: str) -> dict:
         rows = sorted(int(value) for value in values)
@@ -413,11 +485,17 @@ def main() -> None:
     diagnostics_by_memory.update({str(row["memory_id"]): row for row in results})
     all_build_rows = [diagnostics_by_memory[memory_id]
                       for memory_id in wanted if memory_id in diagnostics_by_memory]
+    diagnosed_before = {
+        str(row.get("memory_id") or "") for row in prior_report_rows}
+    inferred_preexisting = max(0, len(built) - len(built & diagnosed_before))
     prior_preexisting = int(prior_report_summary.get(
-        "memories_preexisting", len(built)))
-    prior_built = int(prior_report_summary.get("memories_built", 0))
+        "memories_preexisting", inferred_preexisting))
+    # The publication table is the durable source of truth across resumed
+    # passes.  Summing rows from successive reports under-counts whenever a
+    # failed pass publishes graphs before writing its final diagnostics.
     cumulative_built = min(
-        max(0, len(wanted) - prior_preexisting), prior_built + len(results))
+        max(0, len(wanted) - prior_preexisting),
+        max(0, len(built) + len(results) - prior_preexisting))
     report = {
         "config": str(args.config), "config_hash": config_hash(config),
         "target_db": str(args.target_db),
@@ -425,8 +503,7 @@ def main() -> None:
         "memories_preexisting": prior_preexisting,
         "memories_built": cumulative_built, "failures": failures,
         "wall_minutes": round(
-            float(prior_report_summary.get("wall_minutes", 0.0))
-            + (time.perf_counter() - started) / 60, 1),
+            (prior_wall_seconds + time.perf_counter() - started) / 60, 1),
         "tokens_per_memory": token_stats["total"],
         "build_token_stats": token_stats,
         "tokens_total": sum(row["total_tokens"] for row in ledger),
@@ -436,6 +513,8 @@ def main() -> None:
         "token_gate": token_gate,
         "token_gate_violations": over_gate,
         "embedding": args.embedding,
+        "embedding_request_model": (
+            args.embedding_request_model or config.models.embedding_model),
         "relation_embedding_db": (
             str(args.relation_embedding_db)
             if args.relation_embedding_db else None),
@@ -444,6 +523,7 @@ def main() -> None:
         "predicate_family_state_relations": (
             config.edges.predicate_family_state_relations),
         "enabled_relation_signals": list(config.edges.enabled_relation_signals),
+        "projection_profile": config.projection_profile,
         "memory_workers": memory_workers,
         "llm_workers_per_memory": per_memory_llm_workers,
         "max_concurrency": global_llm_limit,
@@ -452,6 +532,8 @@ def main() -> None:
         "llm_api_key_env": args.llm_api_key_env or None,
         "llm_request_profile": args.llm_request_profile,
         "llm_request_timeout_seconds": args.llm_request_timeout_seconds,
+        "semantic_request_reservation_safety_override": (
+            args.semantic_request_reservation_safety_override),
         "frozen_semantic_cache_only": args.frozen_semantic_cache_only,
         "frozen_semantic_source_report": (
             str(args.frozen_semantic_source_report)
@@ -474,11 +556,20 @@ def main() -> None:
                 row.get("build_quality", {}).get(
                     "budget_skipped_scenes", 0)) for row in all_build_rows),
         },
+        "recovery": {
+            "unpublished_attempts_reset_this_pass": len(recovered_attempts),
+            "discarded_api_tokens_this_pass": sum(int(
+                row.get("total_api_tokens", 0)) for row in recovered_attempts),
+            "audit_path": str(recovery_path),
+        },
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps({"summary": report, "rows": all_build_rows,
                                        "token_ledger": ledger}, indent=2) + "\n",
                            encoding="utf-8")
+    checkpoint_path.write_text("".join(
+        json.dumps(row, sort_keys=True) + "\n" for row in all_build_rows),
+        encoding="utf-8")
     print(json.dumps(report, indent=2)[:2000])
     store.close()
     if relation_store is not None:

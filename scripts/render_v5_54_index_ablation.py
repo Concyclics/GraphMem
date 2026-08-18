@@ -217,7 +217,7 @@ def main() -> None:
         r"\paragraph{查询侧 2$\times$2 消融。}"
         + " ".join(analysis_parts)
         + " " + interpretation
-        + r" 所有臂共享同一 Safe-Witness 图和 V5.54 label-free readout，"
+        + r" 所有臂共享同一图和 label-free readout，"
           r"因此索引路径变化与回答提示策略不再混合；32/64-turn 同时报告，"
           r"避免宽上下文饱和掩盖图索引的 Token--Accuracy 收益。"
         + "\n")

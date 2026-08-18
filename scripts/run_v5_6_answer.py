@@ -85,10 +85,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-output-tokens", type=int, default=0,
                         help="0 omits the API output cap; positive values enable an ablation cap")
     parser.add_argument(
-        "--answer-policy", choices=("legacy", "v5_54"), default="legacy",
+        "--answer-policy", choices=("legacy", "v5_54", "v5_63"),
+        default="legacy",
         help=("core answer/readout contract; v5_54 enables the validated "
               "typed, aggregation, inference and graph-block routes without "
               "offline prompt materializers"))
+    parser.add_argument(
+        "--answer-plan", action="store_true",
+        help=("append the opt-in V5.56 deterministic temporal/state binding "
+              "index after the validated readout policy"))
+    parser.add_argument("--answer-plan-max-candidates", type=int, default=5)
+    parser.add_argument("--answer-plan-excerpt-chars", type=int, default=440)
+    parser.add_argument(
+        "--answer-plan-kind", action="append",
+        choices=("date_difference", "relative_time", "age_projection",
+                 "latest_state", "temporal_lookup", "temporal_order"),
+        help=("eligible V5.56 AnswerPlan route; repeat to select several; "
+              "defaults to the conservative date-difference and explicit "
+              "temporal-order routes"))
     parser.add_argument("--answer-model",
                         help="answer backbone; defaults to models.llm_model")
     parser.add_argument("--answer-base-url",
@@ -140,6 +154,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--span-pack-window", type=int, default=96,
                         help="character context charged around each selected evidence span")
     parser.add_argument("--embedding", action="store_true")
+    parser.add_argument(
+        "--embedding-request-model",
+        help=("served embedding-model alias; storage/cache identity still comes "
+              "from the runtime/config embedding model"))
     parser.add_argument("--embedding-db", type=Path,
                         help="read turn vectors from a separate immutable SQLite sidecar")
     parser.add_argument(
@@ -236,6 +254,10 @@ def parse_args() -> argparse.Namespace:
         help=("replace rendered candidate snippets with a compact operation "
               "card; candidate IDs remain trace-only and are not reserved"))
     parser.add_argument(
+        "--aggregation-operand-worksheet", action="store_true",
+        help=("add the opt-in bounded V5.60 operand worksheet to compact "
+              "aggregation cards; disabled in the validated default"))
+    parser.add_argument(
         "--aggregation-source-reserve", action="store_true",
         help=("during aggregation prompt re-packing, preserve generic user "
               "source turns before optional assistant prose; named multi-party "
@@ -243,7 +265,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--aggregation-source-reserve-operation", action="append",
         choices=("sum", "count_distinct", "date_difference", "difference",
-                 "mean", "minimum", "maximum"),
+                 "mean", "minimum", "maximum", "unit_rate"),
         help=("aggregation operation eligible for direct-source reservation; "
               "repeat to select several; defaults to sum and count_distinct"))
     parser.add_argument(
@@ -267,6 +289,15 @@ def parse_args() -> argparse.Namespace:
         "--compact-topological-prompt", action="store_true",
         help=("replace the verbose graph-label glossary with its compact, "
               "semantically equivalent contract to reclaim answer tokens"))
+    parser.add_argument(
+        "--query-focus-index", action="store_true",
+        help=("repeat bounded query-centered excerpts from the full text of "
+              "already-packed anonymous turns; does not add evidence turns"))
+    parser.add_argument("--query-focus-limit", type=int, default=4)
+    parser.add_argument(
+        "--query-focus-excerpt-chars", type=int,
+        help=("override the answer policy's excerpt length; v5_54 defaults to "
+              "360 and v5_63 uses its validated 480-character setting"))
     parser.add_argument(
         "--focused-prompt-scope", choices=("all", "default"), default="all",
         help=("apply contextual date, recency footer and compact topology to "
@@ -384,10 +415,39 @@ def main() -> None:
                      if args.max_evidence_tokens else {}),
                   **({"max_answer_tokens": args.max_answer_tokens}
                      if args.max_answer_tokens else {})))
-    if args.answer_policy == "v5_54":
+    if args.answer_policy == "v5_63":
+        v563_overrides = ({
+            "max_output_tokens": args.max_output_tokens,
+        } if args.max_output_tokens else {})
+        if args.query_focus_excerpt_chars is not None:
+            v563_overrides["query_focus_excerpt_chars"] = (
+                args.query_focus_excerpt_chars)
+        answer_config = AnswerConfig.v5_63(**v563_overrides,
+            sampling_seed=args.sampling_seed,
+            query_focus_index_limit=args.query_focus_limit,
+            answer_plan_enabled=args.answer_plan,
+            answer_plan_max_candidates=args.answer_plan_max_candidates,
+            answer_plan_excerpt_chars=args.answer_plan_excerpt_chars,
+            answer_plan_kinds=tuple(
+                args.answer_plan_kind
+                or ("date_difference", "temporal_order")))
+    elif args.answer_policy == "v5_54":
         answer_config = AnswerConfig.v5_54(**({
             "max_output_tokens": args.max_output_tokens,
-        } if args.max_output_tokens else {}), sampling_seed=args.sampling_seed)
+        } if args.max_output_tokens else {}), sampling_seed=args.sampling_seed,
+            query_focus_index_enabled=args.query_focus_index,
+            query_focus_index_limit=args.query_focus_limit,
+            query_focus_excerpt_chars=(
+                args.query_focus_excerpt_chars
+                if args.query_focus_excerpt_chars is not None else 360),
+            aggregation_operand_worksheet_enabled=(
+                args.aggregation_operand_worksheet),
+            answer_plan_enabled=args.answer_plan,
+            answer_plan_max_candidates=args.answer_plan_max_candidates,
+            answer_plan_excerpt_chars=args.answer_plan_excerpt_chars,
+            answer_plan_kinds=tuple(
+                args.answer_plan_kind
+                or ("date_difference", "temporal_order")))
     else:
         answer_config = AnswerConfig(
             span_window=(args.span_pack_window if args.obligation_aware_packing
@@ -401,16 +461,29 @@ def main() -> None:
             aggregation_ledger_enabled=args.aggregation_ledger,
             aggregation_ledger_limit=args.aggregation_ledger_limit,
             aggregation_execution_card=args.aggregation_execution_card,
+            aggregation_operand_worksheet_enabled=(
+                args.aggregation_operand_worksheet),
             aggregation_source_reserve_enabled=args.aggregation_source_reserve,
             aggregation_source_reserve_operations=tuple(
                 args.aggregation_source_reserve_operation
-                or ("sum", "count_distinct")),
+                or ("sum", "count_distinct", "unit_rate")),
             preference_synthesis_enabled=args.preference_synthesis_prompt,
             exact_grounding_footer=args.exact_grounding_footer,
             question_date_mode=args.question_date_mode,
             question_recency_footer=args.question_recency_footer,
             compact_topological_contract=args.compact_topological_prompt,
+            query_focus_index_enabled=args.query_focus_index,
+            query_focus_index_limit=args.query_focus_limit,
+            query_focus_excerpt_chars=(
+                args.query_focus_excerpt_chars
+                if args.query_focus_excerpt_chars is not None else 360),
             focused_prompt_scope=args.focused_prompt_scope,
+            answer_plan_enabled=args.answer_plan,
+            answer_plan_max_candidates=args.answer_plan_max_candidates,
+            answer_plan_excerpt_chars=args.answer_plan_excerpt_chars,
+            answer_plan_kinds=tuple(
+                args.answer_plan_kind
+                or ("date_difference", "temporal_order")),
             max_output_tokens=(args.max_output_tokens or None),
             sampling_seed=args.sampling_seed)
 
@@ -426,6 +499,8 @@ def main() -> None:
     if runtime_dense_options is not None:
         embedding_options.update(runtime_dense_options)
         embedding_options["record_usage"] = False
+    if args.embedding_request_model:
+        embedding_options["request_model_id"] = args.embedding_request_model
     if args.embedding_db:
         embedding_store = SQLiteGraphStore(args.embedding_db, read_only=True)
         embedding = QwenEmbeddingIndex(embedding_store, config, **embedding_options)
@@ -655,12 +730,32 @@ def main() -> None:
                     "execution_mode": result.trace.get(
                         "execution_mode", "hierarchical_graph"),
                     "exact_lookup": result.trace.get("exact_lookup", {}),
+                    "dual_lane_rank": result.trace.get("dual_lane_rank", {}),
+                    "dual_lane_active": result.trace.get(
+                        "dual_lane_active", False),
+                    "dual_lane_named_transcript": result.trace.get(
+                        "dual_lane_named_transcript", False),
+                    "dual_lane_legacy_operator_route": result.trace.get(
+                        "dual_lane_legacy_operator_route", False),
+                    "dual_lane_precision_packed": result.trace.get(
+                        "dual_lane_precision_packed", 0),
+                    "dual_lane_coverage_packed": result.trace.get(
+                        "dual_lane_coverage_packed", 0),
                     "traversed_relation_signals": traversed_signals(
                         question.memory_id, result),
                     "retrieved_turn_ids": list(result.retrieved_turn_ids),
                     **({"candidate_scores": [{
                         "turn_id": candidate.turn_id,
                         "rank": rank,
+                        "exact_score": candidate.exact_score,
+                        "bm25_score": candidate.bm25_score,
+                        "dense_score": candidate.dense_score,
+                        "graph_score": candidate.graph_score,
+                        "binding_score": candidate.binding_score,
+                        "operand_ids": list(candidate.operand_ids),
+                        "session_score": candidate.session_score,
+                        "adjacency_score": candidate.adjacency_score,
+                        "source_channels": list(candidate.source_channels),
                         "fused_score": candidate.fused_score,
                         "relational_consensus_score": (
                             candidate.relational_consensus_score),
@@ -709,7 +804,14 @@ def main() -> None:
                                     if runtime_config is not None else None),
             "answer_calls": 0,
             "answer_generation_tokens": 0,
-            "answer_policy": answer_config.readout_policy,
+            "answer_policy": args.answer_policy,
+            "core_readout_policy": answer_config.readout_policy,
+            "answer_plan": answer_config.answer_plan_enabled,
+            "answer_plan_max_candidates": (
+                answer_config.answer_plan_max_candidates),
+            "answer_plan_excerpt_chars": (
+                answer_config.answer_plan_excerpt_chars),
+            "answer_plan_kinds": list(answer_config.answer_plan_kinds),
             "graph_traversal": navigator.h10_traversal,
             "hierarchical_routing": navigator.hierarchical_routing,
             "structural_ablation_override": {
@@ -726,6 +828,16 @@ def main() -> None:
                 answer_config.question_recency_footer),
             "compact_topological_prompt": (
                 answer_config.compact_topological_contract),
+            "query_focus_index": answer_config.query_focus_index_enabled,
+            "query_focus_limit": answer_config.query_focus_index_limit,
+            "query_focus_excerpt_chars": (
+                answer_config.query_focus_excerpt_chars),
+            "temporal_query_focus": (
+                answer_config.temporal_query_focus_enabled),
+            "preference_focus_strategy": (
+                answer_config.preference_focus_strategy),
+            "aggregation_operand_worksheet_selective": (
+                answer_config.aggregation_operand_worksheet_selective),
             "focused_prompt_scope": answer_config.focused_prompt_scope,
             "exact_grounding_footer": (
                 answer_config.exact_grounding_footer),
@@ -749,6 +861,11 @@ def main() -> None:
             "relational_view_named_speakers_only": (
                 navigator.relational_view_named_speakers_only),
             "relational_consensus_bonus": navigator.relational_consensus_bonus,
+            "dual_lane_packing": navigator.dual_lane_packing,
+            "dual_lane_operator_aware": navigator.dual_lane_operator_aware,
+            "dual_lane_precision_head": navigator.dual_lane_precision_head,
+            "dual_lane_rrf_k": navigator.dual_lane_rrf_k,
+            "dual_lane_proof_reserve": navigator.dual_lane_proof_reserve,
             "speaker_owner_bonus": navigator.speaker_owner_bonus,
             "query_witness_bonus": navigator.query_witness_bonus,
             "query_witness_seed_count": navigator.query_witness_seed_count,
@@ -889,6 +1006,17 @@ def main() -> None:
                 "execution_mode": result.trace.get(
                     "execution_mode", "hierarchical_graph"),
                 "exact_lookup": result.trace.get("exact_lookup", {}),
+                "dual_lane_rank": result.trace.get("dual_lane_rank", {}),
+                "dual_lane_active": result.trace.get(
+                    "dual_lane_active", False),
+                "dual_lane_named_transcript": result.trace.get(
+                    "dual_lane_named_transcript", False),
+                "dual_lane_legacy_operator_route": result.trace.get(
+                    "dual_lane_legacy_operator_route", False),
+                "dual_lane_precision_packed": result.trace.get(
+                    "dual_lane_precision_packed", 0),
+                "dual_lane_coverage_packed": result.trace.get(
+                    "dual_lane_coverage_packed", 0),
                 "aggregation_ledger": answer.trace.get("aggregation_ledger"),
                 **{key: value for key, value in metric.items() if key != "question_id"},
             }
@@ -1007,6 +1135,12 @@ def main() -> None:
     manifest = {
         "profile": args.profile, "label": label, "questions": len(answer_rows),
         "answer_policy": answer_config.readout_policy,
+        "answer_plan": answer_config.answer_plan_enabled,
+        "answer_plan_max_candidates": (
+            answer_config.answer_plan_max_candidates),
+        "answer_plan_excerpt_chars": (
+            answer_config.answer_plan_excerpt_chars),
+        "answer_plan_kinds": list(answer_config.answer_plan_kinds),
         "runtime_config": (str(args.runtime_config)
                            if args.runtime_config is not None else None),
         "runtime_config_hash": (runtime_config_hash(runtime_config)
@@ -1060,6 +1194,12 @@ def main() -> None:
         "question_recency_footer": answer_config.question_recency_footer,
         "compact_topological_prompt": (
             answer_config.compact_topological_contract),
+        "query_focus_index": answer_config.query_focus_index_enabled,
+        "query_focus_limit": answer_config.query_focus_index_limit,
+        "query_focus_excerpt_chars": (
+            answer_config.query_focus_excerpt_chars),
+        "temporal_query_focus": answer_config.temporal_query_focus_enabled,
+        "preference_focus_strategy": answer_config.preference_focus_strategy,
         "focused_prompt_scope": answer_config.focused_prompt_scope,
         "precision_grounded_prompt": answer_config.precision_grounding,
         "aggregation_ledger": answer_config.aggregation_ledger_enabled,
@@ -1069,6 +1209,10 @@ def main() -> None:
         "aggregation_ledger_limit": answer_config.aggregation_ledger_limit,
         "aggregation_execution_card": (
             answer_config.aggregation_execution_card),
+        "aggregation_operand_worksheet": (
+            answer_config.aggregation_operand_worksheet_enabled),
+        "aggregation_operand_worksheet_selective": (
+            answer_config.aggregation_operand_worksheet_selective),
         "aggregation_source_reserve": (
             answer_config.aggregation_source_reserve_enabled),
         "aggregation_source_reserve_operations": list(
@@ -1078,6 +1222,11 @@ def main() -> None:
         "exact_grounding_footer": answer_config.exact_grounding_footer,
         "obligation_aware_packing": args.obligation_aware_packing,
         "precision_aware_packing": args.precision_aware_packing,
+        "dual_lane_packing": navigator.dual_lane_packing,
+        "dual_lane_operator_aware": navigator.dual_lane_operator_aware,
+        "dual_lane_precision_head": navigator.dual_lane_precision_head,
+        "dual_lane_rrf_k": navigator.dual_lane_rrf_k,
+        "dual_lane_proof_reserve": navigator.dual_lane_proof_reserve,
         "candidate_pool_limit": args.candidate_pool_limit,
         "raw_fallback_reserve": args.raw_fallback_reserve,
         "obligation_aware_relations": args.obligation_aware_relations,

@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ..domain import AlgebraResult, EvidenceCertificate
+from ..domain import AlgebraResult, EvidenceCertificate, TruthValue
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +29,14 @@ class TypedExecutionResult:
             return "yes" if self.value else "no"
         if isinstance(self.value, tuple):
             return ", ".join(map(str, self.value))
-        return "" if self.value is None else str(self.value)
+        if self.value is None:
+            return ""
+        if self.answer_kind == "sum":
+            rendered = (str(int(self.value))
+                        if isinstance(self.value, float) and self.value.is_integer()
+                        else str(self.value))
+            return f"{rendered} {self.unit}".strip()
+        return str(self.value)
 
 
 def inspect_execution(
@@ -62,7 +69,23 @@ def inspect_execution(
             f"{owner}: {', '.join(values)}"
             for owner, values in sorted(result.groups.items()))
     elif kind == "existence":
-        value = bool(result.members)
+        truth = result.truth_value
+        if truth is None:
+            truth = TruthValue.TRUE if result.members else TruthValue.UNKNOWN
+        value = (True if truth == TruthValue.TRUE
+                 else False if truth == TruthValue.FALSE else None)
+        if truth == TruthValue.UNKNOWN:
+            reasons.append("open_world_unknown")
+        elif truth == TruthValue.FALSE and not (
+                certificate is not None
+                and certificate.negative_scope_required
+                and certificate.post_pack_complete):
+            reasons.append("negative_scope_unproven")
+    elif kind == "sum":
+        value = result.numeric_total
+        unit = result.unit
+        if value is None:
+            reasons.append("unresolved_numeric_sum")
     elif kind == "date_difference":
         endpoints = tuple(result.temporal_endpoints)
         if len(endpoints) == 2:
@@ -100,7 +123,7 @@ def inspect_execution(
         reasons.append("empty_typed_value")
     reasons = list(dict.fromkeys(reasons))
     safe = not reasons and kind in {
-        "count", "list", "group", "existence", "date_difference",
+        "count", "sum", "list", "group", "existence", "date_difference",
         "state", "ordinal"}
     return TypedExecutionResult(
         answer_kind=kind, value=value, unit=unit,

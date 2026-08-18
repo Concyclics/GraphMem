@@ -23,6 +23,13 @@ from ..domain import (
     stable_id,
 )
 from ..storage import SQLiteGraphStore
+from ..projection import (
+    ARMS as PROJECTION_ARMS,
+    build_manifests,
+    build_value_lattice,
+    lattice_stats,
+    manifest_stats,
+)
 from .coarsen import (
     ATOMIC_RELATION_NODE_TYPES,
     GatedRelationPlan,
@@ -304,9 +311,14 @@ class GraphBuildPipeline:
                 scene_nodes[scene.scene_id] = scene_node
                 nodes.append(scene_node)
                 if lean_graph:
+                    units_by_turn: dict[str, list[str]] = defaultdict(list)
+                    for unit in packet.information_units:
+                        units_by_turn[unit.turn_id].append(unit.text)
                     for turn in scene.turns:
                         evidence_ref = self._turn_evidence_ref(
-                            memory_id, scene.scene_id, turn, group_by_turn[turn.turn_id])
+                            memory_id, scene.scene_id, turn,
+                            group_by_turn[turn.turn_id],
+                            routing_atoms=tuple(units_by_turn.get(turn.turn_id, ())))
                         if turn.turn_id in packet.raw_fallback_turn_ids:
                             evidence_ref = replace(evidence_ref, attributes={
                                 **dict(evidence_ref.attributes),
@@ -517,7 +529,15 @@ class GraphBuildPipeline:
                 edges.extend(self._portal_edges(memory_id, session_cards, scene_nodes))
 
         nodes = self._dedup_nodes(nodes)
-        edges = self._bounded_edges(self._dedup_edges(edges), profile)
+        projection = PROJECTION_ARMS[profile.projection_profile]
+        manifest_nodes, manifest_edges, manifest_rows = build_manifests(
+            memory_id, nodes, projection)
+        value_nodes, value_edges, value_rows = build_value_lattice(
+            memory_id, nodes, projection)
+        if manifest_nodes or value_nodes:
+            nodes = self._dedup_nodes((*nodes, *manifest_nodes, *value_nodes))
+        edges = self._bounded_edges(
+            self._dedup_edges((*edges, *manifest_edges, *value_edges)), profile)
         if lean_graph:
             nodes = self._propagate_time_ranges(nodes, edges)
         method_diagnostics: dict[str, Any] = {
@@ -529,6 +549,15 @@ class GraphBuildPipeline:
                 else "deterministic_lexical_fallback"),
             "enabled_relation_signals": tuple(
                 profile.edges.enabled_relation_signals),
+            "projection": {
+                "profile": profile.projection_profile,
+                "config_digest": projection.digest(),
+                **dict(manifest_stats(manifest_rows)),
+                **{f"value_{key}": value
+                   for key, value in lattice_stats(value_rows).items()},
+                "nodes_added": len(manifest_nodes) + len(value_nodes),
+                "edges_proposed": len(manifest_edges) + len(value_edges),
+            },
         }
         if recursive_hierarchy is not None:
             method_diagnostics["coarsening"] = dataclass_dict(
@@ -634,13 +663,17 @@ class GraphBuildPipeline:
         return result
 
     @staticmethod
-    def _turn_evidence_ref(memory_id, scene_id, turn, group):
+    def _turn_evidence_ref(
+        memory_id, scene_id, turn, group, *, routing_atoms=(),
+    ):
         raw_tokens = WORD_RE.findall(turn.raw_text)
         priority = []
         media = re.findall(r"caption:\s*([^\]]+)", turn.raw_text, re.I)
         quoted = re.findall(r'["“]([^"”]{2,80})["”]', turn.raw_text)
         for phrase in (*media, *quoted):
             priority.extend(WORD_RE.findall(phrase))
+        for atom in routing_atoms:
+            priority.extend(WORD_RE.findall(str(atom)))
         priority.extend(token for token in raw_tokens if any(char.isdigit() for char in token))
         # Head-only sketches systematically hid late-turn payloads in LoCoMo.
         # Interleave salient caption/number tokens with the head and tail while
@@ -668,6 +701,13 @@ class GraphBuildPipeline:
             attributes={"scene_id": scene_id, "session_id": turn.session_id,
                         "turn_id": turn.turn_id, "turn_index": turn.turn_index,
                         "value_type": value_type,
+                        # Complete scanner surfaces are kept independently of
+                        # the compact display summary. ReadView indexes these
+                        # atoms, so a number/date/negation in the middle of a
+                        # long turn remains a navigable terminal key.
+                        "routing_atoms": tuple(dict.fromkeys(
+                            " ".join(str(atom).split())
+                            for atom in routing_atoms if str(atom).strip())),
                         "time_interval": dataclass_dict(interval) if interval else None,
                         "roles": ("evidence_turn", "terminal"),
                         "provenance_scope": "terminal"})

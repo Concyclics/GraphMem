@@ -51,6 +51,14 @@ class CountDistinct:
 
 
 @dataclass(frozen=True, slots=True)
+class Sum:
+    """Add scalar values over a closed collection."""
+
+    child: "OperatorNode"
+    unit: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class ExistsAll:
     children: tuple["OperatorNode", ...]
 
@@ -98,7 +106,7 @@ class LatestState:
 
 OperatorNode: TypeAlias = (
     FactSet | Lookup | UnionDistinct | IntersectionDistinct | GroupByOwner | CountDistinct
-    | ExistsAll | Ordinal | ArgMinTime | ArgMaxTime | DateDifference | LatestState
+    | Sum | ExistsAll | Ordinal | ArgMinTime | ArgMaxTime | DateDifference | LatestState
 )
 
 _ROOT_OPERATOR: dict[type, QueryOperator] = {
@@ -108,6 +116,7 @@ _ROOT_OPERATOR: dict[type, QueryOperator] = {
     IntersectionDistinct: QueryOperator.INTERSECTION_DISTINCT,
     GroupByOwner: QueryOperator.GROUP_BY_OWNER,
     CountDistinct: QueryOperator.COUNT_DISTINCT,
+    Sum: QueryOperator.SUM,
     ExistsAll: QueryOperator.EXISTS_ALL,
     Ordinal: QueryOperator.ORDINAL,
     ArgMinTime: QueryOperator.ARGMIN_TIME,
@@ -118,7 +127,7 @@ _ROOT_OPERATOR: dict[type, QueryOperator] = {
 
 # What the answer composer may emit without an LLM once the certificate closes.
 CLOSED_FORM_KINDS = frozenset({
-    "count", "list", "group", "existence", "date_difference", "state", "ordinal",
+    "count", "sum", "list", "group", "existence", "date_difference", "state", "ordinal",
 })
 
 _ANSWER_KIND: dict[type, str] = {
@@ -128,6 +137,7 @@ _ANSWER_KIND: dict[type, str] = {
     IntersectionDistinct: "list",
     GroupByOwner: "group",
     CountDistinct: "count",
+    Sum: "sum",
     ExistsAll: "existence",
     Ordinal: "ordinal",
     ArgMinTime: "ordinal",
@@ -142,7 +152,7 @@ def children_of(node: OperatorNode) -> tuple[OperatorNode, ...]:
         return ()
     if isinstance(node, DateDifference):
         return (node.left, node.right)
-    if isinstance(node, (Lookup, CountDistinct, Ordinal, ArgMinTime, ArgMaxTime, LatestState)):
+    if isinstance(node, (Lookup, CountDistinct, Sum, Ordinal, ArgMinTime, ArgMaxTime, LatestState)):
         return (node.child,)
     return tuple(node.children)
 
@@ -197,7 +207,7 @@ def ordinal_index(node: OperatorNode, default: int = 0) -> int:
 def requires_exhaustive_scope(node: OperatorNode) -> bool:
     """Operators whose answer is wrong unless the collection is fully enumerated."""
     return any(isinstance(row, (UnionDistinct, IntersectionDistinct, GroupByOwner,
-                                CountDistinct, Ordinal, ArgMinTime, ArgMaxTime,
+                                CountDistinct, Sum, Ordinal, ArgMinTime, ArgMaxTime,
                                 LatestState))
                for row in walk(node))
 

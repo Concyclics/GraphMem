@@ -91,6 +91,9 @@ def build_manifests(memory_id: str, nodes: Sequence[GraphNode],
     manifest_nodes: list[GraphNode] = []
     edges: list[GraphEdge] = []
     rows: list[ManifestRow] = []
+    node_by_id = {node.node_id: node for node in nodes}
+    scene_by_id = {
+        node.node_id: node for node in nodes if node.node_type == NodeType.SCENE}
     for chain, members in sorted(collect_chains(nodes, config).items()):
         if len(members) < config.manifest_min_members:
             continue
@@ -102,8 +105,24 @@ def build_manifests(memory_id: str, nodes: Sequence[GraphNode],
         if not evidence:
             continue
         manifest_id = stable_id("node", memory_id, "collection-manifest", *chain)
+        owner_label = (node_by_id[owner_id].summary
+                       if owner_id in node_by_id else owner_id)
+        member_scene_ids = tuple(dict.fromkeys(
+            _attribute(row, "scene_id") for row in members
+            if _attribute(row, "scene_id")))
+        scene_quality = [scene_by_id[item] for item in member_scene_ids
+                         if item in scene_by_id]
+        atomic_closed = bool(scene_quality) and all(
+            int(scene.attributes.get("information_unit_total", 0) or 0) > 0
+            and int(scene.attributes.get("information_unit_covered", 0) or 0)
+                >= int(scene.attributes.get("information_unit_total", 0) or 0)
+            and int(scene.attributes.get("information_unit_missing", 0) or 0) == 0
+            and int(scene.attributes.get("information_unit_unresolved", 0) or 0) == 0
+            for scene in scene_quality)
+        closed = (atomic_closed if config.closure_policy == "atomic_covered"
+                  else True)
         summary = " ".join(filter(None, [
-            owner_id, "not" if polarity == "negative" else "",
+            owner_label, "not" if polarity == "negative" else "",
             modality if modality and modality != "asserted" else "",
             # collection_key carries the class name once the predicate is out of
             # the chain, and it is the field a question's noun actually matches.
@@ -114,7 +133,8 @@ def build_manifests(memory_id: str, nodes: Sequence[GraphNode],
             manifest_id, memory_id, NodeType.COLLECTION_MANIFEST, 1, summary,
             evidence[0], evidence[1:],
             attributes={
-                "owner_id": owner_id, "predicate": predicate, "scope": scope,
+                "owner_id": owner_id, "owner_label": owner_label,
+                "predicate": predicate, "scope": scope,
                 "collection_key": collection_key, "polarity": polarity, "modality": modality,
                 "member_ids": tuple(row.node_id for row in members),
                 "member_count": len(members),
@@ -123,7 +143,12 @@ def build_manifests(memory_id: str, nodes: Sequence[GraphNode],
                 # The manifest enumerates every fact the graph holds for this
                 # chain, so within the graph it is closed by construction.  It
                 # says nothing about facts extraction never produced.
-                "closed": True,
+                "closed": closed,
+                "closure_policy": config.closure_policy,
+                "closure_basis": (
+                    "all_member_scenes_atomically_covered" if atomic_closed
+                    else "graph_enumeration_only"),
+                "member_scene_ids": member_scene_ids,
                 "collection_semantics": "event_instances" if occurrence else "distinct_values",
                 "roles": ("collection_manifest", "route"),
                 "provenance_scope": "route",

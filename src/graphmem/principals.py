@@ -56,6 +56,10 @@ BLOCKED_ALIASES = frozenset({
     "activity", "activities", "time", "times", "day", "days", "life", "right",
     "sounds", "way", "one", "ones", "someone", "something", "everyone", "stuff",
     "place", "places", "year", "years", "week", "month", "today", "yesterday",
+    # function words occasionally emitted as entities by noisy extraction
+    "a", "an", "the", "and", "or", "but", "if", "as", "at", "by", "for",
+    "from", "in", "into", "of", "off", "on", "onto", "out", "over", "per",
+    "than", "then", "through", "to", "under", "up", "with", "within", "without",
 })
 MIN_ALIAS_LENGTH = 3
 

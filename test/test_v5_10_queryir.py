@@ -73,10 +73,14 @@ def test_exact_lookup_gate_excludes_plural_and_preference_plans() -> None:
     preference = QueryIR(
         "What book should Alice read?", QueryOperator.LOOKUP,
         (operand,), (obligation,), slots=QuerySlots())
+    tips = QueryIR(
+        "My phone battery is weak. Any tips?", QueryOperator.LOOKUP,
+        (operand,), (obligation,), slots=QuerySlots(is_advice=True))
 
     assert exact_lookup_eligible(scalar)
     assert not exact_lookup_eligible(plural)
     assert not exact_lookup_eligible(preference)
+    assert not exact_lookup_eligible(tips)
 
 
 def test_relation_mask_metadata_prioritizes_matching_coarse_edge() -> None:

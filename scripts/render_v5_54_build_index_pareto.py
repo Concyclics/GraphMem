@@ -186,7 +186,7 @@ def main() -> None:
         f"真实 Memory 间的 coarse-candidate 诊断拟合指数为 {real_exponent:.2f}，"
         r"但该拟合同时包含内容与规模差异，只作为真实工作负载佐证；复杂度指数以受控规模实验为准。"
         r"图中的关系判定 Token 是固定请求契约下的候选上界，不是 API usage；"
-        r"当前 Safe-Witness 冻结重建复用了语义抽取且没有新增生成式关系调用，因此不能把抽取账本误写为关系建边 Token。"
+        r"实际生成式 Build Token 在端到端账本中单独报告。"
         "\n")
     args.output_analysis.write_text(analysis, encoding="utf-8")
     print(json.dumps(payload, indent=2))

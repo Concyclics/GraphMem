@@ -22,6 +22,7 @@ _SET_OPERATORS = {
     QueryOperator.INTERSECTION_DISTINCT,
     QueryOperator.GROUP_BY_OWNER,
     QueryOperator.COUNT_DISTINCT,
+    QueryOperator.SUM,
 }
 _TEMPORAL_OPERATORS = {
     QueryOperator.ARGMIN_TIME,

@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import re
 
-PROMPT_VERSION = "graphmem-v5.6-answer-v1"
+PROMPT_VERSION = "graphmem-v5.57-answer-unit-rate-v1"
 
 ANSWER_SYSTEM_PROMPT = (
     "Answer the question using only the supplied conversation memories. "
@@ -24,6 +24,8 @@ ANSWER_SYSTEM_PROMPT = (
     "memories, deduplicate repeated mentions, and compute the requested result. "
     "When asked how many more are needed, remain, or must be earned, compute "
     "target minus the latest current amount; do not return the target itself. "
+    "For an each-item or per-item cost, divide the exact aggregate price by the "
+    "matching distinct item count once; do not add the price and count. "
     "For current quantities, apply additions, removals, cancellations, and "
     "replacements to distinct named items before counting active items. "
     "For most/frequency questions, count completed occurrences, expand explicit "
@@ -119,7 +121,7 @@ QUERY_FOCUS_INDEX_APPENDIX = (
     "not extra evidence or a proposed answer; verify each excerpt in its full "
     "memory block."
 )
-AGGREGATION_LEDGER_VERSION = "graphmem-v5.21-aggregation-ledger-v1"
+AGGREGATION_LEDGER_VERSION = "graphmem-v5.57-aggregation-ledger-scope-v2"
 AGGREGATION_LEDGER_APPENDIX = (
     " For an aggregation question, the user message may contain an Aggregation "
     "ledger after the memories. It is a deterministic index over already cited "
@@ -130,13 +132,16 @@ AGGREGATION_LEDGER_APPENDIX = (
     "When the ledger says its result is unavailable, perform the named arithmetic "
     "yourself only after verifying the complete operand set in the source turns."
 )
-PREFERENCE_SYNTHESIS_VERSION = "graphmem-v5.21-preference-synthesis-v1"
+PREFERENCE_SYNTHESIS_VERSION = "graphmem-v5.57-preference-synthesis-grounding-v4"
 PREFERENCE_SYNTHESIS_APPENDIX = (
     " This is a preference, advice, or recommendation request. Treat the "
     "memories as grounded constraints and examples, not as a requirement that "
     "the final suggestion must already appear verbatim. You may synthesize a "
     "new recommendation that is compatible with the user's demonstrated "
-    "preferences, possessions, habits, goals, and negative constraints. Do not "
+    "preferences, possessions, habits, goals, and negative constraints. First "
+    "identify the exact user-stated ingredients, equipment, possessions, "
+    "or constraints in the memories and visibly use them in the recommendation; "
+    "do not claim that personal context is missing when it is present. Do not "
     "invent a user preference or personal fact, and do not claim the user has "
     "already tried or owns a newly suggested item. Prefer a specific, useful "
     "answer over abstaining merely because no memory states the recommendation "
@@ -157,22 +162,11 @@ _QUESTION_DATE_CUE_RE = re.compile(
     re.I,
 )
 
-_PREFERENCE_QUERY_RE = re.compile(
-    r"\b(?:can|could|would) you (?:recommend|suggest|give|help)\b|"
-    r"\bdo you have (?:any|some) (?:\w+\s+){0,3}"
-    r"(?:tips?|advice|suggestions?|recommendations?|ideas?)\b|"
-    r"\b(?:any|some) (?:\w+\s+){0,3}"
-    r"(?:tips?|advice|suggestions?|recommendations?|ideas?)\b|"
-    r"\bwhat (?:should|could) i\b|\bwhat do you think\b|"
-    r"\bdo you think\b|\bcould there be a reason\b",
-    re.I,
-)
-
-
 def is_preference_synthesis_query(question: str) -> bool:
     """Detect an advice request from its wording, without benchmark labels."""
+    from ..retrieval.slots import is_advice_query
 
-    return bool(_PREFERENCE_QUERY_RE.search(" ".join(question.split())))
+    return is_advice_query(question)
 
 
 def question_needs_global_date(question: str) -> bool:
@@ -214,6 +208,7 @@ def build_answer_messages(
     aggregation_ledger: str | None = None,
     aggregation_ledger_contract: bool = False,
     preference_synthesis: bool = False,
+    preference_focus_index: str | None = None,
     exact_grounding_footer: bool = False,
     include_question_date: bool = True,
     question_recency_footer: bool = False,
@@ -241,6 +236,25 @@ def build_answer_messages(
         # system-only instruction before 5K-12K evidence was often ignored by
         # Qwen, which then emitted evidence lists or degenerated into repetition.
         sections += ["", GROUNDED_OUTPUT_CONTRACT]
+    if preference_synthesis:
+        # Repeat the actionable constraint after the long evidence reservoir.
+        # In 64-turn requests the system appendix alone was often obeyed only
+        # stylistically: the model produced sensible generic advice while
+        # overlooking a directly useful possession that had been retrieved.
+        if preference_focus_index:
+            sections += ["", preference_focus_index]
+            grounding_check = (
+                "Grounded recommendation check: the first sentence must "
+                "explicitly name and apply the user anchor above; do not answer "
+                "only with generic advice and do not invent another anchor.")
+        else:
+            grounding_check = (
+                "Grounded recommendation check: before generic advice, name and "
+                "use the most directly relevant user-stated possession, "
+                "preference, ingredient, equipment, or constraint from the "
+                "memories. Do not invent one.")
+        sections += ["", grounding_check,
+                     f"Answer this recommendation request now: {question}"]
     if exact_grounding_footer and not preference_synthesis:
         sections += ["", EXACT_GROUNDING_FOOTER]
     if question_recency_footer:

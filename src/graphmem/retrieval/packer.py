@@ -113,6 +113,102 @@ def adaptive_evidence_turn_limit(
     return max(1, min(requested, target))
 
 
+def coverage_lane_score(
+    row: CandidateScore, *, answer_kind: str = "lookup",
+) -> float:
+    """Score a candidate without trusting graph fan-out as direct evidence.
+
+    The precision rank is allowed to exploit typed bindings and graph paths.
+    A second coverage rank must remain stable when a new projection materializes
+    many more structural edges, so it is deliberately based on source-facing
+    exact/BM25/dense, role, slot, session and dialogue-adjacency signals.  A
+    small capped graph term keeps a witnessed graph hit as a tie breaker without
+    letting graph-only candidates dominate the long tail.
+    """
+
+    kind = str(answer_kind).casefold()
+    advice = any(token in kind for token in (
+        "advice", "preference", "recommend", "suggest"))
+    if advice:
+        return (
+            0.50 * row.exact_score
+            + 0.50 * row.bm25_score
+            + 2.00 * row.dense_score
+            + 0.10 * row.role_gain
+            + 0.25 * row.slot_gain
+            + 0.05 * row.session_score
+            + 0.10 * row.adjacency_score
+        )
+    return (
+        1.20 * row.exact_score
+        + row.bm25_score
+        + row.dense_score
+        + 0.25 * row.role_gain
+        + 0.50 * row.slot_gain
+        + 0.12 * row.session_score
+        + row.adjacency_score
+        + 0.10 * min(0.30, max(0.0, row.graph_score))
+    )
+
+
+def rank_dual_lane_candidates(
+    candidates: Iterable[CandidateScore], *, answer_kind: str,
+    max_turns: int, precision_head: int, rrf_k: int = 60,
+) -> tuple[tuple[CandidateScore, ...], tuple[str, ...], Mapping[str, int]]:
+    """Merge a precision head with a projection-stable coverage tail.
+
+    The first lane preserves the strongest part of the upstream graph rank.  It
+    is capped at half of the evidence budget so a 64-turn request always leaves
+    room for coverage evidence.  The second lane re-ranks the remaining pool by
+    :func:`coverage_lane_score`.  This is rank aggregation, not extra recall:
+    it creates no candidates, performs no model call, and keeps the declared
+    turn/token budgets unchanged.
+    """
+
+    rows = tuple(candidates)
+    if not rows or max_turns <= 0:
+        return rows, (), {
+            "precision_head": 0, "coverage_tail": len(rows),
+            "coverage_top_overlap": 0,
+        }
+    head_limit = min(
+        len(rows), max_turns, max(1, precision_head),
+        max(1, max_turns // 2),
+    )
+    precision = rows[:head_limit]
+    precision_ids = frozenset(row.turn_id for row in precision)
+    coverage = tuple(sorted(rows, key=lambda row: (
+        -coverage_lane_score(row, answer_kind=answer_kind),
+        -row.exact_score, -row.dense_score, -row.bm25_score,
+        -row.fused_score, row.turn_id,
+    )))
+    precision_rank = {row.turn_id: rank for rank, row in enumerate(rows)}
+    coverage_rank = {row.turn_id: rank for rank, row in enumerate(coverage)}
+    # Reciprocal-rank fusion prevents the coverage lane from replacing a large
+    # part of an already-good graph rank merely because the two score scales are
+    # incomparable.  The explicit head is a hard stability floor; RRF controls
+    # the complementary tail.
+    tail = tuple(sorted(
+        (row for row in rows if row.turn_id not in precision_ids),
+        key=lambda row: (
+            -(1.0 / (rrf_k + precision_rank[row.turn_id])
+              + 1.0 / (rrf_k + coverage_rank[row.turn_id])),
+            coverage_rank[row.turn_id], precision_rank[row.turn_id],
+            row.turn_id,
+        )))
+    coverage_top = coverage[:min(max_turns, len(coverage))]
+    return (
+        (*precision, *tail),
+        tuple(row.turn_id for row in precision),
+        {
+            "precision_head": len(precision),
+            "coverage_tail": len(tail),
+            "coverage_top_overlap": sum(
+                row.turn_id in precision_ids for row in coverage_top),
+        },
+    )
+
+
 def _sentences(text: str) -> tuple[tuple[int, int, str], ...]:
     rows = tuple((match.start(), match.end(), match.group(0))
                  for match in _SENTENCE_RE.finditer(text) if match.group(0).strip())
@@ -246,6 +342,7 @@ def pack_obligation_aware(
     span_window: int = 96,
     baseline_floor: Sequence[str] = (),
     precision_aware: bool = False,
+    proof_reserve: bool = True,
 ) -> tuple[
     tuple[str, ...], tuple[str, ...], dict[str, bool], tuple[EvidenceUnit, ...], int
 ]:
@@ -387,7 +484,8 @@ def pack_obligation_aware(
         reserve_capacity,
         max(4, len(required_operands) * 2))) if max_turns else 0)
     considered: set[str] = set()
-    while (uncovered_obligations or uncovered_operands) and len(considered) < len(viable):
+    while (proof_reserve and (uncovered_obligations or uncovered_operands)
+           and len(considered) < len(viable)):
         choices = [unit for unit in viable if unit.unit_id not in considered and (
             set(unit.obligation_ids) & uncovered_obligations
             or set(unit.operand_ids) & uncovered_operands)]
@@ -407,7 +505,7 @@ def pack_obligation_aware(
     # are admitted atomically when possible; if not, an individual high-ranked
     # turn may still be included, but the certificate remains incomplete.
     multi_unit_by_turn: dict[str, list[EvidenceUnit]] = defaultdict(list)
-    for unit in viable:
+    for unit in viable if proof_reserve else ():
         if unit.atomic and len(unit.source_turn_ids) > 1:
             for turn_id in unit.source_turn_ids:
                 multi_unit_by_turn[turn_id].append(unit)
@@ -459,6 +557,7 @@ def pack_obligation_aware(
         "operand_incomplete": not required_operands <= covered_operands,
         "span_packing": True,
         "precision_aware": precision_aware,
+        "proof_reserve": proof_reserve,
     }
     selected_by_id = {unit.unit_id: unit for unit in selected_units}
     audit_units = tuple(

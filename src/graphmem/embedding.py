@@ -44,10 +44,15 @@ class QwenEmbeddingIndex:
                  dense_cache_bytes: int = 256 * 1024 * 1024,
                  dense_cache_memories: int = 32,
                  model_id: str | None = None,
-                 base_url: str | None = None) -> None:
+                 base_url: str | None = None,
+                 request_model_id: str | None = None) -> None:
         self.store = store
         self.config = config
         self.model_id = model_id or config.models.embedding_model
+        # Keep the stable storage/cache identity separate from an endpoint's
+        # served-model alias.  vLLM deployments commonly expose the same
+        # checkpoint with or without its Hugging Face namespace.
+        self.request_model_id = request_model_id or self.model_id
         self.batch_size = batch_size
         self._query_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._query_cache_entries = max(1, int(query_cache_entries))
@@ -450,10 +455,39 @@ class QwenEmbeddingIndex:
         last_error: Exception | None = None
         for attempt in range(12):
             try:
-                response = self.client.embeddings.create(model=self.model_id, input=list(texts))
+                response = self.client.embeddings.create(
+                    model=getattr(self, "request_model_id", self.model_id),
+                    input=list(texts))
                 break
             except Exception as error:
                 status_code = getattr(error, "status_code", None)
+                message = str(error).casefold()
+                context_overflow = (
+                    isinstance(status_code, int) and status_code == 400
+                    and ("maximum context length" in message
+                         or "context length" in message))
+                if context_overflow:
+                    if len(texts) == 1 and len(texts[0]) > 1:
+                        midpoint = len(texts[0]) // 2
+                        left, left_tokens, left_latency = self._embed(
+                            (texts[0][:midpoint],))
+                        right, right_tokens, right_latency = self._embed(
+                            (texts[0][midpoint:],))
+                        left_vector = np.asarray(left[0], dtype=np.float32)
+                        right_vector = np.asarray(right[0], dtype=np.float32)
+                        combined = left_vector + right_vector
+                        norm = float(np.linalg.norm(combined))
+                        if norm > 1e-12:
+                            combined /= norm
+                        return ([combined.tolist()], left_tokens + right_tokens,
+                                left_latency + right_latency)
+                    if len(texts) <= 1:
+                        raise
+                    midpoint = len(texts) // 2
+                    left, left_tokens, left_latency = self._embed(texts[:midpoint])
+                    right, right_tokens, right_latency = self._embed(texts[midpoint:])
+                    return (left + right, left_tokens + right_tokens,
+                            left_latency + right_latency)
                 recoverable = (
                     error.__class__.__name__ in {"APIConnectionError", "APITimeoutError", "InternalServerError"}
                     or (isinstance(status_code, int) and status_code >= 500)

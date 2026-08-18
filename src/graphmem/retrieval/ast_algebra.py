@@ -19,10 +19,12 @@ confidently wrong.
 from __future__ import annotations
 
 from collections import defaultdict
+import re
 from typing import Mapping, Sequence
 
 from ..domain import (
-    AlgebraResult, AnswerMember, FactBinding, QueryOperator, StateResult, TemporalEndpoint,
+    AlgebraResult, AnswerMember, FactBinding, QueryOperator, StateResult,
+    TemporalEndpoint, TruthValue,
 )
 from . import operators as ops
 
@@ -107,6 +109,9 @@ def _build_result(
     endpoints: Sequence[TemporalEndpoint] = (),
     state: StateResult | None = None,
     degradations: Sequence[str] = (),
+    numeric_total: float | None = None,
+    unit: str = "",
+    truth_value: TruthValue | None = None,
 ) -> AlgebraResult:
     stable_members = _dedup_members(members)
     output_ids = tuple(dict.fromkeys(
@@ -137,7 +142,36 @@ def _build_result(
         scope_complete=scope_complete,
         answer_kind=ops.answer_kind(node),
         degradations=tuple(dict.fromkeys(degradations)),
+        numeric_total=numeric_total,
+        unit=unit,
+        truth_value=truth_value,
     )
+
+
+_SCALAR_RE = re.compile(
+    r"(?<![\w.])(?P<currency>[$£€¥])?\s*"
+    r"(?P<number>-?\d+(?:,\d{3})*(?:\.\d+)?)(?![\w.])")
+
+
+def _numeric_scalar(binding: FactBinding) -> tuple[float, str] | None:
+    """Parse one unambiguous scalar from an extracted atomic value."""
+
+    text = binding.value or binding.value_key
+    matches = tuple(_SCALAR_RE.finditer(text))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    try:
+        value = float(match.group("number").replace(",", ""))
+    except ValueError:
+        return None
+    unit = {
+        "$": "USD", "£": "GBP", "€": "EUR", "¥": "JPY",
+    }.get(
+        match.group("currency") or "",
+        "currency" if binding.value_type == "currency" else "",
+    )
+    return value, unit
 
 
 def _children_complete(children: Sequence[AlgebraResult]) -> bool:
@@ -242,12 +276,53 @@ def evaluate_ast(node: ops.OperatorNode, bindings: Sequence[FactBinding], *,
                                  scope_complete=complete, count=len(members),
                                  degradations=child_degradations)
 
+        if isinstance(current, ops.Sum):
+            child = children[0]
+            parsed: list[tuple[FactBinding, float, str]] = []
+            degradations = list(child_degradations)
+            for binding in child.bindings:
+                scalar = _numeric_scalar(binding)
+                if scalar is not None:
+                    parsed.append((binding, scalar[0], scalar[1]))
+            if len(parsed) != len(child.bindings):
+                degradations.append("non_scalar_sum_member")
+            units = {unit for _binding, _value, unit in parsed if unit}
+            if len(units) > 1:
+                degradations.append("mixed_sum_units")
+            total = sum(value for _binding, value, _unit in parsed) if parsed else None
+            selected = tuple(binding for binding, _value, _unit in parsed)
+            members = [_member(binding.binding_id, [binding]) for binding in selected]
+            complete = bool(parsed) and child.scope_complete and exhaustive_complete(current)
+            return _build_result(
+                current, selected, members,
+                scope_complete=complete,
+                numeric_total=total,
+                unit=(next(iter(units)) if len(units) == 1 else current.unit),
+                degradations=degradations,
+            )
+
         if isinstance(current, ops.ExistsAll):
-            present = all(child.members for child in children)
-            members = tuple(member for child in children for member in child.members) if present else ()
+            child_operands = tuple(
+                ops.operand_ids(child) for child in ops.children_of(current))
+            states: list[TruthValue] = []
+            for child, operand_ids in zip(children, child_operands):
+                if child.members:
+                    states.append(TruthValue.TRUE)
+                elif operand_ids and all(closed.get(item, False) for item in operand_ids):
+                    states.append(TruthValue.FALSE)
+                else:
+                    states.append(TruthValue.UNKNOWN)
+            truth = (
+                TruthValue.FALSE if TruthValue.FALSE in states
+                else TruthValue.TRUE if states and all(
+                    item == TruthValue.TRUE for item in states)
+                else TruthValue.UNKNOWN)
+            members = (tuple(member for child in children for member in child.members)
+                       if truth == TruthValue.TRUE else ())
             return _build_result(current, child_bindings, members,
-                                 scope_complete=present,
-                                 degradations=child_degradations)
+                                 scope_complete=truth != TruthValue.UNKNOWN,
+                                 degradations=child_degradations,
+                                 truth_value=truth)
 
         if isinstance(current, (ops.Ordinal, ops.ArgMinTime, ops.ArgMaxTime)):
             child = children[0]

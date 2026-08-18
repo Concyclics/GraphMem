@@ -48,6 +48,10 @@ class BuildTokenLedger:
     skipped_scenes: int = 0
     calls: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _condition: threading.Condition = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._condition = threading.Condition(self._lock)
 
     @property
     def enforced(self) -> bool:
@@ -57,17 +61,28 @@ class BuildTokenLedger:
     def degrade_threshold(self) -> float:
         return self.ceiling * self.degrade_at
 
-    def reserve(self, estimate: int) -> tuple[bool, bool]:
+    def reserve(self, estimate: int, *, wait_for_capacity: bool = False) -> tuple[bool, bool]:
         """Ask to spend ``estimate`` tokens.
 
         Returns ``(allowed, degrade)``.  ``degrade`` asks the caller to request
         fewer facts for this call.  The estimate is held as a reservation so
         concurrent workers cannot each individually fit under the ceiling and
-        collectively blow through it.
+        collectively blow through it.  In strict hard-reservation mode a call
+        may wait when only *in-flight reservations* make it appear not to fit.
+        Once those calls settle, the decision is made from their actual cost.
+        This prevents worker scheduling from turning unused budget into a
+        deterministic fallback while preserving the hard ceiling.
         """
         if not self.enforced:
             return True, False
-        with self._lock:
+        with self._condition:
+            while (
+                wait_for_capacity
+                and self.reserved > 0
+                and self.spent + estimate <= self.ceiling
+                and self.spent + self.reserved + estimate > self.ceiling
+            ):
+                self._condition.wait()
             committed = self.spent + self.reserved
             if committed + estimate > self.ceiling:
                 # Refusing the call is the only hard stop.  With
@@ -88,17 +103,32 @@ class BuildTokenLedger:
     def settle(self, estimate: int, actual: int) -> None:
         """Release a reservation and record what the call actually cost."""
         if not self.enforced:
-            with self._lock:
+            with self._condition:
                 self.spent += actual
                 self.calls += 1
+                self._condition.notify_all()
             return
-        with self._lock:
+        with self._condition:
             self.reserved = max(0, self.reserved - estimate)
             self.spent += actual
             self.calls += 1
+            self._condition.notify_all()
+
+    def cancel(self, estimate: int) -> None:
+        """Release a failed call's reservation without recording token usage.
+
+        Waiting workers must be woken even when the model request raises;
+        otherwise a transient service restart can leave the memory build
+        permanently blocked behind a reservation that will never settle.
+        """
+        if not self.enforced:
+            return
+        with self._condition:
+            self.reserved = max(0, self.reserved - estimate)
+            self._condition.notify_all()
 
     def snapshot(self) -> Mapping[str, object]:
-        with self._lock:
+        with self._condition:
             return {
                 "memory_id": self.memory_id,
                 "ceiling": self.ceiling,

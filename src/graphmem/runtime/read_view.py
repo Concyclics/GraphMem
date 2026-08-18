@@ -132,6 +132,7 @@ class GraphReadView:
                 attrs.get("owner_id", ""), attrs.get("predicate", ""),
                 attrs.get("scope", ""), attrs.get("collection_key", ""),
                 attrs.get("value", ""), " ".join(map(str, attrs.get("owners", ()))),
+                " ".join(map(str, attrs.get("routing_atoms", ()))),
                 " ".join(map(str, attrs.get("predicates", ()))),
                 " ".join(map(str, attrs.get("values", ()))),
                 " ".join(map(str, attrs.get("scopes", ()))),

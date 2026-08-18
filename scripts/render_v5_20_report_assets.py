@@ -305,10 +305,10 @@ def type_accuracy_analysis(payload: dict) -> str:
         f"LoCoMo 64-turn 对 top-50 的总体优势并非各题型均匀提升："
         f"Category 2 Temporal 为 {locomo_deltas['category_2']:+.1f} pp，"
         f"Category 3 Open-domain 为 {locomo_deltas['category_3']:+.1f} pp，"
-        f"但 Category 1 Multi-hop 与 Category 4 Single-hop 分别为 "
-        f"{locomo_deltas['category_1']:+.1f}/{locomo_deltas['category_4']:+.1f} pp。"
+        f"Category 1 Multi-hop 仍为 {locomo_deltas['category_1']:+.1f} pp，"
+        f"而 Category 4 Single-hop 为 {locomo_deltas['category_4']:+.1f} pp。"
         r"因此总体提升应解释为时间关系建模的集中收益，而不是所有查询类型上的全面支配；"
-        r"后两类仍是下一轮索引与回答路径优化的直接目标。" "\n")
+        r"Multi-session 与 Category 1 Multi-hop 仍是下一轮索引与回答路径优化的直接目标。" "\n")
 
 
 def budget_analysis(payload: dict) -> str:
@@ -542,7 +542,7 @@ def plot_budget_accuracy(
         axis.set_ylabel("Accuracy（%）")
         axis.xaxis.set_major_formatter(FuncFormatter(
             lambda value, _: compact_number(value)))
-        axis.set_ylim(50, 84)
+        axis.set_ylim(50, 90)
         finish_axes(axis)
     series_handles = [
         Line2D([0], [0], color=color, linestyle=linestyle, linewidth=1.8,

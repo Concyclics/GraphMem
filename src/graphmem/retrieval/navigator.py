@@ -46,6 +46,7 @@ from .packer import (
     build_proof_units,
     pack as pack_proof_units,
     pack_obligation_aware,
+    rank_dual_lane_candidates,
 )
 from .query_ir import compile_query
 from .scheduler import ScheduleResult, execute as schedule_relations
@@ -68,8 +69,9 @@ TIME_TERMS = frozenset({
     "since", "when", "date", "day", "week", "month", "year", "long", "duration",
 })
 PREFERENCE_QUERY_RE = re.compile(
-    r"\b(?:recommend|suggest|likely|prefer|favorite|favourite|should|"
-    r"would\s+(?:like|enjoy)|good\s+fit)\b", re.I)
+    r"\b(?:recommend|suggest|recommendation|suggestion|advice|tips?|ideas?|"
+    r"likely|prefer|favorite|favourite|should|would\s+(?:like|enjoy)|"
+    r"good\s+fit)\b", re.I)
 
 
 class NavigatorVariant(StrEnum):
@@ -118,6 +120,12 @@ FUSION_DEFAULTS: dict[str, float] = {
     "exact": 1.2, "bm25": 1.0, "dense": 1.0, "graph": 0.8, "binding": 0.7,
     "operand": 0.4, "operand_cap": 1e9, "role": 0.25, "slot": 0.5,
     "session": 0.12, "adjacency": 1.0,
+    # Open-ended advice has no exact fact binding.  Its independent weights are
+    # runtime-overridable so deployments can tune the semantic/noise frontier
+    # without changing the general lookup and aggregation ranking contract.
+    "advice_exact": 0.50, "advice_bm25": 0.50, "advice_dense": 2.00,
+    "advice_graph": 0.35, "advice_role": 0.10, "advice_slot": 0.25,
+    "advice_session": 0.05, "advice_adjacency": 0.10,
 }
 
 
@@ -174,8 +182,31 @@ def exact_lookup_eligible(ir) -> bool:
         and not bool(getattr(slots, "is_count", False))
         and not bool(getattr(slots, "is_duration", False))
         and not bool(getattr(slots, "is_latest", False))
+        and not bool(getattr(slots, "is_advice", False))
         and not PREFERENCE_QUERY_RE.search(ir.query)
 )
+
+_ANONYMOUS_LEGACY_LANE_OPERATORS = frozenset({
+    QueryOperator.LOOKUP,
+    QueryOperator.UNION_DISTINCT,
+    QueryOperator.INTERSECTION_DISTINCT,
+    QueryOperator.GROUP_BY_OWNER,
+    QueryOperator.COUNT_DISTINCT,
+})
+
+
+def operator_aware_legacy_lane(
+    operator: QueryOperator, *, named_transcript: bool, enabled: bool,
+) -> bool:
+    """Route only anonymous lookup/enumeration queries to flat relevance.
+
+    This is intentionally a property of the compiled query and source shape;
+    benchmark names, question IDs, answers, and judge labels are unavailable.
+    """
+
+    return bool(
+        enabled and not named_transcript
+        and operator in _ANONYMOUS_LEGACY_LANE_OPERATORS)
 
 
 def has_named_multi_party(turns: Sequence[SourceTurn]) -> bool:
@@ -359,6 +390,13 @@ class GraphNavigator:
         #: rendered span token and attaches spans for the answer stage.
         obligation_aware_packing: bool = False,
         precision_aware_packing: bool = False,
+        #: Retain a bounded graph-ranked precision head and fill the remaining
+        #: evidence budget from a source-facing coverage rank.
+        dual_lane_packing: bool = False,
+        dual_lane_operator_aware: bool = False,
+        dual_lane_precision_head: int = 32,
+        dual_lane_rrf_k: int = 60,
+        dual_lane_proof_reserve: bool = False,
         candidate_pool_limit: int = 0,
         span_pack_window: int = 96,
         #: Keep a bounded number of the highest-scoring raw provenance
@@ -490,6 +528,15 @@ class GraphNavigator:
         self.binding_discriminant = binding_discriminant
         self.obligation_aware_packing = obligation_aware_packing
         self.precision_aware_packing = precision_aware_packing
+        self.dual_lane_packing = dual_lane_packing
+        self.dual_lane_operator_aware = dual_lane_operator_aware
+        if dual_lane_precision_head <= 0:
+            raise ValueError("dual_lane_precision_head must be positive")
+        self.dual_lane_precision_head = dual_lane_precision_head
+        if dual_lane_rrf_k <= 0:
+            raise ValueError("dual_lane_rrf_k must be positive")
+        self.dual_lane_rrf_k = dual_lane_rrf_k
+        self.dual_lane_proof_reserve = dual_lane_proof_reserve
         self.candidate_pool_limit = max(0, candidate_pool_limit)
         self.span_pack_window = max(0, span_pack_window)
         self.raw_fallback_reserve = max(0, raw_fallback_reserve)
@@ -1041,6 +1088,20 @@ class GraphNavigator:
                 ir = ir.soften_with_legacy(compiled_ir)
         else:
             ir = compiled_ir
+        # Advice is an open-ended synthesis over personal context, not a claim
+        # that one arbitrary CanonicalFact satisfies a binding obligation.
+        # Keep semantic seeding, graph expansion and topology-aware packing,
+        # while preventing the unbound operand from manufacturing proof facts.
+        advice_semantic = bool(
+            ir.slots is not None and ir.slots.is_advice)
+        named_transcript = any(
+            (turn.speaker or "").casefold().strip()
+            not in {"", "assistant", "system", "tool", "user", "human"}
+            for turn in all_turns)
+        compiled_operator = ir.ast_operator or ir.operator
+        operator_aware_legacy_route = operator_aware_legacy_lane(
+            compiled_operator, named_transcript=named_transcript,
+            enabled=self.dual_lane_operator_aware)
         stage_times["query_compile"] = (time.perf_counter() - tick) * 1000
         ast_profiles = {HarnessProfile.H10_AST, HarnessProfile.H11_UNIFIED_IR}
         use_postings = profile in {HarnessProfile.H2_POSTINGS, HarnessProfile.H3_MULTI_ANCHOR,
@@ -1082,7 +1143,8 @@ class GraphNavigator:
                                    and relational_view_active),
                                query_relation_view=(
                                    self.query_relation_view
-                                   and relational_view_active))
+                                   and relational_view_active
+                                   and not advice_semantic))
         stage_times["seed_fusion"] = (time.perf_counter() - tick) * 1000
         if seeded.stats.get("hierarchical_route_ms"):
             stage_times["hierarchical_route"] = float(
@@ -1218,6 +1280,8 @@ class GraphNavigator:
             >= self.exact_lookup_priority_min_score
             and float(exact_lookup_trace.get(
                 "strict_top_provenance_score", 0.0)) >= 0.45)
+        if operator_aware_legacy_route:
+            exact_lookup_priority_active = False
         exact_lookup_trace.update({
             "fast_path_active": exact_lookup_fast_active,
             "priority_active": exact_lookup_priority_active,
@@ -1278,7 +1342,7 @@ class GraphNavigator:
                     | (set(strict_fact_ids)
                        if exact_lookup_priority_active else set()))
         fact_reservoir = None
-        if fact_reservoir_enabled:
+        if fact_reservoir_enabled and not advice_semantic:
             # Facts the narrow path already reached are the precision core and are
             # never displaced; the reservoir only adds rescues, and only the
             # bounded active shortlist reaches binding.
@@ -1321,7 +1385,13 @@ class GraphNavigator:
             node_id: path for node_id, path in node_paths.items() if path
         }
         binding_reasons: dict[str, int] = {}
-        if fact_reservoir_enabled and self.binding_discriminant:
+        if advice_semantic:
+            # The open-ended advice plan has deliberately unbound operands.
+            # Running the CanonicalFact binder here can only manufacture false
+            # proof membership; source/graph ranking remains fully available.
+            bindings = ()
+            binding_reasons = {"advice_semantic_binding_skipped": 1}
+        elif fact_reservoir_enabled and self.binding_discriminant:
             # A wide fact pool scored by the permissive V5.5 rule would
             # manufacture bindings, so H9 uses the dimension-based discriminant:
             # hard conflicts veto, and an ownerless operand needs corroboration.
@@ -1332,7 +1402,10 @@ class GraphNavigator:
                 temporal_constraint=(ir.slots.temporal_key if ir.slots is not None else None))
         else:
             bindings = bind_facts(view, owners, ir.operands, fact_ids, paths)
-        collection_ops = {"union_distinct", "intersection_distinct", "group_by_owner", "count_distinct"}
+        collection_ops = {
+            "union_distinct", "intersection_distinct", "group_by_owner",
+            "count_distinct", "sum",
+        }
         if str(ir.operator) in collection_ops and any(item.predicate_candidates for item in ir.operands):
             # Owner equality alone is insufficient proof for a list/count.  It
             # previously made every fact spoken by an owner mandatory and
@@ -1384,9 +1457,11 @@ class GraphNavigator:
             # Counting the raw binding set produced 15 "antique items" that were
             # actually unrelated facts, reported with scope_complete=True -- a
             # confidently wrong number, which is worse than declining to answer.
-            # So an operand is only closed when a manifest matches it on owner
-            # *and* predicate, and the count is then restricted to that
-            # manifest's members.
+            # A matching manifest always scopes proof packing to its enumerated
+            # members.  It authorizes a deterministic aggregate only when its
+            # independent closure flag is true; an incomplete manifest is still
+            # useful evidence organization, but never turns a partial count
+            # into an exact answer.
             closed_by_operand: dict[str, bool] = {}
             for operand, legacy in zip(ast_specs, legacy_ids + [""] * len(ast_specs)):
                 # Match on the *question's* words, not on the operand's
@@ -1401,7 +1476,6 @@ class GraphNavigator:
                 matched = [
                     node for node in manifests
                     if node.node_type == NodeType.COLLECTION_MANIFEST
-                    and bool(node.attributes.get("closed"))
                     and (not owners.get(legacy)
                          or str(node.attributes.get("owner_id", "")) in owners[legacy])
                     and question and (
@@ -1416,7 +1490,8 @@ class GraphNavigator:
                         or any(question & content_terms(str(value))
                                for value in node.attributes.get("value_keys", ())))
                 ]
-                closed_by_operand[operand.operand_id] = bool(matched)
+                closed_by_operand[operand.operand_id] = any(
+                    bool(node.attributes.get("closed")) for node in matched)
                 scoped_members: set[str] = set()
                 for node in matched:
                     scoped_members.update(str(item) for item in
@@ -1432,13 +1507,13 @@ class GraphNavigator:
                                      or row.fact_node_id in member_scope_by_operand.get(
                                          row.operand_id, set()))
             algebra_bindings = ast_bindings
-            if any(closed_by_operand.values()) or not ops_requires_scope(ir.ast):
+            if (member_scope_by_operand or any(closed_by_operand.values())
+                    or not ops_requires_scope(ir.ast)):
                 algebra_result = evaluate_ast(ir.ast, ast_bindings,
                                               collection_closed=closed_by_operand)
-            # Otherwise leave algebra unset: an aggregate whose collection is
-            # unidentified has no trustworthy member list, and handing the answer
-            # stage "at least 15" built from unrelated facts is worse than
-            # handing it nothing.
+            # An unidentified aggregate still leaves algebra unset. A matched
+            # but open manifest yields an uncertified AlgebraResult so the
+            # packer can keep its witnesses together without injecting a count.
         no_progress = not bindings
         exhausted = any(schedule.exhaustion.values())
         certificate = evaluate_certificate(ir, closure, exhausted=exhausted, no_progress=no_progress)
@@ -1468,7 +1543,15 @@ class GraphNavigator:
         # H10 packs only the witnesses that the recursive algebra selected.
         # Making every candidate binding mandatory produced 95--104 mandatory
         # turns for a 32-turn budget and erased the benefit of evidence ranking.
-        proof_bindings = algebra_result.bindings if algebra_result is not None else closure.bindings
+        if advice_semantic:
+            # A Lookup over an unbound advice operand can otherwise select an
+            # arbitrary graph fact and even reach the deterministic readout.
+            # Advice must always be answered from the ranked source context.
+            algebra_result = None
+            algebra_bindings = ()
+        proof_bindings = (() if advice_semantic else
+                          (algebra_result.bindings
+                           if algebra_result is not None else closure.bindings))
         group_members = {
             group_id: all_group_members[group_id]
             for group_id in group_turns if group_id in all_group_members
@@ -1489,7 +1572,8 @@ class GraphNavigator:
                     continue
             if spans:
                 fact_spans[binding.fact_node_id] = tuple(spans)
-        active_obligations = ir.ast_obligations or ir.proof_obligations
+        active_obligations = (() if advice_semantic else
+                              (ir.ast_obligations or ir.proof_obligations))
         units = build_proof_units(
             proof_bindings, group_turns, obligations=active_obligations,
             group_members=group_members, fact_spans=fact_spans)
@@ -1613,7 +1697,7 @@ class GraphNavigator:
         # ranking O(|candidates| * |bindings| * |evidence|).
         binding_operands_by_turn: dict[str, set[str]] = defaultdict(set)
         binding_confidence_by_operand: dict[str, float] = defaultdict(float)
-        for binding in closure.bindings:
+        for binding in (() if advice_semantic else closure.bindings):
             binding_confidence_by_operand[binding.operand_id] = max(
                 binding_confidence_by_operand[binding.operand_id],
                 binding.confidence)
@@ -1647,19 +1731,36 @@ class GraphNavigator:
             # They stay off for H2-H6 so those rungs keep their frozen V5.5 values.
             w = self.fusion
             operand_gain = w["operand"] * min(len(operand_ids), w["operand_cap"])
-            fused = ((w["exact"] * exact + w["bm25"] * bm25 + w["dense"] * dense
-                      + w["graph"] * graph + w["binding"] * bscore + operand_gain
-                      + w["role"] * role_gain + w["slot"] * slot_gain
-                      + w["session"] * session_score + w["adjacency"] * adjacency_score
-                      + (self.exact_lookup_priority_bonus
-                         * exact_lookup_scores.get(turn_id, 0.0)
-                         if (exact_lookup_priority_active
-                             and turn_id in strict_fact_turn_scores) else
-                         exact_lookup_scores.get(turn_id, 0.0)
-                         if exact_lookup_fast_active else 0.0))
-                     if wide_reservoir else
-                     (exact + bm25 + dense + w["graph"] * graph + w["binding"] * bscore
-                      + operand_gain))
+            if advice_semantic and wide_reservoir:
+                # Whole-question dense similarity is the reliable discriminator
+                # for open-ended personal advice.  Exact/BM25 remain useful but
+                # generic frames ("any tips", "what should I") must not beat a
+                # semantically matching possession or preference.  Graph reach
+                # remains a supporting signal, while session/adjacency are kept
+                # small enough that one broad hit cannot flood an entire chat.
+                fused = (
+                    w["advice_exact"] * exact
+                    + w["advice_bm25"] * bm25
+                    + w["advice_dense"] * dense
+                    + w["advice_graph"] * graph
+                    + w["advice_role"] * role_gain
+                    + w["advice_slot"] * slot_gain
+                    + w["advice_session"] * session_score
+                    + w["advice_adjacency"] * adjacency_score)
+            else:
+                fused = ((w["exact"] * exact + w["bm25"] * bm25 + w["dense"] * dense
+                          + w["graph"] * graph + w["binding"] * bscore + operand_gain
+                          + w["role"] * role_gain + w["slot"] * slot_gain
+                          + w["session"] * session_score + w["adjacency"] * adjacency_score
+                          + (self.exact_lookup_priority_bonus
+                             * exact_lookup_scores.get(turn_id, 0.0)
+                             if (exact_lookup_priority_active
+                                 and turn_id in strict_fact_turn_scores) else
+                             exact_lookup_scores.get(turn_id, 0.0)
+                             if exact_lookup_fast_active else 0.0))
+                         if wide_reservoir else
+                         (exact + bm25 + dense + w["graph"] * graph + w["binding"] * bscore
+                          + operand_gain))
             speaker_terms = content_terms(turn.speaker)
             speaker_owner_match = bool(
                 self.speaker_owner_bonus
@@ -1748,6 +1849,21 @@ class GraphNavigator:
                     query_witness_matches += 1
                 rows = reranked
                 sort_candidates(rows)
+        precision_rank_rows = tuple(rows)
+        answer_kind = (algebra_result.answer_kind if algebra_result is not None
+                       else str(ir.ast_operator or ir.operator))
+        dual_lane_head_ids: tuple[str, ...] = ()
+        dual_lane_trace: Mapping[str, int] = {}
+        dual_lane_active = bool(
+            self.dual_lane_packing and not operator_aware_legacy_route)
+        if dual_lane_active:
+            rows, dual_lane_head_ids, dual_lane_trace = (
+                rank_dual_lane_candidates(
+                    rows, answer_kind=answer_kind,
+                    max_turns=budget.max_evidence_turns,
+                    precision_head=self.dual_lane_precision_head,
+                    rrf_k=self.dual_lane_rrf_k))
+            rows = list(rows)
         candidate_count_before_limit = len(rows)
         if self.candidate_pool_limit:
             rows = rows[:self.candidate_pool_limit]
@@ -1767,8 +1883,6 @@ class GraphNavigator:
         effective_budget = replace(
             budget, max_evidence_turns=effective_turn_limit)
         if self.obligation_aware_packing:
-            answer_kind = (algebra_result.answer_kind if algebra_result is not None
-                           else str(ir.ast_operator or ir.operator))
             pack_turn_limit = (
                 effective_turn_limit if exact_lookup_fast_active else (
                     adaptive_evidence_turn_limit(
@@ -1776,8 +1890,13 @@ class GraphNavigator:
                         query=query)
                     if self.precision_aware_packing else budget.max_evidence_turns))
             pack_budget = replace(budget, max_evidence_turns=pack_turn_limit)
+            floor_rows = precision_rank_rows if dual_lane_active else rows
+            floor_budget = (
+                replace(pack_budget, max_evidence_turns=min(
+                    pack_turn_limit, len(dual_lane_head_ids)))
+                if dual_lane_active else pack_budget)
             baseline_floor, _baseline_dropped, _baseline_coverage = self._rank_pack(
-                rows, by_id, pack_budget, self.per_session_quota,
+                floor_rows, by_id, floor_budget, self.per_session_quota,
                 reserved_turn_ids=raw_fallback_set,
                 reserve_limit=self.raw_fallback_reserve)
             packed, dropped, pack_exhaustion, packed_units, packed_span_tokens = pack_obligation_aware(
@@ -1787,7 +1906,10 @@ class GraphNavigator:
                 count_text_tokens=self._count_tokens_cached,
                 span_window=self.span_pack_window,
                 baseline_floor=baseline_floor,
-                precision_aware=self.precision_aware_packing)
+                precision_aware=self.precision_aware_packing,
+                proof_reserve=(
+                    self.dual_lane_proof_reserve
+                    if dual_lane_active else True))
             units = packed_units
         elif profile in {HarnessProfile.H6_PROOF_PACKING, HarnessProfile.H8_RESERVOIR,
                        HarnessProfile.H9_FACT_RESERVOIR}:
@@ -1853,6 +1975,7 @@ class GraphNavigator:
                    "query_ir_soft_fallback": ir.soft_fallback_applied,
                    "query_ir_mode": ("unified_ast" if profile is HarnessProfile.H11_UNIFIED_IR
                                      else "legacy_plus_shadow_ast"),
+                   "advice_semantic_fusion": advice_semantic,
                    "ast_operands": [item.operand_id for item in compiled_ir.ast_operands],
                    "ast_obligations": [f"{item.kind}:{item.operand_id or 'root'}"
                                        for item in compiled_ir.ast_obligations],
@@ -1892,6 +2015,24 @@ class GraphNavigator:
                    "query_witness_seed_terms": query_witness_seed_terms,
                    "span_pack_window": self.span_pack_window,
                    "precision_aware_packing": self.precision_aware_packing,
+                   "dual_lane_packing": self.dual_lane_packing,
+                   "dual_lane_operator_aware": self.dual_lane_operator_aware,
+                   "dual_lane_active": dual_lane_active,
+                   "dual_lane_named_transcript": named_transcript,
+                   "dual_lane_legacy_operator_route": (
+                       operator_aware_legacy_route),
+                   "dual_lane_precision_head": (
+                       self.dual_lane_precision_head),
+                   "dual_lane_rrf_k": self.dual_lane_rrf_k,
+                   "dual_lane_proof_reserve": (
+                       self.dual_lane_proof_reserve),
+                   "dual_lane_rank": dict(dual_lane_trace),
+                   "dual_lane_precision_packed": sum(
+                       turn_id in frozenset(dual_lane_head_ids)
+                       for turn_id in packed) if dual_lane_active else 0,
+                   "dual_lane_coverage_packed": sum(
+                       turn_id not in frozenset(dual_lane_head_ids)
+                       for turn_id in packed) if dual_lane_active else 0,
                    "exact_lookup_fast_path": self.exact_lookup_fast_path,
                    "exact_lookup_priority": self.exact_lookup_priority,
                    "exact_lookup_priority_named_speakers_only": (

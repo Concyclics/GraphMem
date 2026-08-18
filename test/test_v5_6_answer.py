@@ -17,7 +17,12 @@ from graphmem.domain import (
 )
 from graphmem.tokenization import HeuristicTokenCounter
 from graphmem.storage import SQLiteGraphStore
-from graphmem.answer.stage import _aggregation_source_reserve_ids
+from graphmem.answer.stage import (
+    _aggregation_source_reserve_ids,
+    _preference_focus_index,
+    _query_focus_index,
+)
+from graphmem.answer.aggregation import selective_operand_worksheet_route
 
 
 def _turn(index: int, text: str, session: str = "s1", speaker: str = "user") -> SourceTurn:
@@ -238,7 +243,7 @@ def test_a_degraded_result_is_never_certified() -> None:
 def test_the_prompt_hash_is_frozen() -> None:
     """A prompt edit invalidates every arm scored before it; make that loud."""
     assert PROMPT_HASH == hashlib.sha256(
-        ("graphmem-v5.6-answer-v1" + __import__(
+        ("graphmem-v5.57-answer-unit-rate-v1" + __import__(
             "graphmem.answer.prompts", fromlist=["x"]).ANSWER_SYSTEM_PROMPT).encode()).hexdigest()
 
 
@@ -324,6 +329,129 @@ def test_compact_labels_and_focus_index_are_explicit_prompt_contracts() -> None:
     assert prompt_contract(False, False, True)[2] != prompt_contract(
         False, False, True, False, False, False, False, False, False,
         True, True)[2]
+
+
+def test_query_focus_reads_requested_ordinal_from_full_packed_turn() -> None:
+    text = (
+        "Work from home jobs for seniors: 1. Tutor. 2. Bookkeeper. "
+        "3. Consultant. 4. Translator. 5. Customer support. "
+        "6. Virtual assistant. 7. Transcriptionist. 8. Survey taker.")
+    turn = replace(_turn(0, text, speaker="assistant"), role="assistant")
+    candidate = CandidateScore(
+        turn.turn_id, turn.session_id, 1.0, 1.0, 1.0, 0.0,
+        0.0, 0.0, 40, 5.0, ("exact", "bm25", "dense"))
+
+    focus, ids = _query_focus_index(
+        "Can you remind me what was the 7th job in the list you provided?",
+        {turn.turn_id: turn}, (turn.turn_id,), (candidate,),
+        limit=2, excerpt_chars=160)
+
+    assert focus is not None
+    assert "7. Transcriptionist" in focus
+    assert ids == (turn.turn_id,)
+
+
+def test_query_focus_uses_question_tail_to_recover_clipped_relation_value() -> None:
+    text = (
+        "Yes, here are DIY home decor projects using recycled materials. "
+        "1. Wine Cork Board - arrange and glue the corks into a board. "
+        "2. Newspaper Flower Vase - roll newspaper into a vase, then seal "
+        "the vase with Mod Podge or another sealant to make it water-resistant. "
+        "3. Bottle Cap Coasters - glue caps onto cork bases.")
+    turn = replace(_turn(0, text, speaker="assistant"), role="assistant")
+    candidate = CandidateScore(
+        turn.turn_id, turn.session_id, 1.0, 1.0, 1.0, 0.0,
+        0.0, 0.0, 40, 5.0, ("exact", "bm25", "dense"))
+
+    focus, ids = _query_focus_index(
+        "I'm going back to our previous conversation about DIY home decor "
+        "projects using recycled materials. Can you remind me what sealant "
+        "you recommended for the newspaper flower vase?",
+        {turn.turn_id: turn}, (turn.turn_id,), (candidate,),
+        limit=2, excerpt_chars=180)
+
+    assert focus is not None
+    assert "Mod Podge" in focus
+    assert "sealant" in focus
+    assert ids == (turn.turn_id,)
+
+
+def test_query_focus_uses_adjacent_session_context_to_disambiguate_ordinals() -> None:
+    question_turn = _turn(0, "Brainstorm ideas for work from home jobs for seniors")
+    answer_turn = replace(
+        _turn(1, "1. Tutor 2. Bookkeeper 3. Consultant 4. Translator "
+              "5. Customer support 6. Virtual assistant 7. Transcriptionist "
+              "8. Survey taker", speaker="assistant"), role="assistant")
+    noise_question = _turn(0, "How should I present to a class?", session="noise")
+    noise_answer = replace(
+        _turn(1, "1. Start early 2. Add slides 3. Rehearse 4. Speak clearly "
+              "5. Add examples 6. Pause 7. Encourage Questions 8. Conclude",
+              session="noise", speaker="assistant"), role="assistant")
+    turns = {row.turn_id: row for row in (
+        question_turn, answer_turn, noise_question, noise_answer)}
+    candidates = tuple(
+        CandidateScore(
+            row.turn_id, row.session_id,
+            2.0 if row is noise_answer else 0.2,
+            2.0 if row is noise_answer else 0.2,
+            2.0 if row is noise_answer else 0.2,
+            0.0, 0.0, 0.0, 40,
+            20.0 if row is noise_answer else 1.0,
+            ("exact", "bm25", "dense"))
+        for row in (noise_answer, answer_turn))
+
+    focus, ids = _query_focus_index(
+        "I think we discussed work from home jobs for seniors earlier. Can "
+        "you remind me what was the 7th job in the list you provided?",
+        turns, (noise_answer.turn_id, answer_turn.turn_id), candidates,
+        limit=2, excerpt_chars=160)
+
+    assert focus is not None
+    assert focus.index("7. Transcriptionist") < focus.index("7. Encourage Questions")
+    assert ids[0] == answer_turn.turn_id
+
+
+def test_query_focus_is_disabled_for_named_multi_party_transcript() -> None:
+    turn = replace(
+        _turn(0, "I bought the camera in June.", speaker="Caroline"),
+        role="user")
+    candidate = CandidateScore(
+        turn.turn_id, turn.session_id, 1.0, 1.0, 1.0, 0.0,
+        0.0, 0.0, 10, 5.0, ("exact", "bm25", "dense"))
+
+    focus, ids = _query_focus_index(
+        "When did Caroline buy the camera?", {turn.turn_id: turn},
+        (turn.turn_id,), (candidate,))
+
+    assert focus is None
+    assert ids == ()
+
+
+def test_query_focus_stage_routes_only_non_temporal_lookup(tmp_path) -> None:
+    store = _store(tmp_path, [
+        "A long answer introduced several craft projects before saying that "
+        "the newspaper vase should be sealed with Mod Podge.",
+    ])
+    result = replace(
+        _result([turn.turn_id for turn in store.turns("m")]),
+        trace={"ast_operator": "lookup"})
+    stage = _stage(
+        store, _FakeClient(), answer_config=AnswerConfig(
+            query_focus_index_enabled=True,
+            query_focus_index_limit=2,
+            query_focus_excerpt_chars=160))
+
+    lookup = stage.prepare(
+        "q1", "Can you remind me what sealant you recommended for the "
+        "newspaper vase?", result, QueryBudget())
+    temporal = stage.prepare(
+        "q2", "Can you remind me when you recommended the newspaper vase?",
+        result, QueryBudget())
+
+    assert lookup.trace["query_focus_index"]
+    assert "Mod Podge" in lookup.messages[1]["content"]
+    assert not temporal.trace["query_focus_index"]
+    store.close()
 
 
 def test_default_focused_prompt_scope_preserves_specialized_contracts(
@@ -427,7 +555,9 @@ def test_preference_synthesis_is_wording_routed_and_separately_hashed() -> None:
         question="Can you recommend a movie?", question_date=None,
         evidence_text="I enjoy mysteries.", precision_grounding=True,
         preference_synthesis=True)
-    assert baseline[1] == routed[1]
+    assert baseline[1] != routed[1]
+    assert "Grounded recommendation check" in routed[1]["content"]
+    assert "Answer this recommendation request now" in routed[1]["content"]
     assert baseline[0] != routed[0]
     assert "may synthesize a new recommendation" in routed[0]["content"]
     assert prompt_contract(False, True, False, False, True)[2] != (
@@ -468,6 +598,79 @@ def test_aggregation_execution_card_keeps_candidates_trace_only() -> None:
     assert "Question: How much did I spend" in card.text
     assert "Candidate 1:" not in card.text
     assert "Certified deterministic result: unavailable" not in card.text
+    assert card.worksheet_lines
+    assert card.worksheet_turn_ids
+
+
+def test_v5_54_compact_card_keeps_a_bounded_operand_worksheet(tmp_path) -> None:
+    store = _store(tmp_path, [
+        "I earned $150 selling potted plants at the Saturday market.",
+        "I earned $75 selling herb bundles at the Sunday market.",
+        "An unrelated article mentioned a $900 budget.",
+    ])
+    result = _result([turn.turn_id for turn in store.turns("m")])
+    prepared = _stage(
+        store, _FakeClient(), answer_config=AnswerConfig.v5_54(
+            aggregation_operand_worksheet_enabled=True)).prepare(
+            "q1", "How much more did I earn at the Saturday market than "
+            "the Sunday market?",
+            result, QueryBudget())
+
+    user = prepared.messages[-1]["content"]
+    assert "Operand worksheet" in user
+    assert "$150" in user and "$75" in user
+    assert prepared.trace["aggregation_worksheet_rows"] >= 1
+    assert not prepared.trace["aggregation_ledger"]["execution_card"]
+    assert prepared.trace["readout_policy_evidence_set_frozen"]
+    store.close()
+
+
+def test_selective_operand_workspace_requires_complete_alternatives() -> None:
+    turns = {
+        turn.turn_id: turn for turn in (
+            _turn(0, "The train fare was $10."),
+            _turn(1, "The taxi fare was $60."),
+        )
+    }
+    train = build_aggregation_ledger(
+        "How much will I save by taking the train instead of a taxi?",
+        turns, tuple(turns))
+    bus = build_aggregation_ledger(
+        "How much will I save by taking the bus instead of a taxi?",
+        turns, tuple(turns))
+
+    assert train is not None and selective_operand_worksheet_route(
+        "How much will I save by taking the train instead of a taxi?", train,
+    ) == "complete_alternative"
+    assert bus is not None and selective_operand_worksheet_route(
+        "How much will I save by taking the bus instead of a taxi?", bus,
+    ) is None
+
+
+def test_selective_operand_workspace_accepts_complete_money_sum() -> None:
+    turns = {
+        turn.turn_id: turn for turn in (
+            _turn(0, "I raised $5,000 at a charity bike event."),
+            _turn(1, "I raised $250 at a charity walk."),
+            _turn(2, "I raised $600 at a charity yoga event."),
+        )
+    }
+    question = "How much money did I raise through all charity events in total?"
+    ledger = build_aggregation_ledger(question, turns, tuple(turns))
+
+    assert ledger is not None
+    assert selective_operand_worksheet_route(
+        question, ledger) == "complete_money_sum"
+
+
+def test_selective_operand_workspace_accepts_one_direct_count() -> None:
+    turn = _turn(
+        0, "I attended five sessions of the bereavement support group.")
+    question = "How many sessions of the bereavement support group did I attend?"
+    ledger = build_aggregation_ledger(question, {turn.turn_id: turn}, (turn.turn_id,))
+
+    assert ledger is not None
+    assert selective_operand_worksheet_route(question, ledger) == "direct_count"
 
 
 def test_non_aggregation_question_has_no_ledger() -> None:
@@ -488,6 +691,30 @@ def test_count_in_a_week_is_not_misclassified_as_duration_sum() -> None:
         "How long had I been bird watching when I attended the workshop?") == "date_difference"
     assert aggregation_operation(
         "How many weeks in total did I spend reading three books?") == "sum"
+    assert aggregation_operation(
+        "How many online courses have I completed in total?") == "count_distinct"
+    assert aggregation_operation(
+        "What is the total number of plants I bought?") == "count_distinct"
+    assert aggregation_operation(
+        "How much will I save by taking the train instead of a taxi?") == "difference"
+
+
+def test_historical_window_and_savings_procedures_are_explicit() -> None:
+    first = _turn(0, "That is 15 autographed baseballs in three months.")
+    later = _turn(1, "I have added 20 autographed baseballs in the past few months.")
+    rows = {row.turn_id: row for row in (first, later)}
+
+    historical = build_aggregation_ledger(
+        "How many autographed baseballs did I add in the first three months?",
+        rows, tuple(rows))
+    savings = build_aggregation_ledger(
+        "How much will I save by taking the train instead of a taxi?",
+        rows, tuple(rows))
+
+    assert historical is not None
+    assert "never a later cumulative or current total" in historical.text
+    assert savings is not None and savings.operation == "difference"
+    assert "explicitly rejected option" in savings.text
 
 
 def test_money_ledger_reserves_terse_direct_currency_operands() -> None:
@@ -665,6 +892,20 @@ class _FakeClient:
         return type("_R", (), {"choices": [choice], "usage": usage, "model": "test"})()
 
 
+class _TransientFakeClient(_FakeClient):
+    def __init__(self, failures: int) -> None:
+        super().__init__("Rex")
+        self.failures = failures
+
+    def create(self, **request):
+        if self.failures:
+            self.failures -= 1
+            error = RuntimeError("Service temporarily unavailable")
+            error.status_code = 503
+            raise error
+        return super().create(**request)
+
+
 def _store(tmp_path, texts: list[str]) -> SQLiteGraphStore:
     store = SQLiteGraphStore(tmp_path / "a.sqlite")
     turns = [_turn(index, text) for index, text in enumerate(texts)]
@@ -803,6 +1044,104 @@ def test_v5_54_answer_config_freezes_the_measured_contract() -> None:
     assert config.max_output_tokens == 2000
 
 
+def test_v5_63_answer_config_enables_only_selective_accuracy_routes() -> None:
+    config = AnswerConfig.v5_63()
+
+    assert config.readout_policy == "v5_54"
+    assert not config.query_focus_index_enabled
+    assert config.temporal_query_focus_enabled
+    assert config.preference_focus_strategy == "domain_idf"
+    assert config.aggregation_operand_worksheet_enabled
+    assert config.aggregation_operand_worksheet_selective
+    assert config.query_focus_excerpt_chars == 480
+    assert config.max_output_tokens == 2000
+
+
+def test_domain_preference_focus_uses_the_query_domain_not_dense_rank() -> None:
+    unrelated = _turn(
+        0, "I like photography and own a camera with several lenses.")
+    exact = _turn(
+        1, "I love stand-up comedy specials and watch them on Netflix.")
+    turns = {row.turn_id: row for row in (unrelated, exact)}
+    scores = (
+        CandidateScore(unrelated.turn_id, unrelated.session_id, 0, 0, 9, 0,
+                       0, 0, 1, 9, ()),
+        CandidateScore(exact.turn_id, exact.session_id, 0, 0, 0.1, 0,
+                       0, 0, 1, 0.1, ()),
+    )
+
+    focus, turn_ids = _preference_focus_index(
+        "Can you recommend a show or movie for me to watch tonight?",
+        turns, (unrelated.turn_id, exact.turn_id), scores,
+        strategy="domain_idf")
+
+    assert focus is not None and "stand-up comedy" in focus
+    assert turn_ids == (exact.turn_id,)
+
+
+def test_v5_63_routes_explicit_date_difference_to_query_focus(tmp_path) -> None:
+    store = _store(tmp_path, [
+        "I replaced the spark plugs on February 14, 2023.",
+        "I attended Turbocharged Tuesdays on March 15, 2023.",
+        "An unrelated event happened in January 2023.",
+    ])
+    result = replace(
+        _result([turn.turn_id for turn in store.turns("m")]),
+        trace={"query_operator": "lookup"})
+    prepared = _stage(
+        store, _FakeClient(), answer_config=AnswerConfig.v5_63()).prepare(
+            "q", "How many days passed between replacing the spark plugs and "
+            "attending Turbocharged Tuesdays?", result,
+            QueryBudget(max_evidence_turns=64, max_evidence_tokens=12000))
+
+    assert prepared.trace["query_focus_index"]
+    assert "Query focus (verbatim excerpts" in prepared.messages[-1]["content"]
+    store.close()
+
+
+def test_v5_63_renders_only_a_complete_selective_money_workspace(tmp_path) -> None:
+    store = _store(tmp_path, [
+        "I raised $5,000 at a charity bike event.",
+        "I raised $250 at a charity walk.",
+        "I raised $600 at a charity yoga event.",
+    ])
+    result = _result([turn.turn_id for turn in store.turns("m")])
+    prepared = _stage(
+        store, _FakeClient(), answer_config=AnswerConfig.v5_63()).prepare(
+            "q", "How much money did I raise through all charity events in total?",
+            result, QueryBudget(max_evidence_turns=64, max_evidence_tokens=12000))
+
+    ledger = prepared.trace["aggregation_ledger"]
+    assert ledger["worksheet_route"] == "complete_money_sum"
+    assert "Operand worksheet" in prepared.messages[-1]["content"]
+    assert "selective_operand_worksheet:complete_money_sum" in (
+        prepared.trace["readout_policy_route"])
+    assert prepared.trace["readout_policy_token_delta"] <= 500
+    store.close()
+
+
+def test_v5_63_keeps_nonselected_aggregation_system_contract_frozen(
+        tmp_path) -> None:
+    store = _store(tmp_path, [
+        "My commute takes 25 minutes each way.",
+        "I usually leave home at 8 AM.",
+    ])
+    result = _result([turn.turn_id for turn in store.turns("m")])
+    question = "How long is my daily commute to work?"
+    budget = QueryBudget(max_evidence_turns=64, max_evidence_tokens=12000)
+    baseline = _stage(
+        store, _FakeClient(), answer_config=AnswerConfig.v5_54()).prepare(
+            "baseline", question, result, budget)
+    selective = _stage(
+        store, _FakeClient(), answer_config=AnswerConfig.v5_63()).prepare(
+            "selective", question, result, budget)
+
+    assert not selective.trace["aggregation_ledger"]["worksheet_enabled"]
+    assert baseline.messages[0]["content"] == selective.messages[0]["content"]
+    assert "bounded reading index" not in selective.messages[0]["content"]
+    store.close()
+
+
 def test_v5_54_policy_is_in_core_and_freezes_the_evidence_set(tmp_path) -> None:
     store = _store(tmp_path, [
         "I joined the running club in April 2023.",
@@ -868,6 +1207,23 @@ def test_the_stage_makes_exactly_one_call_and_returns_the_prediction(tmp_path) -
     assert answer.finish_reason == "stop"
     assert answer.api_prompt_tokens == 100
     assert answer.api_total_tokens == 103
+    store.close()
+
+
+def test_the_stage_retries_transient_transport_failure_in_place(
+        tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("graphmem.answer.stage.time.sleep", lambda _seconds: None)
+    store = _store(tmp_path, ["I adopted a beagle named Rex."])
+    client = _TransientFakeClient(failures=2)
+    stage = _stage(store, client)
+    result = _result([turn.turn_id for turn in store.turns("m")])
+
+    answer = stage.answer("q1", "What is the dog called?", result, QueryBudget())
+
+    assert answer.prediction == "Rex"
+    retry_count = store._read_one(
+        "SELECT retry_count FROM llm_calls WHERE stage='answer'")[0]
+    assert retry_count == 2
     store.close()
 
 

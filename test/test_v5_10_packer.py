@@ -13,7 +13,9 @@ from graphmem.domain import (
 from graphmem.retrieval.packer import (
     adaptive_evidence_turn_limit,
     build_proof_units,
+    coverage_lane_score,
     pack_obligation_aware,
+    rank_dual_lane_candidates,
     salient_spans,
 )
 from graphmem.retrieval.navigator import GraphNavigator
@@ -227,3 +229,27 @@ def test_precision_aware_pack_can_displace_a_noisy_monotonic_floor() -> None:
 
     assert set(packed) == {"left", "right"}
     assert flags["precision_aware"]
+
+
+def test_dual_lane_preserves_precision_head_and_recovers_raw_coverage() -> None:
+    turns = {
+        "graph-1": _turn("graph-1", "s1", "graph-only candidate one"),
+        "graph-2": _turn("graph-2", "s1", "graph-only candidate two"),
+        "direct": _turn("direct", "s2", "Alice bought the exact camera."),
+        "dense": _turn("dense", "s3", "A semantically matching camera note."),
+    }
+    rows = (
+        CandidateScore("graph-1", "s1", 0, 0, 0, 1, 0, 0, 4, 9, ("graph",)),
+        CandidateScore("graph-2", "s1", 0, 0, 0, 1, 0, 0, 4, 8, ("graph",)),
+        CandidateScore("dense", "s3", 0, 0, 0.8, 0, 0, 0.5, 6, 3, ("dense",)),
+        CandidateScore("direct", "s2", 1, 0.5, 0.7, 0, 0, 0.5, 6, 2, ("exact", "bm25", "dense")),
+    )
+
+    ranked, head, trace = rank_dual_lane_candidates(
+        rows, answer_kind="lookup", max_turns=4, precision_head=32)
+
+    assert head == ("graph-1", "graph-2")
+    assert tuple(row.turn_id for row in ranked) == (
+        "graph-1", "graph-2", "direct", "dense")
+    assert coverage_lane_score(rows[-1]) > coverage_lane_score(rows[0])
+    assert trace["precision_head"] == 2

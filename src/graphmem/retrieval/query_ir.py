@@ -19,6 +19,7 @@ from .operators import (
     Lookup,
     OperatorNode,
     Ordinal,
+    Sum,
     UnionDistinct,
     describe,
     operand_ids,
@@ -132,6 +133,23 @@ class QueryIR:
 
 def _operator(query: str) -> QueryOperator:
     lowered = query.casefold()
+    query_tokens = set(terms(query))
+    unit_rate = bool(
+        "how much" in lowered
+        and query_tokens & {"each", "per"}
+        and query_tokens & {"spent", "spend", "paid", "pay", "cost", "costs", "price"})
+    if (not unit_rate
+            and (query_tokens & {"sum", "total", "altogether", "combined"})
+            and query_tokens & {
+                "amount", "amounts", "spent", "spend", "paid", "pay",
+                "cost", "costs", "sum", "total",
+            }):
+        return QueryOperator.SUM
+    if (not unit_rate and "how much" in lowered
+            and query_tokens & {
+                "spent", "spend", "paid", "pay", "total", "altogether",
+            }):
+        return QueryOperator.SUM
     if "how many" in lowered or lowered.startswith("count "):
         return QueryOperator.COUNT_DISTINCT
     if "both" in lowered or "in common" in lowered or "shared" in lowered:
@@ -155,7 +173,10 @@ def _query_owners(query: str, view: "GraphReadView") -> tuple[tuple[str, tuple[s
     lowered = f" {normalize_key(query)} "
     matches: list[tuple[str, tuple[str, ...], int]] = []
     for alias, owner_ids in view.owner_alias_index.items():
-        if alias and f" {alias} " in lowered:
+        # The extraction graph can contain malformed one-word entity aliases
+        # such as "for".  They must never become a query owner merely because
+        # the preposition occurs in the question.
+        if alias and content_terms(alias) and f" {alias} " in lowered:
             matches.append((alias, owner_ids, len(alias.split())))
     selected: dict[tuple[str, ...], tuple[str, int]] = {}
     for alias, owner_ids, width in sorted(matches, key=lambda row: (-row[2], row[0])):
@@ -248,6 +269,9 @@ def compose_operator(slots: QuerySlots, operands: Sequence[OperandSpec]) -> Oper
     if slots.is_duration:
         left, right = (leaves[0], leaves[1]) if multi else (leaves[0], leaves[0])
         return DateDifference(left, right)
+    if slots.is_sum:
+        return Sum(
+            combined(), unit="currency" if slots.value_type == "currency" else "")
     if slots.is_count:
         return CountDistinct(combined(), distinct_by=slots.distinct_by)
     if slots.ordinal_index is not None:
@@ -284,7 +308,8 @@ def _ast_operands(query: str, slots: QuerySlots, owners, predicates, scopes, *,
     # explicit owners already supply two leaves and retain their owner mapping.
     if len(event_predicates) == 2 and len(rows) <= 1:
         rows = (rows[0], rows[0])
-    exhaustive = slots.is_count or slots.is_list or slots.quantifier in {"both", "each", "all", "every"}
+    exhaustive = (slots.is_count or slots.is_sum or slots.is_unit_rate or slots.is_list
+                  or slots.quantifier in {"both", "each", "all", "every"})
     return tuple(OperandSpec(
         operand_id=stable_id("ast-operand", query, index, alias),
         owner_aliases=(alias,) if alias else (),
@@ -348,12 +373,24 @@ def _scope_candidates(query: str, view: "GraphReadView") -> tuple[str, ...]:
 
 def compile_query(query: str, view: "GraphReadView", *,
                   registry: PrincipalRegistry | None = None) -> QueryIR:
+    slots = parse_slots(query)
     operator = _operator(query)
     owners = _query_owners(query, view)
     predicates = _predicate_candidates(query, owners, view)
+    # Advice/recommendation questions ask for a synthesis over the user's
+    # context.  Graph-vocabulary overlap is unsafe here: e.g. "should" matched
+    # an extracted predicate "should be inclusive", while generic phrases such
+    # as "I've been ..." matched dozens of unrelated activity predicates.  A
+    # whole-query lexical+dense seed is both more faithful and label-free.  The
+    # graph still expands and topologically packs those semantic seeds; only the
+    # spurious hard owner/predicate binding is removed.
+    if slots.is_advice:
+        owners = ()
+        predicates = ()
     distinct_by = "event_instance" if any(word in query.casefold() for word in ("times", "occasions", "events")) else "value"
     multiplicity = "exhaustive_set" if operator in {
-        QueryOperator.UNION_DISTINCT, QueryOperator.INTERSECTION_DISTINCT, QueryOperator.COUNT_DISTINCT,
+        QueryOperator.UNION_DISTINCT, QueryOperator.INTERSECTION_DISTINCT,
+        QueryOperator.COUNT_DISTINCT, QueryOperator.SUM,
     } else "at_least_one"
     rows = owners or (("", ()),)
     operands = tuple(OperandSpec(
@@ -373,16 +410,16 @@ def compile_query(query: str, view: "GraphReadView", *,
     ordering = "ascending" if any(word in query.casefold() for word in ("before", "earlier", "first")) else None
     # Shadow compile: parse the slots and compose the AST alongside the legacy
     # decision, but execute neither of the AST's operands nor its operator yet.
-    slots = parse_slots(query)
-    scopes = _scope_candidates(query, view)
+    scopes = () if slots.is_advice else _scope_candidates(query, view)
     resolved_owners: tuple[ResolvedOwner, ...] = ()
     owner_warnings: tuple[str, ...] = ()
     if registry is not None:
         resolved_owners, owner_warnings = resolve_query_owners(query, registry)
     # AST operands prefer the principal-aware resolution when it produced one;
     # the legacy alias list stays untouched so H0-H9 execution cannot move.
-    ast_owner_rows = (tuple((row.mention_text, row.canonical_entity_ids)
-                            for row in resolved_owners) or owners)
+    ast_owner_rows = (() if slots.is_advice else
+                      (tuple((row.mention_text, row.canonical_entity_ids)
+                             for row in resolved_owners) or owners))
     event_clauses = _temporal_event_clauses(query, slots)
     event_predicates = tuple(
         _predicate_candidates(clause, owners, view) or predicates
@@ -403,7 +440,8 @@ def compile_query(query: str, view: "GraphReadView", *,
     if owner_warnings:
         fallback_reasons.extend(f"owner:{warning}" for warning in owner_warnings)
         confidence -= min(0.35, 0.12 * len(owner_warnings))
-    if (slots.is_count or slots.expects_multiple) and not predicates:
+    if (slots.is_count or slots.is_sum or slots.is_unit_rate
+            or slots.expects_multiple) and not predicates:
         fallback_reasons.append("exhaustive_query_without_predicate_match")
         confidence -= 0.15
     confidence = max(0.0, min(1.0, confidence))

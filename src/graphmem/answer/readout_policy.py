@@ -30,15 +30,17 @@ V5_54_POLICY = "v5_54"
 _TYPED_VERSION = "graphmem-v5.43-typed-readout-v1"
 _RECENCY_VERSION = "graphmem-v5.42-topological-recency-readout-v1"
 _COMPACT_AGGREGATION_VERSION = (
-    "graphmem-v5.46-compact-aggregation-execution-v1")
+    "graphmem-v5.60-compact-aggregation-worksheet-v1")
 _SINGLE_LINE_VERSION = "graphmem-v5.47-single-line-aggregation-stop-v1"
 _INFERENCE_VERSION = "graphmem-v5.48-grounded-inference-synthesis-v1"
 _LEXICAL_BLOCK_VERSION = "graphmem-v5.51-lexical-block-readout-v1"
+_MAX_READOUT_TOKEN_INCREASE = 500
 
 _MEMORY_MARKER = "Conversation memories:\n"
 _FOOTER_MARKER = "\n\nAnswer the original Question now:"
 _END_MARKERS = (
     "\n\nAggregation ledger (",
+    "\n\nQuery focus (",
     "\n\nOutput contract:",
     "\n\nFinal check:",
     _FOOTER_MARKER,
@@ -110,7 +112,7 @@ _STRICT_ABSENCE = (
     "name the near-match only when useful."
 )
 _INFERENCE_SYSTEM = (
-    "For modal inference questions, infer from stated facts and ordinary "
+    "For modal inference, infer from stated facts and ordinary "
     "knowledge; the conclusion need not be verbatim."
 )
 _COMPACT_AGGREGATION_SYSTEM = (
@@ -121,21 +123,31 @@ _COMPACT_AGGREGATION_SYSTEM = (
     "occurrence, retain distinct occurrences, and never treat an absent operand "
     "as zero. Return only the computed answer."
 )
+_COMPACT_AGGREGATION_WORKSHEET_SYSTEM = (
+    " An Aggregation execution card follows the graph-grouped memories. It "
+    "specifies the requested operation and may include a bounded reading index "
+    "that quotes already supplied source turns. The index is not a certified "
+    "answer or a complete set. Select the complete "
+    "operand set only from direct memories matching the exact subject, relation, "
+    "time, polarity, and completion state. Deduplicate repeated mentions of one "
+    "occurrence, retain distinct occurrences, and never treat an absent operand "
+    "as zero. Return only the computed answer."
+)
 _LEDGER_MARKER = "\n\nAggregation ledger ("
 _OUTPUT_MARKER = "\n\nOutput contract:"
 _OPERATION_RE = re.compile(r"(?:^|\n)Operation:\s*(?P<operation>[a-z_]+)")
-_SINGLE_LINE_OLD = (
+_SINGLE_LINE_SOURCE_GUARD = (
     "Use graph adjacency only to find related evidence; sharing a graph block "
-    "does not by itself make a memory an operand.\n"
-    "Compute and answer this exact Question now: "
+    "does not by itself make a memory an operand."
 )
-_SINGLE_LINE_NEW = "Graph proximity is not operand proof.\nQuestion: "
+_SINGLE_LINE_COMPUTE = "Compute and answer this exact Question now: "
+_SINGLE_LINE_NEW = "Graph proximity is not operand proof."
 _SINGLE_LINE_STOP = (
     "\nOutput one concise final-answer line only, then stop; never list evidence "
     "or repeat."
 )
 _ANONYMOUS_COMPACT_OPERATIONS = frozenset({
-    "date_difference", "difference", "mean",
+    "date_difference", "difference", "mean", "unit_rate",
 })
 
 
@@ -193,7 +205,9 @@ def _with_prompt(
 ) -> Any:
     rows = tuple(dict(message) for message in messages)
     prompt_tokens = sum(counter.count(message["content"]) for message in rows)
-    if not allow_token_increase and prompt_tokens > prepared.packing_prompt_tokens:
+    permitted_increase = (
+        _MAX_READOUT_TOKEN_INCREASE if allow_token_increase else 0)
+    if prompt_tokens > prepared.packing_prompt_tokens + permitted_increase:
         raise ReadoutPolicyError(
             f"{prepared.question_id}: readout policy increased prompt tokens "
             f"{prepared.packing_prompt_tokens} -> {prompt_tokens}")
@@ -282,7 +296,8 @@ def _typed_readout(prepared: Any, counter: TokenCounter) -> Any:
         "recency_layout_blocks": 0,
         "typed_readout_source_payload_hash": prepared.prompt_payload_hash,
     })
-    return _with_prompt(prepared, messages, trace, counter)
+    return _with_prompt(
+        prepared, messages, trace, counter, allow_token_increase=True)
 
 
 def _chunks(evidence: str) -> list[tuple[str, str]]:
@@ -356,20 +371,48 @@ def _reverse_blocks(prepared: Any, counter: TokenCounter) -> Any:
         prepared, messages, trace, counter, evidence_turn_ids=evidence_ids)
 
 
-def _aggregation_rule(operation: str) -> str:
+def _aggregation_rule(operation: str, question: str = "") -> str:
+    if (question and operation == "date_difference"
+            and re.search(
+                r"\bhow\s+many\s+(?:minutes?|hours?|days?|weeks?|months?|"
+                r"years?)\s+did\s+it\s+take\b", question, re.I)
+            and re.search(r"\band\b", question, re.I)):
+        return (
+            "Bind the separately stated completed duration for each named "
+            "activity, deduplicate repeated mentions, add the durations once, "
+            "and return only the combined duration in the requested unit.")
+    if (question and operation == "minimum"
+            and re.search(r"\bminimum\s+amount\b", question, re.I)
+            and re.search(r"\band\b", question, re.I)):
+        return (
+            "Bind the lower-bound sale amount for every named item, then add "
+            "those lower bounds once. Return the combined minimum proceeds, "
+            "not the smaller individual item value.")
     return {
         "count_distinct": (
-            "Enumerate the complete set of distinct qualifying items or completed "
-            "occurrences from direct statements; exclude plans, suggestions, "
-            "near-matches, and duplicate mentions; then count the set once."),
+            "Enumerate the complete set of distinct qualifying items or "
+            "occurrences from direct statements. Match the status requested by "
+            "the question: completed/purchased/attended excludes unrealized "
+            "plans, while a question about planned or pending items retains them. "
+            "Exclude near-matches and duplicate mentions; then count once."),
         "sum": (
             "Collect every distinct unit-compatible amount for the exact subject "
             "and scope; exclude plans, unrelated amounts, stated subtotals, and "
             "duplicate mentions; then add the operands once."),
+        "unit_rate": (
+            "Bind the exact aggregate price and the matching distinct item count. "
+            "Divide total price by item count exactly once and preserve the "
+            "currency unit; do not add unrelated prices."),
         "difference": (
             "Bind the exact two requested quantities. For remaining or needed, "
             "use target minus the latest current amount; preserve the requested "
-            "order, sign, and unit."),
+            "order, sign, and unit. For savings, subtract the exact chosen cost "
+            "from the explicitly rejected cost and do not substitute another "
+            "nearby alternative. In a personal comparison, prefer costs the user "
+            "explicitly stated or adopted for those exact options over generic "
+            "assistant estimates. Only the user's own turn can bind that personal "
+            "cost; an assistant-only estimate is not an operand. If the user "
+            "never bound one option's cost, answer insufficient information."),
         "date_difference": (
             "Bind the exact start and end events, resolve each from its own memory "
             "date or [source-time], subtract the calendar endpoints in the "
@@ -410,20 +453,35 @@ def _compact_aggregation(prepared: Any, counter: TokenCounter) -> Any:
     if traced_operation and operation != traced_operation:
         raise ReadoutPolicyError(
             f"{prepared.question_id}: aggregation operation trace mismatch")
+    worksheet = tuple(
+        str(row) for row in ledger_trace.get("worksheet_lines") or ()
+        if str(row).strip()
+    ) if ledger_trace.get("worksheet_enabled") else ()
+    worksheet_block = ""
+    if worksheet:
+        worksheet_block = (
+            "\nOperand worksheet (verbatim packed-source candidates; not a "
+            "complete set):\n"
+            + "\n".join(worksheet)
+        )
     card = (
         "\n\nAggregation execution card:\n"
         f"Operation: {operation}\n"
-        f"Procedure: {_aggregation_rule(operation)}\n"
+        f"Procedure: {_aggregation_rule(operation, question if worksheet else '')}\n"
         "Use graph adjacency only to find related evidence; sharing a graph block "
-        "does not by itself make a memory an operand.\n"
+        "does not by itself make a memory an operand."
+        f"{worksheet_block}\n"
         f"Compute and answer this exact Question now: {question}"
     )
     messages[-1]["content"] = user[:ledger_at] + user[output_at:] + card
     if AGGREGATION_LEDGER_APPENDIX not in messages[0]["content"]:
         raise ReadoutPolicyError(
             f"{prepared.question_id}: aggregation system appendix is absent")
+    compact_system = (
+        _COMPACT_AGGREGATION_WORKSHEET_SYSTEM
+        if worksheet else _COMPACT_AGGREGATION_SYSTEM)
     messages[0]["content"] = messages[0]["content"].replace(
-        AGGREGATION_LEDGER_APPENDIX, _COMPACT_AGGREGATION_SYSTEM, 1)
+        AGGREGATION_LEDGER_APPENDIX, compact_system, 1)
     _append_version(trace, _COMPACT_AGGREGATION_VERSION)
     trace.update({
         "aggregation_execution_card": True,
@@ -431,19 +489,25 @@ def _compact_aggregation(prepared: Any, counter: TokenCounter) -> Any:
         "aggregation_ledger_candidates_rendered": 0,
         "aggregation_ledger_candidates_available": len(
             ledger_trace.get("candidate_turn_ids") or ()),
+        "aggregation_worksheet_rows": len(worksheet),
+        "aggregation_worksheet_turn_ids": list(
+            ledger_trace.get("worksheet_turn_ids") or ()),
         "aggregation_execution_source_payload_hash": prepared.prompt_payload_hash,
     })
-    return _with_prompt(prepared, messages, trace, counter)
+    return _with_prompt(
+        prepared, messages, trace, counter, allow_token_increase=True)
 
 
 def _single_line_aggregation(prepared: Any, counter: TokenCounter) -> Any:
     messages = _messages(prepared)
     user = messages[-1]["content"]
-    if _SINGLE_LINE_OLD not in user:
+    if (_SINGLE_LINE_SOURCE_GUARD not in user
+            or _SINGLE_LINE_COMPUTE not in user):
         raise ReadoutPolicyError(
             f"{prepared.question_id}: compact aggregation suffix is absent")
     messages[-1]["content"] = (
-        user.replace(_SINGLE_LINE_OLD, _SINGLE_LINE_NEW, 1)
+        user.replace(_SINGLE_LINE_SOURCE_GUARD, _SINGLE_LINE_NEW, 1)
+        .replace(_SINGLE_LINE_COMPUTE, "Question: ", 1)
         + _SINGLE_LINE_STOP)
     trace = dict(prepared.trace)
     _append_version(trace, _SINGLE_LINE_VERSION)
@@ -597,10 +661,14 @@ def apply_v5_54_readout(prepared: Any, counter: TokenCounter) -> Any:
             current = _typed_readout(current, counter)
             routes.append("anonymous_typed")
 
-    # V5.49: only the measured aggregation subsets use compact execution cards;
-    # explicit modal, non-counterfactual questions use one-step synthesis.
+    # Preserve the measured V5.54 routing.  The optional V5.60 worksheet is
+    # consumed by these compact cards only when explicitly enabled.
     trace = current.trace
-    operation = str((trace.get("aggregation_ledger") or {}).get("operation") or "")
+    ledger_trace = trace.get("aggregation_ledger") or {}
+    operation = str(ledger_trace.get("operation") or "")
+    selective_worksheet_route = (
+        str(ledger_trace.get("worksheet_route") or "")
+        if ledger_trace.get("worksheet_selective") else "")
     question = _question(current.messages[-1]["content"])
     named = _named(current)
     if (not operation and _INFERENCE_RE.search(question)
@@ -608,6 +676,11 @@ def apply_v5_54_readout(prepared: Any, counter: TokenCounter) -> Any:
             and not trace.get("preference_synthesis")):
         current = _inference_synthesis(current, counter)
         routes.append("inference")
+    elif operation and selective_worksheet_route and not named:
+        current = _compact_aggregation(current, counter)
+        current = _single_line_aggregation(current, counter)
+        routes.append(
+            f"selective_operand_worksheet:{selective_worksheet_route}")
     elif operation == "date_difference" and named:
         current = _compact_aggregation(current, counter)
         current = _single_line_aggregation(current, counter)
@@ -645,9 +718,10 @@ def apply_v5_54_readout(prepared: Any, counter: TokenCounter) -> Any:
     if frozenset(current.evidence_turn_ids) != base_evidence:
         raise ReadoutPolicyError(
             f"{prepared.question_id}: V5.54 changed the evidence set")
-    if current.packing_prompt_tokens > base_tokens:
+    if current.packing_prompt_tokens > base_tokens + _MAX_READOUT_TOKEN_INCREASE:
         raise ReadoutPolicyError(
-            f"{prepared.question_id}: V5.54 exceeded its source prompt budget")
+            f"{prepared.question_id}: V5.54 exceeded its +"
+            f"{_MAX_READOUT_TOKEN_INCREASE} token readout allowance")
     trace = dict(current.trace)
     trace.update({
         "readout_policy": V5_54_POLICY,

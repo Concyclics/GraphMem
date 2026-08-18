@@ -49,6 +49,7 @@ def evaluate(operator: QueryOperator, bindings: Iterable[FactBinding], operand_i
         collection_complete = operator not in {
             QueryOperator.UNION_DISTINCT, QueryOperator.INTERSECTION_DISTINCT,
             QueryOperator.GROUP_BY_OWNER, QueryOperator.COUNT_DISTINCT,
+            QueryOperator.SUM,
         }
     return ClosureResult(tuple(selected), tuple(item.binding_id for item in selected), complete,
                          collection_complete)
