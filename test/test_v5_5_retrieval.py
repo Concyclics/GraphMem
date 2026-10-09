@@ -7,9 +7,13 @@ from types import SimpleNamespace
 import pytest
 
 from graphmem.build import GraphBuildPipeline, QwenSemanticDistiller
-from graphmem.domain import FactBinding, QueryBudget, QueryOperator
+from graphmem.domain import (
+    FactBinding, NodeType, QueryBudget, QueryOperator, stable_id,
+)
 from graphmem.retrieval import GraphNavigator, HarnessProfile
-from graphmem.retrieval.navigator import has_named_multi_party
+from graphmem.retrieval.navigator import (
+    has_named_multi_party, semantic_fact_witness_eligible,
+)
 from graphmem.retrieval.algebra import evaluate
 from graphmem.retrieval.query_ir import compile_query
 from graphmem.runtime import GraphReadView
@@ -153,6 +157,138 @@ def test_exact_lookup_priority_named_speaker_shape_gate(tmp_path: Path) -> None:
         turn, speaker=("user" if index % 2 == 0 else "assistant"))
         for index, turn in enumerate(turns))
     assert not has_named_multi_party(generic)
+
+
+def test_semantic_fact_witness_uses_fact_provenance_as_soft_source(
+        tmp_path: Path) -> None:
+    store = _semantic_store(tmp_path / "graph.sqlite")
+    fact_id = next(
+        node.node_id for node in store.nodes("travel")
+        if node.node_type == NodeType.CANONICAL_FACT)
+
+    navigator_options = dict(
+        harness_profile=HarnessProfile.H11_UNIFIED_IR,
+        native_seed_fusion=True,
+        obligation_aware_packing=True,
+        fact_dense_search=lambda _memory, _query, _ids, _limit: (
+            (fact_id, 0.9),),
+    )
+    baseline = GraphNavigator(store, **navigator_options).navigate(
+        "travel", "What did Alice visit?",
+        QueryBudget(max_evidence_turns=32, max_evidence_tokens=2_000),
+    )
+    result = GraphNavigator(
+        store,
+        **navigator_options,
+        semantic_fact_witness_reserve=True,
+        semantic_fact_witness_turns=1,
+        semantic_fact_search_limit=4,
+        semantic_fact_min_score=0.5,
+        semantic_fact_operator_aware=False,
+    ).navigate(
+        "travel", "What did Alice visit?",
+        QueryBudget(max_evidence_turns=32, max_evidence_tokens=2_000),
+    )
+
+    witness_ids = result.trace["semantic_fact_witness_turn_ids"]
+    assert witness_ids
+    assert result.trace["semantic_fact_witness_packed"] == 1
+    row_by_id = {row.turn_id: row for row in result.candidate_scores}
+    assert "semantic_fact" in row_by_id[witness_ids[0]].source_channels
+    # A semantic fact remains a soft source signal; it is not promoted into a
+    # proof obligation or marked mandatory merely because the vector matched.
+    baseline_by_id = {row.turn_id: row for row in baseline.candidate_scores}
+    assert row_by_id[witness_ids[0]].mandatory == baseline_by_id[
+        witness_ids[0]].mandatory
+
+
+def test_semantic_fact_witness_gate_rejects_ordinary_lookup_but_keeps_lists(
+        tmp_path: Path) -> None:
+    store = _semantic_store(tmp_path / "graph.sqlite")
+    view = GraphReadView(store.nodes("travel"), store.edges("travel"))
+    ordinary = compile_query("What is Alice excited about?", view).promote_ast()
+    collection = compile_query(
+        "What countries has Alice visited?", view).promote_ast()
+
+    assert not semantic_fact_witness_eligible(ordinary, "What is Alice excited about?")
+    assert semantic_fact_witness_eligible(
+        collection, "What countries has Alice visited?",
+        minimum_confidence=0.0)
+
+    # A noisy principal parse can promote a scalar lookup to GroupByOwner.
+    # The optional semantic bridge must still be gated by explicit question
+    # semantics rather than by that fallible root operator alone.
+    noisy_group = replace(
+        ordinary, operator=QueryOperator.GROUP_BY_OWNER,
+        compile_confidence=1.0)
+    assert not semantic_fact_witness_eligible(
+        noisy_group, "When did Alice go to counseling?",
+        minimum_confidence=0.0)
+
+
+def test_exact_lookup_dense_search_does_not_bypass_semantic_fact_gate(
+        tmp_path: Path) -> None:
+    store = _semantic_store(tmp_path / "graph.sqlite")
+    fact_id = next(
+        node.node_id for node in store.nodes("travel")
+        if node.node_type == NodeType.CANONICAL_FACT)
+    result = GraphNavigator(
+        store,
+        harness_profile=HarnessProfile.H11_UNIFIED_IR,
+        native_seed_fusion=True,
+        obligation_aware_packing=True,
+        exact_lookup_priority=True,
+        # Keep the normal exact-lookup scorer active while making sure its
+        # shared dense rows cannot leak into the optional witness reserve.
+        fact_dense_search=lambda _memory, _query, _ids, _limit: (
+            (fact_id, 0.9),),
+        semantic_fact_witness_reserve=True,
+        semantic_fact_witness_turns=1,
+        semantic_fact_search_limit=4,
+        semantic_fact_min_score=0.5,
+        semantic_fact_operator_aware=True,
+    ).navigate(
+        "travel", "When did Alice go to counseling?",
+        QueryBudget(max_evidence_turns=32, max_evidence_tokens=2_000),
+    )
+
+    assert result.trace["semantic_fact_eligible"] is False
+    assert result.trace["semantic_fact_witness_turn_ids"] == []
+    assert result.trace["semantic_fact_witness_packed"] == 0
+
+
+def test_semantic_predicate_witness_maps_relation_to_source_turn(
+        tmp_path: Path) -> None:
+    store = _semantic_store(tmp_path / "graph.sqlite")
+    view = GraphReadView(store.nodes("travel"), store.edges("travel"))
+    predicate = next(
+        item for item in view.predicate_index
+        if view.predicate_fact_index.get(item))
+    predicate_id = stable_id("predicate", "travel", predicate)
+
+    result = GraphNavigator(
+        store,
+        harness_profile=HarnessProfile.H11_UNIFIED_IR,
+        native_seed_fusion=True,
+        obligation_aware_packing=True,
+        semantic_predicate_witness_reserve=True,
+        semantic_predicate_witness_turns=1,
+        semantic_predicate_search_limit=4,
+        semantic_predicate_min_score=0.5,
+        semantic_fact_min_compile_confidence=0.0,
+        predicate_dense_search=lambda _memory, _query, _ids, _limit: (
+            (predicate_id, 0.9),),
+    ).navigate(
+        "travel", "What countries has Alice visited?",
+        QueryBudget(max_evidence_turns=32, max_evidence_tokens=2_000),
+    )
+
+    witness_ids = result.trace["semantic_predicate_witness_turn_ids"]
+    assert witness_ids
+    assert result.trace["semantic_predicate_witness_packed"] == 1
+    row_by_id = {row.turn_id: row for row in result.candidate_scores}
+    assert "semantic_predicate" in row_by_id[
+        witness_ids[0]].source_channels
 
 
 def test_intersection_requires_a_witness_from_each_operand() -> None:

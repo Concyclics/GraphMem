@@ -19,9 +19,12 @@ _TIME_PHRASE_RE = re.compile(
     r"\d{4}[/-]\d{1,2}[/-]\d{1,2}(?:\s*\([^)]*\))?(?:\s+\d{1,2}:\d{2})?|"
     r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
     r"\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|"
+    r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+\d{4}|(?:19|20)\d{2}|"
     r"(?:about\s+|around\s+)?(?:a|an|one|\d+)\s+(?:day|week|month|year)s?\s+ago|"
     r"(?:for\s+)?(?:(?:just\s+under|almost|nearly|about|around)\s+)?"
     r"(?:a|an|one|\d+)\s+(?:day|week|month|year)s?(?:\s+now)?|"
+    r"(?:the\s+)?day\s+after\s+tomorrow|(?:the\s+)?day\s+before\s+yesterday|"
     r"today|yesterday|tomorrow|last\s+(?:week|month|year|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)|"
     r"next\s+(?:week|month|year|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)|"
     r"Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b", re.I)
@@ -100,6 +103,12 @@ def normalize_time(raw_text: str, observed_at: str | None,
     if anchor:
         start: datetime | None = None; precision = "day"
         if lowered == "today": start = anchor.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif lowered in {"day after tomorrow", "the day after tomorrow"}:
+            start = (anchor + timedelta(days=2)).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+        elif lowered in {"day before yesterday", "the day before yesterday"}:
+            start = (anchor - timedelta(days=2)).replace(
+                hour=0, minute=0, second=0, microsecond=0)
         elif lowered == "yesterday": start = (anchor - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         elif lowered == "tomorrow": start = (anchor + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         elif lowered in _WEEKDAYS:

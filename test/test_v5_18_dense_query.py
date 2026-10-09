@@ -86,6 +86,42 @@ def test_query_views_are_batched_and_persisted_across_index_instances(tmp_path: 
     assert second.stats["query_persistent_hits"] == 2
 
 
+def test_query_prewarm_collapses_cold_views_into_bounded_batches(
+        tmp_path: Path) -> None:
+    store = _store(tmp_path / "graph.sqlite")
+    embeddings = _Embeddings()
+    index = QwenEmbeddingIndex(
+        store, GraphMemV5Config(),
+        client=SimpleNamespace(embeddings=embeddings), record_usage=False)
+
+    stats = index.prewarm_queries(
+        ("query one", "query two", "query one", "query three"),
+        batch_size=2)
+    index.search_many(
+        "memory-one", (("query one", 1), ("query three", 1)))
+
+    assert embeddings.calls == 2
+    assert embeddings.batch_sizes == [2, 1]
+    assert stats["unique_queries"] == 3
+    assert stats["query_batches"] == 2
+    assert stats["query_embedded_views"] == 3
+    assert index.stats["query_memory_hits"] == 2
+
+
+def test_query_prewarm_rejects_non_positive_batch_size(tmp_path: Path) -> None:
+    store = _store(tmp_path / "graph.sqlite")
+    index = QwenEmbeddingIndex(
+        store, GraphMemV5Config(),
+        client=SimpleNamespace(embeddings=_Embeddings()), record_usage=False)
+
+    try:
+        index.prewarm_queries(("query",), batch_size=0)
+    except ValueError as error:
+        assert "batch_size" in str(error)
+    else:  # pragma: no cover - assertion guard
+        raise AssertionError("non-positive prewarm batch size was accepted")
+
+
 def test_query_embedding_singleflight_collapses_concurrent_misses(tmp_path: Path) -> None:
     store = _store(tmp_path / "graph.sqlite")
     embeddings = _Embeddings(delay=0.05)
@@ -127,6 +163,33 @@ def test_search_items_reuses_existing_graph_node_vectors(tmp_path: Path) -> None
     assert first[0][0] == "fact:paris"
     assert second == first
     assert embeddings.calls == 1
+    assert index.stats["item_matrix_entries"] == 1
+
+
+def test_search_items_can_address_an_alternate_index_model(tmp_path: Path) -> None:
+    store = _store(tmp_path / "graph.sqlite")
+    alternate_model = "embedding-model:predicate-v1"
+    store.upsert_embeddings("memory-one", alternate_model, (
+        ("predicate:visit", "predicate-hash-1", [1.0, 0.0, 0.0]),
+        ("predicate:adopt", "predicate-hash-2", [0.0, 1.0, 0.0]),
+    ))
+    embeddings = _Embeddings()
+    index = QwenEmbeddingIndex(
+        store, GraphMemV5Config(),
+        client=SimpleNamespace(embeddings=embeddings), record_usage=False)
+
+    instructed = index.search_items(
+        "memory-one", "Where did Alice travel?",
+        ("predicate:visit", "predicate:adopt"), 2,
+        index_model_id=alternate_model)
+    rows = index.search_items(
+        "memory-one", "Where did Alice travel?",
+        ("predicate:visit", "predicate:adopt"), 2,
+        index_model_id=alternate_model, query_instruction=False)
+
+    assert instructed[0][0] == "predicate:visit"
+    assert rows[0][0] == "predicate:visit"
+    assert embeddings.calls == 2
     assert index.stats["item_matrix_entries"] == 1
 
 

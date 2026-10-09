@@ -178,6 +178,19 @@ def test_plural_head_makes_a_single_owner_question_a_set_question() -> None:
     assert requires_exhaustive_scope(node)
 
 
+def test_plural_wh_head_is_detected_beyond_the_fixed_noun_lexicon() -> None:
+    assert parse_slots(
+        "What book recommendations has Joanna given to Nate?"
+    ).expects_multiple
+    assert parse_slots("What sports does John like?").expects_multiple
+    assert parse_slots(
+        "Which of Joanna's screenplay were rejected?"
+    ).expects_multiple
+    assert not parse_slots(
+        "Where did Alice move four years ago?"
+    ).expects_multiple
+
+
 def test_singular_lookup_stays_a_lookup() -> None:
     node = _ast("What is Alice's job?", "alice")
 

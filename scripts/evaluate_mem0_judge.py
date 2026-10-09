@@ -37,6 +37,10 @@ def parse_args() -> argparse.Namespace:
         default="openai",
     )
     parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["none", "low", "medium", "high", "xhigh", "max"],
+        default="none")
     parser.add_argument("--mode", choices=["answer","retrieval-sufficiency"], default="answer")
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--resume", action="store_true")
@@ -101,11 +105,13 @@ def main() -> None:
             prompt=("You are evaluating retrieval evidence sufficiency for LongMemEval. Decide whether the supplied evidence contains enough information to derive the reference answer to the question. Extra irrelevant or contradictory evidence does not by itself make retrieval insufficient; focus on whether the necessary supporting facts are present and identifiable. For recommendation/preference questions, evidence is sufficient when it contains the user preferences or compatibility constraints needed to tailor a reasonable recommendation, even if an exact recommendation is not already written. For a reference answer that says information is insufficient, an explicit exact-entity absence check over the full indexed memory is sufficient evidence; do not require a positive fact that the reference says is absent. When the question asks for a field such as who, when, or how many, judge whether the reference field value can be derived; an unrelated mismatch in a question presupposition does not negate a clearly supported field value unless it creates multiple plausible answers. Deterministic ledger calculations count as derived evidence only when their cited source facts are present and identifiable. Use the supplied question date to resolve relative dates. Output a brief <judge_thinking> analysis, then output exactly yes or no on the final line.\n\nQuestion date: "+str(row.get("question_date") or "unknown")+"\nQuestion: "+str(row.get("question") or "")+"\nReference answer: "+str(row.get("gold_answer",row.get("answer","")))+"\nEvidence:\n"+str(row.get("prediction",row.get("response",""))) )
         result=client.chat(
             question_id=str(row["question_id"]), variant="mem0_longmemeval_judge" if args.mode=="answer" else "retrieval_sufficiency_judge",
-            stage="judge", messages=[{"role":"user","content":prompt}], thinking_mode="none",
+            stage="judge", messages=[{"role":"user","content":prompt}],
+            thinking_mode=args.reasoning_effort,
             max_tokens=args.max_tokens, temperature=0.0, seed=0,
         )
         result.record.excluded_from_budget=True
-        if result.record.reasoning_tokens != 0:
+        if (args.reasoning_effort == "none"
+                and result.record.reasoning_tokens != 0):
             raise RuntimeError(f"judge reasoning_tokens must be 0 for {row['question_id']}")
         if result.record.prompt_cache_hit_tokens + result.record.prompt_cache_miss_tokens != result.record.prompt_tokens:
             raise RuntimeError(f"invalid judge cache breakdown for {row['question_id']}")
@@ -151,7 +157,8 @@ def main() -> None:
         "excluded_from_build_and_answer_budgets":True, "model":args.model,
         "thinking_request_profile": args.request_profile,
         "thinking": {"type": "disabled"} if args.request_profile == "deepseek" else None,
-        "reasoning_effort": "none" if args.request_profile == "openai" else None,
+        "reasoning_effort": (args.reasoning_effort
+                             if args.request_profile == "openai" else None),
         "reasoning_effort_field_sent": args.request_profile == "openai",
         "judge_mode":args.mode, "prompt_commit":PINNED_COMMIT if args.mode=="answer" else None, "prompt_source_sha256":PROMPT_SOURCE_SHA256 if args.mode=="answer" else None,
         "question_count":len(evaluations), "correct":sum(int(row["correct"]) for row in evaluations),

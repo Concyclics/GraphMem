@@ -38,9 +38,11 @@ _MAX_READOUT_TOKEN_INCREASE = 500
 
 _MEMORY_MARKER = "Conversation memories:\n"
 _FOOTER_MARKER = "\n\nAnswer the original Question now:"
+_TYPED_CARD_MARKER = "\n\nAnswer-critical evidence card ("
 _END_MARKERS = (
     "\n\nAggregation ledger (",
     "\n\nQuery focus (",
+    _TYPED_CARD_MARKER,
     "\n\nOutput contract:",
     "\n\nFinal check:",
     _FOOTER_MARKER,
@@ -59,7 +61,8 @@ _RELAXED_LABEL_RE = re.compile(
 )
 _NAMED_SPEAKER_RE = re.compile(
     r"^\[(?:CHAIN \d+ (?:step=\d+|support)|GRAPH \d+ step=\d+|"
-    r"AUX \d+ rank=\d+)\]\s+\[[^\]]+\]\s+([^:\n]{1,48}):",
+    r"AUX \d+ rank=\d+)\]\s+(?:\{via=[^}]+\}\s+)?"
+    r"\[[^\]]+\]\s+([^:\n]{1,48}):",
     re.M,
 )
 _GENERIC_SPEAKERS = frozenset({
@@ -395,6 +398,11 @@ def _aggregation_rule(operation: str, question: str = "") -> str:
             "the question: completed/purchased/attended excludes unrealized "
             "plans, while a question about planned or pending items retains them. "
             "Exclude near-matches and duplicate mentions; then count once."),
+        "list_distinct": (
+            "Enumerate the complete set of distinct exact-scope items or "
+            "occurrences from direct statements. Respect completion, polarity, "
+            "and the requested time window; exclude plans, near-matches, and "
+            "duplicate mentions. Return the qualifying names, not their count."),
         "sum": (
             "Collect every distinct unit-compatible amount for the exact subject "
             "and scope; exclude plans, unrelated amounts, stated subtotals, and "
@@ -453,17 +461,22 @@ def _compact_aggregation(prepared: Any, counter: TokenCounter) -> Any:
     if traced_operation and operation != traced_operation:
         raise ReadoutPolicyError(
             f"{prepared.question_id}: aggregation operation trace mismatch")
+    event_table = str(ledger_trace.get("worksheet_route") or "") == "event_table"
     worksheet = tuple(
-        str(row) for row in ledger_trace.get("worksheet_lines") or ()
+        str(row) for row in (
+            ledger_trace.get("event_lines") if event_table
+            else ledger_trace.get("worksheet_lines")) or ()
         if str(row).strip()
     ) if ledger_trace.get("worksheet_enabled") else ()
     worksheet_block = ""
     if worksheet:
         worksheet_block = (
+            "\nEvent operand table (typed packed-source candidates; exact_scope "
+            "precedes near_match; not a complete set):\n"
+            if event_table else
             "\nOperand worksheet (verbatim packed-source candidates; not a "
             "complete set):\n"
-            + "\n".join(worksheet)
-        )
+        ) + "\n".join(worksheet)
     card = (
         "\n\nAggregation execution card:\n"
         f"Operation: {operation}\n"
@@ -473,7 +486,13 @@ def _compact_aggregation(prepared: Any, counter: TokenCounter) -> Any:
         f"{worksheet_block}\n"
         f"Compute and answer this exact Question now: {question}"
     )
-    messages[-1]["content"] = user[:ledger_at] + user[output_at:] + card
+    typed_at = user.find(_TYPED_CARD_MARKER, ledger_at + 1)
+    if typed_at >= 0 and typed_at <= output_at:
+        # Put the execution contract immediately before the source-only card so
+        # the card remains the final evidence the model reads.
+        messages[-1]["content"] = user[:ledger_at] + card + user[typed_at:]
+    else:
+        messages[-1]["content"] = user[:ledger_at] + user[output_at:] + card
     if AGGREGATION_LEDGER_APPENDIX not in messages[0]["content"]:
         raise ReadoutPolicyError(
             f"{prepared.question_id}: aggregation system appendix is absent")
@@ -490,6 +509,7 @@ def _compact_aggregation(prepared: Any, counter: TokenCounter) -> Any:
         "aggregation_ledger_candidates_available": len(
             ledger_trace.get("candidate_turn_ids") or ()),
         "aggregation_worksheet_rows": len(worksheet),
+        "aggregation_event_table": event_table,
         "aggregation_worksheet_turn_ids": list(
             ledger_trace.get("worksheet_turn_ids") or ()),
         "aggregation_execution_source_payload_hash": prepared.prompt_payload_hash,
@@ -666,9 +686,11 @@ def apply_v5_54_readout(prepared: Any, counter: TokenCounter) -> Any:
     trace = current.trace
     ledger_trace = trace.get("aggregation_ledger") or {}
     operation = str(ledger_trace.get("operation") or "")
+    raw_worksheet_route = str(ledger_trace.get("worksheet_route") or "")
     selective_worksheet_route = (
-        str(ledger_trace.get("worksheet_route") or "")
-        if ledger_trace.get("worksheet_selective") else "")
+        raw_worksheet_route
+        if (ledger_trace.get("worksheet_selective")
+            or raw_worksheet_route == "event_table") else "")
     question = _question(current.messages[-1]["content"])
     named = _named(current)
     if (not operation and _INFERENCE_RE.search(question)
@@ -676,6 +698,10 @@ def apply_v5_54_readout(prepared: Any, counter: TokenCounter) -> Any:
             and not trace.get("preference_synthesis")):
         current = _inference_synthesis(current, counter)
         routes.append("inference")
+    elif operation and selective_worksheet_route == "event_table":
+        current = _compact_aggregation(current, counter)
+        current = _single_line_aggregation(current, counter)
+        routes.append("event_operand_table")
     elif operation and selective_worksheet_route and not named:
         current = _compact_aggregation(current, counter)
         current = _single_line_aggregation(current, counter)

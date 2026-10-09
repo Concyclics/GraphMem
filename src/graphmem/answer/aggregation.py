@@ -26,6 +26,7 @@ from ..domain import SourceTurn
 
 
 AGGREGATION_LEDGER_SCHEMA_VERSION = "graphmem-v5.60-operand-worksheet-v1"
+EVENT_LEDGER_SCHEMA_VERSION = "graphmem-v5.73-event-ledger-v1"
 
 _WORD_RE = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?", re.I)
 _NUMBER_RE = re.compile(
@@ -58,6 +59,11 @@ class AggregationLedger:
     #: These rows are candidate operands, never a closed set or an answer.
     worksheet_lines: tuple[str, ...] = ()
     worksheet_turn_ids: tuple[str, ...] = ()
+    #: Typed event/operand rows for count/list readout.  Rows carry provenance
+    #: and status but never claim that the set is complete or compute an answer.
+    event_lines: tuple[str, ...] = ()
+    event_turn_ids: tuple[str, ...] = ()
+    max_ordinal: int | None = None
     schema_version: str = AGGREGATION_LEDGER_SCHEMA_VERSION
 
 
@@ -378,6 +384,157 @@ def _multiplication_relation(text: str) -> str:
     return ""
 
 
+_EVENT_LIST_RE = re.compile(
+    r"\b(?:which|what|list|name)\s+(?:all\s+)?(?:activities|activity|books|"
+    r"classes|events|items|locations|places|things|types|games|movies|films|"
+    r"songs|people|friends|sports|hobbies|projects|countries|cities|foods|"
+    r"meals|restaurants|gifts|skills|languages|instruments|festivals|trips|"
+    r"visits|appointments|jobs|pets|animals)\b",
+    re.I,
+)
+_ORDINAL_VALUES = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+    "eleventh": 11, "twelfth": 12, "thirteenth": 13,
+    "fourteenth": 14, "fifteenth": 15, "sixteenth": 16,
+    "seventeenth": 17, "eighteenth": 18, "nineteenth": 19,
+    "twentieth": 20,
+}
+_ORDINAL_RE = re.compile(
+    r"\b(?P<word>" + "|".join(_ORDINAL_VALUES) +
+    r")\b|\b(?P<number>\d{1,3})(?:st|nd|rd|th)\b|"
+    r"(?:^|\s)(?P<list>\d{1,3})[.)]\s",
+    re.I,
+)
+_EVENT_TIME_SURFACE_RE = re.compile(
+    r"\b(?:19|20)\d{2}(?:[-/]\d{1,2}(?:[-/]\d{1,2})?)?\b|"
+    r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"january|february|march|april|may|june|july|august|september|"
+    r"october|november|december|today|yesterday|tomorrow|last\s+\w+|"
+    r"next\s+\w+|\d+\s+(?:days?|weeks?|months?|years?)\s+ago)\b",
+    re.I,
+)
+
+
+def _ordinal_values(text: str) -> tuple[int, ...]:
+    values: list[int] = []
+    for match in _ORDINAL_RE.finditer(text):
+        if match.group("word"):
+            values.append(_ORDINAL_VALUES[match.group("word").casefold()])
+        else:
+            raw = match.group("number") or match.group("list")
+            if raw:
+                values.append(int(raw))
+    return tuple(values)
+
+
+def _event_operand_table(
+    question: str,
+    rows: Sequence[SourceTurn],
+    *,
+    limit: int = 10,
+) -> tuple[tuple[str, ...], tuple[str, ...], int | None]:
+    """Compile a bounded status/time-aware table from packed source turns.
+
+    Coarse graph proximity is useful for finding a turn but is not proof that
+    the turn belongs to a count/list scope.  The table therefore ranks exact
+    subject/predicate/object overlap ahead of one-word near matches, labels
+    completion and observation/event time separately, and marks likely repeated
+    mentions instead of silently deleting them.
+    """
+
+    critical = _selective_terms(question) - _SELECTIVE_GENERIC_TERMS
+    # Generic collection heads are weak scope keys.  Keep them when they are
+    # the only available terms, otherwise require the more specific modifiers.
+    generic_heads = {
+        "activity", "book", "class", "event", "item", "place", "thing",
+        "type", "game", "movie", "people", "trip", "visit", "appointment",
+        "job", "pet", "animal", "time", "shelter", "tournament", "group",
+    }
+    specific = critical - generic_heads
+    scope_modifiers = {
+        _normalize_term(match.group(1).casefold())
+        for match in re.finditer(
+            r"\b([a-z][a-z-]{2,})\s+(?:shelter|tournament|group|class|"
+            r"appointment|visit|trip|event|job|book|movie|game|item)s?\b",
+            question, re.I)
+        if match.group(1).casefold() not in {"which", "what", "many", "every"}
+    }
+    explicit_speakers = {
+        turn.speaker.casefold() for turn in rows
+        if turn.speaker and turn.speaker.casefold() in question.casefold()
+    }
+    ranked: list[tuple[float, int, SourceTurn, set[str], str, tuple[int, ...]]] = []
+    for rank, turn in enumerate(rows):
+        terms = _selective_terms(turn.raw_text)
+        overlap = terms & critical
+        specific_overlap = terms & specific
+        status = _surface_status(turn.raw_text)
+        score = 2.5 * len(specific_overlap) + 0.75 * len(overlap)
+        if explicit_speakers and turn.speaker.casefold() in explicit_speakers:
+            score += 2.0
+        if status == "completed_or_realized":
+            score += 0.8
+        elif status == "negated_or_cancelled":
+            score -= 0.2
+        elif status == "planned_or_hypothetical":
+            score -= 0.4
+        ordinals = _ordinal_values(turn.raw_text)
+        if ordinals:
+            score += 0.8
+        if _EVENT_TIME_SURFACE_RE.search(turn.raw_text):
+            score += 0.4
+        # A one-word generic overlap such as "shelter" is retained only as an
+        # explicitly labelled near-match and cannot outrank an exact "dog
+        # shelter" witness.
+        modifier_match = not scope_modifiers or bool(terms & scope_modifiers)
+        scope = (
+            "exact_scope" if modifier_match and specific_overlap and (
+                len(specific_overlap) >= 2 or len(overlap) >= 2)
+            else "plausible_scope" if modifier_match and specific_overlap
+            else "near_match")
+        if not overlap and not explicit_speakers and not ordinals:
+            continue
+        ranked.append((score, rank, turn, overlap, scope, ordinals))
+
+    ordered = sorted(ranked, key=lambda row: (
+        row[4] == "near_match", -row[0], row[1], row[2].turn_id))
+    exact = [row for row in ordered if row[4] != "near_match"]
+    near = [row for row in ordered if row[4] == "near_match"]
+    selected = (exact + near[:2])[:max(1, limit)]
+    lines: list[str] = []
+    ids: list[str] = []
+    seen_signatures: list[tuple[str, frozenset[str], str]] = []
+    maximum_ordinal: int | None = None
+    for _score, _rank, turn, overlap, scope, ordinals in selected:
+        terms = frozenset(_selective_terms(turn.raw_text) & (critical | specific))
+        time_match = _EVENT_TIME_SURFACE_RE.search(turn.raw_text)
+        event_time = (time_match.group(0) if time_match else "not_explicit")
+        signature = (turn.speaker.casefold(), terms, event_time.casefold())
+        duplicate_of = ""
+        for prior_index, prior in enumerate(seen_signatures, 1):
+            same_time = event_time != "not_explicit" and prior[2] == signature[2]
+            similarity = len(terms & prior[1]) / max(1, len(terms | prior[1]))
+            if prior[0] == signature[0] and same_time and similarity >= 0.75:
+                duplicate_of = f"E{prior_index}"
+                break
+        seen_signatures.append(signature)
+        if ordinals:
+            current_max = max(ordinals)
+            maximum_ordinal = max(maximum_ordinal or 0, current_max)
+        excerpt = _compact(turn.raw_text, frozenset(critical), limit=220)
+        ordinal_text = ",".join(str(value) for value in ordinals) or "none"
+        duplicate_text = duplicate_of or "none"
+        matches = ",".join(sorted(overlap)[:8]) or "none"
+        lines.append(
+            f"E{len(lines) + 1}: scope={scope}; status={_surface_status(turn.raw_text)}; "
+            f"event_time_surface={event_time}; observation_time={turn.timestamp or 'unknown'}; "
+            f"ordinals=[{ordinal_text}]; possible_duplicate_of={duplicate_text}; "
+            f"match=[{matches}]; source={turn.turn_id} :: {excerpt}")
+        ids.append(turn.turn_id)
+    return tuple(lines), tuple(ids), maximum_ordinal
+
+
 def _decimal_text(value: Decimal) -> str:
     text = format(value.normalize(), "f")
     return text.rstrip("0").rstrip(".") if "." in text else text
@@ -488,10 +645,13 @@ def build_aggregation_ledger(
     *,
     limit: int = 24,
     execution_card: bool = False,
+    event_aware: bool = False,
 ) -> AggregationLedger | None:
     """Index packed turns as candidate operands without claiming scope closure."""
 
     operation = aggregation_operation(question)
+    if operation is None and event_aware and _EVENT_LIST_RE.search(question):
+        operation = "list_distinct"
     if operation is None:
         return None
     # Preserve the validated ledger candidate order used by the packer. Alias
@@ -506,6 +666,12 @@ def build_aggregation_ledger(
     rows = [turns[turn_id] for turn_id in packed_turn_ids if turn_id in turns]
     if not rows:
         return None
+    event_lines: tuple[str, ...] = ()
+    event_turn_ids: tuple[str, ...] = ()
+    max_ordinal: int | None = None
+    if event_aware and operation in {"count_distinct", "list_distinct"}:
+        event_lines, event_turn_ids, max_ordinal = _event_operand_table(
+            question, rows, limit=min(10, max(1, limit)))
 
     document_frequency: dict[str, int] = {}
     row_terms: dict[str, frozenset[str]] = {}
@@ -564,6 +730,10 @@ def build_aggregation_ledger(
     deterministic_result = execution[0] if execution else ""
     deterministic_operands = execution[1] if execution else ()
     rules = {
+        "list_distinct": (
+            "enumerate every distinct exact-scope item or completed occurrence; "
+            "exclude plans, suggestions, near-matches, and duplicate mentions; "
+            "return the qualifying names rather than their count"),
         "count_distinct": (
             "enumerate every distinct qualifying item or completed occurrence; "
             "exclude plans, suggestions, near-matches, and duplicate mentions; "
@@ -691,6 +861,12 @@ def build_aggregation_ledger(
                 "the full memories for omitted operands):",
                 *worksheet,
             ]
+        if event_lines:
+            lines += [
+                "Event operand table (typed candidates from already packed source "
+                "turns; exact_scope precedes near_match; verify completeness):",
+                *event_lines,
+            ]
         lines.append(f"Question: {question}")
     else:
         lines = [
@@ -787,4 +963,10 @@ def build_aggregation_ledger(
         deterministic_result=deterministic_result,
         deterministic_operands=deterministic_operands,
         worksheet_lines=tuple(worksheet),
-        worksheet_turn_ids=tuple(worksheet_turn_ids))
+        worksheet_turn_ids=tuple(worksheet_turn_ids),
+        event_lines=event_lines,
+        event_turn_ids=event_turn_ids,
+        max_ordinal=max_ordinal,
+        schema_version=(EVENT_LEDGER_SCHEMA_VERSION if event_aware
+                        and operation in {"count_distinct", "list_distinct"}
+                        else AGGREGATION_LEDGER_SCHEMA_VERSION))

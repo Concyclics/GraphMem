@@ -20,6 +20,15 @@ def test_relative_time_anchors_to_observation_date() -> None:
     assert row.anchor_turn_id == "turn:2"
 
 
+def test_compound_relative_day_is_not_reduced_to_tomorrow() -> None:
+    phrase = extract_time_expression(
+        "I bought tickets and I am leaving the day after tomorrow evening.")
+    assert phrase == "the day after tomorrow"
+    row = normalize_time(phrase, "5:13 pm on 9 July, 2022", "turn:2b")
+    assert row.kind == "relative"
+    assert row.start == "2022-07-11T00:00:00"
+
+
 def test_unresolved_time_never_creates_false_ordering_endpoint() -> None:
     row = normalize_time("sometime eventually", "2023-03-27", "turn:3")
     assert row.kind == "unresolved"
@@ -61,4 +70,21 @@ def test_out_of_range_relative_year_is_unresolved() -> None:
 def test_all_time_expressions_are_returned_in_source_order() -> None:
     assert extract_time_expressions(
         "On June 16 2023 I said I joined last week and went yesterday.") == (
-            "June 16 2023", "last week", "yesterday")
+        "June 16 2023", "last week", "yesterday")
+
+
+def test_month_and_year_are_query_time_intervals() -> None:
+    assert extract_time_expression(
+        "Which city was Calvin visiting in August 2023?") == "August 2023"
+    month = normalize_time("August 2023", None, "query")
+    year = normalize_time("2023", None, "query")
+    assert month.start == "2023-08-01T00:00:00"
+    assert month.end == "2023-08-31T23:59:59"
+    assert year.start == "2023-01-01T00:00:00"
+    assert year.end == "2023-12-31T23:59:59"
+
+
+def test_compound_relative_month_keeps_absolute_month_candidate() -> None:
+    assert extract_time_expressions(
+        "Where was Dave in the last two weeks of August 2023?") == (
+            "August 2023",)

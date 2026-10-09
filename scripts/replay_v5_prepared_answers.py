@@ -7,7 +7,7 @@ import hashlib
 import json
 import math
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,10 +72,18 @@ def main() -> None:
     parser.add_argument("--answer-api-key-env", required=True)
     parser.add_argument("--answer-request-profile",
                         choices=("qwen", "openai", "omit"), default="openai")
+    parser.add_argument(
+        "--answer-reasoning-effort",
+        choices=("none", "low", "medium", "high", "xhigh", "max"),
+        default="none")
     parser.add_argument("--packing-model")
     parser.add_argument(
         "--max-output-tokens", type=int, default=0,
         help="0 omits the API cap; positive values enforce the answer budget")
+    parser.add_argument(
+        "--sampling-temperature", type=float, default=0.0,
+        help="answer sampling temperature; zero preserves deterministic replay")
+    parser.add_argument("--sampling-seed", type=int, default=0)
     parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--checkpoint-every", type=int, default=25)
     parser.add_argument("--resume", action="store_true")
@@ -136,10 +144,14 @@ def main() -> None:
                 continue
             if str(prior.get("answer_model") or "") != args.answer_model:
                 continue
+            if str(prior.get("answer_reasoning_effort") or "none") != (
+                    args.answer_reasoning_effort):
+                continue
             base = dict(metadata[question_id])
             base.update({
                 "prediction": prior.get("prediction", ""),
                 "answer_model": args.answer_model,
+                "answer_reasoning_effort": args.answer_reasoning_effort,
                 "prompt_payload_hash": frozen.prompt_payload_hash,
             })
             answer_checkpoint.append(base)
@@ -150,6 +162,7 @@ def main() -> None:
                     "benchmark": base.get("benchmark"),
                     "stratum": base.get("stratum"),
                     "answer_model": args.answer_model,
+                    "answer_reasoning_effort": args.answer_reasoning_effort,
                     "prompt_payload_hash": frozen.prompt_payload_hash,
                     "reused_from": str(args.reuse_answers),
                 })
@@ -159,10 +172,12 @@ def main() -> None:
                     "benchmark": base.get("benchmark"),
                     "stratum": base.get("stratum"),
                     "answer_model": args.answer_model,
+                    "answer_reasoning_effort": args.answer_reasoning_effort,
                     "prompt_payload_hash": frozen.prompt_payload_hash,
                     "packing_prompt_tokens": int(usage.get("prompt_tokens", 0)),
                     "api_prompt_tokens": int(usage.get("api_prompt_tokens", 0)),
                     "completion_tokens": int(usage.get("completion_tokens", 0)),
+                    "reasoning_tokens": int(usage.get("reasoning_tokens", 0)),
                     "total_tokens": int(usage.get("answer_total_tokens", 0)),
                     "latency_ms": float(usage.get("answer_latency_ms", 0.0)),
                     "cached": bool(usage.get("answer_cached", False)),
@@ -189,46 +204,69 @@ def main() -> None:
     stage = AnswerStage(
         store, config, "v5-prepared-replay",
         answer_config=AnswerConfig(
-            max_output_tokens=(args.max_output_tokens or None)),
+            max_output_tokens=(args.max_output_tokens or None),
+            sampling_temperature=args.sampling_temperature,
+            sampling_seed=args.sampling_seed),
         cache_store=cache, require_exact_tokenizer=True,
         answer_model=args.answer_model, answer_base_url=args.answer_base_url,
         answer_api_key_env=args.answer_api_key_env,
         answer_request_profile=args.answer_request_profile,
+        answer_reasoning_effort=args.answer_reasoning_effort,
         packing_model=args.packing_model)
 
-    batch_size = max(1, args.checkpoint_every)
-    for start in range(0, len(pending), batch_size):
-        batch = pending[start:start + batch_size]
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-            answers = list(pool.map(stage.complete, batch))
-        answer_rows = []
-        usage_rows = []
-        for frozen, answer in zip(batch, answers):
+    completed_now = 0
+    failures: list[dict[str, str]] = []
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = {pool.submit(stage.complete, frozen): frozen
+                   for frozen in pending}
+        for future in as_completed(futures):
+            frozen = futures[future]
+            try:
+                answer = future.result()
+            except Exception as error:
+                failure = {
+                    "question_id": frozen.question_id,
+                    "error": repr(error),
+                }
+                failures.append(failure)
+                append_jsonl(args.output_root / "answer_failures.jsonl", [failure])
+                print(
+                    f"[answer error] {frozen.question_id}: {error}",
+                    flush=True,
+                )
+                continue
             base = dict(metadata[frozen.question_id])
             base.update({
                 "prediction": answer.prediction,
                 "answer_model": answer.answer_model,
+                "answer_reasoning_effort": args.answer_reasoning_effort,
                 "prompt_payload_hash": answer.prompt_payload_hash,
             })
-            answer_rows.append(base)
-            usage_rows.append({
+            usage_row = {
                 "question_id": frozen.question_id,
                 "benchmark": base.get("benchmark"),
                 "stratum": base.get("stratum"),
                 "answer_model": answer.answer_model,
+                "answer_reasoning_effort": args.answer_reasoning_effort,
                 "prompt_payload_hash": answer.prompt_payload_hash,
                 "packing_prompt_tokens": answer.prompt_tokens,
                 "api_prompt_tokens": answer.api_prompt_tokens,
                 "completion_tokens": answer.completion_tokens,
+                "reasoning_tokens": answer.reasoning_tokens,
                 "total_tokens": answer.api_total_tokens,
                 "latency_ms": answer.latency_ms,
                 "cached": answer.cached,
                 "finish_reason": answer.finish_reason,
-            })
-        append_jsonl(answer_path, answer_rows)
-        append_jsonl(usage_path, usage_rows)
-        print(f"checkpointed {min(start + len(batch), len(pending))}/{len(pending)}",
-              flush=True)
+            }
+            append_jsonl(answer_path, [base])
+            append_jsonl(usage_path, [usage_row])
+            completed_now += 1
+            if (completed_now % max(1, args.checkpoint_every) == 0
+                    or completed_now == len(pending)):
+                print(
+                    f"checkpointed {completed_now}/{len(pending)}",
+                    flush=True,
+                )
 
     answers = read_jsonl(answer_path)
     usage = read_jsonl(usage_path)
@@ -238,7 +276,8 @@ def main() -> None:
         raise RuntimeError(
             "prepared replay incomplete: "
             f"prepared={len(prepared_ids)} answers={len(set(answer_ids))} "
-            f"usage={len(set(usage_ids))}")
+            f"usage={len(set(usage_ids))} failures={len(failures)}; "
+            "rerun with --resume")
     if len(answer_ids) != len(prepared_ids) or len(usage_ids) != len(prepared_ids):
         raise RuntimeError("prepared replay artifacts contain duplicate question IDs")
     answer_hashes = {str(row["question_id"]): str(
@@ -260,6 +299,7 @@ def main() -> None:
     manifest = {
         "schema_version": "graphmem-prepared-answer-replay-v1",
         "answer_model": args.answer_model,
+        "answer_reasoning_effort": args.answer_reasoning_effort,
         "config_hash": config_hash(config),
         "answer_request_profile": args.answer_request_profile,
         "metadata_prompt_policy": args.metadata_prompt_policy,
@@ -267,6 +307,8 @@ def main() -> None:
         "reused_prompt_identical_questions": sum(
             bool(row.get("reused_from")) for row in usage),
         "max_output_tokens": args.max_output_tokens or None,
+        "sampling_temperature": args.sampling_temperature,
+        "sampling_seed": args.sampling_seed,
         "prepared": str(args.prepared),
         "prepared_sha256": hashlib.sha256(
             args.prepared.read_bytes()).hexdigest(),
@@ -281,6 +323,7 @@ def main() -> None:
         "api_tokens": {
             "prompt": stats(row.get("api_prompt_tokens", 0) for row in usage),
             "completion": stats(row.get("completion_tokens", 0) for row in usage),
+            "reasoning": stats(row.get("reasoning_tokens", 0) for row in usage),
             "total": stats(row.get("total_tokens", 0) for row in usage),
         },
         "api_tokens_by_benchmark": {
@@ -289,6 +332,8 @@ def main() -> None:
                                 if row.get("benchmark") == benchmark),
                 "completion": stats(row.get("completion_tokens", 0) for row in usage
                                     if row.get("benchmark") == benchmark),
+                "reasoning": stats(row.get("reasoning_tokens", 0) for row in usage
+                                   if row.get("benchmark") == benchmark),
                 "total": stats(row.get("total_tokens", 0) for row in usage
                                if row.get("benchmark") == benchmark),
             } for benchmark in ("longmemeval", "locomo")
@@ -297,6 +342,7 @@ def main() -> None:
         "api_usage_sums": {
             "prompt": sum(int(row.get("api_prompt_tokens") or 0) for row in usage),
             "completion": sum(int(row.get("completion_tokens") or 0) for row in usage),
+            "reasoning": sum(int(row.get("reasoning_tokens") or 0) for row in usage),
             "total": sum(int(row.get("total_tokens") or 0) for row in usage),
         },
         "api_usage_additivity_ok": all(

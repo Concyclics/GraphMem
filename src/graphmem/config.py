@@ -338,6 +338,49 @@ class RetrievalRuntimeConfig:
     dual_lane_precision_head: int = 32
     dual_lane_rrf_k: int = 60
     dual_lane_proof_reserve: bool = False
+    # Preserve a small, deterministic set of QueryIR/operator witnesses from
+    # the full candidate reservoir in addition to the dual-lane precision head.
+    obligation_witness_reserve: bool = False
+    obligation_witness_reserve_turns: int = 8
+    # Query the immutable CanonicalFact embedding sidecar and reserve a small
+    # number of its source turns after the validated rank floor.  This is a
+    # soft semantic bridge for relation paraphrases; it neither certifies a
+    # fact nor evicts evidence selected by the ordinary full-turn pack.
+    semantic_fact_witness_reserve: bool = False
+    semantic_fact_witness_turns: int = 4
+    semantic_fact_search_limit: int = 16
+    semantic_fact_min_score: float = 0.50
+    semantic_fact_operator_aware: bool = True
+    semantic_fact_min_compile_confidence: float = 0.70
+    semantic_predicate_witness_reserve: bool = False
+    semantic_predicate_witness_turns: int = 2
+    semantic_predicate_search_limit: int = 8
+    semantic_predicate_min_score: float = 0.45
+    # Keep the validated evidence budget as the common case, but permit a
+    # larger re-ranked pack when QueryIR and evidence-closure diagnostics agree
+    # that required witnesses are missing. ``query_budget.max_evidence_turns``
+    # remains the hard per-request ceiling.
+    adaptive_recall: bool = False
+    adaptive_recall_base_turns: int = 64
+    adaptive_recall_medium_turns: int = 80
+    adaptive_recall_max_turns: int = 96
+    adaptive_recall_protected_turns: int = 48
+    adaptive_recall_confidence_threshold: float = 0.80
+    adaptive_recall_minimum_severity: int = 3
+    adaptive_recall_maximum_tier_severity: int = 6
+    # Optional V5.76 two-dimensional controller.  A repair re-ranks/replaces
+    # the weak tail without increasing the turn cap.  Token tiers are evidence
+    # budgets and remain independently bounded by QueryBudget.
+    adaptive_recall_in_budget_repair: bool = False
+    adaptive_recall_repair_minimum_severity: int = 2
+    # Optional accuracy profile: move the answer-stage Pareto gate into the
+    # pre-answer retrieval controller, so the backbone is still called once.
+    # Zero disables scalar-lookup expansion and preserves the validated gate.
+    adaptive_recall_lookup_minimum_severity: int = 0
+    adaptive_recall_expand_queryir_soft_fallback: bool = False
+    adaptive_recall_base_tokens: int = 0
+    adaptive_recall_medium_tokens: int = 0
+    adaptive_recall_max_tokens: int = 0
     # 0 keeps the full id-only reservoir. Positive values expose a genuine
     # candidate precision/recall operating point before evidence packing.
     candidate_pool_limit: int = 0
@@ -408,6 +451,23 @@ class RetrievalRuntimeConfig:
             "exact_lookup_turn_limit": self.exact_lookup_turn_limit,
             "dual_lane_precision_head": self.dual_lane_precision_head,
             "dual_lane_rrf_k": self.dual_lane_rrf_k,
+            "obligation_witness_reserve_turns": (
+                self.obligation_witness_reserve_turns),
+            "semantic_fact_witness_turns": self.semantic_fact_witness_turns,
+            "semantic_fact_search_limit": self.semantic_fact_search_limit,
+            "semantic_predicate_witness_turns": (
+                self.semantic_predicate_witness_turns),
+            "semantic_predicate_search_limit": (
+                self.semantic_predicate_search_limit),
+            "adaptive_recall_base_turns": self.adaptive_recall_base_turns,
+            "adaptive_recall_medium_turns": self.adaptive_recall_medium_turns,
+            "adaptive_recall_max_turns": self.adaptive_recall_max_turns,
+            "adaptive_recall_protected_turns": (
+                self.adaptive_recall_protected_turns),
+            "adaptive_recall_minimum_severity": (
+                self.adaptive_recall_minimum_severity),
+            "adaptive_recall_maximum_tier_severity": (
+                self.adaptive_recall_maximum_tier_severity),
             "query_witness_seed_count": self.query_witness_seed_count,
             "query_witness_rare_df": self.query_witness_rare_df,
             "query_witness_min_shared_terms": self.query_witness_min_shared_terms,
@@ -433,6 +493,13 @@ class RetrievalRuntimeConfig:
             raise ValueError("speaker_owner_bonus must be non-negative")
         if self.query_witness_bonus < 0:
             raise ValueError("query_witness_bonus must be non-negative")
+        if not -1.0 <= self.semantic_fact_min_score <= 1.0:
+            raise ValueError("semantic_fact_min_score must be in [-1, 1]")
+        if not 0.0 <= self.semantic_fact_min_compile_confidence <= 1.0:
+            raise ValueError(
+                "semantic_fact_min_compile_confidence must be in [0, 1]")
+        if not -1.0 <= self.semantic_predicate_min_score <= 1.0:
+            raise ValueError("semantic_predicate_min_score must be in [-1, 1]")
         if (self.exact_lookup_priority_min_score < 0
                 or self.exact_lookup_priority_bonus < 0):
             raise ValueError("exact lookup priority values must be non-negative")
@@ -441,6 +508,43 @@ class RetrievalRuntimeConfig:
             raise ValueError("proof flood thresholds must be non-negative")
         if not 0.0 <= self.queryir_soft_fallback_threshold <= 1.0:
             raise ValueError("queryir_soft_fallback_threshold must be in [0, 1]")
+        if not 0.0 <= self.adaptive_recall_confidence_threshold <= 1.0:
+            raise ValueError(
+                "adaptive_recall_confidence_threshold must be in [0, 1]")
+        if not (0 <= self.adaptive_recall_minimum_severity
+                <= self.adaptive_recall_maximum_tier_severity):
+            raise ValueError(
+                "adaptive recall severity must satisfy 0 <= minimum <= "
+                "maximum tier")
+        if not (0 <= self.adaptive_recall_repair_minimum_severity
+                <= self.adaptive_recall_maximum_tier_severity):
+            raise ValueError(
+                "adaptive repair severity must satisfy 0 <= repair <= "
+                "maximum tier")
+        if not (0 <= self.adaptive_recall_lookup_minimum_severity
+                <= self.adaptive_recall_maximum_tier_severity):
+            raise ValueError(
+                "adaptive lookup severity must satisfy 0 <= lookup <= "
+                "maximum tier")
+        if not (self.adaptive_recall_protected_turns
+                <= self.adaptive_recall_base_turns
+                <= self.adaptive_recall_medium_turns
+                <= self.adaptive_recall_max_turns):
+            raise ValueError(
+                "adaptive recall turns must satisfy protected <= base <= "
+                "medium <= max")
+        token_tiers = (
+            self.adaptive_recall_base_tokens,
+            self.adaptive_recall_medium_tokens,
+            self.adaptive_recall_max_tokens,
+        )
+        if any(value < 0 for value in token_tiers):
+            raise ValueError("adaptive recall token limits cannot be negative")
+        if any(token_tiers) and not (
+                0 < token_tiers[0] <= token_tiers[1] <= token_tiers[2]):
+            raise ValueError(
+                "adaptive recall tokens must be all zero or satisfy "
+                "0 < base <= medium <= max")
         if self.dense_backend not in {"auto", "numpy_exact", "faiss_flat"}:
             raise ValueError("dense_backend must be auto, numpy_exact or faiss_flat")
         if self.dense_search_enabled:
@@ -473,6 +577,51 @@ class RetrievalRuntimeConfig:
             "dual_lane_precision_head": self.dual_lane_precision_head,
             "dual_lane_rrf_k": self.dual_lane_rrf_k,
             "dual_lane_proof_reserve": self.dual_lane_proof_reserve,
+            "obligation_witness_reserve": self.obligation_witness_reserve,
+            "obligation_witness_reserve_turns": (
+                self.obligation_witness_reserve_turns),
+            "semantic_fact_witness_reserve": (
+                self.semantic_fact_witness_reserve),
+            "semantic_fact_witness_turns": self.semantic_fact_witness_turns,
+            "semantic_fact_search_limit": self.semantic_fact_search_limit,
+            "semantic_fact_min_score": self.semantic_fact_min_score,
+            "semantic_fact_operator_aware": self.semantic_fact_operator_aware,
+            "semantic_fact_min_compile_confidence": (
+                self.semantic_fact_min_compile_confidence),
+            "semantic_predicate_witness_reserve": (
+                self.semantic_predicate_witness_reserve),
+            "semantic_predicate_witness_turns": (
+                self.semantic_predicate_witness_turns),
+            "semantic_predicate_search_limit": (
+                self.semantic_predicate_search_limit),
+            "semantic_predicate_min_score": (
+                self.semantic_predicate_min_score),
+            "adaptive_recall": self.adaptive_recall,
+            "adaptive_recall_base_turns": self.adaptive_recall_base_turns,
+            "adaptive_recall_medium_turns": self.adaptive_recall_medium_turns,
+            "adaptive_recall_max_turns": self.adaptive_recall_max_turns,
+            "adaptive_recall_protected_turns": (
+                self.adaptive_recall_protected_turns),
+            "adaptive_recall_confidence_threshold": (
+                self.adaptive_recall_confidence_threshold),
+            "adaptive_recall_minimum_severity": (
+                self.adaptive_recall_minimum_severity),
+            "adaptive_recall_maximum_tier_severity": (
+                self.adaptive_recall_maximum_tier_severity),
+            "adaptive_recall_in_budget_repair": (
+                self.adaptive_recall_in_budget_repair),
+            "adaptive_recall_repair_minimum_severity": (
+                self.adaptive_recall_repair_minimum_severity),
+            "adaptive_recall_lookup_minimum_severity": (
+                self.adaptive_recall_lookup_minimum_severity),
+            "adaptive_recall_expand_queryir_soft_fallback": (
+                self.adaptive_recall_expand_queryir_soft_fallback),
+            "adaptive_recall_base_tokens": (
+                self.adaptive_recall_base_tokens),
+            "adaptive_recall_medium_tokens": (
+                self.adaptive_recall_medium_tokens),
+            "adaptive_recall_max_tokens": (
+                self.adaptive_recall_max_tokens),
             "candidate_pool_limit": self.candidate_pool_limit,
             "span_pack_window": self.span_pack_window,
             "obligation_aware_relations": self.obligation_aware_relations,

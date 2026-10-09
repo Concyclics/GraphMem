@@ -114,12 +114,35 @@ COMPACT_TOPOLOGICAL_LABELS_APPENDIX = (
     "relevance, then graph or time order. Labels are navigation hints only: "
     "verify the facts and do not merge memories only because they share a block."
 )
+RELATION_PATH_LABELS_VERSION = "graphmem-v5.78-relation-path-labels-v1"
+RELATION_PATH_LABELS_APPENDIX = (
+    " A {via=a>b} suffix names only the index route families used to reach that "
+    "source (for example entity, time, collection, or relation). It is a reading "
+    "hint, not a claim; answer from the following source text."
+)
 QUERY_FOCUS_INDEX_VERSION = "graphmem-v5.39-query-focus-index-v1"
 QUERY_FOCUS_INDEX_APPENDIX = (
     " A Query focus index after the memories repeats short, exact excerpts "
     "from turns already present in the packed evidence. It is a reading aid, "
     "not extra evidence or a proposed answer; verify each excerpt in its full "
     "memory block."
+)
+TYPED_EVIDENCE_CARD_VERSION = "graphmem-v5.73-typed-evidence-card-v1"
+TYPED_EVIDENCE_CARD_APPENDIX = (
+    " An Answer-critical evidence card near the end of the user message repeats "
+    "a bounded set of verbatim excerpts from turns already present in the memory "
+    "pack. It is a reading index, not additional evidence, a completeness claim, "
+    "or a proposed answer. Verify attribution, event status, and time in the cited "
+    "source excerpts before answering."
+)
+BOUNDED_COMMON_KNOWLEDGE_VERSION = "graphmem-v5.73-bounded-knowledge-v1"
+BOUNDED_COMMON_KNOWLEDGE_APPENDIX = (
+    " For an inference or identification question, first bind every personal or "
+    "conversational premise to the supplied memories. You may then use stable "
+    "ordinary knowledge to name the narrow concept, activity, product, place, or "
+    "condition entailed by those premises. Ordinary knowledge may connect or label "
+    "source facts, but it may not invent a conversation event, preference, date, "
+    "possession, relationship, or quotation."
 )
 AGGREGATION_LEDGER_VERSION = "graphmem-v5.57-aggregation-ledger-scope-v2"
 AGGREGATION_LEDGER_APPENDIX = (
@@ -215,6 +238,9 @@ def build_answer_messages(
     compact_topological_contract: bool = False,
     compact_topological_labels: bool = False,
     query_focus_index: str | None = None,
+    typed_evidence_card: str | None = None,
+    bounded_common_knowledge: bool = False,
+    relation_path_labels: bool = False,
 ) -> list[dict[str, str]]:
     sections = ([f"Question date: {question_date or 'unknown'}"]
                 if include_question_date else []) + [
@@ -231,6 +257,10 @@ def build_answer_messages(
         # Recency is intentional: aggregation errors persisted when all gold
         # turns were packed but their operands were scattered through 64 turns.
         sections += ["", aggregation_ledger]
+    if typed_evidence_card:
+        # Keep the compact source card at the readout boundary.  Subsequent
+        # route-specific checks may follow, but no unbounded evidence does.
+        sections += ["", typed_evidence_card]
     if precision_grounding:
         # Repeat the short format contract *after* the long evidence block.  A
         # system-only instruction before 5K-12K evidence was often ignored by
@@ -273,7 +303,8 @@ def build_answer_messages(
             preference_synthesis, exact_grounding_footer,
             not include_question_date, question_recency_footer,
             compact_topological_contract, compact_topological_labels,
-            bool(query_focus_index))[1]},
+            bool(query_focus_index), bool(typed_evidence_card),
+            bounded_common_knowledge, relation_path_labels)[1]},
         {"role": "user", "content": "\n".join(sections)},
     ]
 
@@ -294,6 +325,9 @@ def prompt_contract(normalize_relative_time: bool = False,
                     compact_topological_contract: bool = False,
                     compact_topological_labels: bool = False,
                     query_focus_index: bool = False,
+                    typed_evidence_card: bool = False,
+                    bounded_common_knowledge: bool = False,
+                    relation_path_labels: bool = False,
                     ) -> tuple[str, str, str]:
     """Return the exact version/text/hash for an answer configuration."""
 
@@ -314,6 +348,9 @@ def prompt_contract(normalize_relative_time: bool = False,
         else:
             version += "+" + TOPOLOGICAL_LAYOUT_VERSION
             prompt += TOPOLOGICAL_LAYOUT_APPENDIX
+        if relation_path_labels:
+            version += "+" + RELATION_PATH_LABELS_VERSION
+            prompt += RELATION_PATH_LABELS_APPENDIX
     if aggregation_ledger:
         version += "+" + AGGREGATION_LEDGER_VERSION
         prompt += AGGREGATION_LEDGER_APPENDIX
@@ -332,4 +369,10 @@ def prompt_contract(normalize_relative_time: bool = False,
     if query_focus_index:
         version += "+" + QUERY_FOCUS_INDEX_VERSION
         prompt += QUERY_FOCUS_INDEX_APPENDIX
+    if typed_evidence_card:
+        version += "+" + TYPED_EVIDENCE_CARD_VERSION
+        prompt += TYPED_EVIDENCE_CARD_APPENDIX
+    if bounded_common_knowledge:
+        version += "+" + BOUNDED_COMMON_KNOWLEDGE_VERSION
+        prompt += BOUNDED_COMMON_KNOWLEDGE_APPENDIX
     return version, prompt, hashlib.sha256((version + prompt).encode("utf-8")).hexdigest()

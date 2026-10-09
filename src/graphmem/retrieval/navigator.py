@@ -32,6 +32,7 @@ from ..runtime import GraphReadView, SQLiteSnapshotRuntime
 from ..storage import SQLiteGraphStore
 from ..tokenization import TokenCounter, resolve_token_counter
 from .algebra import evaluate as evaluate_algebra
+from .adaptive_recall import AdaptiveRecallPlan, plan_adaptive_recall
 from .ast_algebra import evaluate_ast
 from .operators import requires_exhaustive_scope as ops_requires_scope
 from .bindings import bind_facts, bind_facts_discriminant
@@ -47,6 +48,8 @@ from .packer import (
     pack as pack_proof_units,
     pack_obligation_aware,
     rank_dual_lane_candidates,
+    rank_query_aware_candidates,
+    select_obligation_witnesses,
 )
 from .query_ir import compile_query
 from .scheduler import ScheduleResult, execute as schedule_relations
@@ -72,6 +75,40 @@ PREFERENCE_QUERY_RE = re.compile(
     r"\b(?:recommend|suggest|recommendation|suggestion|advice|tips?|ideas?|"
     r"likely|prefer|favorite|favourite|should|would\s+(?:like|enjoy)|"
     r"good\s+fit)\b", re.I)
+_SEMANTIC_FACT_MULTI_VALUE_RE = re.compile(
+    r"\b(?:activities|artists|arts|bands|books|classes|countries|events|"
+    r"friends|games|groups|hobbies|items|languages|names|pets|places|"
+    r"projects|skills|sports|states|things|trips|types|ways)\b|"
+    r"\b(?:how many|which of|what kinds?)\b",
+    re.I,
+)
+_SEMANTIC_FACT_INFERENCE_BRIDGE_RE = re.compile(
+    r"\b(?:based on|underlying condition|would .+ if|wouldn['’]?t .+ cause)\b",
+    re.I,
+)
+
+
+def semantic_fact_witness_eligible(
+    ir, query: str, *, minimum_confidence: float = 0.70,
+) -> bool:
+    """Gate the fact bridge to relation-complete or multi-value requests.
+
+    A broad dense-fact reserve improves collections and indirect joins but can
+    displace useful span-compression tail evidence for ordinary single-fact
+    lookups.  This gate depends only on compiled request shape and surface form.
+    """
+
+    if ir.compile_confidence < minimum_confidence:
+        return False
+    if (_SEMANTIC_FACT_MULTI_VALUE_RE.search(query)
+            or _SEMANTIC_FACT_INFERENCE_BRIDGE_RE.search(query)):
+        return True
+    # Do not infer eligibility from the compiled root operator.  On real
+    # memories, noisy owner aliases can turn an otherwise scalar lookup into a
+    # GroupByOwner/ExistsAll plan, while the conservative parser maps many
+    # ordinary ``what`` questions to UNION_DISTINCT.  The explicit surface
+    # forms above are the stable contract for this optional recall lane.
+    return False
 
 
 class NavigatorVariant(StrEnum):
@@ -319,6 +356,7 @@ class GraphNavigator:
         dense_search: DenseSearch | None = None,
         dense_search_many: DenseSearchMany | None = None,
         fact_dense_search: FactDenseSearch | None = None,
+        predicate_dense_search: FactDenseSearch | None = None,
         harness_profile: HarnessProfile | str | None = None,
         token_counter: TokenCounter | None = None,
         fact_channels: Sequence[str] | None = None,
@@ -397,6 +435,43 @@ class GraphNavigator:
         dual_lane_precision_head: int = 32,
         dual_lane_rrf_k: int = 60,
         dual_lane_proof_reserve: bool = False,
+        #: Add a bounded set of QueryIR/operator witnesses from the complete
+        #: candidate reservoir after the protected precision head.  This is a
+        #: packing reserve only; it does not create candidates or traverse more
+        #: graph edges.
+        obligation_witness_reserve: bool = False,
+        obligation_witness_reserve_turns: int = 8,
+        #: Soft relation-paraphrase bridge over build-time CanonicalFact
+        #: vectors.  Witnesses are admitted only after the validated rank floor
+        #: and therefore cannot evict its evidence.
+        semantic_fact_witness_reserve: bool = False,
+        semantic_fact_witness_turns: int = 4,
+        semantic_fact_search_limit: int = 16,
+        semantic_fact_min_score: float = 0.50,
+        semantic_fact_operator_aware: bool = True,
+        semantic_fact_min_compile_confidence: float = 0.70,
+        semantic_predicate_witness_reserve: bool = False,
+        semantic_predicate_witness_turns: int = 2,
+        semantic_predicate_search_limit: int = 8,
+        semantic_predicate_min_score: float = 0.45,
+        #: Re-run only the evidence ordering/packing stage when QueryIR and
+        #: closure diagnostics expose missing witnesses.  The request budget is
+        #: the hard ceiling; these values define the normal and fallback tiers.
+        adaptive_recall: bool = False,
+        adaptive_recall_base_turns: int = 64,
+        adaptive_recall_medium_turns: int = 80,
+        adaptive_recall_max_turns: int = 96,
+        adaptive_recall_protected_turns: int = 48,
+        adaptive_recall_confidence_threshold: float = 0.80,
+        adaptive_recall_minimum_severity: int = 3,
+        adaptive_recall_maximum_tier_severity: int = 6,
+        adaptive_recall_in_budget_repair: bool = False,
+        adaptive_recall_repair_minimum_severity: int = 2,
+        adaptive_recall_lookup_minimum_severity: int = 0,
+        adaptive_recall_expand_queryir_soft_fallback: bool = False,
+        adaptive_recall_base_tokens: int = 0,
+        adaptive_recall_medium_tokens: int = 0,
+        adaptive_recall_max_tokens: int = 0,
         candidate_pool_limit: int = 0,
         span_pack_window: int = 96,
         #: Keep a bounded number of the highest-scoring raw provenance
@@ -509,6 +584,7 @@ class GraphNavigator:
         self.dense_search = dense_search
         self.dense_search_many = dense_search_many
         self.fact_dense_search = fact_dense_search
+        self.predicate_dense_search = predicate_dense_search
         self.harness_profile = HarnessProfile(harness_profile) if harness_profile else None
         # Evidence budgets are only meaningful against the backbone's own
         # vocabulary.  The word-count estimate stays available as a labelled
@@ -537,6 +613,103 @@ class GraphNavigator:
             raise ValueError("dual_lane_rrf_k must be positive")
         self.dual_lane_rrf_k = dual_lane_rrf_k
         self.dual_lane_proof_reserve = dual_lane_proof_reserve
+        self.obligation_witness_reserve = obligation_witness_reserve
+        if obligation_witness_reserve_turns <= 0:
+            raise ValueError("obligation_witness_reserve_turns must be positive")
+        self.obligation_witness_reserve_turns = obligation_witness_reserve_turns
+        self.semantic_fact_witness_reserve = semantic_fact_witness_reserve
+        if min(semantic_fact_witness_turns, semantic_fact_search_limit) <= 0:
+            raise ValueError("semantic fact witness limits must be positive")
+        if not -1.0 <= semantic_fact_min_score <= 1.0:
+            raise ValueError("semantic_fact_min_score must be in [-1, 1]")
+        if not 0.0 <= semantic_fact_min_compile_confidence <= 1.0:
+            raise ValueError(
+                "semantic_fact_min_compile_confidence must be in [0, 1]")
+        self.semantic_fact_witness_turns = semantic_fact_witness_turns
+        self.semantic_fact_search_limit = semantic_fact_search_limit
+        self.semantic_fact_min_score = semantic_fact_min_score
+        self.semantic_fact_operator_aware = semantic_fact_operator_aware
+        self.semantic_fact_min_compile_confidence = (
+            semantic_fact_min_compile_confidence)
+        self.semantic_predicate_witness_reserve = (
+            semantic_predicate_witness_reserve)
+        if min(semantic_predicate_witness_turns,
+               semantic_predicate_search_limit) <= 0:
+            raise ValueError("semantic predicate witness limits must be positive")
+        if not -1.0 <= semantic_predicate_min_score <= 1.0:
+            raise ValueError("semantic_predicate_min_score must be in [-1, 1]")
+        self.semantic_predicate_witness_turns = (
+            semantic_predicate_witness_turns)
+        self.semantic_predicate_search_limit = (
+            semantic_predicate_search_limit)
+        self.semantic_predicate_min_score = semantic_predicate_min_score
+        self.adaptive_recall = adaptive_recall
+        adaptive_turns = (
+            adaptive_recall_protected_turns, adaptive_recall_base_turns,
+            adaptive_recall_medium_turns, adaptive_recall_max_turns)
+        if any(value <= 0 for value in adaptive_turns):
+            raise ValueError("adaptive recall turn limits must be positive")
+        if not (adaptive_recall_protected_turns
+                <= adaptive_recall_base_turns
+                <= adaptive_recall_medium_turns
+                <= adaptive_recall_max_turns):
+            raise ValueError(
+                "adaptive recall turns must satisfy protected <= base <= "
+                "medium <= max")
+        if not 0.0 <= adaptive_recall_confidence_threshold <= 1.0:
+            raise ValueError(
+                "adaptive_recall_confidence_threshold must be in [0, 1]")
+        if not (0 <= adaptive_recall_minimum_severity
+                <= adaptive_recall_maximum_tier_severity):
+            raise ValueError(
+                "adaptive recall severity must satisfy 0 <= minimum <= "
+                "maximum tier")
+        if not (0 <= adaptive_recall_repair_minimum_severity
+                <= adaptive_recall_maximum_tier_severity):
+            raise ValueError(
+                "adaptive repair severity must satisfy 0 <= repair <= "
+                "maximum tier")
+        if not (0 <= adaptive_recall_lookup_minimum_severity
+                <= adaptive_recall_maximum_tier_severity):
+            raise ValueError(
+                "adaptive lookup severity must satisfy 0 <= lookup <= "
+                "maximum tier")
+        adaptive_tokens = (
+            adaptive_recall_base_tokens,
+            adaptive_recall_medium_tokens,
+            adaptive_recall_max_tokens,
+        )
+        if any(value < 0 for value in adaptive_tokens):
+            raise ValueError("adaptive recall token limits cannot be negative")
+        if any(adaptive_tokens) and not (
+                0 < adaptive_tokens[0]
+                <= adaptive_tokens[1]
+                <= adaptive_tokens[2]):
+            raise ValueError(
+                "adaptive recall tokens must be all zero or satisfy "
+                "0 < base <= medium <= max")
+        self.adaptive_recall_base_turns = adaptive_recall_base_turns
+        self.adaptive_recall_medium_turns = adaptive_recall_medium_turns
+        self.adaptive_recall_max_turns = adaptive_recall_max_turns
+        self.adaptive_recall_protected_turns = (
+            adaptive_recall_protected_turns)
+        self.adaptive_recall_confidence_threshold = (
+            adaptive_recall_confidence_threshold)
+        self.adaptive_recall_minimum_severity = (
+            adaptive_recall_minimum_severity)
+        self.adaptive_recall_maximum_tier_severity = (
+            adaptive_recall_maximum_tier_severity)
+        self.adaptive_recall_in_budget_repair = (
+            adaptive_recall_in_budget_repair)
+        self.adaptive_recall_repair_minimum_severity = (
+            adaptive_recall_repair_minimum_severity)
+        self.adaptive_recall_lookup_minimum_severity = (
+            adaptive_recall_lookup_minimum_severity)
+        self.adaptive_recall_expand_queryir_soft_fallback = (
+            adaptive_recall_expand_queryir_soft_fallback)
+        self.adaptive_recall_base_tokens = adaptive_recall_base_tokens
+        self.adaptive_recall_medium_tokens = adaptive_recall_medium_tokens
+        self.adaptive_recall_max_tokens = adaptive_recall_max_tokens
         self.candidate_pool_limit = max(0, candidate_pool_limit)
         self.span_pack_window = max(0, span_pack_window)
         self.raw_fallback_reserve = max(0, raw_fallback_reserve)
@@ -1178,6 +1351,110 @@ class GraphNavigator:
         strict_fact_turn_scores: dict[str, float] = {}
         exact_lookup_scores: dict[str, float] = {}
         exact_lookup_confident = False
+        all_fact_ids = tuple(
+            node.node_id for node in view.nodes.values()
+            if node.node_type == NodeType.CANONICAL_FACT)
+        semantic_fact_enabled = bool(
+            self.semantic_fact_witness_reserve
+            and self.fact_dense_search is not None
+            and not advice_semantic
+            and (not self.semantic_fact_operator_aware
+                 or semantic_fact_witness_eligible(
+                     ir, query,
+                     minimum_confidence=(
+                         self.semantic_fact_min_compile_confidence))))
+        dense_fact_limit = max(
+            24 if exact_lookup_candidate else 0,
+            self.semantic_fact_search_limit if semantic_fact_enabled else 0)
+        dense_fact_rows_all = (
+            tuple(self.fact_dense_search(
+                memory_id, query, all_fact_ids, dense_fact_limit))
+            if dense_fact_limit and self.fact_dense_search is not None else ())
+        # ``dense_fact_rows_all`` is shared with exact-lookup scoring to avoid a
+        # second vector search.  Sharing the computation must not implicitly
+        # enable the semantic witness lane: otherwise any exact-lookup request
+        # receives forced fact witnesses even when its operator/surface gate is
+        # closed.
+        semantic_fact_rows = (
+            tuple(
+                row
+                for row in dense_fact_rows_all[:self.semantic_fact_search_limit]
+                if float(row[1]) >= self.semantic_fact_min_score)
+            if semantic_fact_enabled else ())
+        resolved_owner_ids = (
+            frozenset().union(*owners.values()) if owners else frozenset())
+        semantic_group_turns: Mapping[str, tuple[str, ...]] = {}
+        semantic_predicate_enabled = bool(
+            self.semantic_predicate_witness_reserve
+            and self.predicate_dense_search is not None
+            and not advice_semantic
+            and semantic_fact_witness_eligible(
+                ir, query,
+                minimum_confidence=(
+                    self.semantic_fact_min_compile_confidence)))
+        if semantic_fact_rows or semantic_predicate_enabled:
+            _semantic_groups, semantic_group_turns, _semantic_members = (
+                self._evidence_indexes(memory_id, view.graph_version))
+        semantic_fact_turn_scores: dict[str, float] = {}
+        semantic_fact_witness_ids: list[str] = []
+        if semantic_fact_rows:
+            for fact_id, similarity in semantic_fact_rows:
+                node = view.nodes.get(fact_id)
+                if node is None:
+                    continue
+                fact_owner = str(node.attributes.get("owner_id", ""))
+                # When QueryIR resolved an explicit owner, facts belonging to a
+                # different owner are topical distractors, not relation bridges.
+                if (resolved_owner_ids and fact_owner
+                        and fact_owner not in resolved_owner_ids):
+                    continue
+                for group_id in view.terminal_groups_for_nodes((fact_id,)):
+                    for turn_id in semantic_group_turns.get(group_id, ()):
+                        semantic_fact_turn_scores[turn_id] = max(
+                            semantic_fact_turn_scores.get(turn_id, -1.0),
+                            float(similarity))
+                        if turn_id not in semantic_fact_witness_ids:
+                            semantic_fact_witness_ids.append(turn_id)
+        semantic_fact_witness_ids = semantic_fact_witness_ids[
+            :self.semantic_fact_witness_turns]
+        predicate_by_id = {
+            stable_id("predicate", memory_id, predicate): predicate
+            for predicate in view.predicate_index}
+        semantic_predicate_rows = (
+            tuple(self.predicate_dense_search(
+                memory_id, query, tuple(predicate_by_id),
+                self.semantic_predicate_search_limit))
+            if semantic_predicate_enabled
+            and self.predicate_dense_search is not None else ())
+        semantic_predicate_turn_scores: dict[str, float] = {}
+        semantic_predicate_witness_ids: list[str] = []
+        for predicate_id, similarity in semantic_predicate_rows:
+            if float(similarity) < self.semantic_predicate_min_score:
+                continue
+            predicate = predicate_by_id.get(predicate_id)
+            if predicate is None:
+                continue
+            predicate_fact_ids = view.lookup_facts(
+                owner_ids=tuple(resolved_owner_ids),
+                predicates=(predicate,), limit=8,
+                rank_terms=content_terms(query))
+            for fact_id in predicate_fact_ids:
+                node = view.nodes.get(fact_id)
+                if node is None:
+                    continue
+                fact_owner = str(node.attributes.get("owner_id", ""))
+                if (resolved_owner_ids and fact_owner
+                        and fact_owner not in resolved_owner_ids):
+                    continue
+                for group_id in view.terminal_groups_for_nodes((fact_id,)):
+                    for turn_id in semantic_group_turns.get(group_id, ()):
+                        semantic_predicate_turn_scores[turn_id] = max(
+                            semantic_predicate_turn_scores.get(turn_id, -1.0),
+                            float(similarity))
+                        if turn_id not in semantic_predicate_witness_ids:
+                            semantic_predicate_witness_ids.append(turn_id)
+        semantic_predicate_witness_ids = semantic_predicate_witness_ids[
+            :self.semantic_predicate_witness_turns]
         exact_lookup_trace: dict[str, object] = {
             "eligible": exact_lookup_candidate,
             "confident": False,
@@ -1199,13 +1476,7 @@ class GraphNavigator:
                         limit=12,
                         rank_terms=query_content))
             lexical_fact_ids = view.facts_for_terms(query_content, limit=16)
-            dense_fact_rows = (
-                self.fact_dense_search(
-                    memory_id, query,
-                    tuple(node.node_id for node in view.nodes.values()
-                          if node.node_type == NodeType.CANONICAL_FACT),
-                    24)
-                if self.fact_dense_search is not None else ())
+            dense_fact_rows = dense_fact_rows_all[:24]
             dense_fact_scores = {
                 fact_id: max(
                     0.0,
@@ -1629,6 +1900,8 @@ class GraphNavigator:
              (*seeded.source_turn_ids, *hydrated_turn_ids,
              *(strict_fact_turn_scores
                if exact_lookup_priority_active else ()),
+             *semantic_fact_witness_ids,
+             *semantic_predicate_witness_ids,
              *reserved_fallback_candidates)))
         hydrated_set = frozenset(hydrated_turn_ids)
         raw_fallback_set = frozenset(raw_fallback_turn_ids)
@@ -1778,10 +2051,17 @@ class GraphNavigator:
                     and relational_view_active and relational_consensus):
                 fused += self.relational_consensus_bonus * relational_consensus
                 relational_consensus_matches += 1
+            source_channels = tuple(name for name, value in (
+                ("exact", exact), ("bm25", bm25), ("dense", dense),
+                ("graph", graph),
+                ("semantic_fact", semantic_fact_turn_scores.get(turn_id, 0.0)),
+                ("semantic_predicate",
+                 semantic_predicate_turn_scores.get(turn_id, 0.0)),
+            ) if value)
             rows.append(CandidateScore(turn_id, turn.session_id, exact, bm25, dense, graph,
                                        role_gain, slot_gain,
                                        self._turn_tokens(turn), fused,
-                                       tuple(name for name, value in (("exact", exact), ("bm25", bm25), ("dense", dense), ("graph", graph)) if value),
+                                       source_channels,
                                        session_score, adjacency_score,
                                        graph_path_ids=graph_path_by_turn.get(turn_id, ()),
                                        relation_contributions=tuple(
@@ -1852,6 +2132,18 @@ class GraphNavigator:
         precision_rank_rows = tuple(rows)
         answer_kind = (algebra_result.answer_kind if algebra_result is not None
                        else str(ir.ast_operator or ir.operator))
+        hard_evidence_turn_limit = budget.max_evidence_turns
+        hard_evidence_token_limit = budget.max_evidence_tokens
+        base_evidence_turn_limit = min(
+            hard_evidence_turn_limit,
+            self.adaptive_recall_base_turns
+            if self.adaptive_recall else hard_evidence_turn_limit)
+        base_evidence_token_limit = min(
+            hard_evidence_token_limit,
+            self.adaptive_recall_base_tokens
+            if (self.adaptive_recall
+                and self.adaptive_recall_base_tokens > 0)
+            else hard_evidence_token_limit)
         dual_lane_head_ids: tuple[str, ...] = ()
         dual_lane_trace: Mapping[str, int] = {}
         dual_lane_active = bool(
@@ -1860,7 +2152,7 @@ class GraphNavigator:
             rows, dual_lane_head_ids, dual_lane_trace = (
                 rank_dual_lane_candidates(
                     rows, answer_kind=answer_kind,
-                    max_turns=budget.max_evidence_turns,
+                    max_turns=base_evidence_turn_limit,
                     precision_head=self.dual_lane_precision_head,
                     rrf_k=self.dual_lane_rrf_k))
             rows = list(rows)
@@ -1878,18 +2170,26 @@ class GraphNavigator:
         # `rank_mandatory=True` recovers 0.808 by restoring exactly the ordering
         # `_rank_pack` already had.
         effective_turn_limit = (
-            min(budget.max_evidence_turns, self.exact_lookup_turn_limit)
-            if exact_lookup_fast_active else budget.max_evidence_turns)
+            min(base_evidence_turn_limit, self.exact_lookup_turn_limit)
+            if exact_lookup_fast_active else base_evidence_turn_limit)
         effective_budget = replace(
-            budget, max_evidence_turns=effective_turn_limit)
+            budget,
+            max_evidence_turns=effective_turn_limit,
+            max_evidence_tokens=base_evidence_token_limit)
+        witness_floor: tuple[str, ...] = ()
+        witness_trace: Mapping[str, int] = {}
+        proof_units_before_pack = units
         if self.obligation_aware_packing:
             pack_turn_limit = (
                 effective_turn_limit if exact_lookup_fast_active else (
                     adaptive_evidence_turn_limit(
-                        answer_kind, len(ir.operands), budget.max_evidence_turns,
+                        answer_kind, len(ir.operands), effective_turn_limit,
                         query=query)
-                    if self.precision_aware_packing else budget.max_evidence_turns))
-            pack_budget = replace(budget, max_evidence_turns=pack_turn_limit)
+                    if self.precision_aware_packing else effective_turn_limit))
+            pack_budget = replace(
+                budget,
+                max_evidence_turns=pack_turn_limit,
+                max_evidence_tokens=base_evidence_token_limit)
             floor_rows = precision_rank_rows if dual_lane_active else rows
             floor_budget = (
                 replace(pack_budget, max_evidence_turns=min(
@@ -1899,13 +2199,40 @@ class GraphNavigator:
                 floor_rows, by_id, floor_budget, self.per_session_quota,
                 reserved_turn_ids=raw_fallback_set,
                 reserve_limit=self.raw_fallback_reserve)
+            if self.obligation_witness_reserve:
+                # Evaluate obligation gaps against the complete pack that the
+                # frozen ordering would have produced, not merely its protected
+                # 32-turn precision head.  Otherwise already-packed witnesses
+                # are "reserved" again and displace useful coverage-tail turns.
+                witness_baseline, _witness_dropped, _witness_coverage = (
+                    self._rank_pack(
+                        rows, by_id, pack_budget, self.per_session_quota,
+                        reserved_turn_ids=raw_fallback_set,
+                        reserve_limit=self.raw_fallback_reserve))
+                witness_terms, witness_df = self._query_witness_features(
+                    memory_id, view.graph_version, all_turns)
+                witness_floor, witness_trace = select_obligation_witnesses(
+                    precision_rank_rows, by_id,
+                    query=query, answer_kind=answer_kind,
+                    max_witnesses=self.obligation_witness_reserve_turns,
+                    baseline_turn_ids=witness_baseline,
+                    terms_by_turn=witness_terms,
+                    document_frequency=witness_df)
+            # Keep the semantic bridge behind the existing QueryIR/date
+            # witnesses.  ``pack_obligation_aware`` first admits the validated
+            # rank floor, so these turns can use span-compression headroom but
+            # cannot replace an ordinary ranked selection.
+            witness_floor = tuple(dict.fromkeys((
+                *witness_floor, *semantic_fact_witness_ids,
+                *semantic_predicate_witness_ids)))
             packed, dropped, pack_exhaustion, packed_units, packed_span_tokens = pack_obligation_aware(
                 units, rows, by_id, query=query, answer_kind=answer_kind,
                 max_turns=pack_turn_limit,
-                max_tokens=budget.max_evidence_tokens,
+                max_tokens=pack_budget.max_evidence_tokens,
                 count_text_tokens=self._count_tokens_cached,
                 span_window=self.span_pack_window,
                 baseline_floor=baseline_floor,
+                witness_floor=witness_floor,
                 precision_aware=self.precision_aware_packing,
                 proof_reserve=(
                     self.dual_lane_proof_reserve
@@ -1915,7 +2242,7 @@ class GraphNavigator:
                        HarnessProfile.H9_FACT_RESERVOIR}:
             packed, dropped, pack_exhaustion = pack_proof_units(units, rows, by_id,
                                                                  max_turns=effective_turn_limit,
-                                                                 max_tokens=budget.max_evidence_tokens,
+                                                                 max_tokens=effective_budget.max_evidence_tokens,
                                                                  token_cost=self._turn_tokens,
                                                                  rank_mandatory=self.rank_mandatory)
         else:
@@ -1929,7 +2256,261 @@ class GraphNavigator:
                     reserved_turn_ids=raw_fallback_set,
                     reserve_limit=self.raw_fallback_reserve)
             pack_exhaustion = {"turn_cap_reached": len(packed) >= effective_turn_limit,
-                               "token_cap_reached": sum(self._turn_tokens(by_id[item]) for item in packed) >= budget.max_evidence_tokens}
+                               "token_cap_reached": sum(self._turn_tokens(by_id[item]) for item in packed) >= effective_budget.max_evidence_tokens}
+
+        # The compact B0 pack is always produced first.  Only a visible
+        # QueryIR/closure deficit may consume a larger part of the request's
+        # hard evidence budget.  This two-pass design keeps non-triggered
+        # requests byte-for-byte on the compact path.
+        closure_certificate = certificate
+        baseline_certificate = certificate
+        if algebra_result is not None:
+            baseline_certificate = finalize_ast_certificate(
+                ir, algebra_result, algebra_bindings, group_turns, packed,
+                units=units,
+                exhausted=exhausted or any(pack_exhaustion.values()))
+        adaptive_plan = AdaptiveRecallPlan(
+            base_evidence_turn_limit, base_evidence_turn_limit, "disabled",
+            base_tokens=base_evidence_token_limit,
+            target_tokens=base_evidence_token_limit)
+        adaptive_rank_trace: Mapping[str, int] = {}
+        adaptive_baseline_packed = tuple(packed)
+        adaptive_added_turn_ids: tuple[str, ...] = ()
+        adaptive_removed_turn_ids: tuple[str, ...] = ()
+        adaptive_tail_signal_count = 0
+        adaptive_supported_tail_protected = 0
+        if (self.adaptive_recall and self.obligation_aware_packing
+                and not exact_lookup_fast_active):
+            adaptive_plan = plan_adaptive_recall(
+                ir, closure_certificate, baseline_certificate,
+                hard_turn_limit=hard_evidence_turn_limit,
+                base_turns=self.adaptive_recall_base_turns,
+                medium_turns=self.adaptive_recall_medium_turns,
+                maximum_turns=self.adaptive_recall_max_turns,
+                hard_token_limit=hard_evidence_token_limit,
+                base_tokens=self.adaptive_recall_base_tokens,
+                medium_tokens=self.adaptive_recall_medium_tokens,
+                maximum_tokens=self.adaptive_recall_max_tokens,
+                compile_confidence_threshold=(
+                    self.adaptive_recall_confidence_threshold),
+                minimum_severity=self.adaptive_recall_minimum_severity,
+                maximum_tier_severity=(
+                    self.adaptive_recall_maximum_tier_severity),
+                enable_in_budget_repair=(
+                    self.adaptive_recall_in_budget_repair),
+                repair_minimum_severity=(
+                    self.adaptive_recall_repair_minimum_severity),
+                lookup_minimum_severity=(
+                    self.adaptive_recall_lookup_minimum_severity),
+                expand_queryir_soft_fallback=(
+                    self.adaptive_recall_expand_queryir_soft_fallback),
+                base_token_cap_reached=bool(
+                    pack_exhaustion.get("token_cap_reached")),
+                candidate_count=len(rows))
+        if adaptive_plan.active:
+            witness_terms, witness_df = self._query_witness_features(
+                memory_id, view.graph_version, all_turns)
+            target_dual_lane = bool(
+                adaptive_plan.triggered and dual_lane_active)
+            if target_dual_lane:
+                # Recompile the already validated dual-lane order for the
+                # target tier.  Reusing a 32-turn lane split and globally
+                # reranking its tail reduced answer accuracy even while gold
+                # coverage increased.  QueryIR/certificates decide *whether*
+                # to expand; the target tier keeps the same ordering contract
+                # as a native fixed-budget request.
+                (adaptive_rows, adaptive_head_ids,
+                 adaptive_rank_trace) = rank_dual_lane_candidates(
+                    precision_rank_rows, answer_kind=answer_kind,
+                    max_turns=adaptive_plan.target_turns,
+                    precision_head=self.dual_lane_precision_head,
+                    rrf_k=self.dual_lane_rrf_k)
+            else:
+                adaptive_rows, adaptive_head_ids, adaptive_rank_trace = (
+                    rank_query_aware_candidates(
+                        precision_rank_rows, by_id, query=query,
+                        answer_kind=answer_kind,
+                        max_turns=adaptive_plan.target_turns,
+                        terms_by_turn=witness_terms,
+                        document_frequency=witness_df,
+                        witness_rare_df=self.query_witness_rare_df,
+                        rrf_k=self.dual_lane_rrf_k))
+            if self.candidate_pool_limit:
+                adaptive_rows = adaptive_rows[:self.candidate_pool_limit]
+
+            baseline_set = frozenset(adaptive_baseline_packed)
+            query_surface = content_terms(query)
+            adaptive_prefix = adaptive_rows[:adaptive_plan.target_turns]
+            adaptive_tail_signal_count = sum(
+                row.turn_id not in baseline_set and (
+                    bool(row.proof_unit_ids)
+                    or row.binding_score >= 0.50
+                    or (row.obligation_gain > 0
+                        and row.binding_score >= 0.25)
+                    or len(query_surface & content_terms(
+                        by_id[row.turn_id].raw_text)) >= 2
+                    or (row.adjacency_score > 0
+                        and bool(query_surface & content_terms(
+                            by_id[row.turn_id].raw_text)))
+                    or sum(value > 0 for value in (
+                        row.exact_score, row.bm25_score,
+                        row.dense_score)) >= 2)
+                for row in adaptive_prefix if row.turn_id in by_id)
+
+            # If the alternative rank found no independently supported tail,
+            # the closure warning cannot be repaired by adding topical text.
+            if adaptive_tail_signal_count:
+                adaptive_witness_floor: tuple[str, ...] = ()
+                target_baseline_floor: tuple[str, ...] = ()
+                if target_dual_lane:
+                    # Select the precision head under the target layout, but
+                    # leave the final token allowance to the two-pass pack
+                    # below.  This makes B1 ordering equivalent to native
+                    # 64-turn dual-lane retrieval without granting 64-turn
+                    # tokens to B0 requests.
+                    target_floor_budget = replace(
+                        budget,
+                        max_evidence_turns=min(
+                            adaptive_plan.target_turns,
+                            len(adaptive_head_ids)),
+                        max_evidence_tokens=hard_evidence_token_limit)
+                    (target_baseline_floor, _target_floor_dropped,
+                     _target_floor_coverage) = self._rank_pack(
+                        precision_rank_rows, by_id, target_floor_budget,
+                        self.per_session_quota,
+                        reserved_turn_ids=raw_fallback_set,
+                        reserve_limit=self.raw_fallback_reserve)
+                if self.obligation_witness_reserve:
+                    witness_baseline = adaptive_baseline_packed
+                    if target_dual_lane:
+                        target_witness_budget = replace(
+                            budget,
+                            max_evidence_turns=adaptive_plan.target_turns,
+                            max_evidence_tokens=hard_evidence_token_limit)
+                        (witness_baseline, _target_witness_dropped,
+                         _target_witness_coverage) = self._rank_pack(
+                            adaptive_rows, by_id, target_witness_budget,
+                            self.per_session_quota,
+                            reserved_turn_ids=raw_fallback_set,
+                            reserve_limit=self.raw_fallback_reserve)
+                    adaptive_witness_floor, _adaptive_witness_trace = (
+                        select_obligation_witnesses(
+                            precision_rank_rows, by_id,
+                            query=query, answer_kind=answer_kind,
+                            max_witnesses=self.obligation_witness_reserve_turns,
+                            baseline_turn_ids=witness_baseline,
+                            terms_by_turn=witness_terms,
+                            document_frequency=witness_df))
+                adaptive_row_by_id = {
+                    row.turn_id: row for row in precision_rank_rows}
+
+                def independently_supported_tail(turn_id: str) -> bool:
+                    """Keep baseline-tail evidence backed by a second signal.
+
+                    The first part of the validated pack is immutable.  In its
+                    tail, a turn may be replaced only when it lacks proof,
+                    binding, relational-dialogue, and exact+dense agreement.
+                    This preserves evidence continuity without freezing a
+                    generic topical tail that the adaptive rank is meant to
+                    remove.
+                    """
+
+                    row = adaptive_row_by_id.get(turn_id)
+                    if row is None:
+                        return False
+                    return bool(
+                        row.mandatory
+                        or row.binding_score >= 0.50
+                        or (row.operand_ids and row.graph_score > 0
+                            and row.adjacency_score >= 0.30)
+                        or (row.exact_score > 0 and row.dense_score >= 0.50))
+
+                if target_dual_lane:
+                    protected = target_baseline_floor
+                    adaptive_supported_tail_protected = 0
+                else:
+                    protected = tuple(
+                        turn_id for index, turn_id in enumerate(
+                            adaptive_baseline_packed)
+                        if (index < self.adaptive_recall_protected_turns
+                            or independently_supported_tail(turn_id)))
+                    adaptive_supported_tail_protected = max(
+                        0, len(protected) - min(
+                            len(adaptive_baseline_packed),
+                            self.adaptive_recall_protected_turns))
+                adaptive_witness_floor = tuple(dict.fromkeys((
+                    *witness_floor, *adaptive_witness_floor)))
+                witness_floor = adaptive_witness_floor
+                packed, dropped, pack_exhaustion, packed_units, packed_span_tokens = (
+                    pack_obligation_aware(
+                        proof_units_before_pack, adaptive_rows, by_id,
+                        query=query, answer_kind=answer_kind,
+                        max_turns=adaptive_plan.target_turns,
+                        max_tokens=(adaptive_plan.target_tokens
+                                    or hard_evidence_token_limit),
+                        count_text_tokens=self._count_tokens_cached,
+                        span_window=self.span_pack_window,
+                        baseline_floor=protected,
+                        witness_floor=adaptive_witness_floor,
+                        precision_aware=self.precision_aware_packing,
+                        proof_reserve=(
+                            self.dual_lane_proof_reserve
+                            if dual_lane_active else True)))
+                # Turn expansion and Token expansion are separate decisions.
+                # First search farther under the base Token allowance; only if
+                # that concrete second pack rejects evidence on Token cost do
+                # we grant the next Token tier and replay the deterministic
+                # packer.  Easy 32-turn requests never enter this branch.
+                if (pack_exhaustion.get("token_cap_reached")
+                        and adaptive_plan.target_tokens
+                        <= adaptive_plan.base_tokens
+                        and self.adaptive_recall_medium_tokens
+                        > adaptive_plan.base_tokens):
+                    expanded_token_limit = min(
+                        hard_evidence_token_limit,
+                        (self.adaptive_recall_max_tokens
+                         if adaptive_plan.severity
+                         >= self.adaptive_recall_maximum_tier_severity
+                         else self.adaptive_recall_medium_tokens))
+                    if expanded_token_limit > adaptive_plan.target_tokens:
+                        adaptive_plan = replace(
+                            adaptive_plan,
+                            target_tokens=expanded_token_limit,
+                            reasons=tuple(dict.fromkeys((
+                                *adaptive_plan.reasons,
+                                "post_expansion_token_cap_reached"))))
+                        (packed, dropped, pack_exhaustion, packed_units,
+                         packed_span_tokens) = pack_obligation_aware(
+                            proof_units_before_pack, adaptive_rows, by_id,
+                            query=query, answer_kind=answer_kind,
+                            max_turns=adaptive_plan.target_turns,
+                            max_tokens=adaptive_plan.target_tokens,
+                            count_text_tokens=self._count_tokens_cached,
+                            span_window=self.span_pack_window,
+                            baseline_floor=protected,
+                            witness_floor=adaptive_witness_floor,
+                            precision_aware=self.precision_aware_packing,
+                            proof_reserve=(
+                                self.dual_lane_proof_reserve
+                                if dual_lane_active else True))
+                units = packed_units
+                rows = list(adaptive_rows)
+                pack_turn_limit = adaptive_plan.target_turns
+                packed_set = frozenset(packed)
+                adaptive_added_turn_ids = tuple(
+                    turn_id for turn_id in packed
+                    if turn_id not in baseline_set)
+                adaptive_removed_turn_ids = tuple(
+                    turn_id for turn_id in adaptive_baseline_packed
+                    if turn_id not in packed_set)
+            else:
+                adaptive_plan = AdaptiveRecallPlan(
+                    adaptive_plan.base_turns, adaptive_plan.base_turns,
+                    adaptive_plan.route,
+                    (*adaptive_plan.reasons, "no_supported_tail"),
+                    adaptive_plan.severity,
+                    base_tokens=adaptive_plan.base_tokens,
+                    target_tokens=adaptive_plan.base_tokens)
         stage_times["evidence_pack"] = (time.perf_counter() - tick) * 1000
         tick = time.perf_counter()
         if algebra_result is not None:
@@ -1973,6 +2554,7 @@ class GraphNavigator:
                    "query_ir_confidence": compiled_ir.compile_confidence,
                    "query_ir_fallback_reasons": list(compiled_ir.fallback_reasons),
                    "query_ir_soft_fallback": ir.soft_fallback_applied,
+                   "query_ir_parse_warnings": list(ir.parse_warnings),
                    "query_ir_mode": ("unified_ast" if profile is HarnessProfile.H11_UNIFIED_IR
                                      else "legacy_plus_shadow_ast"),
                    "advice_semantic_fusion": advice_semantic,
@@ -2026,6 +2608,85 @@ class GraphNavigator:
                    "dual_lane_rrf_k": self.dual_lane_rrf_k,
                    "dual_lane_proof_reserve": (
                        self.dual_lane_proof_reserve),
+                   "obligation_witness_reserve": (
+                       self.obligation_witness_reserve),
+                   "obligation_witness_reserve_turns": (
+                       self.obligation_witness_reserve_turns),
+                   "obligation_witness_rank": dict(
+                       witness_trace),
+                   "obligation_witness_turn_ids": list(
+                       witness_floor),
+                   "obligation_witness_packed": sum(
+                       turn_id in frozenset(packed)
+                       for turn_id in witness_floor),
+                   "semantic_fact_witness_reserve": (
+                       self.semantic_fact_witness_reserve),
+                   "semantic_fact_search_limit": (
+                       self.semantic_fact_search_limit),
+                   "semantic_fact_min_score": self.semantic_fact_min_score,
+                   "semantic_fact_operator_aware": (
+                       self.semantic_fact_operator_aware),
+                   "semantic_fact_eligible": semantic_fact_enabled,
+                   "semantic_fact_min_compile_confidence": (
+                       self.semantic_fact_min_compile_confidence),
+                   "semantic_fact_hit_count": len(semantic_fact_rows),
+                   "semantic_fact_witness_turn_ids": list(
+                       semantic_fact_witness_ids),
+                   "semantic_fact_witness_packed": sum(
+                       turn_id in frozenset(packed)
+                       for turn_id in semantic_fact_witness_ids),
+                   "semantic_fact_witness_scores": {
+                       turn_id: semantic_fact_turn_scores[turn_id]
+                       for turn_id in semantic_fact_witness_ids},
+                   "semantic_predicate_witness_reserve": (
+                       self.semantic_predicate_witness_reserve),
+                   "semantic_predicate_eligible": (
+                       semantic_predicate_enabled),
+                   "semantic_predicate_search_limit": (
+                       self.semantic_predicate_search_limit),
+                   "semantic_predicate_min_score": (
+                       self.semantic_predicate_min_score),
+                   "semantic_predicate_hit_count": len(
+                       semantic_predicate_rows),
+                   "semantic_predicate_witness_turn_ids": list(
+                       semantic_predicate_witness_ids),
+                   "semantic_predicate_witness_packed": sum(
+                       turn_id in frozenset(packed)
+                       for turn_id in semantic_predicate_witness_ids),
+                   "semantic_predicate_witness_scores": {
+                       turn_id: semantic_predicate_turn_scores[turn_id]
+                       for turn_id in semantic_predicate_witness_ids},
+                   "adaptive_recall": self.adaptive_recall,
+                   "adaptive_recall_active": adaptive_plan.active,
+                   "adaptive_recall_triggered": adaptive_plan.triggered,
+                   "adaptive_recall_in_budget_repair": (
+                       adaptive_plan.in_budget_repair),
+                   "adaptive_recall_route": adaptive_plan.route,
+                   "adaptive_recall_reasons": list(adaptive_plan.reasons),
+                   "adaptive_recall_severity": adaptive_plan.severity,
+                   "adaptive_recall_base_turns": (
+                       adaptive_plan.base_turns),
+                   "adaptive_recall_target_turns": (
+                       adaptive_plan.target_turns),
+                   "adaptive_recall_base_tokens": (
+                       adaptive_plan.base_tokens),
+                   "adaptive_recall_target_tokens": (
+                       adaptive_plan.target_tokens),
+                   "adaptive_recall_tail_signal_count": (
+                       adaptive_tail_signal_count),
+                   "adaptive_recall_supported_tail_protected": (
+                       adaptive_supported_tail_protected),
+                   "adaptive_recall_rank": dict(adaptive_rank_trace),
+                   "adaptive_recall_added_turn_ids": list(
+                       adaptive_added_turn_ids),
+                   "adaptive_recall_removed_turn_ids": list(
+                       adaptive_removed_turn_ids),
+                   "adaptive_recall_added_turns": len(
+                       adaptive_added_turn_ids),
+                   "adaptive_recall_removed_turns": len(
+                       adaptive_removed_turn_ids),
+                   "adaptive_recall_baseline_packed_turns": len(
+                       adaptive_baseline_packed),
                    "dual_lane_rank": dict(dual_lane_trace),
                    "dual_lane_precision_packed": sum(
                        turn_id in frozenset(dual_lane_head_ids)

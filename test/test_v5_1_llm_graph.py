@@ -8,6 +8,8 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from graphmem.build import GraphBuildPipeline, QwenSemanticDistiller
 from graphmem.build.semantic import SemanticFact, frozen_semantic_request_fingerprint
 from graphmem.config import GraphMemV5Config
@@ -104,6 +106,118 @@ def test_openai_semantic_profile_uses_gpt_request_contract() -> None:
     assert request["reasoning_effort"] == "none"
     assert "max_tokens" not in request
     assert "extra_body" not in request
+
+
+def test_openai_semantic_reasoning_effort_is_sent_and_accounted() -> None:
+    class _ReasoningCompletions(FakeCompletions):
+        def create(self, **request):
+            result = super().create(**request)
+            result.usage.completion_tokens_details = SimpleNamespace(
+                reasoning_tokens=7)
+            return result
+
+    recording = _ReasoningCompletions()
+    distiller = QwenSemanticDistiller(
+        _NoopCallStore(), GraphMemV5Config(), "dataset",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=recording)),
+        request_profile="openai", reasoning_effort="low")
+
+    _response, usage = distiller._call(
+        "memory", "probe", "system", {"i": 1}, 1, max_tokens=321)
+
+    assert recording.requests[0]["reasoning_effort"] == "low"
+    assert usage["reasoning_tokens"] == 7
+    assert usage["total_tokens"] == 125
+
+
+def test_semantic_reasoning_requires_openai_profile() -> None:
+    with pytest.raises(ValueError, match="requires the openai profile"):
+        QwenSemanticDistiller(
+            _NoopCallStore(), GraphMemV5Config(), "dataset", client=object(),
+            request_profile="qwen", reasoning_effort="low")
+
+
+def test_semantic_transport_retry_preserves_exact_request(monkeypatch) -> None:
+    class _TransientError(Exception):
+        status_code = 429
+
+    class _TransientCompletions(FakeCompletions):
+        def create(self, **request):
+            if self.calls < 2:
+                self.calls += 1
+                self.requests.append(request)
+                raise _TransientError("pending request limit")
+            return super().create(**request)
+
+    monkeypatch.setattr("graphmem.build.semantic.time.sleep", lambda _delay: None)
+    recording = _TransientCompletions()
+    distiller = QwenSemanticDistiller(
+        _NoopCallStore(), GraphMemV5Config(), "dataset",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=recording)),
+        request_profile="openai", reasoning_effort="low")
+
+    _response, usage = distiller._call(
+        "memory", "probe", "system", {"i": 1}, 1, max_tokens=321)
+
+    assert recording.calls == 3
+    assert usage["transport_retry_count"] == 2
+    assert recording.requests[0] == recording.requests[-1]
+
+
+def test_semantic_biological_filter_retries_once_with_benign_context() -> None:
+    class _BiologicalFilterError(Exception):
+        status_code = 502
+
+    class _FilteredCompletions(FakeCompletions):
+        def create(self, **request):
+            if self.calls == 0:
+                self.calls += 1
+                self.requests.append(request)
+                raise _BiologicalFilterError(
+                    "This content was flagged for possible biological risk")
+            return super().create(**request)
+
+    recording = _FilteredCompletions()
+    distiller = QwenSemanticDistiller(
+        _NoopCallStore(), GraphMemV5Config(), "dataset",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=recording)),
+        request_profile="openai")
+
+    _response, usage = distiller._call(
+        "memory", "probe", "system", {"i": 1}, 1, max_tokens=321)
+
+    assert recording.calls == 2
+    assert recording.requests[0]["messages"][1] == recording.requests[1]["messages"][1]
+    assert recording.requests[1]["messages"][0]["content"].startswith(
+        "This is a benign information-retrieval data transformation.")
+    assert usage["transport_retry_count"] == 1
+    assert usage["content_filter_retry_count"] == 1
+    assert len(usage["content_filter_recovery_request_sha256"]) == 64
+
+
+def test_semantic_repeated_biological_filter_fails_after_one_recovery() -> None:
+    class _BiologicalFilterError(Exception):
+        status_code = 502
+
+    class _AlwaysFilteredCompletions:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, **_request):
+            self.calls += 1
+            raise _BiologicalFilterError(
+                "This content was flagged for possible biological risk")
+
+    recording = _AlwaysFilteredCompletions()
+    distiller = QwenSemanticDistiller(
+        _NoopCallStore(), GraphMemV5Config(), "dataset",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=recording)),
+        request_profile="openai")
+
+    with pytest.raises(_BiologicalFilterError):
+        distiller._call(
+            "memory", "probe", "system", {"i": 1}, 1, max_tokens=321)
+    assert recording.calls == 2
 
 
 class FakeCompletions:

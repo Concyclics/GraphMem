@@ -5,7 +5,7 @@ multi-session conversations into a sparse hierarchical graph, compiles a user
 question into a typed QueryIR plan, and retrieves a bounded evidence set for
 answer generation.
 
-The current V5.63 implementation focuses on three system goals:
+GraphMem focuses on three system goals:
 
 - **Token-efficient construction.** HNSW-assisted coarsening, reconnecting and
   parent-gated refinement replace all-pairs relation induction. Lossless atomic
@@ -28,7 +28,53 @@ The graph is stored as a versioned SQLite snapshot. The core package is under
 `src/graphmem`; benchmark, audit and reproduction entrypoints are under
 `scripts`.
 
-## Qwen3-30B benchmark results
+## Current implementation
+
+The repository includes the implementation and experiment tooling developed
+through V5.81. The V5.63 profiles and benchmark results below remain frozen;
+new retrieval and answer policies are explicit options, not replacements for
+those historical results.
+
+- **Adaptive evidence budgets:** QueryIR and evidence-closure checks can repair
+  the evidence tail, preserve a protected head, and expand turn/token budgets
+  within configured limits before answering. Runtime routing does not use gold
+  answers or judge verdicts.
+- **Source-grounded readout:** optional typed evidence cards, relation-route
+  hints, temporal normalization and witness reserves improve evidence
+  organization. Multi-label query obligations retain one primary execution
+  route and narrowly scoped presentation hints.
+- **Deterministic retrieval:** stable score accumulation and tie-breaking,
+  persistent query embeddings, batched query prewarming, and reusable FAISS
+  sidecars support repeatable preparation.
+- **Resumable model comparisons:** frozen-prompt replay supports configurable
+  reasoning effort, multiple answer candidates, bounded concurrency and API
+  usage accounting. Answer selection and judge-based best-of-N upper-bound
+  analysis are separate experiment paths.
+
+| Entry point | Purpose |
+|---|---|
+| `configs/v5/runtime_v5_73_accuracy64.json` | Fixed 64-turn retrieval with witness reserves |
+| `configs/v5/runtime_v5_76_adaptive_budget.json` | Adaptive 32/64/80-turn and 2,200/3,800/4,500 evidence-token budgets |
+| `configs/v5/runtime_v5_78_semantic_witness.json` | Opt-in semantic-witness experiment |
+| `scripts/run_v5_6_answer.py --answer-policy v5_73` | Source-grounded evidence-card answer policy |
+| `scripts/replay_v5_prepared_best_of.py` | Multiple candidates from frozen requests |
+| `scripts/replay_v5_prepared_ensemble.py` | Split-prompt candidates and evidence-based selection |
+
+Use `--help` on each entrypoint for its required inputs and options. Runtime
+profiles contain workspace-relative artifact paths; override them for your
+deployment and use the embedding model that created the stored vectors.
+Archived runner scripts require the external datasets, graph snapshots and
+tokenizer assets described in their arguments; these assets are not shipped.
+Experimental witness, fusion and multi-call policies are not all enabled by
+default or claimed to improve every benchmark.
+
+See the [adaptive-budget design](docs/V5_76_ADAPTIVE_BUDGET.md),
+[retrieval-quality results](docs/V5_79_RETRIEVAL_QUALITY_RESULTS_20260910.md),
+and [multi-label QueryIR and determinism notes](docs/V5_80_MULTILABEL_QUERYIR_UPGRADE_20260910.md)
+for configuration details and paired evaluations. Best-of-N oracle scores in
+experiment notes are diagnostic upper bounds, not single-answer accuracy.
+
+## Frozen V5.63 Qwen3-30B benchmark results
 
 We evaluate the full [LongMemEval-S](https://github.com/xiaowu0162/LongMemEval)
 set (500 questions over 500 memories) and LoCoMo
@@ -236,7 +282,8 @@ python -m pytest test/ -q
 ```
 
 Unit tests use synthetic fixtures and do not require benchmark data or model
-services. The V5.63 release gate passes all 523 tests.
+services. The current implementation passes all 626 tests (2026-10-09);
+this is a code-validation result, not a new full-benchmark run.
 
 ## Repository layout
 

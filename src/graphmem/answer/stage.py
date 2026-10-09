@@ -2,7 +2,9 @@
 
 Contracts this stage holds:
 
-* **One generative call per question, at temperature 0, thinking disabled.**
+* **One generative call per question, at temperature 0.**  Thinking remains
+  disabled by default; frozen-prompt model studies may opt into an explicit
+  OpenAI reasoning effort without changing retrieval or packing.
   Retrieval must still make zero generative calls; this is the only such call
   in the read path.
 * **The budget is enforced, not reported.**  Evidence is rendered under
@@ -46,6 +48,17 @@ from .rendering import (
 )
 from .readout_policy import apply_readout_policy
 from .answer_plan import apply_answer_plan
+from .evidence_card import TypedEvidenceCard, build_typed_evidence_card
+from .relation_labels import relation_route_hint
+
+
+def _relation_route_hint(candidate: Any | None) -> str:
+    """Return compact navigation metadata without restating any fact value."""
+
+    if candidate is None:
+        return ""
+    return relation_route_hint(
+        candidate.source_channels, candidate.relation_contributions)
 
 
 def _aggregation_source_reserve_ids(
@@ -637,6 +650,7 @@ class AnswerResult:
     latency_ms: float = 0.0
     api_prompt_tokens: int = 0
     api_total_tokens: int = 0
+    reasoning_tokens: int = 0
     answer_model: str = ""
     prompt_payload_hash: str = ""
     warnings: tuple[str, ...] = ()
@@ -720,6 +734,7 @@ class AnswerStage:
                  answer_base_url: str | None = None,
                  answer_api_key_env: str | None = None,
                  answer_request_profile: str = "qwen",
+                 answer_reasoning_effort: str = "none",
                  packing_model: str | None = None) -> None:
         self.store = store
         # Scoring runs open the authority graph read-only, so answers and their
@@ -733,6 +748,16 @@ class AnswerStage:
         self.answer_request_profile = answer_request_profile
         if self.answer_request_profile not in {"qwen", "openai", "omit"}:
             raise ValueError("answer_request_profile must be qwen, openai or omit")
+        self.answer_reasoning_effort = answer_reasoning_effort
+        if self.answer_reasoning_effort not in {
+                "none", "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError(
+                "answer_reasoning_effort must be none, low, medium, high, "
+                "xhigh or max")
+        if (self.answer_request_profile != "openai"
+                and self.answer_reasoning_effort != "none"):
+            raise ValueError(
+                "non-none answer_reasoning_effort requires the openai profile")
         self.counter = resolve_token_counter(packing_model or config.models.llm_model,
                                              require_exact=require_exact_tokenizer)
         if client is None:
@@ -743,7 +768,13 @@ class AnswerStage:
                 raise RuntimeError(f"{answer_api_key_env} is required for answer calls")
             client = OpenAI(
                 base_url=answer_base_url or config.models.llm_base_url,
-                api_key=api_key)
+                api_key=api_key,
+                # AnswerStage already owns a durable, observable retry loop.
+                # Disable the SDK's implicit retries so a stalled request does
+                # not multiply the per-attempt timeout before our checkpointed
+                # recovery policy can run.
+                max_retries=0,
+                timeout=600.0)
         self.client = client
         self._turn_cache: dict[str, tuple[dict[str, SourceTurn], dict[str, int]]] = {}
         self._cache_lock = threading.Lock()
@@ -804,7 +835,8 @@ class AnswerStage:
                 "topological_plain", "topological", "topological_recency"}:
             ordered, prefixes, layout_stats = self._topological_layout(
                 result, ordered, turn_map, session_order,
-                strongest_last=evidence_order == "topological_recency")
+                strongest_last=evidence_order == "topological_recency",
+                relation_labels=self.answer_config.relation_path_labels)
             if evidence_order == "topological_plain":
                 # Pure graph-rerank ablation: preserve the topology-derived
                 # order and block statistics, but do not reveal graph labels
@@ -830,7 +862,8 @@ class AnswerStage:
     def _topological_layout(result: NavigationResult, packed: Sequence[str],
                             turns: Mapping[str, SourceTurn],
                             session_order: Mapping[str, int], *,
-                            strongest_last: bool = False) -> tuple[
+                            strongest_last: bool = False,
+                            relation_labels: bool = False) -> tuple[
                                 list[str], dict[str, str], dict[str, int]]:
         """Group packed evidence by proof topology without filtering turns.
 
@@ -923,7 +956,10 @@ class AnswerStage:
                          unit.rank, chronological)
                 if turn_id not in assignments or value < assignments[turn_id]:
                     assignments[turn_id] = value
-                    prefixes[turn_id] = f"[CHAIN {chain} step={depth}]"
+                    hint = (_relation_route_hint(candidate_by_turn.get(turn_id))
+                            if relation_labels else "")
+                    prefixes[turn_id] = (
+                        f"[CHAIN {chain} step={depth}]{hint}")
 
         for turn_id in packed:
             if turn_id in assignments or turn_id not in turns:
@@ -948,7 +984,8 @@ class AnswerStage:
                 chain_best[chain], 0, chain, 1,
                 candidate_rank.get(turn_id, 1 << 30),
                 chronological)
-            prefixes[turn_id] = f"[CHAIN {chain} support]"
+            hint = _relation_route_hint(row) if relation_labels else ""
+            prefixes[turn_id] = f"[CHAIN {chain} support]{hint}"
 
         # A graph-reached candidate can be useful even when permissive/partial
         # QueryIR binding did not attach an operand.  Group those turns by their
@@ -984,8 +1021,9 @@ class AnswerStage:
                 assignments[turn_id] = (
                     graph_best[key], 1, group, len(path), path,
                     candidate_rank.get(turn_id, 1 << 30), chronological)
+                hint = _relation_route_hint(row) if relation_labels else ""
                 prefixes[turn_id] = (
-                    f"[GRAPH {group} step={len(path)}]")
+                    f"[GRAPH {group} step={len(path)}]{hint}")
 
         auxiliary = [turn_id for turn_id in packed
                      if turn_id not in assignments and turn_id in turns]
@@ -1020,7 +1058,10 @@ class AnswerStage:
                 # local packet and its relevance.  Repeating ``group=`` plus
                 # the identical anchor rank on every member cost hundreds of
                 # prompt tokens at 64 turns without adding topology.
-                prefixes[turn_id] = f"[AUX {group} rank={rank + 1}]"
+                hint = (_relation_route_hint(candidate_by_turn.get(turn_id))
+                        if relation_labels else "")
+                prefixes[turn_id] = (
+                    f"[AUX {group} rank={rank + 1}]{hint}")
 
         if strongest_last:
             assignments = {
@@ -1078,8 +1119,23 @@ class AnswerStage:
             return build_aggregation_ledger(
                 question, turn_map, rendered.turn_ids,
                 limit=self.answer_config.aggregation_ledger_limit,
-                execution_card=self.answer_config.aggregation_execution_card)
+                execution_card=self.answer_config.aggregation_execution_card,
+                event_aware=(
+                    self.answer_config.aggregation_event_table_enabled))
         ledger = make_ledger(evidence)
+        def make_evidence_card(
+            rendered: RenderedEvidence,
+        ) -> TypedEvidenceCard | None:
+            if not self.answer_config.typed_evidence_card_enabled:
+                return None
+            answer_kind = str(
+                result.trace.get("ast_operator")
+                or result.trace.get("query_operator") or "")
+            return build_typed_evidence_card(
+                question, turn_map, rendered.turn_ids,
+                result.candidate_scores, answer_kind=answer_kind,
+                config=self.answer_config, counter=self.counter)
+        evidence_card = make_evidence_card(evidence)
         def make_query_focus(
             rendered: RenderedEvidence,
             current_ledger: AggregationLedger | None,
@@ -1237,11 +1293,18 @@ class AnswerStage:
             preference_synthesis=preference_synthesis,
             preference_focus_index=preference_focus,
             query_focus_index=query_focus,
+            typed_evidence_card=(evidence_card.text
+                                 if evidence_card else None),
+            bounded_common_knowledge=bool(
+                evidence_card is not None
+                and evidence_card.route == "inference"
+                and self.answer_config.bounded_common_knowledge),
             exact_grounding_footer=(
                 self.answer_config.exact_grounding_footer),
             include_question_date=include_question_date,
             question_recency_footer=question_recency_footer,
-            compact_topological_contract=compact_topological_contract)
+            compact_topological_contract=compact_topological_contract,
+            relation_path_labels=self.answer_config.relation_path_labels)
         prompt_version, _prompt_text, prompt_hash = prompt_contract(
             self.answer_config.normalize_relative_time,
             self.answer_config.precision_grounding,
@@ -1250,26 +1313,34 @@ class AnswerStage:
             self.answer_config.exact_grounding_footer,
             contextual_question_date,
             question_recency_footer, compact_topological_contract,
-            False, bool(query_focus))
+            False, bool(query_focus), bool(evidence_card), bool(
+                evidence_card is not None
+                and evidence_card.route == "inference"
+                and self.answer_config.bounded_common_knowledge),
+            self.answer_config.relation_path_labels)
         prompt_tokens = self._prompt_tokens(messages)
         relaxed = False
         if prompt_tokens > budget.max_answer_tokens:
             overhead = prompt_tokens - evidence.tokens
+            reserved_ledger_ids = (
+                ledger.candidate_turn_ids
+                if ledger is not None
+                and not self.answer_config.aggregation_execution_card
+                else ledger.worksheet_turn_ids
+                if ledger is not None else ())
+            reserved_card_ids = (
+                evidence_card.turn_ids if evidence_card else ())
             evidence = self.render(
                 result, budget,
                 max_tokens=max(1, budget.max_answer_tokens - overhead),
                 question=question,
-                reserved_turn_ids=tuple(dict.fromkeys((
-                    *((ledger.candidate_turn_ids
-                       if ledger is not None
-                       and not self.answer_config.aggregation_execution_card
-                       else ledger.worksheet_turn_ids
-                       if ledger is not None else ())),
-                    *aggregation_source_reserve,
-                    *query_focus_ids))))
+                reserved_turn_ids=tuple(dict.fromkeys(
+                    reserved_ledger_ids + aggregation_source_reserve
+                    + query_focus_ids + reserved_card_ids)))
             ledger = make_ledger(evidence)
             query_focus, query_focus_ids = make_query_focus(evidence, ledger)
             preference_focus, preference_focus_ids = make_preference_focus(evidence)
+            evidence_card = make_evidence_card(evidence)
             messages = build_answer_messages(
                 question=question, question_date=question_date,
                 evidence_text=evidence.text,
@@ -1286,11 +1357,19 @@ class AnswerStage:
                 preference_synthesis=preference_synthesis,
                 preference_focus_index=preference_focus,
                 query_focus_index=query_focus,
+                typed_evidence_card=(evidence_card.text
+                                     if evidence_card else None),
+                bounded_common_knowledge=bool(
+                    evidence_card is not None
+                    and evidence_card.route == "inference"
+                    and self.answer_config.bounded_common_knowledge),
                 exact_grounding_footer=(
                     self.answer_config.exact_grounding_footer),
                 include_question_date=include_question_date,
                 question_recency_footer=question_recency_footer,
-                compact_topological_contract=compact_topological_contract)
+                compact_topological_contract=compact_topological_contract,
+                relation_path_labels=(
+                    self.answer_config.relation_path_labels))
             prompt_tokens = self._prompt_tokens(messages)
             if prompt_tokens > budget.max_answer_tokens:
                 relaxed = True
@@ -1306,7 +1385,11 @@ class AnswerStage:
             self.answer_config.exact_grounding_footer,
             contextual_question_date,
             question_recency_footer, compact_topological_contract,
-            False, bool(query_focus))
+            False, bool(query_focus), bool(evidence_card), bool(
+                evidence_card is not None
+                and evidence_card.route == "inference"
+                and self.answer_config.bounded_common_knowledge),
+            self.answer_config.relation_path_labels)
         if prompt_tokens > budget.max_answer_tokens_hard:
             raise RuntimeError(
                 f"answer prompt for {question_id} is {prompt_tokens} tokens, above the hard "
@@ -1314,6 +1397,13 @@ class AnswerStage:
 
         worksheet_route: str | None = None
         if (ledger is not None
+                and self.answer_config.aggregation_event_table_enabled
+                and ledger.event_lines):
+            # Event tables are explicitly scoped/status-labelled and therefore
+            # safe for named multi-party transcripts where the older generic
+            # worksheet gate was intentionally disabled.
+            worksheet_route = "event_table"
+        elif (ledger is not None
                 and self.answer_config.aggregation_operand_worksheet_enabled):
             worksheet_route = "all"
             if self.answer_config.aggregation_operand_worksheet_selective:
@@ -1355,9 +1445,22 @@ class AnswerStage:
                 "query_focus_turns": len(query_focus_ids),
                 "query_focus_excerpt_chars": (
                     self.answer_config.query_focus_excerpt_chars),
+                "typed_evidence_card": bool(evidence_card),
+                "typed_evidence_card_route": (
+                    evidence_card.route if evidence_card else None),
+                "typed_evidence_card_turn_ids": (
+                    list(evidence_card.turn_ids) if evidence_card else []),
+                "typed_evidence_card_tokens": (
+                    evidence_card.tokens if evidence_card else 0),
+                "bounded_common_knowledge": bool(
+                    evidence_card is not None
+                    and evidence_card.route == "inference"
+                    and self.answer_config.bounded_common_knowledge),
                 "span_window": self.answer_config.span_window,
                 "evidence_order": self.answer_config.evidence_order,
                 "resolved_evidence_order": evidence_order,
+                "relation_path_labels": (
+                    self.answer_config.relation_path_labels),
                 "packed_turns": len(evidence.turn_ids),
                 "evidence_truncated": evidence.truncated,
                 "evidence_layout": evidence.layout_mode,
@@ -1391,6 +1494,11 @@ class AnswerStage:
                     "deterministic_result": ledger.deterministic_result,
                     "worksheet_lines": list(ledger.worksheet_lines),
                     "worksheet_turn_ids": list(ledger.worksheet_turn_ids),
+                    "event_lines": list(ledger.event_lines),
+                    "event_turn_ids": list(ledger.event_turn_ids),
+                    "max_ordinal": ledger.max_ordinal,
+                    "event_table_enabled": (
+                        self.answer_config.aggregation_event_table_enabled),
                     "worksheet_enabled": bool(worksheet_route),
                     "worksheet_selective": (
                         self.answer_config.
@@ -1400,11 +1508,18 @@ class AnswerStage:
                 "aggregation_source_reserve_turns": len(
                     aggregation_source_reserve),
                 "aggregation_worksheet_rows": (
+                    len(ledger.event_lines)
+                    if ledger is not None
+                    and worksheet_route == "event_table" else
                     len(ledger.worksheet_lines)
                     if ledger is not None
                     and worksheet_route else 0),
                 "aggregation_worksheet_turn_ids": (
-                    list(ledger.worksheet_turn_ids) if ledger is not None else []),
+                    list(ledger.event_turn_ids)
+                    if ledger is not None
+                    and worksheet_route == "event_table" else
+                    list(ledger.worksheet_turn_ids)
+                    if ledger is not None else []),
                 "preference_synthesis": preference_synthesis,
                 "preference_focus_strategy": (
                     self.answer_config.preference_focus_strategy),
@@ -1444,10 +1559,12 @@ class AnswerStage:
                 prompt_hash=prepared.prompt_hash,
                 prompt_payload_hash=prepared.prompt_payload_hash,
                 answer_model=self.answer_model,
+                reasoning_tokens=0,
                 latency_ms=prepared.preparation_latency_ms,
                 warnings=tuple(warnings), trace=prepared.trace)
 
-        text, api_prompt, completion, api_total, cached, finish_reason = self._call(
+        (text, api_prompt, completion, api_total, reasoning, cached,
+         finish_reason) = self._call(
             prepared.question_id, prepared.memory_id,
             prepared.messages, prepared.prompt_hash)
         prediction = " ".join(text.split())
@@ -1470,6 +1587,7 @@ class AnswerStage:
                         + (time.perf_counter() - started) * 1000),
             api_prompt_tokens=api_prompt,
             api_total_tokens=api_total,
+            reasoning_tokens=reasoning,
             answer_model=self.answer_model,
             prompt_payload_hash=prepared.prompt_payload_hash,
             warnings=tuple(warnings), prompt_hash=prepared.prompt_hash,
@@ -1480,44 +1598,51 @@ class AnswerStage:
 
     def _call(self, question_id: str, memory_id: str,
               messages: Sequence[Mapping[str, str]], prompt_hash: str,
-              ) -> tuple[str, int, int, int, bool, str]:
+              ) -> tuple[str, int, int, int, int, bool, str]:
         request = {
             "model": self.answer_model, "messages": list(messages),
-            "temperature": 0, "seed": self.answer_config.sampling_seed,
+            "temperature": self.answer_config.sampling_temperature,
+            "seed": self.answer_config.sampling_seed,
         }
         if self.answer_request_profile == "qwen":
             request["extra_body"] = {
                 "chat_template_kwargs": {"enable_thinking": False}}
         elif self.answer_request_profile == "openai":
-            request["reasoning_effort"] = "none"
+            request["reasoning_effort"] = self.answer_reasoning_effort
         if self.answer_config.max_output_tokens is not None:
             output_key = ("max_completion_tokens"
                           if (self.answer_request_profile == "openai"
                               and self.answer_model.casefold().startswith("gpt-5"))
                           else "max_tokens")
             request[output_key] = self.answer_config.max_output_tokens
+        answer_identity = {
+            "span_window": self.answer_config.span_window,
+            "include_dates": self.answer_config.include_dates,
+            "include_speaker": self.answer_config.include_speaker,
+            "evidence_order": self.answer_config.evidence_order,
+            "normalize_relative_time": self.answer_config.normalize_relative_time,
+            "precision_grounding": self.answer_config.precision_grounding,
+            "candidate_answer_injection": (
+                self.answer_config.candidate_answer_injection),
+            "max_output_tokens": self.answer_config.max_output_tokens,
+            "sampling_temperature": self.answer_config.sampling_temperature,
+            "sampling_seed": self.answer_config.sampling_seed,
+            "request_profile": self.answer_request_profile,
+            "answer_plan_enabled": self.answer_config.answer_plan_enabled,
+            "answer_plan_max_candidates": (
+                self.answer_config.answer_plan_max_candidates),
+            "answer_plan_excerpt_chars": (
+                self.answer_config.answer_plan_excerpt_chars),
+            "answer_plan_kinds": self.answer_config.answer_plan_kinds,
+        }
+        # Preserve the historical ``none`` cache identity while ensuring that
+        # every reasoning arm owns a disjoint answer cache entry.
+        if self.answer_reasoning_effort != "none":
+            answer_identity["reasoning_effort"] = self.answer_reasoning_effort
         identity = CacheIdentity(
             self.dataset_hash, self.answer_model, prompt_hash,
             self.config.schema_version,
-            hashlib.sha256(canonical_json({
-                "span_window": self.answer_config.span_window,
-                "include_dates": self.answer_config.include_dates,
-                "include_speaker": self.answer_config.include_speaker,
-                "evidence_order": self.answer_config.evidence_order,
-                "normalize_relative_time": self.answer_config.normalize_relative_time,
-                "precision_grounding": self.answer_config.precision_grounding,
-                "candidate_answer_injection": (
-                    self.answer_config.candidate_answer_injection),
-                "max_output_tokens": self.answer_config.max_output_tokens,
-                "sampling_seed": self.answer_config.sampling_seed,
-                "request_profile": self.answer_request_profile,
-                "answer_plan_enabled": self.answer_config.answer_plan_enabled,
-                "answer_plan_max_candidates": (
-                    self.answer_config.answer_plan_max_candidates),
-                "answer_plan_excerpt_chars": (
-                    self.answer_config.answer_plan_excerpt_chars),
-                "answer_plan_kinds": self.answer_config.answer_plan_kinds,
-            }).encode()).hexdigest(),
+            hashlib.sha256(canonical_json(answer_identity).encode()).hexdigest(),
             "answer:" + hashlib.sha256(canonical_json(request["messages"]).encode()).hexdigest(),
         )
         key = identity.key()
@@ -1528,6 +1653,7 @@ class AnswerStage:
             response, usage, is_cached = cached["response"], dict(cached["usage"]), True
             prompt = int(usage.get("uncached_input_tokens", 0))
             completion = int(usage.get("output_tokens", 0))
+            reasoning = int(usage.get("reasoning_tokens", 0))
             api_total = int(usage.get("total_tokens", prompt + completion))
             usage = {"cached_input_tokens": int(usage.get("uncached_input_tokens", 0)),
                      "uncached_input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
@@ -1557,7 +1683,8 @@ class AnswerStage:
                     # durable checkpoint batch.
                     time.sleep(min(8.0, float(2 ** attempt)))
             message = completion_result.choices[0].message
-            if getattr(message, "reasoning_content", None):
+            if (self.answer_reasoning_effort == "none"
+                    and getattr(message, "reasoning_content", None)):
                 raise RuntimeError("answer stage returned reasoning content")
             response = {"content": message.content or "",
                         "model": getattr(completion_result, "model", ""),
@@ -1565,10 +1692,12 @@ class AnswerStage:
             raw = getattr(completion_result, "usage", None)
             prompt = int(getattr(raw, "prompt_tokens", 0) or 0)
             completion = int(getattr(raw, "completion_tokens", 0) or 0)
+            details = getattr(raw, "completion_tokens_details", None)
+            reasoning = int(getattr(details, "reasoning_tokens", 0) or 0)
             api_total = int(getattr(raw, "total_tokens", 0)
                             or (prompt + completion))
             usage = {"cached_input_tokens": 0, "uncached_input_tokens": prompt,
-                     "output_tokens": completion, "reasoning_tokens": 0,
+                     "output_tokens": completion, "reasoning_tokens": reasoning,
                      "total_tokens": prompt + completion}
             self.cache_store.cache_put(key, "answer", request, response, usage, prompt_hash)
             is_cached = False
@@ -1583,4 +1712,5 @@ class AnswerStage:
             retry_count=retry_count, batch_size=1,
             prompt_hash=prompt_hash)
         return (str(response.get("content", "")), prompt, completion, api_total,
-                is_cached, str(response.get("finish_reason") or ""))
+                reasoning, is_cached,
+                str(response.get("finish_reason") or ""))

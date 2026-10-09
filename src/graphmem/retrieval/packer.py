@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from collections import defaultdict
 from dataclasses import replace
@@ -76,6 +77,68 @@ _NEGATION_RE = re.compile(
 _STATUS_RE = re.compile(
     r"\b(?:started|stopped|finished|completed|cancelled|planned|currently|now|"
     r"became|bought|sold|moved|joined|left|won|lost|received|returned)\b", re.I)
+_MONTH_RE = re.compile(
+    r"\b(january|february|march|april|may|june|july|august|september|"
+    r"october|november|december)\b", re.I)
+_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+_DAY_MONTH_RE = re.compile(
+    r"\b(?:on\s+)?(\d{1,2})(?:st|nd|rd|th)?\s+"
+    r"(january|february|march|april|may|june|july|august|september|"
+    r"october|november|december)\b", re.I)
+_MONTH_DAY_RE = re.compile(
+    r"\b(january|february|march|april|may|june|july|august|september|"
+    r"october|november|december)\s+"
+    r"(\d{1,2})(?:st|nd|rd|th)?\b", re.I)
+_ISO_DATE_RE = re.compile(
+    r"\b((?:19|20)\d{2})[-/](\d{1,2})[-/](\d{1,2})\b")
+_MONTH_NUMBER = {
+    name: index for index, name in enumerate((
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november",
+        "december"), start=1)
+}
+
+
+def _explicit_date_parts(text: str) -> tuple[set[int], set[int], set[int]]:
+    """Return explicit years, months and days without guessing relative time."""
+
+    years = {int(value) for value in _YEAR_RE.findall(text)}
+    months = {
+        _MONTH_NUMBER[value.casefold()] for value in _MONTH_RE.findall(text)}
+    days: set[int] = set()
+    for day, month in _DAY_MONTH_RE.findall(text):
+        days.add(int(day))
+        months.add(_MONTH_NUMBER[month.casefold()])
+    for month, day in _MONTH_DAY_RE.findall(text):
+        days.add(int(day))
+        months.add(_MONTH_NUMBER[month.casefold()])
+    for year, month, day in _ISO_DATE_RE.findall(text):
+        years.add(int(year))
+        months.add(int(month))
+        days.add(int(day))
+    return years, months, days
+
+
+def source_date_match_score(query: str, timestamp: str | None) -> float:
+    """Match an explicit query date against a source observation date.
+
+    Source dates live in metadata rather than turn text, so ordinary lexical
+    and dense ranks cannot recover an otherwise terse answer from the correct
+    session.  Only explicit month/year or day/month constraints activate this
+    lane; generic temporal words never do.
+    """
+
+    if not timestamp:
+        return 0.0
+    query_years, query_months, query_days = _explicit_date_parts(query)
+    source_years, source_months, source_days = _explicit_date_parts(timestamp)
+    if not query_months or not (query_months & source_months):
+        return 0.0
+    if query_years and not (query_years & source_years):
+        return 0.0
+    if query_days:
+        return 3.0 if query_days & source_days else 0.0
+    return 2.0 if query_years else 1.0
 
 
 def adaptive_evidence_turn_limit(
@@ -207,6 +270,452 @@ def rank_dual_lane_candidates(
                 row.turn_id in precision_ids for row in coverage_top),
         },
     )
+
+
+def rank_query_aware_candidates(
+    candidates: Iterable[CandidateScore],
+    turns: Mapping[str, SourceTurn],
+    *,
+    query: str,
+    answer_kind: str,
+    max_turns: int,
+    terms_by_turn: Mapping[str, frozenset[str]],
+    document_frequency: Mapping[str, int],
+    witness_rare_df: int = 4,
+    rrf_k: int = 60,
+) -> tuple[tuple[CandidateScore, ...], tuple[str, ...], Mapping[str, int]]:
+    """Select a bounded multi-channel pack from the full candidate reservoir.
+
+    Candidate generation already reaches most annotated evidence, but a single
+    fused ordering can place a short response, a second temporal endpoint, or a
+    bridge fact just below the evidence cap.  This selector keeps a stable
+    precision head and spends the remaining seats on five deterministic lanes:
+    query-IDF overlap, source-facing coverage, dialogue adjacency, memory-rare
+    witness closure, and operator-critical numeric/temporal/state evidence.
+
+    The routine is deliberately a re-ranker: it creates no graph edge or turn,
+    makes no model call, and cannot exceed ``max_turns``.  The complete ordering
+    (selected prefix followed by the unused candidates) lets the normal token
+    packer skip an expensive selected turn without losing access to the tail.
+    """
+
+    rows = tuple(candidates)
+    if not rows or max_turns <= 0:
+        return rows, (), {
+            "precision": 0, "query_lexical": 0, "source_coverage": 0,
+            "dialogue_adjacent": 0, "rare_witness": 0,
+            "operator_critical": 0, "rrf_fill": 0,
+        }
+    row_by_id = {row.turn_id: row for row in rows}
+    original_rank = {row.turn_id: rank for rank, row in enumerate(rows)}
+    available = frozenset(row_by_id) & frozenset(turns)
+    query_terms = content_terms(query)
+    document_count = max(1, len(terms_by_turn))
+
+    def idf(term: str) -> float:
+        return math.log((document_count + 1.0)
+                        / (float(document_frequency.get(term, 0)) + 0.5))
+
+    query_norm = sum(idf(term) for term in query_terms) or 1.0
+
+    def lexical_score(row: CandidateScore) -> float:
+        return sum(idf(term) for term in (
+            query_terms & terms_by_turn.get(row.turn_id, frozenset())
+        )) / query_norm
+
+    def ranked(key: Callable[[CandidateScore], float]) -> tuple[
+            tuple[str, ...], dict[str, int]]:
+        ordered = tuple(row.turn_id for row in sorted(
+            rows, key=lambda row: (-key(row), original_rank[row.turn_id],
+                                   row.turn_id)))
+        return ordered, {turn_id: rank for rank, turn_id in enumerate(ordered)}
+
+    lexical_ids, lexical_rank = ranked(lexical_score)
+    coverage_ids, coverage_rank = ranked(
+        lambda row: coverage_lane_score(row, answer_kind=answer_kind))
+    dense_ids, dense_rank = ranked(lambda row: row.dense_score)
+
+    selected: list[str] = []
+    selected_set: set[str] = set()
+    lane_counts: dict[str, int] = {
+        "precision": 0, "query_lexical": 0, "source_coverage": 0,
+        "dialogue_adjacent": 0, "rare_witness": 0,
+        "operator_critical": 0, "rrf_fill": 0,
+    }
+
+    def admit(values: Iterable[str], quota: int, lane: str) -> None:
+        if len(selected) >= max_turns or quota <= 0:
+            return
+        target = min(max_turns, len(selected) + max(0, quota))
+        for turn_id in values:
+            if turn_id not in available or turn_id in selected_set:
+                continue
+            selected.append(turn_id)
+            selected_set.add(turn_id)
+            lane_counts[lane] += 1
+            if len(selected) >= target:
+                break
+
+    # These fractions sum to one at the production 32/64-turn operating
+    # points.  Deduplication releases overlapping seats to the final RRF fill.
+    precision_quota = max(1, 3 * max_turns // 8)
+    lexical_quota = max(1, 3 * max_turns // 16)
+    coverage_quota = max(1, max_turns // 8)
+    adjacency_quota = max(1, max_turns // 16)
+    witness_quota = max(1, 3 * max_turns // 16)
+    critical_quota = max(1, max_turns // 16)
+
+    admit((row.turn_id for row in rows), precision_quota, "precision")
+    admit(lexical_ids, lexical_quota, "query_lexical")
+    admit(coverage_ids, coverage_quota, "source_coverage")
+
+    # A short answer often has little surface overlap while the immediately
+    # adjacent dialogue question is a strong seed.  Closure is bounded and
+    # only follows source order inside one session.
+    by_session_index = {
+        (turn.session_id, turn.turn_index): turn.turn_id
+        for turn in turns.values() if turn.turn_id in available}
+    adjacent: list[str] = []
+    for turn_id in selected[:min(32, len(selected))]:
+        turn = turns[turn_id]
+        for delta in (-1, 1):
+            neighbor = by_session_index.get(
+                (turn.session_id, turn.turn_index + delta))
+            if neighbor is not None:
+                adjacent.append(neighbor)
+    admit(adjacent, adjacency_quota, "dialogue_adjacent")
+
+    # Expand from already-supported facts through very rare lexical witnesses.
+    # An inverted anchor vocabulary makes this O(total candidate terms), rather
+    # than comparing every candidate with every anchor.
+    rare_anchor_weight: dict[str, float] = {}
+    for anchor_rank, turn_id in enumerate(selected[:min(48, len(selected))]):
+        rank_discount = 1.0 + anchor_rank / 16.0
+        for term in terms_by_turn.get(turn_id, frozenset()) - query_terms:
+            df = int(document_frequency.get(term, 0))
+            if 0 < df <= witness_rare_df:
+                rare_anchor_weight[term] = max(
+                    rare_anchor_weight.get(term, 0.0), idf(term) / rank_discount)
+    witness_score: dict[str, float] = {}
+    for row in rows:
+        if row.turn_id in selected_set:
+            continue
+        matches = tuple(
+            term for term in terms_by_turn.get(row.turn_id, frozenset())
+            if term in rare_anchor_weight)
+        if not matches:
+            continue
+        # One memory-unique key is sufficient; otherwise require two witnesses
+        # so a single generic topic word cannot create an unbounded flood.
+        if (len(matches) < 2
+                and min(document_frequency.get(term, document_count)
+                        for term in matches) > 2):
+            continue
+        witness_score[row.turn_id] = sum(
+            rare_anchor_weight[term] for term in matches)
+    witness_ids = tuple(sorted(witness_score, key=lambda turn_id: (
+        -witness_score[turn_id], original_rank[turn_id], turn_id)))
+    admit(witness_ids, witness_quota, "rare_witness")
+
+    kind = str(answer_kind).casefold()
+    operator_critical = bool(re.search(
+        r"\b(?:when|what\s+time|how\s+long|how\s+many|how\s+much|before|"
+        r"after|first|last|earlier|later|date|day|week|month|year|count|total)\b",
+        query, re.I)) or any(token in kind for token in (
+            "temporal", "duration", "date_difference", "ordering", "argmin",
+            "argmax", "count", "sum", "latest_state", "state_change"))
+    if operator_critical:
+        critical_ids = tuple(row.turn_id for row in sorted(rows, key=lambda row: (
+            min(lexical_rank[row.turn_id], coverage_rank[row.turn_id],
+                dense_rank[row.turn_id]),
+            original_rank[row.turn_id], row.turn_id))
+            if row.turn_id in available and (
+                _NUMBER_RE.search(turns[row.turn_id].raw_text)
+                or _TIME_RE.search(turns[row.turn_id].raw_text)
+                or _STATUS_RE.search(turns[row.turn_id].raw_text)))
+        admit(critical_ids, critical_quota, "operator_critical")
+
+    rrf_ids = tuple(row.turn_id for row in sorted(rows, key=lambda row: (
+        -(1.0 / (rrf_k + original_rank[row.turn_id])
+          + 1.0 / (rrf_k + lexical_rank[row.turn_id])
+          + 1.0 / (rrf_k + coverage_rank[row.turn_id])
+          + 1.0 / (rrf_k + dense_rank[row.turn_id])),
+        original_rank[row.turn_id], row.turn_id)))
+    admit(rrf_ids, max_turns, "rrf_fill")
+    admit((row.turn_id for row in rows), max_turns, "rrf_fill")
+
+    unused = tuple(row.turn_id for row in rows
+                   if row.turn_id not in selected_set)
+    ordered = tuple(row_by_id[turn_id] for turn_id in (*selected, *unused))
+    return ordered, tuple(selected[:precision_quota]), {
+        **lane_counts,
+        "rare_anchor_terms": len(rare_anchor_weight),
+        "rare_witness_candidates": len(witness_score),
+    }
+
+
+def select_obligation_witnesses(
+    candidates: Iterable[CandidateScore],
+    turns: Mapping[str, SourceTurn],
+    *,
+    query: str,
+    answer_kind: str,
+    max_witnesses: int,
+    baseline_turn_ids: Sequence[str] = (),
+    terms_by_turn: Mapping[str, frozenset[str]] | None = None,
+    document_frequency: Mapping[str, int] | None = None,
+) -> tuple[tuple[str, ...], Mapping[str, int]]:
+    """Reserve a small set of query obligations from the full reservoir.
+
+    The 64-turn dual-lane pack deliberately protects a large precision head.
+    On long memories, however, a second endpoint, a terse dialogue answer, or
+    one operand witness can sit below that head even though candidate generation
+    found it.  This selector does *not* replace the validated ordering.  It
+    chooses at most ``max_witnesses`` additional source turns, which the packer
+    admits after the precision floor and before ordinary tail fill.
+
+    Selection is deterministic and source-only: query-IDF overlap, compiled
+    operand/proof provenance, operator-specific surfaces, explicit source-date
+    metadata, and same-session dialogue adjacency are allowed; graph expansion,
+    model calls, answers, and evaluation labels are not.  A redundancy penalty
+    prevents all reserved seats from being spent on paraphrases of one event.
+    """
+
+    rows = tuple(row for row in candidates if row.turn_id in turns)
+    limit = max(0, int(max_witnesses))
+    if not rows or limit == 0:
+        return (), {
+            "requested": limit, "selected": 0, "operand": 0,
+            "dialogue": 0, "operator": 0, "source_date": 0, "lexical": 0,
+        }
+    rank = {row.turn_id: index for index, row in enumerate(rows)}
+    row_by_id = {row.turn_id: row for row in rows}
+    baseline = frozenset(baseline_turn_ids)
+    feature_terms = dict(terms_by_turn or {
+        turn_id: content_terms(turn.raw_text) for turn_id, turn in turns.items()
+    })
+    df = dict(document_frequency or {})
+    if not df:
+        for values in feature_terms.values():
+            for term in values:
+                df[term] = df.get(term, 0) + 1
+    document_count = max(1, len(feature_terms))
+    query_terms = content_terms(query)
+
+    def idf(term: str) -> float:
+        return math.log((document_count + 1.0) / (df.get(term, 0) + 0.5))
+
+    temporal_route = bool(_TIME_RE.search(query)) or any(
+        token in str(answer_kind).casefold() for token in (
+            "temporal", "time", "date", "duration", "ordering", "ordinal",
+            "argmin", "argmax", "latest"))
+    aggregate_route = bool(re.search(
+        r"\b(?:how\s+many|how\s+much|count|total|average|mean|sum|"
+        r"minimum|maximum|most|least|each|per)\b", query, re.I)) or any(
+            token in str(answer_kind).casefold() for token in (
+                "count", "sum", "mean", "minimum", "maximum", "collection"))
+    state_route = bool(re.search(
+        r"\b(?:current|currently|now|latest|before|after|changed|stopped|"
+        r"started|completed|cancelled|planned)\b", query, re.I))
+
+    explicit_speakers = frozenset(
+        turn.speaker for turn in turns.values()
+        if (speaker_terms := content_terms(turn.speaker))
+        and not speaker_terms <= {"user", "assistant", "system", "human"}
+        and speaker_terms <= query_terms)
+    speaker_query_terms = frozenset(
+        term for speaker in explicit_speakers for term in content_terms(speaker))
+    # A named owner is a scope constraint, not a relation/value witness.  If it
+    # remains in the lexical numerator, every turn by that speaker looks like a
+    # strong match and the reserve degenerates into random owner sampling.
+    witness_query_terms = query_terms - speaker_query_terms or query_terms
+    query_weight = sum(idf(term) for term in witness_query_terms) or 1.0
+
+    score: dict[str, float] = {}
+    reasons: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        if row.turn_id in baseline:
+            continue
+        turn = turns[row.turn_id]
+        overlap = witness_query_terms & feature_terms.get(
+            row.turn_id, frozenset())
+        lexical = sum(idf(term) for term in overlap) / query_weight
+        strong_lexical = lexical >= 0.25 or len(overlap) >= 2
+        value = 4.0 * lexical
+        lexical_reason = strong_lexical
+        proof_strength = (
+            row.obligation_gain + row.binding_score
+            + 0.5 * row.relation_path_score
+            + 0.25 * row.provenance_novelty)
+        # Operand ids are attached to a broad QueryIR view and occur on nearly
+        # every named-speaker candidate.  Reserve only a materialized binding or
+        # obligation witness with real score, never operand membership alone.
+        strong_proof = (
+            bool(row.proof_unit_ids) and proof_strength >= 0.75
+            and strong_lexical)
+        if strong_proof:
+            value += 1.5 + min(1.5, proof_strength)
+            reasons[row.turn_id].add("operand")
+        if row.mandatory and strong_proof:
+            value += 1.0
+        if (explicit_speakers and turn.speaker in explicit_speakers
+                and (strong_lexical or strong_proof)):
+            value += 1.5
+        if (temporal_route and overlap and _TIME_RE.search(turn.raw_text)):
+            value += 0.8
+            reasons[row.turn_id].add("operator")
+        if aggregate_route and overlap and _NUMBER_RE.search(turn.raw_text):
+            value += 0.9
+            reasons[row.turn_id].add("operator")
+        if (state_route and overlap and (
+                _STATUS_RE.search(turn.raw_text)
+                or _NEGATION_RE.search(turn.raw_text))):
+            value += 0.7
+            reasons[row.turn_id].add("operator")
+        # A question may identify the source session by calendar date while
+        # the turn body contains only the event.  Timestamp metadata is thus
+        # an evidence-bearing retrieval field.  This lane remains bounded
+        # below so a month-only query cannot turn into a full session scan.
+        date_match = source_date_match_score(query, turn.timestamp)
+        if (date_match > 0.0 and (
+                not explicit_speakers or turn.speaker in explicit_speakers)):
+            value += 3.0 + date_match + 1.5 * lexical
+            value += min(1.0, row.binding_score + row.obligation_gain)
+            reasons[row.turn_id].add("source_date")
+        # Source-facing channels are tie breakers, not an independent reason
+        # to reserve a dense-only topical match.
+        value += min(0.8, 0.35 * row.exact_score + 0.15 * row.bm25_score
+                     + 0.20 * row.dense_score + 0.10 * row.slot_gain)
+        # Ordinary lexical similarity is already represented by the validated
+        # dual-lane rank.  It may strengthen a real proof/operator witness, but
+        # cannot by itself force a lower-ranked turn into the 64-turn pack.
+        if reasons[row.turn_id]:
+            if lexical_reason:
+                reasons[row.turn_id].add("lexical")
+            score[row.turn_id] = value
+
+    # Dialogue answers can be too short to carry any query terms.  A strongly
+    # matching question/prompt is sufficient to reserve its immediate response,
+    # but never crosses a session boundary.
+    by_session_index = {
+        (turn.session_id, turn.turn_index): turn.turn_id
+        for turn in turns.values() if turn.turn_id in row_by_id}
+    dialogue_candidates: dict[str, float] = {}
+    for row in rows:
+        turn = turns[row.turn_id]
+        overlap = witness_query_terms & feature_terms.get(
+            row.turn_id, frozenset())
+        overlap_weight = sum(idf(term) for term in overlap) / query_weight
+        # A question mark alone is not evidence that this historical prompt
+        # answers the current query.  It only lowers the lexical threshold for
+        # a terse adjacent response; some material query overlap is mandatory.
+        dialogue_threshold = 0.30 if "?" in turn.raw_text else 0.40
+        if overlap_weight < dialogue_threshold:
+            continue
+        response_id = by_session_index.get(
+            (turn.session_id, turn.turn_index + 1))
+        if response_id is None or response_id in baseline:
+            continue
+        response = turns[response_id]
+        # This closure is for terse replies, not the next long topic block.
+        if len(response.raw_text) > 320:
+            continue
+        # Do not jump from a relevant prompt into an arbitrarily deep tail.
+        # The closure repairs a local ranking miss; it is not another recall
+        # channel over the full memory.
+        if rank[response_id] >= max(96, 3 * max(1, len(baseline))):
+            continue
+        dialogue_candidates[response_id] = max(
+            dialogue_candidates.get(response_id, 0.0),
+            3.0 + 3.0 * overlap_weight)
+    for turn_id, value in dialogue_candidates.items():
+        score[turn_id] = max(score.get(turn_id, 0.0), value)
+        reasons[turn_id].add("dialogue")
+
+    selected: list[str] = []
+    selected_terms: list[frozenset[str]] = []
+
+    def redundancy(turn_id: str) -> float:
+        terms = feature_terms.get(turn_id, frozenset())
+        if not terms or not selected_terms:
+            return 0.0
+        return max(
+            len(terms & prior) / max(1, len(terms | prior))
+            for prior in selected_terms)
+
+    # First protect one best *materialized* witness for each QueryIR obligation
+    # that the precision floor has not already satisfied.  ``operand_ids`` are
+    # deliberately broad routing annotations; treating them as proof filled
+    # the reserve with arbitrary turns from a named speaker.
+    def is_strong_proof(row: CandidateScore) -> bool:
+        proof_strength = (
+            row.obligation_gain + row.binding_score
+            + 0.5 * row.relation_path_score
+            + 0.25 * row.provenance_novelty)
+        return bool(row.proof_unit_ids) and proof_strength >= 0.75
+
+    covered_operands = frozenset(
+        operand_id
+        for row in rows
+        if row.turn_id in baseline and is_strong_proof(row)
+        for operand_id in row.operand_ids)
+    operand_ids = tuple(dict.fromkeys(
+        operand_id for row in rows for operand_id in row.operand_ids
+        if operand_id not in covered_operands))
+    for operand_id in operand_ids:
+        choices = [row.turn_id for row in rows
+                   if operand_id in row.operand_ids and row.turn_id in score
+                   and "operand" in reasons[row.turn_id]
+                   and row.turn_id not in selected]
+        if not choices or len(selected) >= limit:
+            continue
+        turn_id = min(choices, key=lambda item: (
+            -score[item], rank[item], item))
+        selected.append(turn_id)
+        selected_terms.append(feature_terms.get(turn_id, frozenset()))
+
+    # At most one dialogue endpoint and one operator endpoint supplement the
+    # missing proof operands.  This makes the configured eight turns a hard
+    # safety cap instead of a target quota.
+    selected_dialogue = sum("dialogue" in reasons[item] for item in selected)
+    selected_operator = sum("operator" in reasons[item] for item in selected)
+    selected_source_date = sum(
+        "source_date" in reasons[item] for item in selected)
+    while len(selected) < limit:
+        choices = [turn_id for turn_id in score if turn_id not in selected]
+        choices = [turn_id for turn_id in choices
+                   if not ("dialogue" in reasons[turn_id]
+                           and selected_dialogue >= 1)
+                   and not ("operator" in reasons[turn_id]
+                            and "source_date" not in reasons[turn_id]
+                            and "operand" not in reasons[turn_id]
+                            and selected_operator >= 1)
+                   and not ("source_date" in reasons[turn_id]
+                            and selected_source_date >= 4)]
+        if not choices:
+            break
+        turn_id = min(choices, key=lambda item: (
+            -(score[item] - 1.75 * redundancy(item)), rank[item], item))
+        # Do not spend a reserve seat on a weak, redundant topical tail.
+        if score[turn_id] - 1.75 * redundancy(turn_id) < 1.75:
+            break
+        selected.append(turn_id)
+        selected_terms.append(feature_terms.get(turn_id, frozenset()))
+        selected_dialogue += "dialogue" in reasons[turn_id]
+        selected_operator += "operator" in reasons[turn_id]
+        selected_source_date += "source_date" in reasons[turn_id]
+
+    trace = {
+        "requested": limit,
+        "selected": len(selected),
+        "operand": sum("operand" in reasons[item] for item in selected),
+        "dialogue": sum("dialogue" in reasons[item] for item in selected),
+        "operator": sum("operator" in reasons[item] for item in selected),
+        "source_date": sum(
+            "source_date" in reasons[item] for item in selected),
+        "lexical": sum("lexical" in reasons[item] for item in selected),
+    }
+    return tuple(selected), trace
 
 
 def _sentences(text: str) -> tuple[tuple[int, int, str], ...]:
@@ -341,6 +850,7 @@ def pack_obligation_aware(
     count_text_tokens: Callable[[str], int],
     span_window: int = 96,
     baseline_floor: Sequence[str] = (),
+    witness_floor: Sequence[str] = (),
     precision_aware: bool = False,
     proof_reserve: bool = True,
 ) -> tuple[
@@ -467,6 +977,17 @@ def pack_obligation_aware(
             if row is not None:
                 admit_optional(row)
 
+    # QueryIR witness reserve is additive to the validated precision floor.  It
+    # is intentionally admitted before proof/tail fill so a lower-ranked second
+    # endpoint or terse response cannot be pushed out after candidate generation
+    # already found it.  Capacity and the exact evidence-token budget remain
+    # hard; failed admissions simply fall through to the normal ranked fill.
+    witness_requested = tuple(dict.fromkeys(witness_floor))
+    for turn_id in witness_requested:
+        row = candidate_by_turn.get(turn_id)
+        if row is not None:
+            admit_optional(row)
+
     # Reserve only the minimum number of high-ranked complete proof units needed
     # to cover QueryIR obligations/operands.  The former cost-normalized greedy
     # reordered the entire reservoir in favour of short turns: it saved tokens
@@ -558,6 +1079,10 @@ def pack_obligation_aware(
         "span_packing": True,
         "precision_aware": precision_aware,
         "proof_reserve": proof_reserve,
+        "witness_floor_requested": bool(witness_requested),
+        "witness_floor_requested_count": len(witness_requested),
+        "witness_floor_packed_count": sum(
+            turn_id in packed_set for turn_id in witness_requested),
     }
     selected_by_id = {unit.unit_id: unit for unit in selected_units}
     audit_units = tuple(

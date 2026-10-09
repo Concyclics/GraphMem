@@ -19,6 +19,7 @@ from .storage import SQLiteGraphStore
 
 
 QUERY_INSTRUCTION_REVISION = "graphmem-turn-evidence-v1"
+RAW_QUERY_INSTRUCTION_REVISION = "graphmem-raw-semantic-v1"
 QUERY_INSTRUCTION = (
     "Instruct: Retrieve conversation turns that provide all evidence needed to answer "
     "the memory question.\nQuery: "
@@ -108,6 +109,40 @@ class QwenEmbeddingIndex:
         if self._dense_cache is not None:
             values["dense_sidecar"] = self._dense_cache.stats()
         return values
+
+    def prewarm_queries(
+        self, queries: Sequence[str], *, batch_size: int = 256,
+    ) -> Mapping[str, int | float]:
+        """Populate the reusable query cache in bounded API batches.
+
+        Materializing many immutable prompts used to discover one missing
+        query vector at a time, turning a few hundred views into a few hundred
+        HTTP requests.  Prewarming preserves the exact cache key and vector
+        path used by normal search while collapsing cold misses into bounded
+        batches.  It has no effect on ranking or stored graph embeddings.
+        """
+
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        unique = tuple(dict.fromkeys(
+            str(query) for query in queries if str(query).strip()))
+        before = dict(self.stats)
+        for start in range(0, len(unique), batch_size):
+            self._query_vectors(
+                None, unique[start:start + batch_size])
+        after = dict(self.stats)
+        keys = (
+            "query_memory_hits", "query_persistent_hits", "query_misses",
+            "query_batches", "query_embedded_views", "query_api_ms",
+            "query_api_tokens", "query_cache_errors",
+        )
+        return {
+            "unique_queries": len(unique),
+            **{
+                key: after.get(key, 0) - before.get(key, 0)
+                for key in keys
+            },
+        }
 
     def _put_query_memory(self, cache_key: str, vector: Sequence[float] | np.ndarray) -> None:
         normalized = np.asarray(vector, dtype=np.float32).reshape(-1)
@@ -207,10 +242,17 @@ class QwenEmbeddingIndex:
                     count=int(row["dimension"])).copy()
         return result
 
-    def _query_vectors(self, memory_id: str, queries: Sequence[str]) -> list[np.ndarray]:
-        query_texts = [QUERY_INSTRUCTION + query for query in queries]
+    def _query_vectors(
+        self,
+        memory_id: str | None,
+        queries: Sequence[str],
+        *,
+        instruction: str = QUERY_INSTRUCTION,
+        instruction_revision: str = QUERY_INSTRUCTION_REVISION,
+    ) -> list[np.ndarray]:
+        query_texts = [instruction + query for query in queries]
         keys = [hashlib.sha256((
-            self.model_id + "\n" + QUERY_INSTRUCTION_REVISION + "\n" + text
+            self.model_id + "\n" + instruction_revision + "\n" + text
         ).encode()).hexdigest() for text in query_texts]
 
         unresolved: list[str] = []
@@ -274,7 +316,7 @@ class QwenEmbeddingIndex:
                     self._stats["query_embedded_views"] += len(owned)
                     self._stats["query_api_ms"] += latency
                     self._stats["query_api_tokens"] += tokens
-                if self.record_usage:
+                if self.record_usage and memory_id is not None:
                     self.store.log_embedding_call(
                         stable_id("embedding-call", memory_id, "query-batch", *owned_keys),
                         memory_id, self.model_id, len(owned), tokens, latency,
@@ -387,6 +429,8 @@ class QwenEmbeddingIndex:
         limit: int,
         *,
         source_store: SQLiteGraphStore | None = None,
+        index_model_id: str | None = None,
+        query_instruction: bool = True,
     ) -> Sequence[tuple[str, float]]:
         """Search an immutable subset such as CanonicalFacts by dense vector.
 
@@ -398,12 +442,13 @@ class QwenEmbeddingIndex:
         if limit <= 0 or not item_ids:
             return ()
         authority = source_store or self.store
+        resolved_index_model = index_model_id or self.model_id
         expected = tuple(sorted(set(str(item) for item in item_ids)))
         signature = (
             len(expected), expected[0] if expected else "",
             expected[-1] if expected else "",
         )
-        key = (id(authority), memory_id, self.model_id, signature)
+        key = (id(authority), memory_id, resolved_index_model, signature)
         with self._memory_lock:
             cached = self._item_memory_cache.get(key)
             if cached is None:
@@ -413,7 +458,7 @@ class QwenEmbeddingIndex:
                 for row in authority._read(
                     "SELECT item_id,dimension,vector FROM embeddings "
                     "WHERE memory_id=? AND model_id=? ORDER BY item_id",
-                    (memory_id, self.model_id),
+                    (memory_id, resolved_index_model),
                 ):
                     item_id = str(row["item_id"])
                     if item_id not in allowed:
@@ -437,7 +482,12 @@ class QwenEmbeddingIndex:
         ids, matrix = cached
         if not ids:
             return ()
-        vector = self._query_vectors(memory_id, (query,))[0]
+        vector = self._query_vectors(
+            memory_id, (query,),
+            instruction=(QUERY_INSTRUCTION if query_instruction else ""),
+            instruction_revision=(
+                QUERY_INSTRUCTION_REVISION if query_instruction else
+                RAW_QUERY_INSTRUCTION_REVISION))[0]
         scores = matrix @ vector
         count = min(limit, len(ids))
         indices = np.argpartition(-scores, count - 1)[:count]

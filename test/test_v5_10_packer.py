@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 
 from graphmem.domain import (
     CandidateScore,
@@ -16,10 +17,12 @@ from graphmem.retrieval.packer import (
     coverage_lane_score,
     pack_obligation_aware,
     rank_dual_lane_candidates,
+    rank_query_aware_candidates,
     salient_spans,
 )
 from graphmem.retrieval.navigator import GraphNavigator
 from graphmem.config import QueryBudget
+from graphmem.text import content_terms
 
 
 def _turn(turn_id: str, session: str, text: str) -> SourceTurn:
@@ -253,3 +256,56 @@ def test_dual_lane_preserves_precision_head_and_recovers_raw_coverage() -> None:
         "graph-1", "graph-2", "direct", "dense")
     assert coverage_lane_score(rows[-1]) > coverage_lane_score(rows[0])
     assert trace["precision_head"] == 2
+
+
+def test_query_aware_rank_recovers_rare_bridge_and_short_response() -> None:
+    turns = {
+        f"t{index}": _turn(f"t{index}", "s-noise", f"generic camera chatter {index}")
+        for index in range(70)
+    }
+    turns.update({
+        "anchor": _turn(
+            "anchor", "s-bridge",
+            "Maria volunteers at the Northbridge shelter every Friday."),
+        "bridge": _turn(
+            "bridge", "s-other",
+            "John also served meals at the Northbridge shelter."),
+        "prompt": _turn(
+            "prompt", "s-dialogue", "What are your children's names?"),
+        "response": _turn(
+            "response", "s-dialogue", "Luna and Oliver!"),
+    })
+    # Preserve actual source adjacency for the short response closure.
+    turns["prompt"] = replace(turns["prompt"], turn_index=0)
+    turns["response"] = replace(turns["response"], turn_index=1)
+    rows = tuple(
+        _candidate(turns[f"t{index}"], 100.0 - index)
+        for index in range(64)
+    ) + (
+        CandidateScore("anchor", "s-bridge", 1, 1, 1, 0, 0, 0, 8, 4,
+                       ("exact", "dense")),
+        _candidate(turns["prompt"], 3.0),
+        _candidate(turns["bridge"], 1.0),
+        _candidate(turns["response"], 0.5),
+    ) + tuple(
+        _candidate(turns[f"t{index}"], 0.1)
+        for index in range(64, 70)
+    )
+    terms_by_turn = {
+        turn_id: content_terms(turn.raw_text) for turn_id, turn in turns.items()}
+    document_frequency = {
+        term: sum(term in values for values in terms_by_turn.values())
+        for term in {item for values in terms_by_turn.values() for item in values}}
+
+    ranked, head, trace = rank_query_aware_candidates(
+        rows, turns,
+        query="What volunteering did they both do, and what are their children's names?",
+        answer_kind="intersection_distinct", max_turns=64,
+        terms_by_turn=terms_by_turn,
+        document_frequency=document_frequency)
+    selected = {row.turn_id for row in ranked[:64]}
+
+    assert {"anchor", "bridge", "prompt", "response"} <= selected
+    assert len(selected) == 64 and len(head) == 24
+    assert trace["rare_witness"] > 0
+    assert trace["dialogue_adjacent"] > 0

@@ -26,7 +26,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from graphmem.answer import AnswerConfig, AnswerStage, prompt_contract  # noqa: E402
-from graphmem.answer.aggregation import AGGREGATION_LEDGER_SCHEMA_VERSION  # noqa: E402
+from graphmem.answer.aggregation import (  # noqa: E402
+    AGGREGATION_LEDGER_SCHEMA_VERSION, EVENT_LEDGER_SCHEMA_VERSION,
+)
 from graphmem.config import (  # noqa: E402
     config_hash, load_config, load_runtime_config, runtime_config_hash,
 )
@@ -85,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-output-tokens", type=int, default=0,
                         help="0 omits the API output cap; positive values enable an ablation cap")
     parser.add_argument(
-        "--answer-policy", choices=("legacy", "v5_54", "v5_63"),
+        "--answer-policy", choices=("legacy", "v5_54", "v5_63", "v5_73"),
         default="legacy",
         help=("core answer/readout contract; v5_54 enables the validated "
               "typed, aggregation, inference and graph-block routes without "
@@ -115,6 +117,10 @@ def parse_args() -> argparse.Namespace:
                         help="tokenizer model used only to enforce the evidence budget")
     parser.add_argument("--sampling-seed", type=int, default=0,
                         help="explicit seed sent to the answer service")
+    parser.add_argument(
+        "--sampling-temperature", type=float, default=0.0,
+        help=("answer sampling temperature; zero is the deterministic default, "
+              "positive values are intended for labelled Best-of-N studies"))
     parser.add_argument("--span-window", type=int, default=-1,
                         help="-1 renders whole turns; >=0 renders cited spans widened by N chars")
     parser.add_argument("--evidence-order",
@@ -158,14 +164,29 @@ def parse_args() -> argparse.Namespace:
         "--embedding-request-model",
         help=("served embedding-model alias; storage/cache identity still comes "
               "from the runtime/config embedding model"))
+    parser.add_argument(
+        "--embedding-model",
+        help="override the embedding model identity used by dense retrieval")
+    parser.add_argument(
+        "--embedding-base-url",
+        help="override the OpenAI-compatible embedding endpoint")
     parser.add_argument("--embedding-db", type=Path,
                         help="read turn vectors from a separate immutable SQLite sidecar")
     parser.add_argument(
         "--relation-embedding-db", type=Path,
         help=("read existing graph-node vectors for exact CanonicalFact search; "
               "no new build or embedding calls are performed"))
+    parser.add_argument(
+        "--no-semantic-fact-witness", action="store_true",
+        help="ablate the optional CanonicalFact semantic witness reserve")
+    parser.add_argument(
+        "--no-semantic-predicate-witness", action="store_true",
+        help="ablate the optional predicate semantic witness reserve")
     parser.add_argument("--dense-sidecar-dir", type=Path,
                         help="versioned per-memory FAISS/NumPy turn-vector indexes")
+    parser.add_argument(
+        "--compiled-cache-dir", type=Path,
+        help="override the compiled-memory sidecar directory from runtime config")
     parser.add_argument("--dense-backend",
                         choices=("auto", "numpy_exact", "faiss_flat"), default="auto")
     parser.add_argument("--query-embedding-cache", type=Path,
@@ -290,6 +311,10 @@ def parse_args() -> argparse.Namespace:
         help=("replace the verbose graph-label glossary with its compact, "
               "semantically equivalent contract to reclaim answer tokens"))
     parser.add_argument(
+        "--relation-path-labels", action="store_true",
+        help=("append compact edge-family hints such as via=entity>time to "
+              "topological evidence labels; source text remains authoritative"))
+    parser.add_argument(
         "--query-focus-index", action="store_true",
         help=("repeat bounded query-centered excerpts from the full text of "
               "already-packed anonymous turns; does not add evidence turns"))
@@ -350,10 +375,12 @@ def main() -> None:
         runtime_dense_options = runtime_config.retrieval.embedding_options()
         if runtime_dense_options is not None:
             args.embedding = True
-            if runtime_dense_options["dense_sidecar_dir"]:
+            if (runtime_dense_options["dense_sidecar_dir"]
+                    and args.dense_sidecar_dir is None):
                 args.dense_sidecar_dir = Path(str(
                     runtime_dense_options["dense_sidecar_dir"]))
-            if runtime_dense_options["query_cache_path"]:
+            if (runtime_dense_options["query_cache_path"]
+                    and args.query_embedding_cache is None):
                 args.query_embedding_cache = Path(str(
                     runtime_dense_options["query_cache_path"]))
             args.dense_backend = str(runtime_dense_options["dense_backend"])
@@ -371,6 +398,13 @@ def main() -> None:
     cache_store = SQLiteGraphStore(cache_db)
 
     config = load_config(args.config)
+    if args.embedding_model or args.embedding_base_url:
+        config = replace(config, models=replace(
+            config.models,
+            embedding_model=(
+                args.embedding_model or config.models.embedding_model),
+            embedding_base_url=(
+                args.embedding_base_url or config.models.embedding_base_url)))
     gold = load_gold_turns(args.gold)
     if args.full:
         # FullQuestion proxies attribute access to its DevQuestion, so everything
@@ -415,15 +449,20 @@ def main() -> None:
                      if args.max_evidence_tokens else {}),
                   **({"max_answer_tokens": args.max_answer_tokens}
                      if args.max_answer_tokens else {})))
-    if args.answer_policy == "v5_63":
+    if args.answer_policy in {"v5_63", "v5_73"}:
         v563_overrides = ({
             "max_output_tokens": args.max_output_tokens,
         } if args.max_output_tokens else {})
         if args.query_focus_excerpt_chars is not None:
             v563_overrides["query_focus_excerpt_chars"] = (
                 args.query_focus_excerpt_chars)
-        answer_config = AnswerConfig.v5_63(**v563_overrides,
+        answer_factory = (AnswerConfig.v5_73
+                          if args.answer_policy == "v5_73"
+                          else AnswerConfig.v5_63)
+        answer_config = answer_factory(**v563_overrides,
+            sampling_temperature=args.sampling_temperature,
             sampling_seed=args.sampling_seed,
+            relation_path_labels=args.relation_path_labels,
             query_focus_index_limit=args.query_focus_limit,
             answer_plan_enabled=args.answer_plan,
             answer_plan_max_candidates=args.answer_plan_max_candidates,
@@ -434,7 +473,10 @@ def main() -> None:
     elif args.answer_policy == "v5_54":
         answer_config = AnswerConfig.v5_54(**({
             "max_output_tokens": args.max_output_tokens,
-        } if args.max_output_tokens else {}), sampling_seed=args.sampling_seed,
+        } if args.max_output_tokens else {}),
+            sampling_temperature=args.sampling_temperature,
+            sampling_seed=args.sampling_seed,
+            relation_path_labels=args.relation_path_labels,
             query_focus_index_enabled=args.query_focus_index,
             query_focus_index_limit=args.query_focus_limit,
             query_focus_excerpt_chars=(
@@ -472,6 +514,7 @@ def main() -> None:
             question_date_mode=args.question_date_mode,
             question_recency_footer=args.question_recency_footer,
             compact_topological_contract=args.compact_topological_prompt,
+            relation_path_labels=args.relation_path_labels,
             query_focus_index_enabled=args.query_focus_index,
             query_focus_index_limit=args.query_focus_limit,
             query_focus_excerpt_chars=(
@@ -485,6 +528,7 @@ def main() -> None:
                 args.answer_plan_kind
                 or ("date_difference", "temporal_order")),
             max_output_tokens=(args.max_output_tokens or None),
+            sampling_temperature=args.sampling_temperature,
             sampling_seed=args.sampling_seed)
 
     embedding_store = None
@@ -499,6 +543,14 @@ def main() -> None:
     if runtime_dense_options is not None:
         embedding_options.update(runtime_dense_options)
         embedding_options["record_usage"] = False
+    if args.embedding_model:
+        embedding_options["model_id"] = args.embedding_model
+    if args.embedding_base_url:
+        embedding_options["base_url"] = args.embedding_base_url
+    if args.dense_sidecar_dir:
+        embedding_options["dense_sidecar_dir"] = args.dense_sidecar_dir
+    if args.query_embedding_cache:
+        embedding_options["query_cache_path"] = args.query_embedding_cache
     if args.embedding_request_model:
         embedding_options["request_model_id"] = args.embedding_request_model
     if args.embedding_db:
@@ -519,10 +571,18 @@ def main() -> None:
              source_store=relation_embedding_store))
         if embedding is not None and relation_embedding_store is not None
         else None)
+    predicate_dense_search = (
+        (lambda memory_id, query, item_ids, limit:
+         embedding.search_items(
+             memory_id, query, item_ids, limit,
+             source_store=store,
+             index_model_id=embedding.model_id + ":predicate-v1"))
+        if embedding is not None else None)
     navigator_common = {
         "dense_search": embedding.search if embedding else None,
         "dense_search_many": embedding.search_many if embedding else None,
         "fact_dense_search": fact_dense_search,
+        "predicate_dense_search": predicate_dense_search,
     }
     if runtime_config is not None:
         navigator_options = effective_runtime_navigator_options(
@@ -536,7 +596,16 @@ def main() -> None:
                 "raw_fallback_reserve": args.raw_fallback_reserve,
                 "query_gated_rare_lexical": args.query_gated_rare_lexical,
                 "relational_consensus_bonus": args.relational_consensus_bonus,
+                "semantic_fact_witness_reserve": (
+                    False if args.no_semantic_fact_witness else
+                    runtime_config.retrieval.semantic_fact_witness_reserve),
+                "semantic_predicate_witness_reserve": (
+                    False if args.no_semantic_predicate_witness else
+                    runtime_config.retrieval.semantic_predicate_witness_reserve),
             })
+        if args.compiled_cache_dir is not None:
+            navigator_options["compiled_cache_dir"] = str(
+                args.compiled_cache_dir)
         # These research-only switches are intentionally absent from the
         # stable runtime schema. They remain off unless explicitly requested.
         navigator = GraphNavigator(
@@ -725,6 +794,12 @@ def main() -> None:
                     "aggregation_source_reserve_turns": (
                         prepared_answer.trace.get(
                             "aggregation_source_reserve_turns", 0)),
+                    "typed_evidence_card_route": prepared_answer.trace.get(
+                        "typed_evidence_card_route"),
+                    "typed_evidence_card_turn_ids": prepared_answer.trace.get(
+                        "typed_evidence_card_turn_ids", []),
+                    "typed_evidence_card_tokens": prepared_answer.trace.get(
+                        "typed_evidence_card_tokens", 0),
                     "evidence_layout": prepared_answer.trace.get(
                         "evidence_layout", ""),
                     "execution_mode": result.trace.get(
@@ -741,6 +816,81 @@ def main() -> None:
                         "dual_lane_precision_packed", 0),
                     "dual_lane_coverage_packed": result.trace.get(
                         "dual_lane_coverage_packed", 0),
+                    "obligation_witness_rank": result.trace.get(
+                        "obligation_witness_rank", {}),
+                    "obligation_witness_turn_ids": result.trace.get(
+                        "obligation_witness_turn_ids", []),
+                    "obligation_witness_packed": result.trace.get(
+                        "obligation_witness_packed", 0),
+                    "semantic_fact_witness_turn_ids": result.trace.get(
+                        "semantic_fact_witness_turn_ids", []),
+                    "semantic_fact_witness_packed": result.trace.get(
+                        "semantic_fact_witness_packed", 0),
+                    "semantic_fact_witness_scores": result.trace.get(
+                        "semantic_fact_witness_scores", {}),
+                    "semantic_predicate_witness_turn_ids": result.trace.get(
+                        "semantic_predicate_witness_turn_ids", []),
+                    "semantic_predicate_witness_packed": result.trace.get(
+                        "semantic_predicate_witness_packed", 0),
+                    "semantic_predicate_witness_scores": result.trace.get(
+                        "semantic_predicate_witness_scores", {}),
+                    "query_ir_confidence": result.trace.get(
+                        "query_ir_confidence", 1.0),
+                    "query_ir_soft_fallback": result.trace.get(
+                        "query_ir_soft_fallback", False),
+                    "query_ir_fallback_reasons": result.trace.get(
+                        "query_ir_fallback_reasons", []),
+                    "query_ir_parse_warnings": result.trace.get(
+                        "query_ir_parse_warnings", []),
+                    "adaptive_recall_triggered": result.trace.get(
+                        "adaptive_recall_triggered", False),
+                    "adaptive_recall_active": result.trace.get(
+                        "adaptive_recall_active", False),
+                    "adaptive_recall_in_budget_repair": result.trace.get(
+                        "adaptive_recall_in_budget_repair", False),
+                    "adaptive_recall_route": result.trace.get(
+                        "adaptive_recall_route", ""),
+                    "adaptive_recall_reasons": result.trace.get(
+                        "adaptive_recall_reasons", []),
+                    "adaptive_recall_severity": result.trace.get(
+                        "adaptive_recall_severity", 0),
+                    "adaptive_recall_base_turns": result.trace.get(
+                        "adaptive_recall_base_turns", len(
+                            result.retrieved_turn_ids)),
+                    "adaptive_recall_target_turns": result.trace.get(
+                        "adaptive_recall_target_turns", len(
+                            result.retrieved_turn_ids)),
+                    "adaptive_recall_base_tokens": result.trace.get(
+                        "adaptive_recall_base_tokens", 0),
+                    "adaptive_recall_target_tokens": result.trace.get(
+                        "adaptive_recall_target_tokens", 0),
+                    "adaptive_recall_tail_signal_count": result.trace.get(
+                        "adaptive_recall_tail_signal_count", 0),
+                    "adaptive_recall_supported_tail_protected": (
+                        result.trace.get(
+                            "adaptive_recall_supported_tail_protected", 0)),
+                    "adaptive_recall_rank": result.trace.get(
+                        "adaptive_recall_rank", {}),
+                    "adaptive_recall_added_turn_ids": result.trace.get(
+                        "adaptive_recall_added_turn_ids", []),
+                    "adaptive_recall_removed_turn_ids": result.trace.get(
+                        "adaptive_recall_removed_turn_ids", []),
+                    "adaptive_recall_added_turns": result.trace.get(
+                        "adaptive_recall_added_turns", 0),
+                    "adaptive_recall_removed_turns": result.trace.get(
+                        "adaptive_recall_removed_turns", 0),
+                    "evidence_certificate_complete": bool(
+                        result.certificate
+                        and result.certificate.post_pack_complete),
+                    "evidence_certificate_status": (
+                        str(result.certificate.status)
+                        if result.certificate else ""),
+                    "evidence_certificate_missing_slots": list(
+                        result.certificate.missing_slots
+                        if result.certificate else ()),
+                    "evidence_certificate_unsatisfied_phase": (
+                        result.certificate.unsatisfied_phase
+                        if result.certificate else None),
                     "traversed_relation_signals": traversed_signals(
                         question.memory_id, result),
                     "retrieved_turn_ids": list(result.retrieved_turn_ids),
@@ -752,7 +902,11 @@ def main() -> None:
                         "dense_score": candidate.dense_score,
                         "graph_score": candidate.graph_score,
                         "binding_score": candidate.binding_score,
+                        "graph_path_ids": list(candidate.graph_path_ids),
+                        "relation_contributions": list(
+                            candidate.relation_contributions),
                         "operand_ids": list(candidate.operand_ids),
+                        "proof_unit_ids": list(candidate.proof_unit_ids),
                         "session_score": candidate.session_score,
                         "adjacency_score": candidate.adjacency_score,
                         "source_channels": list(candidate.source_channels),
@@ -828,6 +982,7 @@ def main() -> None:
                 answer_config.question_recency_footer),
             "compact_topological_prompt": (
                 answer_config.compact_topological_contract),
+            "relation_path_labels": answer_config.relation_path_labels,
             "query_focus_index": answer_config.query_focus_index_enabled,
             "query_focus_limit": answer_config.query_focus_index_limit,
             "query_focus_excerpt_chars": (
@@ -838,6 +993,14 @@ def main() -> None:
                 answer_config.preference_focus_strategy),
             "aggregation_operand_worksheet_selective": (
                 answer_config.aggregation_operand_worksheet_selective),
+            "aggregation_event_table_enabled": (
+                answer_config.aggregation_event_table_enabled),
+            "typed_evidence_card_enabled": (
+                answer_config.typed_evidence_card_enabled),
+            "typed_evidence_card_limit": answer_config.typed_evidence_card_limit,
+            "typed_evidence_card_max_tokens": (
+                answer_config.typed_evidence_card_max_tokens),
+            "bounded_common_knowledge": answer_config.bounded_common_knowledge,
             "focused_prompt_scope": answer_config.focused_prompt_scope,
             "exact_grounding_footer": (
                 answer_config.exact_grounding_footer),
@@ -866,6 +1029,58 @@ def main() -> None:
             "dual_lane_precision_head": navigator.dual_lane_precision_head,
             "dual_lane_rrf_k": navigator.dual_lane_rrf_k,
             "dual_lane_proof_reserve": navigator.dual_lane_proof_reserve,
+            "obligation_witness_reserve": (
+                navigator.obligation_witness_reserve),
+            "obligation_witness_reserve_turns": (
+                navigator.obligation_witness_reserve_turns),
+            "semantic_fact_witness_reserve": (
+                navigator.semantic_fact_witness_reserve),
+            "semantic_fact_witness_turns": (
+                navigator.semantic_fact_witness_turns),
+            "semantic_fact_search_limit": (
+                navigator.semantic_fact_search_limit),
+            "semantic_fact_min_score": navigator.semantic_fact_min_score,
+            "semantic_fact_operator_aware": (
+                navigator.semantic_fact_operator_aware),
+            "semantic_fact_min_compile_confidence": (
+                navigator.semantic_fact_min_compile_confidence),
+            "semantic_predicate_witness_reserve": (
+                navigator.semantic_predicate_witness_reserve),
+            "semantic_predicate_witness_turns": (
+                navigator.semantic_predicate_witness_turns),
+            "semantic_predicate_search_limit": (
+                navigator.semantic_predicate_search_limit),
+            "semantic_predicate_min_score": (
+                navigator.semantic_predicate_min_score),
+            "adaptive_recall": navigator.adaptive_recall,
+            "adaptive_recall_base_turns": (
+                navigator.adaptive_recall_base_turns),
+            "adaptive_recall_medium_turns": (
+                navigator.adaptive_recall_medium_turns),
+            "adaptive_recall_max_turns": (
+                navigator.adaptive_recall_max_turns),
+            "adaptive_recall_protected_turns": (
+                navigator.adaptive_recall_protected_turns),
+            "adaptive_recall_confidence_threshold": (
+                navigator.adaptive_recall_confidence_threshold),
+            "adaptive_recall_minimum_severity": (
+                navigator.adaptive_recall_minimum_severity),
+            "adaptive_recall_maximum_tier_severity": (
+                navigator.adaptive_recall_maximum_tier_severity),
+            "adaptive_recall_in_budget_repair": (
+                navigator.adaptive_recall_in_budget_repair),
+            "adaptive_recall_repair_minimum_severity": (
+                navigator.adaptive_recall_repair_minimum_severity),
+            "adaptive_recall_lookup_minimum_severity": (
+                navigator.adaptive_recall_lookup_minimum_severity),
+            "adaptive_recall_expand_queryir_soft_fallback": (
+                navigator.adaptive_recall_expand_queryir_soft_fallback),
+            "adaptive_recall_base_tokens": (
+                navigator.adaptive_recall_base_tokens),
+            "adaptive_recall_medium_tokens": (
+                navigator.adaptive_recall_medium_tokens),
+            "adaptive_recall_max_tokens": (
+                navigator.adaptive_recall_max_tokens),
             "speaker_owner_bonus": navigator.speaker_owner_bonus,
             "query_witness_bonus": navigator.query_witness_bonus,
             "query_witness_seed_count": navigator.query_witness_seed_count,
@@ -1017,6 +1232,52 @@ def main() -> None:
                     "dual_lane_precision_packed", 0),
                 "dual_lane_coverage_packed": result.trace.get(
                     "dual_lane_coverage_packed", 0),
+                "obligation_witness_rank": result.trace.get(
+                    "obligation_witness_rank", {}),
+                "obligation_witness_turn_ids": result.trace.get(
+                    "obligation_witness_turn_ids", []),
+                "obligation_witness_packed": result.trace.get(
+                    "obligation_witness_packed", 0),
+                "query_ir_confidence": result.trace.get(
+                    "query_ir_confidence", 1.0),
+                "query_ir_soft_fallback": result.trace.get(
+                    "query_ir_soft_fallback", False),
+                "query_ir_fallback_reasons": result.trace.get(
+                    "query_ir_fallback_reasons", []),
+                "adaptive_recall_triggered": result.trace.get(
+                    "adaptive_recall_triggered", False),
+                "adaptive_recall_active": result.trace.get(
+                    "adaptive_recall_active", False),
+                "adaptive_recall_in_budget_repair": result.trace.get(
+                    "adaptive_recall_in_budget_repair", False),
+                "adaptive_recall_route": result.trace.get(
+                    "adaptive_recall_route", ""),
+                "adaptive_recall_reasons": result.trace.get(
+                    "adaptive_recall_reasons", []),
+                "adaptive_recall_target_turns": result.trace.get(
+                    "adaptive_recall_target_turns", len(
+                        result.retrieved_turn_ids)),
+                "adaptive_recall_base_tokens": result.trace.get(
+                    "adaptive_recall_base_tokens", 0),
+                "adaptive_recall_target_tokens": result.trace.get(
+                    "adaptive_recall_target_tokens", 0),
+                "adaptive_recall_tail_signal_count": result.trace.get(
+                    "adaptive_recall_tail_signal_count", 0),
+                "adaptive_recall_supported_tail_protected": result.trace.get(
+                    "adaptive_recall_supported_tail_protected", 0),
+                "adaptive_recall_added_turns": result.trace.get(
+                    "adaptive_recall_added_turns", 0),
+                "adaptive_recall_removed_turns": result.trace.get(
+                    "adaptive_recall_removed_turns", 0),
+                "evidence_certificate_complete": bool(
+                    result.certificate
+                    and result.certificate.post_pack_complete),
+                "evidence_certificate_status": (
+                    str(result.certificate.status)
+                    if result.certificate else ""),
+                "evidence_certificate_missing_slots": list(
+                    result.certificate.missing_slots
+                    if result.certificate else ()),
                 "aggregation_ledger": answer.trace.get("aggregation_ledger"),
                 **{key: value for key, value in metric.items() if key != "question_id"},
             }
@@ -1158,7 +1419,8 @@ def main() -> None:
             answer_config.aggregation_ledger_enabled,
             answer_config.preference_synthesis_enabled,
             answer_config.exact_grounding_footer,
-            *default_contract_flags)[2],
+            *default_contract_flags,
+            relation_path_labels=answer_config.relation_path_labels)[2],
         "answer_prompt_hashes_observed": sorted({
             str(row.get("prompt_hash") or "") for row in prepared_rows
             if str(row.get("prompt_hash") or "")}),
@@ -1167,16 +1429,18 @@ def main() -> None:
                 answer_config.normalize_relative_time,
                 answer_config.precision_grounding,
                 answer_config.evidence_order in {
-                    "topological", "topological_recency"}, False, False,
+                "topological", "topological_recency"}, False, False,
                 answer_config.exact_grounding_footer,
-                *default_contract_flags)[2],
+                *default_contract_flags,
+                relation_path_labels=answer_config.relation_path_labels)[2],
             "aggregation": (prompt_contract(
                 answer_config.normalize_relative_time,
                 answer_config.precision_grounding,
                 answer_config.evidence_order in {
                     "topological", "topological_recency"}, True, False,
                 answer_config.exact_grounding_footer,
-                *aggregation_contract_flags)[2]
+                *aggregation_contract_flags,
+                relation_path_labels=answer_config.relation_path_labels)[2]
                 if answer_config.aggregation_ledger_enabled else None),
             "preference_synthesis": (prompt_contract(
                 answer_config.normalize_relative_time,
@@ -1184,7 +1448,8 @@ def main() -> None:
                 answer_config.evidence_order in {
                     "topological", "topological_recency"}, False, True,
                 answer_config.exact_grounding_footer,
-                *preference_contract_flags)[2]
+                *preference_contract_flags,
+                relation_path_labels=answer_config.relation_path_labels)[2]
                 if answer_config.preference_synthesis_enabled else None),
         },
         "span_window": answer_config.span_window,
@@ -1194,6 +1459,7 @@ def main() -> None:
         "question_recency_footer": answer_config.question_recency_footer,
         "compact_topological_prompt": (
             answer_config.compact_topological_contract),
+        "relation_path_labels": answer_config.relation_path_labels,
         "query_focus_index": answer_config.query_focus_index_enabled,
         "query_focus_limit": answer_config.query_focus_index_limit,
         "query_focus_excerpt_chars": (
@@ -1204,6 +1470,8 @@ def main() -> None:
         "precision_grounded_prompt": answer_config.precision_grounding,
         "aggregation_ledger": answer_config.aggregation_ledger_enabled,
         "aggregation_ledger_schema_version": (
+            EVENT_LEDGER_SCHEMA_VERSION
+            if answer_config.aggregation_event_table_enabled else
             AGGREGATION_LEDGER_SCHEMA_VERSION
             if answer_config.aggregation_ledger_enabled else None),
         "aggregation_ledger_limit": answer_config.aggregation_ledger_limit,
@@ -1213,6 +1481,14 @@ def main() -> None:
             answer_config.aggregation_operand_worksheet_enabled),
         "aggregation_operand_worksheet_selective": (
             answer_config.aggregation_operand_worksheet_selective),
+        "aggregation_event_table_enabled": (
+            answer_config.aggregation_event_table_enabled),
+        "typed_evidence_card_enabled": (
+            answer_config.typed_evidence_card_enabled),
+        "typed_evidence_card_limit": answer_config.typed_evidence_card_limit,
+        "typed_evidence_card_max_tokens": (
+            answer_config.typed_evidence_card_max_tokens),
+        "bounded_common_knowledge": answer_config.bounded_common_knowledge,
         "aggregation_source_reserve": (
             answer_config.aggregation_source_reserve_enabled),
         "aggregation_source_reserve_operations": list(
@@ -1223,6 +1499,27 @@ def main() -> None:
         "obligation_aware_packing": args.obligation_aware_packing,
         "precision_aware_packing": args.precision_aware_packing,
         "dual_lane_packing": navigator.dual_lane_packing,
+        "obligation_witness_reserve": navigator.obligation_witness_reserve,
+        "obligation_witness_reserve_turns": (
+            navigator.obligation_witness_reserve_turns),
+        "semantic_fact_witness_reserve": (
+            navigator.semantic_fact_witness_reserve),
+        "semantic_fact_witness_turns": (
+            navigator.semantic_fact_witness_turns),
+        "semantic_fact_search_limit": navigator.semantic_fact_search_limit,
+        "semantic_fact_min_score": navigator.semantic_fact_min_score,
+        "semantic_fact_operator_aware": (
+            navigator.semantic_fact_operator_aware),
+        "semantic_fact_min_compile_confidence": (
+            navigator.semantic_fact_min_compile_confidence),
+        "semantic_predicate_witness_reserve": (
+            navigator.semantic_predicate_witness_reserve),
+        "semantic_predicate_witness_turns": (
+            navigator.semantic_predicate_witness_turns),
+        "semantic_predicate_search_limit": (
+            navigator.semantic_predicate_search_limit),
+        "semantic_predicate_min_score": (
+            navigator.semantic_predicate_min_score),
         "dual_lane_operator_aware": navigator.dual_lane_operator_aware,
         "dual_lane_precision_head": navigator.dual_lane_precision_head,
         "dual_lane_rrf_k": navigator.dual_lane_rrf_k,
@@ -1280,6 +1577,7 @@ def main() -> None:
         "closed_form_enabled": answer_config.closed_form_enabled,
         "candidate_answer_injection": answer_config.candidate_answer_injection,
         "max_output_tokens": answer_config.max_output_tokens,
+        "sampling_temperature": answer_config.sampling_temperature,
         "sampling_seed": answer_config.sampling_seed,
         "answer_model": stage.answer_model,
         "answer_base_url": args.answer_base_url or config.models.llm_base_url,

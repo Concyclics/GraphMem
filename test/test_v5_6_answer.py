@@ -953,6 +953,46 @@ def test_topological_layout_keeps_a_root_to_leaf_chain_contiguous(tmp_path) -> N
     store.close()
 
 
+def test_topological_layout_can_expose_compact_relation_families(tmp_path) -> None:
+    store = _store(tmp_path, ["root evidence", "leaf evidence"])
+    turns = store.turns("m")
+    units = (
+        EvidenceUnit("leaf", ("need",), ("b2",), (turns[1].turn_id,),
+                     ("edge-1", "edge-2"), 0, True, ("operand",)),
+        EvidenceUnit("root", ("need",), ("b1",), (turns[0].turn_id,),
+                     ("edge-1",), 0, True, ("operand",)),
+    )
+    candidates = tuple(
+        CandidateScore(
+            turn.turn_id, turn.session_id, 0.0, 0.0, 0.0, 1.0,
+            0.0, 0.0, 4, 1.0, ("graph",),
+            graph_path_ids=(("edge-1",) if index == 0 else
+                            ("edge-1", "edge-2")),
+            relation_contributions=(("shared_entity",) if index == 0 else
+                                    ("shared_entity", "temporal_after")),
+        )
+        for index, turn in enumerate(turns))
+    result = replace(
+        _result([turn.turn_id for turn in turns], units),
+        candidate_scores=candidates)
+    stage = _stage(
+        store, _FakeClient(), answer_config=AnswerConfig(
+            evidence_order="topological", relation_path_labels=True))
+
+    prepared = stage.prepare(
+        "q1", "When did Alice move?", result, QueryBudget())
+    user = prepared.messages[1]["content"]
+
+    assert "{via=entity}" in user
+    assert "{via=entity>time}" in user
+    assert "{via=a>b}" in prepared.messages[0]["content"]
+    assert prompt_contract(
+        topological_layout=True, relation_path_labels=True)[2] != (
+            prompt_contract(topological_layout=True)[2])
+    assert prepared.trace["relation_path_labels"] is True
+    store.close()
+
+
 def test_topological_plain_reorders_without_exposing_graph_labels(tmp_path) -> None:
     store = _store(tmp_path, ["unbound noise", "root evidence", "leaf evidence"])
     turns = store.turns("m")
@@ -1261,6 +1301,47 @@ def test_openai_answer_profile_uses_separate_model_and_no_output_cap(tmp_path) -
     assert "max_tokens" not in request
     assert "max_completion_tokens" not in request
     assert answer.answer_model == "gpt-5.4-mini"
+    store.close()
+
+
+def test_openai_answer_profile_sends_explicit_reasoning_effort(tmp_path) -> None:
+    store = _store(tmp_path, ["I adopted a beagle named Rex."])
+    client = _FakeClient("Rex")
+    stage = _stage(
+        store, client, answer_model="gpt-5.6-sol",
+        answer_request_profile="openai", answer_reasoning_effort="medium")
+    result = _result([turn.turn_id for turn in store.turns("m")])
+
+    stage.answer("q1", "What is the dog called?", result, QueryBudget())
+
+    request = client.requests[0]
+    assert request["model"] == "gpt-5.6-sol"
+    assert request["reasoning_effort"] == "medium"
+    assert "extra_body" not in request
+    store.close()
+
+
+def test_best_of_sampling_parameters_are_sent_and_isolate_cache(tmp_path) -> None:
+    store = _store(tmp_path, ["I adopted a beagle named Rex."])
+    client = _FakeClient("Rex")
+    result = _result([turn.turn_id for turn in store.turns("m")])
+
+    first = _stage(
+        store, client,
+        answer_config=AnswerConfig(
+            sampling_temperature=0.7, sampling_seed=101))
+    second = _stage(
+        store, client,
+        answer_config=AnswerConfig(
+            sampling_temperature=0.7, sampling_seed=102))
+
+    first.answer("q1", "What is the dog called?", result, QueryBudget())
+    second.answer("q1", "What is the dog called?", result, QueryBudget())
+
+    assert len(client.requests) == 2
+    assert client.requests[0]["temperature"] == 0.7
+    assert client.requests[0]["seed"] == 101
+    assert client.requests[1]["seed"] == 102
     store.close()
 
 

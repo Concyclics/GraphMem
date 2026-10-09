@@ -93,6 +93,10 @@ def main() -> None:
         default="openai",
     )
     parser.add_argument("--workers", type=int, default=64)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["none", "low", "medium", "high", "xhigh", "max"],
+        default="none")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument(
         "--semantic-retries",
@@ -160,7 +164,7 @@ def main() -> None:
                     {"role": "system", "content": prompts.JUDGE_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt + repair},
                 ],
-                thinking_mode="none",
+                thinking_mode=args.reasoning_effort,
                 max_tokens=args.max_tokens if attempt == 0 else max(args.max_tokens, 512),
                 json_mode=True,
                 temperature=0.0,
@@ -176,7 +180,8 @@ def main() -> None:
                     raise ValueError(
                         f"invalid LoCoMo judge label for {question_id}: {label!r}"
                     )
-                if result.record.reasoning_tokens != 0:
+                if (args.reasoning_effort == "none"
+                        and result.record.reasoning_tokens != 0):
                     raise RuntimeError(
                         f"judge reasoning_tokens must be 0 for {question_id}"
                     )
@@ -250,7 +255,8 @@ def main() -> None:
         "model": args.model,
         "thinking_request_profile": args.request_profile,
         "thinking": {"type": "disabled"} if args.request_profile == "deepseek" else None,
-        "reasoning_effort": "none" if args.request_profile == "openai" else None,
+        "reasoning_effort": (args.reasoning_effort
+                             if args.request_profile == "openai" else None),
         "reasoning_effort_field_sent": args.request_profile == "openai",
         "excluded_from_build_and_answer_budgets": True,
         "question_count": len(evaluations),

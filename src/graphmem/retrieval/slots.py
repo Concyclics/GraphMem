@@ -80,6 +80,16 @@ PLURAL_HINTS = {
     "friends", "things", "books", "games", "pets", "items", "activities", "events",
     "topics", "hobbies", "shows", "movies", "songs", "projects", "courses", "ones",
 }
+_WH_HEAD_RE = re.compile(
+    r"^\s*(?:what|which)\s+(.+?)\s+"
+    r"(?:did|does|do|has|have|had|is|are|was|were|will|would|can|could|"
+    r"may|might|shall|should)\b",
+    re.I,
+)
+_NON_PLURAL_S_FORMS = frozenset({
+    "does", "has", "his", "is", "news", "series", "species", "status",
+    "this", "was",
+})
 
 
 
@@ -168,6 +178,31 @@ def is_advice_query(query: str) -> bool:
     """Detect an open-ended advice/recommendation request from its wording."""
 
     return bool(ADVICE_QUERY_RE.search(" ".join(query.split())))
+
+
+def _plural_answer_head(query: str) -> bool:
+    """Detect plurality in the requested WH noun phrase, not its context.
+
+    Looking for any plural token in the whole question wrongly treats
+    ``Where did Alice move four years ago?`` as a list.  Restricting the test
+    to the phrase between ``what/which`` and the first auxiliary identifies
+    heads such as ``book recommendations`` and ``sports`` while ignoring
+    plural owners, dates and supporting clauses.
+    """
+
+    if re.match(r"^\s*which\s+of\b", query, re.I):
+        return True
+    match = _WH_HEAD_RE.match(query)
+    if match is None:
+        return False
+    for token in terms(match.group(1)):
+        if token in PLURAL_HINTS or token in {"children", "men", "women"}:
+            return True
+        if (len(token) > 3 and token.endswith("s")
+                and token not in _NON_PLURAL_S_FORMS
+                and not token.endswith(("ss", "us", "is"))):
+            return True
+    return False
 
 
 def _question_terms(row: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
@@ -294,7 +329,7 @@ def parse_slots(query: str) -> QuerySlots:
     # A plural answer head asks for a set even with a single owner named.
     expects_multiple = (bool(tokens & PLURAL_HINTS)
                         or quantifier in {"all", "every", "both", "each"}
-                        or is_unit_rate)
+                        or is_unit_rate or _plural_answer_head(stripped))
 
     answer_slot = next((name for name, words in ANSWER_SLOTS if _has(tokens, words)), "")
     value_type = next((name for name, words in VALUE_TYPES if _has(tokens, words)), None)

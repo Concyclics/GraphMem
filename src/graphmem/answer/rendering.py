@@ -103,6 +103,10 @@ class AnswerConfig:
     # worksheet looked authoritative and displaced the correct full-context
     # answer.  ``False`` preserves the original all-or-nothing experiment.
     aggregation_operand_worksheet_selective: bool = False
+    # Compile exact-scope/status/time candidate rows for count/list questions.
+    # Unlike the legacy 32-row ledger this stays bounded and labels near-matches
+    # rather than presenting graph neighbours as operands.
+    aggregation_event_table_enabled: bool = False
     # When a generic user/assistant transcript is re-packed to make room for
     # the aggregation ledger, keep the direct user statements before optional
     # assistant prose.  This is deliberately disabled for named multi-party
@@ -132,6 +136,10 @@ class AnswerConfig:
     # the verbose label glossary.  The saved budget pays for a post-evidence
     # query reminder without increasing any answer request.
     compact_topological_contract: bool = False
+    # Add compact, deterministic route-family hints (for example
+    # ``via=entity>time``) to topological labels.  These are derived only from
+    # traversed edge types/source channels and never summarize source claims.
+    relation_path_labels: bool = False
     # Repeat bounded, query-centered excerpts from the *full text* of turns
     # that are already present in the evidence pack.  Relation spans can point
     # at the beginning of a long list while the requested item is near its
@@ -143,6 +151,16 @@ class AnswerConfig:
     # Allow Query Focus for explicit date-difference surfaces (ago/before/
     # between/passed/take), while retaining the temporal exclusion elsewhere.
     temporal_query_focus_enabled: bool = False
+    # A short source-only card repeats the most answer-critical already-packed
+    # excerpts at the readout boundary.  It adds no candidate answer and never
+    # introduces a turn that retrieval did not pack.
+    typed_evidence_card_enabled: bool = False
+    typed_evidence_card_limit: int = 4
+    typed_evidence_card_excerpt_chars: int = 240
+    typed_evidence_card_max_tokens: int = 420
+    # Only inference/identification routes may combine their grounded facts
+    # with stable ordinary knowledge; conversational facts remain source-only.
+    bounded_common_knowledge: bool = False
     # ``default`` applies the contextual-date/footer/compact-layout rewrite
     # only when no specialized aggregation or preference contract is active.
     # Those contracts already own the post-evidence readout semantics.
@@ -173,6 +191,9 @@ class AnswerConfig:
     # model then ends on its stop condition or context limit; actual completion
     # usage and finish_reason are still recorded for every call.
     max_output_tokens: int | None = None
+    # Zero preserves the deterministic production contract. Positive values
+    # are reserved for explicitly labelled Best-of-N answer studies.
+    sampling_temperature: float = 0.0
     sampling_seed: int = 0
     #: Rendered evidence is ``[session date] speaker: text``; this bounds the
     #: per-turn header so a pathological speaker label cannot eat the budget.
@@ -240,6 +261,25 @@ class AnswerConfig:
         values.update(overrides)
         return cls.v5_54(**values)
 
+    @classmethod
+    def v5_73(cls, **overrides) -> "AnswerConfig":
+        """Return the opt-in post-V5.63 accuracy contract.
+
+        The graph and 64-turn budget are unchanged.  Added prompt material is
+        source-only and capped below the existing +500-token readout allowance.
+        """
+
+        values = {
+            "aggregation_event_table_enabled": True,
+            "typed_evidence_card_enabled": True,
+            "typed_evidence_card_limit": 4,
+            "typed_evidence_card_excerpt_chars": 240,
+            "typed_evidence_card_max_tokens": 420,
+            "bounded_common_knowledge": True,
+        }
+        values.update(overrides)
+        return cls.v5_63(**values)
+
     def __post_init__(self) -> None:
         if self.span_window is not None and self.span_window < 0:
             raise ValueError("span_window must be None or non-negative")
@@ -251,6 +291,8 @@ class AnswerConfig:
                 "topological_plain, topological, or topological_recency")
         if self.max_output_tokens is not None and self.max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be None or positive")
+        if not 0.0 <= self.sampling_temperature <= 2.0:
+            raise ValueError("sampling_temperature must be between 0 and 2")
         if self.sampling_seed < 0:
             raise ValueError("sampling_seed must be non-negative")
         if self.aggregation_ledger_limit <= 0:
@@ -263,6 +305,14 @@ class AnswerConfig:
             raise ValueError("query_focus_index_limit must be positive")
         if self.query_focus_excerpt_chars < 120:
             raise ValueError("query_focus_excerpt_chars must be at least 120")
+        if self.typed_evidence_card_limit <= 0:
+            raise ValueError("typed_evidence_card_limit must be positive")
+        if self.typed_evidence_card_excerpt_chars < 80:
+            raise ValueError(
+                "typed_evidence_card_excerpt_chars must be at least 80")
+        if not 64 <= self.typed_evidence_card_max_tokens <= 500:
+            raise ValueError(
+                "typed_evidence_card_max_tokens must be in [64, 500]")
         if self.preference_focus_strategy not in {"legacy", "domain_idf"}:
             raise ValueError(
                 "preference_focus_strategy must be legacy or domain_idf")

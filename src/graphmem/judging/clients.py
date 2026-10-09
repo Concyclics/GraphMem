@@ -181,7 +181,12 @@ class OpenAICompatibleClient:
                     request["temperature"] = temperature
                 if seed is not None:
                     request["seed"] = seed
-                if thinking_mode == "enabled":
+                if thinking_mode in {"low", "medium", "high", "xhigh", "max"}:
+                    if self.request_profile != "openai":
+                        raise ValueError(
+                            "explicit reasoning effort requires the openai profile")
+                    request["reasoning_effort"] = thinking_mode
+                elif thinking_mode == "enabled":
                     if self.request_profile == "deepseek":
                         request["extra_body"] = {"thinking": {"type": "enabled"}}
                         request["reasoning_effort"] = "high"

@@ -24,6 +24,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True,
                         help="graph build config that identifies the embedding model")
+    parser.add_argument(
+        "--model-id",
+        help="override the embedding model identity recorded in the graph")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--backend", choices=("auto", "numpy_exact", "faiss_flat"),
                         default="auto")
@@ -48,7 +51,7 @@ def main() -> None:
         memory_ids = memory_ids[:args.limit]
     result = sync_dense_sidecars(
         args.db, args.output,
-        model_id=config.models.embedding_model,
+        model_id=args.model_id or config.models.embedding_model,
         backend=args.backend,
         memory_ids=memory_ids,
         workers=args.workers,
@@ -61,7 +64,7 @@ def main() -> None:
         "db": str(args.db),
         "output": str(args.output),
         "requested_backend": args.backend,
-        "model_id": config.models.embedding_model,
+        "model_id": args.model_id or config.models.embedding_model,
         "requested": len(memory_ids),
         "compiled": int(result["compiled"]),
         "current": int(result["current"]),

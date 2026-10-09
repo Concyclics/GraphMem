@@ -13,6 +13,7 @@ memory a non-resumable build would be an unacceptable thing to lose.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -46,6 +47,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed-db", type=Path, help="frozen artifact to copy already-built graphs from")
     parser.add_argument("--seed-report", type=Path,
                         help="build report paired with seed-db; carries diagnostics for copied memories")
+    parser.add_argument(
+        "--seed-embedding-db", type=Path,
+        help=("import only source-turn vectors whose memory, item and content "
+              "hash exactly match the newly ingested authority"))
     parser.add_argument("--seed-relation-embedding-db", type=Path,
                         help="immutable relation-vector cache used to seed a new sidecar")
     parser.add_argument("--target-db", type=Path, required=True)
@@ -67,6 +72,11 @@ def parse_args() -> argparse.Namespace:
         "--llm-request-profile", choices=("qwen", "openai"), default="qwen",
         help="select Qwen-local or OpenAI request fields for semantic extraction")
     parser.add_argument(
+        "--llm-reasoning-effort",
+        choices=("none", "low", "medium", "high", "xhigh", "max"),
+        default="none",
+        help="reasoning effort for OpenAI-profile semantic extraction")
+    parser.add_argument(
         "--llm-request-timeout-seconds", type=float, default=120.0,
         help="fail one external request so the resumable build can recover")
     parser.add_argument(
@@ -80,6 +90,10 @@ def parse_args() -> argparse.Namespace:
         help=("join state routing by owner-role + morphological predicate family "
               "+ polarity + modality instead of exact predicate phrase"))
     parser.add_argument(
+        "--skip-predicate-canonicalization", action="store_true",
+        help=("operational semantic-cache warm pass only: avoid embedding "
+              "predicate labels before a later full graph materialization"))
+    parser.add_argument(
         "--enabled-relation-signals",
         help="comma-separated relation signal allow-list; empty disables all signals")
     parser.add_argument(
@@ -90,12 +104,22 @@ def parse_args() -> argparse.Namespace:
         help=("served-model alias sent to the embedding endpoint; storage and "
               "cache identity remain the configured embedding model"))
     parser.add_argument(
+        "--embedding-model",
+        help="override the embedding model identity for this build")
+    parser.add_argument(
+        "--embedding-base-url",
+        help="override the OpenAI-compatible embedding endpoint")
+    parser.add_argument(
         "--relation-embedding-db", type=Path,
         help=("separate cache for RoutingCard and atomic-summary vectors; "
               "keeps online turn search free of graph-node embeddings"))
     parser.add_argument("--memory-workers", type=int, default=16)
     parser.add_argument("--max-concurrency", type=int, default=256)
     parser.add_argument("--max-memories", type=int)
+    parser.add_argument(
+        "--memory-id-file", type=Path,
+        help=("optional newline-delimited or JSON-array Memory allow-list; "
+              "only those memories are ingested and built"))
     parser.add_argument(
         "--development-set", action="store_true",
         help="expect the frozen 100 LongMemEval + 100 LoCoMo question subset")
@@ -106,6 +130,10 @@ def parse_args() -> argparse.Namespace:
         help=("when resuming after an interrupted process, rebuild only graph "
               "versions absent from the existing report so every published "
               "Memory receives a same-run diagnostic row"))
+    parser.add_argument(
+        "--preserve-unpublished-llm-cache", action="store_true",
+        help=("retain completed semantic calls for an explicitly staged cache-"
+              "warm pass whose disposable graph publication was removed"))
     parser.add_argument(
         "--frozen-semantic-cache-only", action="store_true",
         help=("never call the semantic LLM; replay Full-arm responses by exact "
@@ -140,6 +168,13 @@ def main() -> None:
             config.models,
             llm_model=args.llm_model or config.models.llm_model,
             llm_base_url=args.llm_base_url or config.models.llm_base_url))
+    if args.embedding_model or args.embedding_base_url:
+        config = replace(config, models=replace(
+            config.models,
+            embedding_model=(
+                args.embedding_model or config.models.embedding_model),
+            embedding_base_url=(
+                args.embedding_base_url or config.models.embedding_base_url)))
     if args.max_concurrency:
         config = replace(config, models=replace(config.models, max_concurrency=args.max_concurrency))
     if args.llm_request_timeout_seconds <= 0:
@@ -191,6 +226,34 @@ def main() -> None:
         args.lme, args.locomo, load_gold_turns(args.gold),
         expect_lme=(100 if args.development_set else 500),
         expect_locomo=(100 if args.development_set else 1540))
+    selected_memory_ids: set[str] | None = None
+    memory_id_file_sha256: str | None = None
+    if args.memory_id_file is not None:
+        raw_memory_ids = args.memory_id_file.read_text(encoding="utf-8")
+        memory_id_file_sha256 = hashlib.sha256(
+            raw_memory_ids.encode("utf-8")).hexdigest()
+        try:
+            parsed_memory_ids = json.loads(raw_memory_ids)
+        except json.JSONDecodeError:
+            parsed_memory_ids = [
+                line.strip() for line in raw_memory_ids.splitlines()
+                if line.strip() and not line.lstrip().startswith("#")]
+        if not isinstance(parsed_memory_ids, list):
+            raise ValueError("--memory-id-file must contain a JSON array or one id per line")
+        selected_memory_ids = {
+            str(value).strip() for value in parsed_memory_ids if str(value).strip()}
+        if not selected_memory_ids:
+            raise ValueError("--memory-id-file selected no memories")
+        available_memory_ids = {
+            row.question.memory_id for row in questions}
+        missing_memory_ids = selected_memory_ids - available_memory_ids
+        if missing_memory_ids:
+            raise ValueError(
+                "unknown memory ids in --memory-id-file: "
+                f"{sorted(missing_memory_ids)}")
+        questions = [
+            row for row in questions
+            if row.question.memory_id in selected_memory_ids]
     store = SQLiteGraphStore(args.target_db)
     relation_store = (SQLiteGraphStore(args.relation_embedding_db)
                       if args.relation_embedding_db else None)
@@ -209,8 +272,50 @@ def main() -> None:
     if fresh:
         ingest_questions(store, fresh)
 
-    wanted = [row[0] for row in store._read(
+    seeded_turn_embeddings_this_pass = 0
+    exact_turn_embeddings_available = 0
+    if args.seed_embedding_db is not None:
+        if not args.seed_embedding_db.exists():
+            raise FileNotFoundError(args.seed_embedding_db)
+        if args.seed_embedding_db.resolve() == args.target_db.resolve():
+            raise ValueError("--seed-embedding-db must differ from --target-db")
+        # Copy only vectors whose immutable source-turn authority is identical.
+        # Predicate and graph-node vectors are deliberately excluded: their
+        # item IDs/content are products of the graph compiler being rebuilt.
+        store.close()
+        with sqlite3.connect(args.target_db, timeout=120.0) as target:
+            target.execute("ATTACH DATABASE ? AS embedding_seed",
+                           (str(args.seed_embedding_db),))
+            before = target.total_changes
+            target.execute(
+                "INSERT OR IGNORE INTO main.embeddings("
+                "item_id,memory_id,model_id,content_hash,dimension,vector) "
+                "SELECT e.item_id,e.memory_id,e.model_id,e.content_hash,"
+                "e.dimension,e.vector FROM embedding_seed.embeddings e "
+                "JOIN main.source_turns t ON t.memory_id=e.memory_id "
+                "AND t.turn_id=e.item_id AND t.content_hash=e.content_hash "
+                "WHERE e.model_id=?",
+                (config.models.embedding_model,))
+            seeded_turn_embeddings_this_pass = target.total_changes - before
+            target.commit()
+            exact_turn_embeddings_available = int(target.execute(
+                "SELECT COUNT(*) FROM main.embeddings e "
+                "JOIN main.source_turns t ON t.memory_id=e.memory_id "
+                "AND t.turn_id=e.item_id AND t.content_hash=e.content_hash "
+                "WHERE e.model_id=?",
+                (config.models.embedding_model,)).fetchone()[0])
+            target.execute("DETACH DATABASE embedding_seed")
+        store = SQLiteGraphStore(args.target_db)
+        print(
+            f"seeded {seeded_turn_embeddings_this_pass} new exact source-turn "
+            f"embeddings ({exact_turn_embeddings_available} available) from "
+            f"{args.seed_embedding_db}", flush=True)
+
+    stored_memory_ids = [row[0] for row in store._read(
         "SELECT memory_id FROM conversations ORDER BY memory_id")]
+    wanted = ([memory_id for memory_id in stored_memory_ids
+               if memory_id in selected_memory_ids]
+              if selected_memory_ids is not None else stored_memory_ids)
     checkpoint_path = args.report.with_name(
         f"{args.report.stem}_rows.jsonl")
     progress_path = args.report.with_name(
@@ -246,7 +351,10 @@ def main() -> None:
     recovery_path = args.report.with_name(
         f"{args.report.stem}_recovery.jsonl")
     recovered_attempts = ()
-    if not args.rebuild_missing_diagnostics:
+    preserve_cache_marker = args.report.parent / "preserve_unpublished_llm_cache"
+    preserve_unpublished_cache = (
+        args.preserve_unpublished_llm_cache or preserve_cache_marker.exists())
+    if not args.rebuild_missing_diagnostics and not preserve_unpublished_cache:
         recovered_attempts = reset_unpublished_llm_attempts(store)
         if recovered_attempts:
             recovery_path.parent.mkdir(parents=True, exist_ok=True)
@@ -256,6 +364,10 @@ def main() -> None:
             print(
                 f"reset {len(recovered_attempts)} unpublished partial LLM "
                 f"attempts; audit={recovery_path}", flush=True)
+    elif preserve_unpublished_cache:
+        print(
+            "preserving unpublished semantic cache for staged graph "
+            "materialization", flush=True)
     if args.rebuild_missing_diagnostics and prior_report_rows:
         diagnosed = {str(row.get("memory_id") or "")
                      for row in prior_report_rows}
@@ -313,6 +425,7 @@ def main() -> None:
             request_gate=request_gate,
             worker_limit=per_memory_llm_workers,
             request_profile=args.llm_request_profile,
+            reasoning_effort=args.llm_reasoning_effort,
             frozen_cache_only=args.frozen_semantic_cache_only,
             frozen_fallback_calls=frozen_fallback_calls.get(memory_id, 0),
             request_reservation_safety_override=(
@@ -328,9 +441,11 @@ def main() -> None:
                           if relation_store is not None else None)
         pipeline = GraphBuildPipeline(
             store, dataset_hash="v5.6-full", distiller=distiller,
-            predicate_canonicalizer=PredicateCanonicalizer(
-                store, config,
-                request_model_id=args.embedding_request_model),
+            predicate_canonicalizer=(None
+                if args.skip_predicate_canonicalization else
+                PredicateCanonicalizer(
+                    store, config,
+                    request_model_id=args.embedding_request_model)),
             coarsen_vector_provider=(
                 relation_index.embed_graph_nodes if relation_index else None),
             relation_vector_provider=(
@@ -347,6 +462,7 @@ def main() -> None:
                 "input_tokens": int(usage.get("uncached_input_tokens", 0)),
                 "cached_input_tokens": int(usage.get("cached_input_tokens", 0)),
                 "output_tokens": int(usage.get("output_tokens", 0)),
+                "reasoning_tokens": int(usage.get("reasoning_tokens", 0)),
                 "tokens": (int(usage.get("uncached_input_tokens", 0))
                            + int(usage.get("output_tokens", 0))),
                 "seconds": round(time.perf_counter() - tick, 1),
@@ -449,6 +565,7 @@ def main() -> None:
         "SUM(CAST(json_extract(usage_json,'$.uncached_input_tokens') AS INTEGER)) input_tokens,"
         "SUM(CAST(json_extract(usage_json,'$.cached_input_tokens') AS INTEGER)) cached_input_tokens,"
         "SUM(CAST(json_extract(usage_json,'$.output_tokens') AS INTEGER)) output_tokens,"
+        "SUM(CAST(json_extract(usage_json,'$.reasoning_tokens') AS INTEGER)) reasoning_tokens,"
         "SUM(retry_count) retry_count "
         "FROM llm_calls GROUP BY memory_id")
     ledger = []
@@ -460,6 +577,7 @@ def main() -> None:
             "input_tokens": input_tokens,
             "cached_input_tokens": int(row["cached_input_tokens"] or 0),
             "output_tokens": output_tokens,
+            "reasoning_tokens": int(row["reasoning_tokens"] or 0),
             "total_tokens": input_tokens + output_tokens,
             "retry_count": int(row["retry_count"] or 0),
         })
@@ -471,6 +589,8 @@ def main() -> None:
             (row["input_tokens"] for row in ledger), "tokens_per_memory"),
         "output": nearest_stats(
             (row["output_tokens"] for row in ledger), "tokens_per_memory"),
+        "reasoning": nearest_stats(
+            (row["reasoning_tokens"] for row in ledger), "tokens_per_memory"),
         "total": nearest_stats(
             (row["total_tokens"] for row in ledger), "tokens_per_memory"),
     }
@@ -513,6 +633,11 @@ def main() -> None:
         "token_gate": token_gate,
         "token_gate_violations": over_gate,
         "embedding": args.embedding,
+        "seed_embedding_db": (
+            str(args.seed_embedding_db) if args.seed_embedding_db else None),
+        "seeded_turn_embeddings_this_pass": seeded_turn_embeddings_this_pass,
+        "exact_turn_embeddings_available_before_build": (
+            exact_turn_embeddings_available),
         "embedding_request_model": (
             args.embedding_request_model or config.models.embedding_model),
         "relation_embedding_db": (
@@ -522,6 +647,9 @@ def main() -> None:
         "rare_lexical_relation": config.edges.rare_lexical_relation,
         "predicate_family_state_relations": (
             config.edges.predicate_family_state_relations),
+        "skip_predicate_canonicalization": (
+            args.skip_predicate_canonicalization),
+        "preserved_unpublished_llm_cache": preserve_unpublished_cache,
         "enabled_relation_signals": list(config.edges.enabled_relation_signals),
         "projection_profile": config.projection_profile,
         "memory_workers": memory_workers,
@@ -531,7 +659,12 @@ def main() -> None:
         "llm_base_url": config.models.llm_base_url,
         "llm_api_key_env": args.llm_api_key_env or None,
         "llm_request_profile": args.llm_request_profile,
+        "llm_reasoning_effort": args.llm_reasoning_effort,
         "llm_request_timeout_seconds": args.llm_request_timeout_seconds,
+        "memory_id_file": str(args.memory_id_file) if args.memory_id_file else None,
+        "memory_id_file_sha256": memory_id_file_sha256,
+        "selected_memory_count": (
+            len(selected_memory_ids) if selected_memory_ids is not None else None),
         "semantic_request_reservation_safety_override": (
             args.semantic_request_reservation_safety_override),
         "frozen_semantic_cache_only": args.frozen_semantic_cache_only,

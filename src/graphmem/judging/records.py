@@ -28,7 +28,9 @@ class DeepSeekCallRecord:
     stage: str
     call_id: str
     model: str
-    thinking_mode: Literal["enabled", "disabled", "none"]
+    thinking_mode: Literal[
+        "enabled", "disabled", "none", "low", "medium", "high", "xhigh",
+        "max"]
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
