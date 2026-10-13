@@ -1,0 +1,27 @@
+services:
+  memory:
+    build:
+      context: ../..
+      dockerfile: deploy/memory/Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 10m
+    ports:
+      - "127.0.0.1:8090:8090"
+    environment:
+      GRAPHMEM_API_KEY: ${GRAPHMEM_API_KEY:?Set a service API key}
+      GRAPHMEM_TOKENIZER_PATH: /models/tokenizer.json
+      GRAPHMEM_MODEL_API_KEY: ${GRAPHMEM_MODEL_API_KEY:-local}
+    volumes:
+      - graphmem-data:/var/lib/graphmem
+      - ../../config/memory-service.json:/app/service.json:ro
+      - ${GRAPHMEM_TOKENIZER_PATH:?Set the host tokenizer.json path}:/models/tokenizer.json:ro
+    command: ["--config", "/app/service.json", "--data-dir", "/var/lib/graphmem", "--host", "0.0.0.0"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  graphmem-data:

@@ -23,3 +23,10 @@ artifacts/
 *.orig
 /0
 /20
+
+# Product runtime data and packaging output
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+/build/
+/dist/

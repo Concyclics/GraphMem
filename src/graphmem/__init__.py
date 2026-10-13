@@ -1,9 +1,6 @@
-"""GraphMem 5.0 contracts.
+"""GraphMem persistent Memory SDK and versioned graph contracts."""
 
-The V5 package is self-contained.  Gate A exposes
-stable domain/configuration interfaces and a read-only legacy adapter without
-changing the V4/V4.1 execution path.
-"""
+__version__ = "5.81.0"
 
 from .config import (
     CacheIdentity,
@@ -79,4 +76,14 @@ __all__ = [
     "load_runtime_config",
     "runtime_config_hash",
     "stable_id",
+    "MemoryService",
+    "ServiceConfig",
 ]
+
+
+def __getattr__(name):
+    # Domain-only users need not import model clients or the service platform.
+    if name in {"MemoryService", "ServiceConfig"}:
+        from .service import MemoryService, ServiceConfig
+        return {"MemoryService": MemoryService, "ServiceConfig": ServiceConfig}[name]
+    raise AttributeError(name)

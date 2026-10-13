@@ -4,8 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphmem"
-version = "5.0.0a1"
-description = "Versioned graph-memory construction and navigation contracts"
+version = "5.81.0"
+description = "Persistent graph memory with adaptive retrieval and grounded prompts"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26",
@@ -14,9 +15,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "hypothesis>=6"]
+dev = ["pytest>=8", "hypothesis>=6", "pytest-asyncio>=0.24", "matplotlib>=3.8"]
+service = ["tokenizers>=0.20", "faiss-cpu>=1.8", "hnswlib>=0.8"]
 experiment = ["neo4j>=5.26", "pandas>=2.2", "pyarrow>=16"]
 dense = ["faiss-cpu>=1.8"]
+
+[project.scripts]
+graphmem = "graphmem.service.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -24,6 +29,9 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["graphmem*"]
+
+[tool.setuptools.package-data]
+"graphmem.service" = ["profiles/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]
