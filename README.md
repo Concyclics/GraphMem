@@ -1,296 +1,120 @@
 # GraphMem
 
-GraphMem is a graph-structured long-term memory system for AI agents. It turns
-multi-session conversations into a sparse hierarchical graph, compiles a user
-question into a typed QueryIR plan, and retrieves a bounded evidence set for
-answer generation.
+面向产品集成的持久化 Memory 框架，提供 **Python SDK、HTTP API 和可交给产品自身 LLM 的回答 Prompt**。当前包版本 **5.81.0**，整合截至 V5.81 的检索与图式证据呈现能力。服务与 SDK 共用一套实现；运行时无需 benchmark 数据或实验产物。
 
-GraphMem focuses on three system goals:
+## 默认方案
 
-- **Token-efficient construction.** HNSW-assisted coarsening, reconnecting and
-  parent-gated refinement replace all-pairs relation induction. Lossless atomic
-  extraction preserves dates, durations, quantities, negation and collection
-  items, while an exact response cache and recoverable publication keep the
-  510-Memory build inside the 230K generative-token gate with zero SDK retries.
-  On the full corpus, the measured coarse-candidate exponent is `0.89` and the
-  final relation set is `99.98%` smaller than the all-pairs upper bound.
-- **Low-latency retrieval.** Per-memory FAISS indexes, compiled graph views,
-  dual-lane coarse-to-fine traversal and deterministic QueryIR execution avoid
-  an LLM call on the query path. Operator-aware pruning keeps relevance and
-  proof/witness candidates separate until evidence packing.
-- **High-precision readout.** Source-time normalization, topological evidence
-  blocks and typed aggregation are augmented only for high-confidence temporal,
-  preference and arithmetic routes. The V5.63 selector is label-free, never
-  reads predictions or judge verdicts, and permits at most 500 additional prompt
-  tokens for a selected request.
-
-The graph is stored as a versioned SQLite snapshot. The core package is under
-`src/graphmem`; benchmark, audit and reproduction entrypoints are under
-`scripts`.
-
-## Current implementation
-
-The repository includes the implementation and experiment tooling developed
-through V5.81. The V5.63 profiles and benchmark results below remain frozen;
-new retrieval and answer policies are explicit options, not replacements for
-those historical results.
-
-- **Adaptive evidence budgets:** QueryIR and evidence-closure checks can repair
-  the evidence tail, preserve a protected head, and expand turn/token budgets
-  within configured limits before answering. Runtime routing does not use gold
-  answers or judge verdicts.
-- **Source-grounded readout:** optional typed evidence cards, relation-route
-  hints, temporal normalization and witness reserves improve evidence
-  organization. Multi-label query obligations retain one primary execution
-  route and narrowly scoped presentation hints.
-- **Deterministic retrieval:** stable score accumulation and tie-breaking,
-  persistent query embeddings, batched query prewarming, and reusable FAISS
-  sidecars support repeatable preparation.
-- **Resumable model comparisons:** frozen-prompt replay supports configurable
-  reasoning effort, multiple answer candidates, bounded concurrency and API
-  usage accounting. Answer selection and judge-based best-of-N upper-bound
-  analysis are separate experiment paths.
-
-| Entry point | Purpose |
+| 阶段 | 产品配置启用的能力 |
 |---|---|
-| `configs/v5/runtime_v5_73_accuracy64.json` | Fixed 64-turn retrieval with witness reserves |
-| `configs/v5/runtime_v5_76_adaptive_budget.json` | Adaptive 32/64/80-turn and 2,200/3,800/4,500 evidence-token budgets |
-| `configs/v5/runtime_v5_78_semantic_witness.json` | Opt-in semantic-witness experiment |
-| `scripts/run_v5_6_answer.py --answer-policy v5_73` | Source-grounded evidence-card answer policy |
-| `scripts/replay_v5_prepared_best_of.py` | Multiple candidates from frozen requests |
-| `scripts/replay_v5_prepared_ensemble.py` | Split-prompt candidates and evidence-based selection |
+| 写入 / 建图 | 原文持久化、原子信息覆盖、时间归一化、递归层次图、HNSW 候选、父节点门控关系、谓词归一化、构建缓存 |
+| 检索 | QueryIR、双通道证据打包、witness 保留、自适应 **32 / 64 / 80** 条图证据及 **2,200 / 3,800 / 4,500** evidence-token 预算 |
+| 回答准备 | V5.81 Graph + Source-focus、关系 / 时间 / dense 补充视图、Focus Capsule、按路由启用的导航提示、多标签解析和精简结构约束 |
+| 工程 | SQLite WAL、租户隔离、幂等追加、重建恢复、稳定排序、持久化查询向量缓存、FAISS / 编译视图缓存、Prompt 哈希 |
 
-Use `--help` on each entrypoint for its required inputs and options. Runtime
-profiles contain workspace-relative artifact paths; override them for your
-deployment and use the embedding model that created the stored vectors.
-Archived runner scripts require the external datasets, graph snapshots and
-tokenizer assets described in their arguments; these assets are not shipped.
-Experimental witness, fusion and multi-call policies are not all enabled by
-default or claimed to improve every benchmark.
+Source-focus 有独立的有限补充预算；整个 Prompt 另受硬上限约束。V5.73 证据卡策略可通过 `readout: "v5_73"` 选择。多候选、verifier、oracle 等研究工具保留在 `scripts/`，线上默认每题生成一个答案；所有开关见 [集成说明](docs/INTEGRATION.md)。
 
-See the [adaptive-budget design](docs/V5_76_ADAPTIVE_BUDGET.md),
-[retrieval-quality results](docs/V5_79_RETRIEVAL_QUALITY_RESULTS_20260910.md),
-and [multi-label QueryIR and determinism notes](docs/V5_80_MULTILABEL_QUERYIR_UPGRADE_20260910.md)
-for configuration details and paired evaluations. Best-of-N oracle scores in
-experiment notes are diagnostic upper bounds, not single-answer accuracy.
+## 安装与启动
 
-## Frozen V5.63 Qwen3-30B benchmark results
-
-We evaluate the full [LongMemEval-S](https://github.com/xiaowu0162/LongMemEval)
-set (500 questions over 500 memories) and LoCoMo
-[Category 1–4](https://github.com/snap-research/locomo) (1,540 questions over
-10 conversations). LoCoMo Category 5 is excluded. GraphMem and the archived
-Mem0 baseline use Qwen3-30B; all answers are judged by the pinned
-`gpt-5.6-luna` prompts. Accuracy is end-to-end answer accuracy, not retrieval
-recall.
-
-| Benchmark | System | Retrieval budget | Accuracy | Mean build Token | Mean answer Token |
-|---|---|---:|---:|---:|---:|
-| LongMemEval-S | GraphMem V5.63 | 32 turns | **75.40%** | **189,297** | 6,191 |
-| LongMemEval-S | Mem0 baseline | top-50 | 56.80% | 2,461,197 | **5,202** |
-| LongMemEval-S | GraphMem V5.63 | 64 turns | **79.20%** | **189,297** | **9,199** |
-| LongMemEval-S | Mem0 baseline | top-200 | 57.60% | 2,461,197 | 11,761 |
-| LoCoMo Cat. 1–4 | GraphMem V5.63 | 32 turns | **83.70%** | **75,243** | **3,220** |
-| LoCoMo Cat. 1–4 | Mem0 baseline | top-50 | 67.66% | 5,318,818 | 5,514 |
-| LoCoMo Cat. 1–4 | GraphMem V5.63 | 64 turns | **86.23%** | **75,243** | **5,724** |
-| LoCoMo Cat. 1–4 | Mem0 baseline | top-200 | 68.31% | 5,318,818 | 13,515 |
-
-The 32-turn/top-50 and 64-turn/top-200 rows are approximate retrieval-budget
-operating points, not claims that their prompts contain exactly the same number
-of tokens.
-
-| Matched comparison | Accuracy gain | Build Token saving | Answer Token saving |
-|---|---:|---:|---:|
-| LongMemEval-S: 32 turns vs top-50 | **+18.60 pp (+32.75%)** | **92.31%** | -19.01% |
-| LongMemEval-S: 64 turns vs top-200 | **+21.60 pp (+37.50%)** | **92.31%** | **21.78%** |
-| LoCoMo: 32 turns vs top-50 | **+16.04 pp (+23.70%)** | **98.59%** | **41.60%** |
-| LoCoMo: 64 turns vs top-200 | **+17.92 pp (+26.24%)** | **98.59%** | **57.65%** |
-
-The percentage in parentheses is the relative accuracy uplift over the matched
-Mem0 baseline; `pp` is the absolute percentage-point gain.
-`-19.01%` means the LongMemEval-S 32-turn GraphMem prompt costs 19.01% more
-answer Token than Mem0 top-50; it is retained to show the complete comparison.
-Build Token means are per LongMemEval memory and per LoCoMo conversation.
-Answer Token means are per question. Build values count generative API input +
-output tokens and exclude embeddings and judge calls; one GraphMem build is
-shared by its 32-turn and 64-turn query runs. Answer values count prompt +
-completion tokens with a 2,000-token completion ceiling.
-
-The exact p95/p99/max values, per-type accuracy and verdict hashes are generated
-by [`scripts/build_v5_63_report_accuracy.py`](scripts/build_v5_63_report_accuracy.py).
-The frozen V5.63 report manifest has SHA-256
-`57c5e01d9cc4352e862c0343d5819281d4008bbca3289f2a184415e23e9caa11`.
-The previous V5.54 result contract remains available as a historical snapshot
-in [`docs/results/v5_54_qwen30b.json`](docs/results/v5_54_qwen30b.json).
-
-## Reproduce V5.63
-
-### 1. Install
-
-Python 3.11 or newer is required.
+支持 Python 3.11+、Linux。服务调用外部兼容接口，本身无需 GPU。
 
 ```bash
-git clone https://github.com/Concyclics/GraphMem.git
-cd GraphMem
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev,dense,experiment]"
-cp .env.example .env
+python -m pip install '.[service]'
+
+# 无模型的持久化 / API 联调：省略语义抽取与向量召回
+graphmem serve --offline --data-dir ./data/graphmem --port 8090
 ```
 
-Benchmark datasets are not redistributed. Prepare the official datasets as:
+**持久化默认开启**，数据保存在 `--data-dir`，重启时使用同一路径即可继续读取。`--offline` 仅用于联调；下面是完整方案的启动方式：
+
+1. 准备 chat-completions 与 embeddings 服务，编辑 [config/memory-service.json](config/memory-service.json) 中的模型名、地址和数据目录。
+2. 准备与 `llm_model` 匹配的本地 `tokenizer.json`，用于预算计数。
+3. 启动：
+
+```bash
+export GRAPHMEM_TOKENIZER_PATH=/models/qwen/tokenizer.json
+# 模型服务需要认证时，设置配置中 *_api_key_env 指定的环境变量
+graphmem check --config config/memory-service.json
+graphmem serve --config config/memory-service.json --port 8090
+```
+
+`check` 校验配置和 tokenizer，不发模型请求。默认只监听 `127.0.0.1`；跨主机部署需设置 `GRAPHMEM_API_KEY`，并使用 `--host 0.0.0.0`。Docker 持久卷示例见 [deploy/memory](deploy/memory/compose.yaml)。
+
+## HTTP 接入
+
+`X-Tenant-ID` 由产品后端确定。下例使用本地无认证服务；配置了服务密钥时，每个业务请求还需 `Authorization: Bearer <GRAPHMEM_API_KEY>`。
+
+```bash
+# 写入并同步建立索引；重试必须保留 request_id 和原始 payload
+curl -sS http://127.0.0.1:8090/v1/memories/alice/messages \
+  -H 'Content-Type: application/json' -H 'X-Tenant-ID: product-a' \
+  -d '{"request_id":"event-001","session_id":"chat-001","messages":[
+    {"role":"user","speaker":"Alice","timestamp":"2026-10-13",
+     "content":"I adopted a dog named Luna."}]}'
+
+# 返回原文证据与自适应召回 trace
+curl -sS http://127.0.0.1:8090/v1/memories/alice/retrieve \
+  -H 'Content-Type: application/json' -H 'X-Tenant-ID: product-a' \
+  -d '{"query":"What is the name of Alice\u0027s dog?"}'
+
+# 返回 messages、证据 ID、Prompt 哈希，可直接交给产品自身的 LLM
+curl -sS http://127.0.0.1:8090/v1/memories/alice/prepare \
+  -H 'Content-Type: application/json' -H 'X-Tenant-ID: product-a' \
+  -d '{"query":"What is the name of Alice\u0027s dog?"}'
+```
+
+| API | 用途 |
+|---|---|
+| `GET /healthz` | 服务模式、配置标识、待重建数量 |
+| `GET /v1/memories/{id}` | 记忆状态、版本、消息数量 |
+| `POST /v1/memories/{id}/messages` | 幂等追加；成功返回 `status: ready` |
+| `POST /v1/memories/{id}/retrieve` | 仅返回检索证据 |
+| `POST /v1/memories/{id}/prepare` | 生成 V5.81 回答 Prompt，不调用回答模型 |
+| `POST /v1/memories/{id}/answer` | 生成答案；须配置 `generate_answers: true` |
+| `POST /v1/memories/{id}/rebuild` | 用 `{}` 请求重建持久化原文的图和向量 |
+
+## Python SDK
+
+```python
+from graphmem import MemoryService, ServiceConfig
+
+config = ServiceConfig.from_file("config/memory-service.json")
+# 本地联调可改为 ServiceConfig.offline("./data/graphmem")
+with MemoryService(config) as memory:
+    memory.add("alice", [{"role": "user", "speaker": "Alice",
+                          "content": "I adopted a dog named Luna."}],
+               tenant_id="product-a", session_id="chat-001", request_id="sdk-event-001")
+    request = memory.prepare("alice", "What is the name of Alice's dog?",
+                             tenant_id="product-a")
+    messages = list(request.messages)  # 产品 LLM 的 messages 参数
+    print(request.evidence_turn_ids, request.prompt_payload_hash)
+```
+
+可直接运行的无模型示例：[examples/persistent_memory.py](examples/persistent_memory.py)。
+
+## 数据保留与恢复
+
+- 一个数据目录由一个服务进程独占；同步写入和查询串行执行，写入后即可读取新版本。SDK 与 HTTP 服务不能同时打开同一目录。大批量写入建议每次提交一个会话片段。
+- 原文及幂等记录先提交，随后建图 / 索引。模型失败时返回 `503`，原文仍在磁盘，记忆为 `pending`；恢复模型后重试同一请求或调用 `rebuild`。待重建记忆的查询返回 `409`，避免混用不同版本。
+- Docker 必须保留 `/var/lib/graphmem` 持久卷。`memory.sqlite` 是权威数据；`compiled/`、`dense/`、`query_embeddings.sqlite` 是可重建缓存。
+- 在线备份：`graphmem backup --data-dir ./data/graphmem --output ./memory-backup.sqlite`。恢复时停止服务，将备份放入**新的空目录**并命名为 `memory.sqlite`，使用相同模型 / 构建配置启动。不要只复制运行中的 SQLite 主文件而遗漏 WAL。
+- 服务密钥是后端间认证；产品网关须从登录身份派生租户 ID，并负责用户权限与 TLS。API 不应直接开放给终端用户。
+
+## 代码与验证
 
 ```text
-<workspace>/GraphMem/                         # this repository
-<workspace>/artifacts/data/longmemeval_s_cleaned.json
-<workspace>/artifacts/data/locomo10_graphmem.json
-<workspace>/third_party/memory-benchmarks/    # Mem0 judge prompts
+src/graphmem/service/       SDK、HTTP、CLI、随 wheel 发布的产品配置
+src/graphmem/build/         建图与原子信息抽取
+src/graphmem/retrieval/     QueryIR、自适应召回、证据打包
+src/graphmem/answer/        V5.81 Prompt 与回答策略
+config/memory-service.json 产品启动配置
+test/                      核心与服务回归测试
+scripts/、configs/v5/       历史研究、消融和评测入口
 ```
-
-The LoCoMo conversion must preserve conversation, session, speaker, timestamp
-and Category 1–4 question IDs. Gold turn annotations used only for retrieval
-auditing are versioned in `eval_annotations/`; they are never passed to the
-retriever or answer model.
-
-### 2. Start local model endpoints
-
-Expose OpenAI-compatible endpoints with these frozen models:
-
-```text
-http://127.0.0.1:8001/v1  Qwen/Qwen3-Embedding-0.6B
-http://127.0.0.1:8002/v1  Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
-```
-
-The managed local workflow can be checked with:
 
 ```bash
-scripts/smoke_longmemeval.sh up
-scripts/smoke_longmemeval.sh run
+python -m pip install '.[dev,service]'
+python -m pytest -q
+python examples/persistent_memory.py --data-dir ./data/example-memory
 ```
 
-### 3. Rebuild all 510 memories
-
-```bash
-mkdir -p ../artifacts/report/v5_57/full/graph
-
-python scripts/run_v5_6_full_build.py \
-  --target-db ../artifacts/report/v5_57/full/graph/graphmem.sqlite \
-  --relation-embedding-db ../artifacts/report/v5_57/full/graph/relation_embeddings.sqlite \
-  --lme ../artifacts/data/longmemeval_s_cleaned.json \
-  --locomo ../artifacts/data/locomo10_graphmem.json \
-  --gold eval_annotations/longmemeval_v5_dev100_gold_turns.jsonl \
-  --config configs/v5/v5_57_lossless_atomic.json --profile b5 \
-  --embedding --embedding-request-model Qwen3-Embedding-0.6B \
-  --memory-workers 8 --max-concurrency 256 \
-  --require-zero-retries --require-complete-diagnostics \
-  --report ../artifacts/report/v5_57/full/build_report.json
-
-python scripts/precompile_dense_indexes.py \
-  --db ../artifacts/report/v5_57/full/graph/graphmem.sqlite \
-  --config configs/v5/v5_57_lossless_atomic.json \
-  --output ../artifacts/report/v5_57/full/dense_indexes \
-  --backend faiss_flat --workers 16
-```
-
-V5.63 shares this single V5.57 lossless graph build across both query budgets.
-The runner is resumable by graph version and exact LLM-call cache. A valid full
-build has 510/510 published memories, zero SDK retries, complete diagnostics
-and no memory above the configured 230K generative-token gate. The convenience
-runner [`scripts/run_v5_57_full_benchmark.sh`](scripts/run_v5_57_full_benchmark.sh)
-automates build, FAISS precompilation and the frozen pre-V5.63 answer arms.
-
-### 4. Run the 32-turn and 64-turn answer arms
-
-```bash
-for budget in 32 64; do
-  if [ "$budget" = 32 ]; then
-    runtime=configs/v5/runtime_v5_63_selective32.json
-  else
-    runtime=configs/v5/runtime_v5_59_hybrid64.json
-  fi
-
-  python scripts/run_v5_6_answer.py \
-    --source-db ../artifacts/report/v5_57/full/graph/graphmem.sqlite \
-    --relation-embedding-db ../artifacts/report/v5_57/full/graph/relation_embeddings.sqlite \
-    --output-root ../artifacts/repro/v5_63/turn${budget} \
-    --run-root ../artifacts/repro/v5_63/turn${budget}/answer \
-    --lme ../artifacts/data/longmemeval_s_cleaned.json \
-    --locomo ../artifacts/data/locomo10_graphmem.json \
-    --gold eval_annotations/longmemeval_v5_dev100_gold_turns.jsonl \
-    --config configs/v5/v5_57_lossless_atomic.json \
-    --runtime-config "$runtime" --answer-policy v5_63 \
-    --embedding --embedding-request-model Qwen3-Embedding-0.6B --full \
-    --answer-model Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
-    --answer-base-url http://127.0.0.1:8002/v1 \
-    --answer-request-profile qwen --max-output-tokens 2000 \
-    --answer-workers 256 --navigate-workers 32 \
-    --label v563_qwen30b_turn${budget} --resume
-done
-```
-
-Runtime JSON is the authority for the evidence budget, QueryIR, hierarchy,
-FAISS and traversal settings. The 32-turn profile is frozen directly as V5.63;
-the 64-turn profile retains the validated V5.59 retrieval layout and applies
-the V5.63 selective readout in core code. The archived 64-turn paper artifact
-was also independently composed from frozen full-corpus arms with
-[`scripts/materialize_v5_63_selective_accuracy.py`](scripts/materialize_v5_63_selective_accuracy.py).
-That audit changed 75/2,040 prompts, used no prediction, gold label, category or
-judge result for routing, and added only 2.51 mean prompt tokens over all
-questions. The end-to-end 32-turn answer and paired-judge workflow is available
-as [`scripts/run_v5_63_selective32_full.sh`](scripts/run_v5_63_selective32_full.sh).
-
-### 5. Judge and audit
-
-With `SGAO_API_KEY` and `SGAO_BASE_URL` set in the ignored `.env`, judge each
-arm using the pinned prompts:
-
-```bash
-python scripts/evaluate_mem0_judge.py \
-  --answers ../artifacts/repro/v5_63/turn64/answer/answers.jsonl \
-  --output-dir ../artifacts/repro/v5_63/turn64/answer/judge_longmemeval \
-  --model gpt-5.6-luna --api-key-env SGAO_API_KEY \
-  --request-profile openai --workers 32 --resume
-
-python scripts/evaluate_memory_benchmarks_locomo_judge.py \
-  --data ../artifacts/data/locomo10_graphmem.json \
-  --answers ../artifacts/repro/v5_63/turn64/answer/answers.jsonl \
-  --output-dir ../artifacts/repro/v5_63/turn64/answer/judge_locomo \
-  --memory-benchmarks-repo ../third_party/memory-benchmarks \
-  --model gpt-5.6-luna --api-key-env SGAO_API_KEY \
-  --request-profile openai --workers 32 --resume
-```
-
-Repeat for `turn32`. Percentiles use nearest rank, `ceil(p * N) - 1`.
-Generate the final report contract only from completed, audited artifacts:
-
-```bash
-python scripts/build_v5_63_report_accuracy.py \
-  --v563-root ../artifacts/report/v5_63/selective64_v3 \
-  --v563-32-root ../artifacts/report/v5_63/selective32_v1 \
-  --output ../artifacts/report/v5_63/latest_accuracy/summary.json
-```
-
-The builder verifies question counts, verdict IDs, token additivity, nearest-rank
-statistics, answer hashes and the shared build ledger before publishing the
-manifest. V5.54 structural factorial results remain documented in
-[`docs/V5_54_INDEX_STRUCTURE_ABLATION.md`](docs/V5_54_INDEX_STRUCTURE_ABLATION.md).
-
-## Tests
-
-```bash
-python -m pytest test/ -q
-```
-
-Unit tests use synthetic fixtures and do not require benchmark data or model
-services. The current implementation passes all 626 tests (2026-10-09);
-this is a code-validation result, not a new full-benchmark run.
-
-## Repository layout
-
-```text
-src/graphmem/   graph construction, storage, retrieval, answer and serving
-configs/v5/     frozen build and runtime profiles
-scripts/        resumable benchmark, audit and rendering entrypoints
-test/           unit and contract tests
-docs/           design, deployment, result and ablation notes
-```
+历史 V5.63 指标及复现命令移至 [BENCHMARKS.md](docs/BENCHMARKS.md)。本次交付整合已有优化并验证服务行为，未重新运行全量付费 benchmark；历史指标不能直接视为该在线组合的重新验收结果。现有路由规则主要按英文对话验证，其他语言需产品场景评测。

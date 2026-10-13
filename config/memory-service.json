@@ -1,0 +1,17 @@
+{
+  "data_dir": "../data/graphmem",
+  "semantic_build": true,
+  "dense_retrieval": true,
+  "generate_answers": false,
+  "require_exact_tokenizer": true,
+  "llm_model": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+  "llm_base_url": "http://127.0.0.1:8002/v1",
+  "llm_api_key_env": "",
+  "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+  "embedding_base_url": "http://127.0.0.1:8001/v1",
+  "embedding_api_key_env": "",
+  "request_profile": "qwen",
+  "answer_request_profile": "qwen",
+  "max_output_tokens": 512,
+  "readout": "v5_81"
+}
