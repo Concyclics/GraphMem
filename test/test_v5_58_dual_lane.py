@@ -13,9 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_v558_dual_lane_profiles_only_change_evidence_budget() -> None:
     turn64 = load_runtime_config(
-        ROOT / "configs/v5/runtime_v5_58_dual64.json")
+        ROOT / "test/fixtures/profiles/runtime_v5_58_dual64.json")
     turn128 = load_runtime_config(
-        ROOT / "configs/v5/runtime_v5_58_dual128.json")
+        ROOT / "test/fixtures/profiles/runtime_v5_58_dual128.json")
 
     assert turn64.retrieval.dual_lane_packing
     assert turn64.retrieval.dual_lane_precision_head == 32

@@ -9,9 +9,6 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RAW = Path(
-    "/mnt/ssd1/yongan/Resources/RefRepos/locomo_benchmark/locomo/data/locomo10.json"
-)
 
 
 def _session_numbers(conversation: dict[str, Any]) -> list[int]:
@@ -122,7 +119,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert the official LoCoMo 10-conversation JSON to GraphMem cases."
     )
-    parser.add_argument("--input", type=Path, default=DEFAULT_RAW)
+    parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=ROOT / "data/locomo10_graphmem.json")
     args = parser.parse_args()
 

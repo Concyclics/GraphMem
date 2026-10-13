@@ -205,7 +205,8 @@ class AnswerConfig:
 
         Retrieval budgets stay outside this answer-only configuration.  The
         matching query-plane values live in
-        ``configs/v5/runtime_v5_54_accuracy64.json``.
+        the package's service profile; historical regression samples live in
+        ``test/fixtures/profiles/``.
         """
 
         values = {

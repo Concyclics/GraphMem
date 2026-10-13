@@ -25,6 +25,13 @@ MESSAGES = [{"role": "user", "speaker": "Alice", "timestamp": "2026-10-13",
 QUESTION = "What is the name of Alice's dog?"
 
 
+def test_retired_storage_backend_is_rejected_instead_of_silently_ignored(tmp_path):
+    config = ServiceConfig(data_dir=str(tmp_path),
+                           build_overrides={"storage": {"neo4j_enabled": True}})
+    with pytest.raises(ValueError, match="sqlite_snapshot"):
+        config.profiles()
+
+
 def add(service, *, tenant="team-a", request="event-1", messages=None, session="chat-1"):
     return service.add("alice", MESSAGES if messages is None else messages, tenant_id=tenant,
                        session_id=session, request_id=request)

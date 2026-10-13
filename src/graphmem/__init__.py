@@ -1,6 +1,6 @@
 """GraphMem persistent Memory SDK and versioned graph contracts."""
 
-__version__ = "5.81.0"
+__version__ = "5.81.1"
 
 from .config import (
     CacheIdentity,

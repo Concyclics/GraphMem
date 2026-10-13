@@ -67,9 +67,9 @@ def _scene(scene_id: str, *, covered: int, total: int, missing: int = 0,
 
 
 def test_v557_profiles_enable_fresh_projection_and_guarded_priority() -> None:
-    build = load_config(ROOT / "configs/v5/v5_57_lossless_atomic.json")
-    runtime = load_runtime_config(ROOT / "configs/v5/runtime_v5_57_accuracy64.json")
-    runtime32 = load_runtime_config(ROOT / "configs/v5/runtime_v5_57_accuracy32.json")
+    build = load_config(ROOT / "test/fixtures/profiles/v5_57_lossless_atomic.json")
+    runtime = load_runtime_config(ROOT / "test/fixtures/profiles/runtime_v5_57_accuracy64.json")
+    runtime32 = load_runtime_config(ROOT / "test/fixtures/profiles/runtime_v5_57_accuracy32.json")
 
     assert build.projection_profile == "R3"
     assert build.models.semantic_adaptive_fact_cap
@@ -89,7 +89,7 @@ def test_v557_profiles_enable_fresh_projection_and_guarded_priority() -> None:
 
 
 def test_projection_profile_is_part_of_graph_identity() -> None:
-    config = load_config(ROOT / "configs/v5/v5_57_lossless_atomic.json")
+    config = load_config(ROOT / "test/fixtures/profiles/v5_57_lossless_atomic.json")
 
     assert config_hash(config) != config_hash(replace(config, projection_profile="P0"))
 

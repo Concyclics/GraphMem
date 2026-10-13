@@ -1,0 +1,13 @@
+# Verified LoCoMo client/test environment: Python 3.11.15.
+# Install with: pip install -c config/reproduction-constraints.txt '.[service,dev]'
+numpy==2.4.6
+openai==2.53.0
+PyYAML==6.0.3
+tokenizers==0.23.1
+faiss-cpu==1.15.0
+hnswlib==0.8.0
+httpx==0.28.1
+pydantic==2.13.4
+pytest==9.1.1
+pytest-asyncio==1.4.0
+hypothesis==6.165.2
