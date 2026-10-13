@@ -1,12 +1,2 @@
-openai>=1.0.0
-pytest
-numpy
-pandas
-tqdm
-rank-bm25
-networkx
-transformers
-sentencepiece
-llmlingua
-
-python-dotenv>=1.0.1
+# Product dependencies have one source of truth in pyproject.toml.
+.[service]

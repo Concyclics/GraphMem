@@ -1609,6 +1609,8 @@ class AnswerStage:
                 "chat_template_kwargs": {"enable_thinking": False}}
         elif self.answer_request_profile == "openai":
             request["reasoning_effort"] = self.answer_reasoning_effort
+        if self.answer_config.sampling_frequency_penalty:
+            request["frequency_penalty"] = self.answer_config.sampling_frequency_penalty
         if self.answer_config.max_output_tokens is not None:
             output_key = ("max_completion_tokens"
                           if (self.answer_request_profile == "openai"
@@ -1639,6 +1641,8 @@ class AnswerStage:
         # every reasoning arm owns a disjoint answer cache entry.
         if self.answer_reasoning_effort != "none":
             answer_identity["reasoning_effort"] = self.answer_reasoning_effort
+        if self.answer_config.sampling_frequency_penalty:
+            answer_identity["frequency_penalty"] = self.answer_config.sampling_frequency_penalty
         identity = CacheIdentity(
             self.dataset_hash, self.answer_model, prompt_hash,
             self.config.schema_version,

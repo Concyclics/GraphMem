@@ -1,4 +1,4 @@
-# 产品集成契约（5.81.0）
+# 产品集成契约（5.81.1）
 
 主入口为 `graphmem.MemoryService`；HTTP adapter 与 SDK 使用相同路径。安装 wheel 后可在任意工作目录运行 `graphmem` 或 `python -m graphmem`，不需要复制 `scripts/`、研究数据库或数据集。
 
@@ -17,7 +17,8 @@
 | `request_profile` | 构建接口：`qwen` / `openai` |
 | `answer_request_profile` | 回答接口：`qwen` / `openai` / `omit`（不发厂商专有参数） |
 | `answer_reasoning_effort` | `none`；仅 `openai` profile 接受其他档位 |
-| `max_output_tokens` | `512`；回答输出上限 |
+| `max_output_tokens` | `2000`；回答输出上限，实际开支由 API usage 决定 |
+| `answer_frequency_penalty` | `0.2`；Qwen profile 按生成次数抑制重复，防止循环输出；其他 profile 默认不发送此参数 |
 | `model_timeout_seconds` | `180`；底层模型单次调用超时，现有 SDK 层有有限重试 |
 | `build_overrides` | 对随包构建配置按节覆盖，如 `models`、`coarsen`、`edges` |
 | `runtime_overrides` | 对随包运行配置按节覆盖，如 `retrieval`、`query_budget` |
@@ -28,7 +29,7 @@
 
 32/64/80 是图检索容量，2,200/3,800/4,500 是该阶段的 evidence-token 预算，均不等于最终完整 Prompt 的大小。最终图式 Prompt 包含辅助来源和指令，受 `query_budget.max_answer_tokens_hard`（默认 13,000）约束；先减少 source-focus，仍超限则保留已受限的 V5.73 Prompt，并在 `trace.optimized_readout.fallback` 标记。`/retrieve` 返回图检索；`/prepare` 返回最终回答所用证据与 Prompt。
 
-本组合按在线自适应结果呈现，未承诺与某一冻结 benchmark Prompt 逐字节相同。历史 Best-of-N oracle、previous-answer verifier、多次回答合并等研究路径不自动作为产品默认路由；需要时可使用 `answer/ensemble.py`、`budget_controller.py`、`incremental.py` 与相应实验脚本。
+本组合按在线自适应结果呈现，未承诺与某一冻结 benchmark Prompt 逐字节相同。历史 Best-of-N oracle、previous-answer verifier、多次回答合并等研究路径不自动作为产品默认路由；这些废弃实验路径已移出当前代码树，历史版本可从 Git 恢复。
 
 ## 请求与一致性
 
@@ -65,4 +66,4 @@ docker compose -f deploy/memory/compose.yaml up -d --build
 
 单元 / 集成测试覆盖持久化重开、租户隔离、并发幂等、索引失败恢复、写后读、备份恢复、Prompt 证据不丢失、HTTP 认证及错误映射；模型路径使用确定性的测试客户端，不产生外部 API 费用。产品上线前仍需在实际模型、数据、语言与流量上验证质量和吞吐。
 
-本次交付验证（2026-10-13）：651 项测试通过；独立 wheel 安装后，在仓库外完成 HTTP 写入 / Prompt、SIGKILL 后重启、幂等重试、在线备份与新目录恢复。Docker Compose 配置校验通过；当前账户没有 Docker daemon 访问权限，镜像构建与容器运行未实测。
+验证包含核心 / 服务回归测试，以及实际本地模型的持久化服务联调和 LoCoMo 复现。复现配置、成绩和 Token 口径见 [REPRODUCTION.md](REPRODUCTION.md)。Docker Compose 可用于部署；本机无 Docker daemon 权限，容器构建未实测。

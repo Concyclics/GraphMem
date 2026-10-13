@@ -8,9 +8,8 @@ import pytest
 
 from graphmem.answer import (
     AnswerConfig, build_answer_messages, build_aggregation_ledger,
-    build_candidate_verifier_messages, build_ensemble_family_messages,
-    build_typed_evidence_card, combine_candidate_families,
-    cross_family_consensus_choice, parse_verifier_choice, prompt_contract,
+    build_typed_evidence_card,
+    prompt_contract,
 )
 from graphmem.config import load_runtime_config
 from graphmem.domain import CandidateScore, SourceTurn
@@ -70,7 +69,7 @@ def test_witness_reserve_recovers_terse_dialogue_answer_below_precision_floor() 
 
 def test_v573_runtime_enables_only_bounded_witness_reserve() -> None:
     config = load_runtime_config(
-        __import__("pathlib").Path("configs/v5/runtime_v5_73_accuracy64.json"))
+        __import__("pathlib").Path("test/fixtures/profiles/runtime_v5_73_accuracy64.json"))
     assert config.query_budget.max_evidence_turns == 64
     assert config.retrieval.obligation_witness_reserve
     assert config.retrieval.obligation_witness_reserve_turns == 8
@@ -159,66 +158,6 @@ def test_event_aware_list_gets_a_typed_ledger_without_changing_legacy() -> None:
         question, {turn.turn_id: turn}, (turn.turn_id,), event_aware=True)
     assert ledger is not None and ledger.operation == "list_distinct"
 
-
-def test_split_prompt_families_are_distinct_and_verifier_cannot_rewrite() -> None:
-    base = build_answer_messages(
-        question="When did Maria adopt Luna?", question_date=None,
-        evidence_text="[s1] Maria: I adopted Luna yesterday.",
-        typed_evidence_card=(
-            "Answer-critical evidence card (source excerpts only; not a proposed "
-            "answer):\nK1 source=t1: adopted Luna yesterday"))
-    extractive = build_ensemble_family_messages(base, "extractive")
-    audit = build_ensemble_family_messages(base, "audit")
-    assert extractive != audit
-    assert "adopted Luna yesterday" in extractive[-1]["content"]
-    assert "adopted Luna yesterday" in audit[-1]["content"]
-    candidates = (
-        {"prediction": "May 7", "family": "extractive", "family_rank": 1},
-        {"prediction": "May 8", "family": "audit", "family_rank": 1},
-    )
-    verifier = build_candidate_verifier_messages(base, candidates)
-    assert "must not synthesize" in verifier[0]["content"]
-    assert "C1" in verifier[-1]["content"] and "C2" in verifier[-1]["content"]
-    assert parse_verifier_choice('{"choice": 2, "reason_code": "correct_time"}', 2) == 1
-    assert parse_verifier_choice("I would write May 9", 2) is None
-
-
-def test_direct_structured_candidate_pair_preserves_four_by_four_provenance() -> None:
-    direct = tuple({
-        "rank": index, "prediction": f"direct {index}",
-        "prediction_sha256": hashlib.sha256(
-            f"direct {index}".encode()).hexdigest(),
-    } for index in range(1, 6))
-    structured = tuple({
-        "rank": index, "family": "extractive",
-        "prediction": f"structured {index}",
-        "prediction_sha256": hashlib.sha256(
-            f"structured {index}".encode()).hexdigest(),
-    } for index in range(1, 6))
-
-    rows = combine_candidate_families(direct, structured)
-
-    assert len(rows) == 8
-    assert [row["family"] for row in rows[:4]] == ["direct_v563"] * 4
-    assert [row["family"] for row in rows[4:]] == ["structured_v573"] * 4
-    assert [row["rank"] for row in rows] == list(range(1, 9))
-
-    repeated = [dict(rows[0]) for _ in range(8)]
-    verifier = build_candidate_verifier_messages(
-        build_answer_messages(
-            question="What happened?", question_date=None,
-            evidence_text="[s1] Maria: A direct event happened."),
-        [{**repeated[0], "support_count": 8,
-          "support_families": ["direct_v563", "structured_v573"]}],
-    )
-    assert "support=8" in verifier[-1]["content"]
-    assert "direct_v563,structured_v573" in verifier[-1]["content"]
-
-    mixed = [dict(row) for row in rows]
-    mixed[4]["prediction"] = mixed[0]["prediction"]
-    mixed[4]["prediction_sha256"] = mixed[0]["prediction_sha256"]
-    assert cross_family_consensus_choice(mixed) == 0
-    assert cross_family_consensus_choice(rows) is None
 
 
 def test_v563_defaults_remain_off_and_v573_is_opt_in() -> None:

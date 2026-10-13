@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
     "runtime_v5_11_report_8w.json",
 ])
 def test_runtime_profiles_load_and_translate_to_online_options(name: str) -> None:
-    config = load_runtime_config(ROOT / "configs/v5" / name)
+    config = load_runtime_config(ROOT / "test/fixtures/profiles" / name)
     navigator = config.retrieval.navigator_options()
     pool = config.serving.pool_options()
 
@@ -48,7 +48,7 @@ def test_runtime_profiles_load_and_translate_to_online_options(name: str) -> Non
 
 def test_v5_17_accuracy_profile_keeps_wider_evidence_budget() -> None:
     config = load_runtime_config(
-        ROOT / "configs/v5/runtime_v5_17_accuracy64.json")
+        ROOT / "test/fixtures/profiles/runtime_v5_17_accuracy64.json")
 
     assert config.profile == "v5_17_accuracy64"
     assert config.query_budget.max_evidence_turns == 64
@@ -67,7 +67,7 @@ def test_v5_17_accuracy_profile_keeps_wider_evidence_budget() -> None:
 
 def test_v5_54_accuracy64_profile_freezes_the_winner_query_path() -> None:
     config = load_runtime_config(
-        ROOT / "configs/v5/runtime_v5_54_accuracy64.json")
+        ROOT / "test/fixtures/profiles/runtime_v5_54_accuracy64.json")
 
     assert config.profile == "v5_54_accuracy64"
     assert config.query_budget.max_evidence_turns == 64
@@ -88,7 +88,7 @@ def test_v5_54_accuracy64_profile_freezes_the_winner_query_path() -> None:
 
 def test_runtime_profile_matches_report_pareto_worker_configuration() -> None:
     config = load_runtime_config(
-        ROOT / "configs/v5/runtime_v5_11_report_8w.json")
+        ROOT / "test/fixtures/profiles/runtime_v5_11_report_8w.json")
     assert config.serving.workers == 8
     assert config.serving.worker_cpu_ids == tuple(range(8))
     assert config.serving.affinity_replicas == 2

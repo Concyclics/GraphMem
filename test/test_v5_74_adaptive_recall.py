@@ -213,7 +213,7 @@ def test_adaptive_recall_expands_tokens_only_after_observed_cap() -> None:
 
 def test_v574_runtime_declares_baseline_and_hard_caps() -> None:
     config = load_runtime_config(
-        Path("configs/v5/runtime_v5_74_adaptive64.json"))
+        Path("test/fixtures/profiles/runtime_v5_74_adaptive64.json"))
     assert config.retrieval.adaptive_recall
     assert config.retrieval.adaptive_recall_base_turns == 64
     assert config.retrieval.adaptive_recall_medium_turns == 80
@@ -226,7 +226,7 @@ def test_v574_runtime_declares_baseline_and_hard_caps() -> None:
 
 def test_v576_runtime_declares_independent_turn_and_token_tiers() -> None:
     config = load_runtime_config(
-        Path("configs/v5/runtime_v5_76_adaptive_budget.json"))
+        Path("test/fixtures/profiles/runtime_v5_76_adaptive_budget.json"))
     retrieval = config.retrieval
     assert retrieval.adaptive_recall_in_budget_repair
     assert retrieval.adaptive_recall_repair_minimum_severity == 2

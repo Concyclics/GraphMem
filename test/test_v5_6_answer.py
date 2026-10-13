@@ -1345,6 +1345,22 @@ def test_best_of_sampling_parameters_are_sent_and_isolate_cache(tmp_path) -> Non
     store.close()
 
 
+def test_qwen_repetition_guard_invalidates_cached_unpenalized_output(tmp_path) -> None:
+    store = _store(tmp_path, ["I adopted a beagle named Rex."])
+    client = _FakeClient("Rex")
+    result = _result([turn.turn_id for turn in store.turns("m")])
+    original = _stage(store, client, answer_config=AnswerConfig())
+    guarded = _stage(store, client, answer_config=AnswerConfig(sampling_frequency_penalty=0.2))
+    original.answer("q", "What is the dog called?", result, QueryBudget())
+    guarded.answer("q", "What is the dog called?", result, QueryBudget())
+    replay = guarded.answer("q", "What is the dog called?", result, QueryBudget())
+    assert len(client.requests) == 2
+    assert "frequency_penalty" not in client.requests[0]
+    assert client.requests[1]["frequency_penalty"] == 0.2
+    assert replay.cached
+    store.close()
+
+
 def test_an_explicit_output_cap_is_sent_only_for_an_ablation(tmp_path) -> None:
     store = _store(tmp_path, ["I adopted a beagle named Rex."])
     client = _FakeClient("Rex")

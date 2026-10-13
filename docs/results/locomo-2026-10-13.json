@@ -1,0 +1,597 @@
+{
+  "schema": "graphmem-locomo-product-release-v1",
+  "release_version": "5.81.1",
+  "date": "2026-10-13",
+  "generated_at_utc": "2026-10-13T05:26:43.167046+00:00",
+  "evaluated_implementation_sha256": "a8698375cca22224106ce53087db1ddba43c220b635208beb2f2cc1758faaf45",
+  "protocol": {
+    "dataset": "LoCoMo 10 conversations, categories 1-4, 1540 questions; category 5 excluded",
+    "dataset_sha256": "92823d71d378367c512083337eb10183668d8d38e0fa3c5f47af6cd3a6527c7e",
+    "judge_repository": "https://github.com/mem0ai/memory-benchmarks",
+    "judge_repository_commit": "4b61c5d31b9c668a12b4f5e78064248a02c82d2b",
+    "judge_template_sha256": "8ebac1ef60e9ab5caf99079fdaac038b85472e81491ed35e2d2655f3927c76c2",
+    "answer_model": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+    "judge_model": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+    "judge_with_evidence": false,
+    "answer_sampling": {
+      "temperature": 0,
+      "seed": 0,
+      "n": 1,
+      "max_output_tokens": 2000,
+      "frequency_penalty": 0.2
+    },
+    "judge_sampling": {
+      "temperature": 0,
+      "seed": 0,
+      "max_tokens": 512,
+      "response_format": "json_object"
+    },
+    "judge_format_repair_attempts_max": 1,
+    "reference_answers_used_only_by_judge": true,
+    "product_embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+    "control_embedding_model": "BAAI/bge-m3 (historical frozen graph; not recomputed)",
+    "historical_luna_score_not_comparable": true,
+    "historical_candidate1": {
+      "correct": 1359,
+      "questions": 1540,
+      "judge": "Luna-medium",
+      "temperature": 0.7
+    }
+  },
+  "environment": {
+    "client": {
+      "python": "3.11.15",
+      "packages": {
+        "openai": "2.53.0",
+        "numpy": "2.4.6",
+        "tokenizers": "0.23.1",
+        "faiss-cpu": "1.15.0",
+        "hnswlib": "0.8.0"
+      }
+    },
+    "model_server": {
+      "python": "3.12.11",
+      "packages": {
+        "vllm": "0.23.0",
+        "torch": "2.11.0",
+        "transformers": "5.12.1"
+      },
+      "gpu": "NVIDIA H100 PCIe, 81559, 580.95.05, GPU-ebaa9e56-6745-01c7-7e91-7e7de189da53"
+    },
+    "gpu_index": 0,
+    "models": [
+      {
+        "model": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+        "snapshot": "5a5a776300a41aaa681dd7ff0106608ef2bc90db",
+        "port": 8002,
+        "command": [
+          "/home/chenhan/miniconda3/envs/vllm/bin/python",
+          "-m",
+          "vllm.entrypoints.openai.api_server",
+          "--model",
+          "/ssd1/chenhan/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507-FP8/snapshots/5a5a776300a41aaa681dd7ff0106608ef2bc90db",
+          "--served-model-name",
+          "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "8002",
+          "--max-model-len",
+          "16384",
+          "--gpu-memory-utilization",
+          "0.72",
+          "--max-num-seqs",
+          "64",
+          "--max-num-batched-tokens",
+          "16384",
+          "--generation-config",
+          "vllm"
+        ]
+      },
+      {
+        "model": "Qwen/Qwen3-Embedding-0.6B",
+        "snapshot": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
+        "port": 8001,
+        "command": [
+          "/home/chenhan/miniconda3/envs/vllm/bin/python",
+          "-m",
+          "vllm.entrypoints.openai.api_server",
+          "--model",
+          "/ssd1/chenhan/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
+          "--served-model-name",
+          "Qwen/Qwen3-Embedding-0.6B",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "8001",
+          "--max-model-len",
+          "16384",
+          "--gpu-memory-utilization",
+          "0.1",
+          "--max-num-seqs",
+          "64",
+          "--runner",
+          "pooling",
+          "--enforce-eager"
+        ]
+      }
+    ]
+  },
+  "lineage": {
+    "cold_build_and_retrieval": "runs/locomo-product",
+    "final_product_answer_and_judge": "runs/locomo-final",
+    "control_answer_and_judge": "runs/locomo-control-final",
+    "product_prompt_messages_unchanged_after_decoding_fix": true,
+    "changed_config_fields_after_cold_prepare": [
+      "answer_frequency_penalty",
+      "data_dir",
+      "max_output_tokens"
+    ],
+    "source_answer_cache_removed_before_final_replays": true,
+    "raw_source_audit": {
+      "cold": {
+        "turns": 5882,
+        "raw_sha256": "489a9e8ee5484904f37afb1fe88a19c46a2022d2ab9a2825e7f8a65efa77280c",
+        "nodes": 13659,
+        "edges": 23734
+      },
+      "historical": {
+        "turns": 5882,
+        "raw_sha256": "489a9e8ee5484904f37afb1fe88a19c46a2022d2ab9a2825e7f8a65efa77280c",
+        "nodes": 13640,
+        "edges": 23663
+      }
+    },
+    "build": {
+      "chat": {
+        "calls": 135,
+        "errors": 0,
+        "tokens": {
+          "prompt_tokens": 497341,
+          "completion_tokens": 367733,
+          "total_tokens": 865074
+        },
+        "truncated": 0
+      },
+      "embedding": {
+        "calls": 332,
+        "errors": 0,
+        "tokens": {
+          "prompt_tokens": 438176,
+          "completion_tokens": 0,
+          "total_tokens": 438176
+        },
+        "truncated": 0
+      },
+      "memories": [
+        {
+          "memory_id": "locomo:conv-30",
+          "graph_version": 1,
+          "turns": 369,
+          "reused_graph": false
+        },
+        {
+          "memory_id": "locomo:conv-26",
+          "graph_version": 1,
+          "turns": 419,
+          "reused_graph": false
+        },
+        {
+          "memory_id": "locomo:conv-42",
+          "graph_version": 1,
+          "turns": 629,
+          "reused_graph": false
+        },
+        {
+          "memory_id": "locomo:conv-41",
+          "graph_version": 1,
+          "turns": 663,
+          "reused_graph": false
+        },
+        {
+          "memory_id": "locomo:conv-43",
+          "graph_version": 1,
+          "turns": 680,
+          "reused_graph": false
+        },
+        {
+          "memory_id": "locomo:conv-44",
+          "graph_version": 1,
+          "turns": 675,
+          "reused_graph": false
+        },
+        {
+          "memory_id": "locomo:conv-47",
+          "graph_version": 1,
+          "turns": 689,
+          "reused_graph": false
+        },
+        {
+          "memory_id": "locomo:conv-48",
+          "graph_version": 1,
+          "turns": 681,
+          "reused_graph": false
+        },
+        {
+          "memory_id": "locomo:conv-49",
+          "graph_version": 1,
+          "turns": 509,
+          "reused_graph": false
+        },
+        {
+          "memory_id": "locomo:conv-50",
+          "graph_version": 1,
+          "turns": 568,
+          "reused_graph": false
+        }
+      ]
+    },
+    "control_is_frozen_prompt_replay_not_cold_build": true
+  },
+  "product": {
+    "expected_questions": 1540,
+    "answers": 1540,
+    "judged": 1540,
+    "correct": 1409,
+    "accuracy": 0.9149350649350649,
+    "by_category": {
+      "1": {
+        "correct": 256,
+        "total": 282,
+        "accuracy": 0.9078014184397163
+      },
+      "2": {
+        "correct": 284,
+        "total": 321,
+        "accuracy": 0.8847352024922118
+      },
+      "3": {
+        "correct": 71,
+        "total": 96,
+        "accuracy": 0.7395833333333334
+      },
+      "4": {
+        "correct": 798,
+        "total": 841,
+        "accuracy": 0.9488703923900119
+      }
+    },
+    "complete": true,
+    "judge_aligned_with_answers": true,
+    "full_locomo": true,
+    "truncated_answers": 0,
+    "empty_answers": 0,
+    "failed_api_attempts": 0,
+    "actual_api_usage": {
+      "answer/chat": {
+        "calls": 1531,
+        "errors": 0,
+        "missing_usage": 0,
+        "prompt_tokens": 8783336,
+        "completion_tokens": 42999,
+        "total_tokens": 8826335
+      },
+      "judge/chat": {
+        "calls": 1542,
+        "errors": 0,
+        "missing_usage": 0,
+        "prompt_tokens": 1171356,
+        "completion_tokens": 65355,
+        "total_tokens": 1236711
+      }
+    },
+    "api_token_accounting_complete": true,
+    "truncated_calls_by_phase": {},
+    "answer_tokens_per_question": {
+      "api_prompt_tokens": {
+        "count": 1540,
+        "sum": 8843140,
+        "mean": 5742.298701298701,
+        "p50": 6147,
+        "p95": 7139,
+        "p99": 7754,
+        "max": 8548
+      },
+      "completion_tokens": {
+        "count": 1540,
+        "sum": 43169,
+        "mean": 28.03181818181818,
+        "p50": 20,
+        "p95": 77,
+        "p99": 130,
+        "max": 272
+      },
+      "api_total_tokens": {
+        "count": 1540,
+        "sum": 8886309,
+        "mean": 5770.33051948052,
+        "p50": 6174,
+        "p95": 7169,
+        "p99": 7792,
+        "max": 8575
+      }
+    },
+    "cached_answers": 9,
+    "deterministic_answers": 0,
+    "budget_note": "Actual API ledger counts retries and cold build; cached answer metadata is not charged again. Judge is separate. No n-best oracle.",
+    "adaptive_turn_tiers": {
+      "64": 997,
+      "32": 492,
+      "80": 51
+    },
+    "adaptive_token_tiers": {
+      "3800": 866,
+      "2200": 623,
+      "4500": 51
+    },
+    "checks_pass": true
+  },
+  "control": {
+    "expected_questions": 1540,
+    "answers": 1540,
+    "judged": 1540,
+    "correct": 1416,
+    "accuracy": 0.9194805194805195,
+    "by_category": {
+      "1": {
+        "correct": 256,
+        "total": 282,
+        "accuracy": 0.9078014184397163
+      },
+      "2": {
+        "correct": 291,
+        "total": 321,
+        "accuracy": 0.9065420560747663
+      },
+      "3": {
+        "correct": 70,
+        "total": 96,
+        "accuracy": 0.7291666666666666
+      },
+      "4": {
+        "correct": 799,
+        "total": 841,
+        "accuracy": 0.9500594530321046
+      }
+    },
+    "complete": true,
+    "judge_aligned_with_answers": true,
+    "full_locomo": true,
+    "truncated_answers": 0,
+    "empty_answers": 0,
+    "failed_api_attempts": 0,
+    "actual_api_usage": {
+      "answer/chat": {
+        "calls": 1530,
+        "errors": 0,
+        "missing_usage": 0,
+        "prompt_tokens": 9307229,
+        "completion_tokens": 43309,
+        "total_tokens": 9350538
+      },
+      "judge/chat": {
+        "calls": 1541,
+        "errors": 0,
+        "missing_usage": 0,
+        "prompt_tokens": 1170902,
+        "completion_tokens": 64655,
+        "total_tokens": 1235557
+      }
+    },
+    "api_token_accounting_complete": true,
+    "truncated_calls_by_phase": {},
+    "answer_tokens_per_question": {
+      "api_prompt_tokens": {
+        "count": 1540,
+        "sum": 9371272,
+        "mean": 6085.2415584415585,
+        "p50": 6283,
+        "p95": 7075,
+        "p99": 7413,
+        "max": 8003
+      },
+      "completion_tokens": {
+        "count": 1540,
+        "sum": 43500,
+        "mean": 28.246753246753247,
+        "p50": 21,
+        "p95": 82,
+        "p99": 127,
+        "max": 345
+      },
+      "api_total_tokens": {
+        "count": 1540,
+        "sum": 9414772,
+        "mean": 6113.488311688312,
+        "p50": 6314,
+        "p95": 7099,
+        "p99": 7434,
+        "max": 8052
+      }
+    },
+    "cached_answers": 10,
+    "deterministic_answers": 0,
+    "budget_note": "Actual API ledger counts retries and cold build; cached answer metadata is not charged again. Judge is separate. No n-best oracle.",
+    "adaptive_turn_tiers": {},
+    "adaptive_token_tiers": {},
+    "checks_pass": true
+  },
+  "paired": {
+    "schema_version": "graphmem-v5.21-paired-judge-merge-v1",
+    "benchmark_filter": null,
+    "identity_field": "prediction",
+    "questions": 1540,
+    "correct": 1408,
+    "accuracy": 0.9142857142857143,
+    "baseline_correct": 1416,
+    "baseline_accuracy": 0.9194805194805195,
+    "accuracy_delta": -0.005194805194805195,
+    "gains": 37,
+    "losses": 45,
+    "stable_correct": 1371,
+    "stable_wrong": 87,
+    "mcnemar_exact_p": 0.4397054291858219,
+    "changed_fresh": 872,
+    "delta_verdicts_available": 1540,
+    "carried_identical": 668,
+    "output": "runs/locomo-paired/judge.jsonl"
+  },
+  "comparison": {
+    "raw_accuracy_delta_pp": -0.4545454545454519,
+    "paired_accuracy_delta_pp": -0.5194805194805194,
+    "answer_tokens_per_question_delta_percent": -5.61312584096566,
+    "answer_tokens_comparison_uses_logical_per_question_usage_including_cache_metadata": true,
+    "no_statistical_noninferiority_claim": true
+  },
+  "accepted_pipeline_cost": {
+    "phases": {
+      "build/chat": {
+        "calls": 135,
+        "errors": 0,
+        "missing_usage": 0,
+        "prompt_tokens": 497341,
+        "completion_tokens": 367733,
+        "total_tokens": 865074,
+        "source": "runs/locomo-product/api_calls.jsonl"
+      },
+      "build/embedding": {
+        "calls": 332,
+        "errors": 0,
+        "missing_usage": 0,
+        "prompt_tokens": 438176,
+        "completion_tokens": 0,
+        "total_tokens": 438176,
+        "source": "runs/locomo-product/api_calls.jsonl"
+      },
+      "prepare/embedding": {
+        "calls": 671,
+        "errors": 0,
+        "missing_usage": 0,
+        "prompt_tokens": 68385,
+        "completion_tokens": 0,
+        "total_tokens": 68385,
+        "source": "runs/locomo-product/api_calls.jsonl"
+      },
+      "answer/chat": {
+        "calls": 1531,
+        "errors": 0,
+        "missing_usage": 0,
+        "prompt_tokens": 8783336,
+        "completion_tokens": 42999,
+        "total_tokens": 8826335,
+        "source": "runs/locomo-final/api_calls.jsonl"
+      },
+      "judge/chat": {
+        "calls": 1542,
+        "errors": 0,
+        "missing_usage": 0,
+        "prompt_tokens": 1171356,
+        "completion_tokens": 65355,
+        "total_tokens": 1236711,
+        "source": "runs/locomo-final/api_calls.jsonl"
+      }
+    },
+    "cold_build_total_tokens": 1303250,
+    "production_total_including_cold_build_excluding_judge": 10197970,
+    "total_including_cold_build_and_judge": 11434681,
+    "token_accounting_complete_for_accepted_phases": true,
+    "local_inference_no_paid_remote_model_calls": true,
+    "not_including_discarded_diagnostic_runs_or_control": true
+  },
+  "verification": {
+    "regression_tests_passed": 586,
+    "regression_seconds": 10.14,
+    "installed_wheel_live_smoke": {
+      "http_write_prepare_answer": true,
+      "sigkill_restart": true,
+      "idempotent_retry": true,
+      "online_backup_restore": true,
+      "models_called": true,
+      "prediction": "Luna",
+      "answer_prompt_tokens": 595,
+      "answer_completion_tokens": 3
+    },
+    "wheel_smoke_ran_outside_checkout": true,
+    "docker_compose_config_validated": true,
+    "docker_image_execution_tested": false,
+    "optimized_readout_fallback_counts": {
+      "False": 1540
+    },
+    "release_wheel": {
+      "path": "dist/graphmem-5.81.1-py3-none-any.whl",
+      "sha256": "aeb77905eaf208517bea4f7c6ac9a58fafc6e536b147813faf6c17e5ea7221cb",
+      "bytes": 454147,
+      "runtime_files": 82,
+      "runtime_identical_to_live_tested_wheel": true,
+      "source_matches_wheel": true
+    }
+  },
+  "diagnostic_runs": [
+    {
+      "run": "runs/locomo-product-initial-mixed-load",
+      "reason": "Cancelled: concurrent long build and answer requests caused 16 timeouts; serialized runs now required.",
+      "answers": 0,
+      "truncated_answers": 0,
+      "recorded_api_attempts": 67,
+      "failed_api_attempts": 16,
+      "observed_total_tokens": 182765
+    },
+    {
+      "run": "runs/locomo-frozen-control",
+      "reason": "Diagnostic control: max_tokens=512, frequency_penalty=0; two truncated answers.",
+      "answers": 1540,
+      "truncated_answers": 2,
+      "recorded_api_attempts": 3072,
+      "failed_api_attempts": 0,
+      "observed_total_tokens": 10582515
+    },
+    {
+      "run": "runs/locomo-product",
+      "reason": "Cold build and prepare reused; initial answer/judge excluded from accepted costs because one answer truncated at max_tokens=512.",
+      "answers": 1540,
+      "truncated_answers": 1,
+      "recorded_api_attempts": 4210,
+      "failed_api_attempts": 0,
+      "observed_total_tokens": 11430892
+    },
+    {
+      "run": "runs/locomo-release",
+      "reason": "Discarded decoding trial: repetition_penalty=1.05 and max_tokens=2000 still produced one repetitive truncated answer; judge run cancelled.",
+      "answers": 1540,
+      "truncated_answers": 1,
+      "recorded_api_attempts": 2305,
+      "failed_api_attempts": 0,
+      "observed_total_tokens": 9448250
+    }
+  ],
+  "whole_debug_session_cost_note": "The phase ledger above is one accepted pipeline, not total debug spend. Timeout/cancelled requests can have unreported server usage; total debug cost cannot be stated exactly. Diagnostic logs and probes are retained under runs/.",
+  "artifact_sha256": {
+    "config/memory-service.json": "ef32c5b0057e39178a8fc257199c23e75bef75ab29c929f245290c4620b8c5bf",
+    "config/reproduction-constraints.txt": "48f833d39d2db4118e68a054cf359de6d632e079d644dbe399b4cac205aa5fca",
+    "src/graphmem/service/profiles/build_v5_81.json": "edc2b1c6b58e12d0beac782321c325f26d8c0bffc9d110d4839ddb66e71ae89c",
+    "src/graphmem/service/profiles/runtime_v5_81.json": "f5ce4606d03285a63b60a9b571638f5f00b5e9062b51506f7fb56801b8b51d73",
+    "runs/locomo-product/built.jsonl": "9603af26932dec2dd6a5110c9ac37411cecc8d71e54dae76923e76d72074605b",
+    "runs/locomo-product/prepared.jsonl": "8b44fe86c3cbd48857d0f2d35d35a42272f973dbb1e318ee94a3d083da8c0c5a",
+    "runs/locomo-product/manifest.json": "424916daa19656dbab8a811f1e552fd21a17af7ac123eb48696dccf807179aa6",
+    "runs/locomo-product/api_calls.jsonl": "73f07447305f9785eac0e7cb42f5940209627818ca975bc9ea9fbb27271a045e",
+    "runs/locomo-product/raw_source_audit.json": "b0673ccde74dc8872467928d3f3e7b8e7f8786401dfc7cfaab06ff3222f5af15",
+    "runs/memory-service-wheel-live/summary.json": "0e503e4e898f9d955ef5fe8702ec1e0d4c46fe6863ade2abda733bb452da8229",
+    "runs/test-results.log": "89fd1be79349c904da840a2b830395bb63111548020bd3f3f8d4d17e375564b8",
+    "runs/locomo-final/manifest.json": "c66f0f44e9989b9aab56689d7eb44348e9dc498102850c383e5598f2a19b3553",
+    "runs/locomo-final/prepared.jsonl": "dc669a2773d519853f41a3afb923dc056f303be34d35669423a90bbc806a4fc5",
+    "runs/locomo-final/answers.jsonl": "da3f6f01798210dac3aeabb0e650f068adbf89db28c639ed65bbfadda99da9d7",
+    "runs/locomo-final/judge.jsonl": "c3c000b56fc8ee8314fa2765758df7b8aca54235508bd296e2dbe149795650ec",
+    "runs/locomo-final/api_calls.jsonl": "8d6150f14579ad9bf66008af9692f7b4c7e8d21df27bdc587fd20168a9769eb4",
+    "runs/locomo-final/environment.json": "04997f2d1b7c5cd7698b9ce00dbd9679f1accb1d74e488d4235c0462b784e774",
+    "runs/locomo-final/summary.json": "f43075860b1f83bbd07fb0fe7ef2011507a0265d20998009b4a54ebe03252a70",
+    "runs/locomo-control-final/manifest.json": "b171ac16a0e67c5a8ad17f14e173d2056ad285bf33c3a0650a971e43d6154b79",
+    "runs/locomo-control-final/prepared.jsonl": "9f22d0b5bc3a7438f89d458c4debe6257a4090a164440d7fa515114b60e0042b",
+    "runs/locomo-control-final/answers.jsonl": "701e8b4eff6dd92701ff5f7f5ccbea8e710d0b05e14b3ba83dd153d43c4722a5",
+    "runs/locomo-control-final/judge.jsonl": "bcafc18acab33ecfa35efadb2c26e53cc64b9b7b566862960ef4f399ffc6255e",
+    "runs/locomo-control-final/api_calls.jsonl": "2d1442b4c91a152bace70dfade5575653f5a26757b343d283c7be384f24fe68b",
+    "runs/locomo-control-final/environment.json": "04997f2d1b7c5cd7698b9ce00dbd9679f1accb1d74e488d4235c0462b784e774",
+    "runs/locomo-control-final/summary.json": "a8f94f603c592bc577d4f4c9d3ccb101643fdd9fa50007be5d4bb6c9f40ef0f9",
+    "runs/locomo-paired/judge.jsonl": "52317cbd3daab4bed5bc88bfae8ba7a8609c414de9dc4e35f7c1cc3d8f8cfcd6",
+    "runs/locomo-paired/summary.json": "68cec4d887f5297eec65fcb3f35ff8526005896d0c2af2260997141cbaff7260"
+  }
+}

@@ -12,6 +12,7 @@
   "embedding_api_key_env": "",
   "request_profile": "qwen",
   "answer_request_profile": "qwen",
-  "max_output_tokens": 512,
+  "max_output_tokens": 2000,
+  "answer_frequency_penalty": 0.2,
   "readout": "v5_81"
 }

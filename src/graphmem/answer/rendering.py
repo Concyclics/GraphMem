@@ -195,6 +195,7 @@ class AnswerConfig:
     # are reserved for explicitly labelled Best-of-N answer studies.
     sampling_temperature: float = 0.0
     sampling_seed: int = 0
+    sampling_frequency_penalty: float = 0.0
     #: Rendered evidence is ``[session date] speaker: text``; this bounds the
     #: per-turn header so a pathological speaker label cannot eat the budget.
     max_speaker_chars: int = 48
@@ -205,7 +206,8 @@ class AnswerConfig:
 
         Retrieval budgets stay outside this answer-only configuration.  The
         matching query-plane values live in
-        ``configs/v5/runtime_v5_54_accuracy64.json``.
+        the package's service profile; historical regression samples live in
+        ``test/fixtures/profiles/``.
         """
 
         values = {
@@ -295,6 +297,8 @@ class AnswerConfig:
             raise ValueError("sampling_temperature must be between 0 and 2")
         if self.sampling_seed < 0:
             raise ValueError("sampling_seed must be non-negative")
+        if not 0.0 <= self.sampling_frequency_penalty <= 2.0:
+            raise ValueError("sampling_frequency_penalty must be between 0 and 2")
         if self.aggregation_ledger_limit <= 0:
             raise ValueError("aggregation_ledger_limit must be positive")
         if self.answer_plan_max_candidates <= 0:

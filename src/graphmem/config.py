@@ -296,6 +296,8 @@ class EdgeConfig:
 class StorageConfig:
     runtime_mode: str = "sqlite_snapshot"
     sqlite_path: str = "artifacts/v5/graphmem.sqlite"
+    # Keep inactive fields in the serialized schema so existing SQLite build
+    # identities/caches remain readable after removing the Neo4j experiment.
     neo4j_enabled: bool = False
     neo4j_uri: str = "bolt://127.0.0.1:7687"
     neo4j_batch_nodes: int = 1000
@@ -785,10 +787,8 @@ class GraphMemV5Config:
             raise ValueError("unsupported GraphMem schema version")
         if self.models.thinking_enabled:
             raise ValueError("GraphMem V5 memory backbone thinking must remain disabled")
-        if self.storage.runtime_mode not in {
-            "neo4j_direct", "neo4j_cached", "sqlite_snapshot"
-        }:
-            raise ValueError("invalid graph runtime mode")
+        if self.storage.runtime_mode != "sqlite_snapshot" or self.storage.neo4j_enabled:
+            raise ValueError("only sqlite_snapshot is supported; Neo4j experiments were retired")
         if self.edges.refine_mode not in {
             "none", "ambiguous_only", "high_value_only", "all_bounded_candidates"
         }:
