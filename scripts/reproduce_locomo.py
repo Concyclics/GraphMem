@@ -93,6 +93,19 @@ def copy_graph(source_path, destination):
             target.execute("DELETE FROM llm_calls WHERE stage='answer'")
 
 
+def normalize_frozen_prompt(row, counter):
+    """Validate message identity and recount content with the actual tokenizer.
+
+    Historical materializers sometimes retained an earlier packing estimate
+    after adding focus views. That estimate must never masquerade as API usage.
+    """
+    digest = hashlib.sha256(canonical_json(row["messages"]).encode()).hexdigest()
+    if digest != row["prompt_payload_hash"]:
+        raise ValueError(f"frozen prompt payload hash mismatch: {row['question_id']}")
+    return {**row, "original_packing_prompt_tokens": row.get("packing_prompt_tokens"),
+            "packing_prompt_tokens": sum(counter.count_many([m["content"] for m in row["messages"]]))}
+
+
 class Meter:
     """Record actual response.usage at the transport boundary, before any caches."""
     def __init__(self, path):
@@ -254,7 +267,10 @@ def main():
                 "question_ids": sorted(expected), "judge_prompt_sha256": JUDGE_SHA,
                 "source_db_sha256": sha(args.source_db) if args.source_db else None,
                 "prepared_sha256": sha(args.prepared) if args.prepared else None,
-                "answer_sampling": {"temperature": 0, "seed": 0, "n": 1},
+                "answer_sampling": {"temperature": 0, "seed": 0, "n": 1,
+                    "max_output_tokens": config.max_output_tokens,
+                    "frequency_penalty": (config.answer_frequency_penalty
+                                           if config.answer_request_profile == "qwen" else 0.0)},
                 "judge_model": config.llm_model, "judge_with_evidence": False}
     manifest = output / "manifest.json"
     if manifest.exists() and json.loads(manifest.read_text()) != identity:
@@ -279,7 +295,10 @@ def main():
     counter = resolve_token_counter(config.llm_model, require_exact=True)
     embedding = QwenEmbeddingIndex(store, build, client=embed, **runtime.retrieval.embedding_options())
     stage = AnswerStage(store, build, "locomo-product-reproduction", client=chat,
-                        answer_config=AnswerConfig.v5_73(max_output_tokens=config.max_output_tokens),
+                        answer_config=AnswerConfig.v5_73(
+                            max_output_tokens=config.max_output_tokens,
+                            sampling_frequency_penalty=(config.answer_frequency_penalty
+                                if config.answer_request_profile == "qwen" else 0.0)),
                         answer_model=config.llm_model, answer_request_profile=config.answer_request_profile,
                         require_exact_tokenizer=True)
     if args.stage in {"all", "build"} and not args.prepared:
@@ -308,7 +327,8 @@ def main():
     if args.stage in {"all", "prepare"}:
         meter.phase = "prepare"
         if args.prepared:
-            frozen = [r for r in read_rows(args.prepared) if r["question_id"] in expected]
+            frozen = [normalize_frozen_prompt(r, counter) for r in read_rows(args.prepared)
+                      if r["question_id"] in expected]
             if {r["question_id"] for r in frozen} != expected or len(frozen) != len(expected):
                 raise ValueError("frozen prompts do not cover the selected questions exactly")
             (output / "prepared.jsonl").write_text("".join(json.dumps(r) + "\n" for r in frozen))

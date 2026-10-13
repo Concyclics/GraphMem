@@ -6,6 +6,8 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from graphmem.domain import canonical_json
+from graphmem.tokenization import HeuristicTokenCounter
 
 SPEC = importlib.util.spec_from_file_location(
     "reproduction", Path(__file__).resolve().parents[1] / "scripts/reproduce_locomo.py")
@@ -93,3 +95,16 @@ def test_graph_snapshot_keeps_build_cache_but_never_imports_answers(tmp_path):
         assert db.execute("SELECT * FROM llm_calls").fetchall() == [("scene_semantic",)]
     with sqlite3.connect(source) as db:
         assert db.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0] == 2
+
+
+def test_frozen_prompt_recounts_stale_estimate_and_rejects_modified_messages():
+    counter = HeuristicTokenCounter()
+    messages = [{"role": "user", "content": "Original source and added focus witnesses."}]
+    row = {"question_id": "q", "messages": messages, "packing_prompt_tokens": 1,
+           "prompt_payload_hash": hashlib.sha256(canonical_json(messages).encode()).hexdigest()}
+    recounted = RUNNER.normalize_frozen_prompt(row, counter)
+    assert recounted["original_packing_prompt_tokens"] == 1
+    assert recounted["packing_prompt_tokens"] == counter.count(messages[0]["content"])
+    messages[0]["content"] = "Modified evidence"
+    with pytest.raises(ValueError, match="payload hash mismatch"):
+        RUNNER.normalize_frozen_prompt(row, counter)

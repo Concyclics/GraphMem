@@ -326,7 +326,10 @@ class MemoryService:
     def _stage(self, *, answering=False):
         return AnswerStage(
             self.store, self.build_config, "memory-service-v1",
-            answer_config=AnswerConfig.v5_73(max_output_tokens=self.config.max_output_tokens),
+            answer_config=AnswerConfig.v5_73(
+                max_output_tokens=self.config.max_output_tokens,
+                sampling_frequency_penalty=(self.config.answer_frequency_penalty
+                    if self.config.answer_request_profile == "qwen" else 0.0)),
             # Preparation is model independent; never construct a client or
             # require answer credentials until a completion is actually asked for.
             client=self._client("answer") if answering else object(),

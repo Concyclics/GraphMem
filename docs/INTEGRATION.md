@@ -17,7 +17,8 @@
 | `request_profile` | 构建接口：`qwen` / `openai` |
 | `answer_request_profile` | 回答接口：`qwen` / `openai` / `omit`（不发厂商专有参数） |
 | `answer_reasoning_effort` | `none`；仅 `openai` profile 接受其他档位 |
-| `max_output_tokens` | `512`；回答输出上限 |
+| `max_output_tokens` | `2000`；回答输出上限，实际开支由 API usage 决定 |
+| `answer_frequency_penalty` | `0.2`；Qwen profile 按生成次数抑制重复，防止循环输出；其他 profile 默认不发送此参数 |
 | `model_timeout_seconds` | `180`；底层模型单次调用超时，现有 SDK 层有有限重试 |
 | `build_overrides` | 对随包构建配置按节覆盖，如 `models`、`coarsen`、`edges` |
 | `runtime_overrides` | 对随包运行配置按节覆盖，如 `retrieval`、`query_budget` |

@@ -41,6 +41,8 @@ python scripts/reproduce_locomo.py \
 
 同一 GPU 上顺序运行实验。入口用文件锁防止本脚本的多个实验同时运行；不要同时向端点灌入其他大量推理请求，持续 prefill 会拖慢长输出建图并触发超时。评分输出缺少合法标签时最多补一次格式约束，重试调用同样计入账本。
 
+回答参数固定为 `temperature=0, seed=0, n=1, frequency_penalty=0.2, max_tokens=2000`。频率惩罚用于抑制 Qwen 的重复输出；上限不是预先计费量。所有题目使用同一参数，不针对错误题切换解码设置。评分使用独立的 `temperature=0, seed=0, max_tokens=512` JSON 请求。
+
 | 产物 | 内容 |
 |---|---|
 | `manifest.json` | 数据 / 配置 / 固定评分模板、完整题目 ID、采样参数及可选冻结输入哈希 |
@@ -53,13 +55,27 @@ python scripts/reproduce_locomo.py \
 
 `summary.actual_api_usage` 是实际开支账本；缓存中的旧 usage 仅用于描述每题逻辑 Token，不能重复计费。建库、查询 embedding、回答和评分分列；冷建库成本需按服务生命周期摊销。失败请求如果未返回 usage，无法精确知道其服务端消耗，因此另列失败次数。这里报告 Token，不把本地 GPU 开销伪装成 API 美元费用。
 
+`checks_pass` 校验题目完整性、答案与判定哈希一致、无空答案 / 截断、API usage 完整；它不代表达到某个准确率阈值。成绩须与相同评分模型和口径的对照一起判断。`packing_prompt_tokens` 是 tokenizer 对消息正文的计数；实际开支以 API usage 为准，包含服务端 chat template 开销。
+
 ## 历史最佳对照
 
 可以显式增加 `--source-db /path/to/graphmem.sqlite --prepared /path/to/prepared_answers.jsonl`，重新回答冻结 Prompt；该模式复用图与检索，**不是冷建库复现**。只传 `--source-db` 时会复用图并重新准备产品 Prompt，必须确保图的构建模型、embedding 和 schema 与配置一致。
 
 历史 v27 的 88.25% 来自另一个评分模型（Luna-medium）及 temperature=0.7 的 candidate 1；本地新测使用 Qwen 评分、temperature=0、n=1。两者不能直接用百分点作质量变化结论。应比较本次使用相同本地模型、评分模板和采样设置的新产品与冻结对照，并同时报告建库 / 检索差异。best-of-8 oracle 不作为可上线成绩。
 
-实际运行环境、结果和验收结论在完成全量验证后记录于本目录的复现结果文件。
+本次完整结果、冷建库来源、对照差异和调试失败记录见 [LOCOMO_RESULTS.md](LOCOMO_RESULTS.md)，机器可读汇总见 [results/locomo-2026-10-13.json](results/locomo-2026-10-13.json)。同一预测的配对审计命令：
+
+```bash
+python scripts/paired_judge_delta.py merge \
+  --baseline-answers runs/locomo-control-final/answers.jsonl \
+  --candidate-answers runs/locomo-final/answers.jsonl \
+  --baseline-judge runs/locomo-control-final/judge.jsonl \
+  --delta-judge runs/locomo-final/judge.jsonl \
+  --output runs/locomo-paired/judge.jsonl \
+  --manifest runs/locomo-paired/summary.json
+```
+
+配对结果对逐字节相同的预测复用对照判定，变化的预测使用本轮判定，以分离评委噪声；独立评分的原始成绩同时保留。
 
 真实模型持久化验收可单独运行（输出目录必须未存在）：
 

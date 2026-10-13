@@ -29,7 +29,8 @@ class ServiceConfig:
     answer_api_key_env: str = ""
     answer_request_profile: str = "qwen"
     answer_reasoning_effort: str = "none"
-    max_output_tokens: int = 512
+    max_output_tokens: int = 2000
+    answer_frequency_penalty: float = 0.2
     model_timeout_seconds: float = 180.0
     readout: str = "v5_81"
     build_overrides: Mapping[str, Any] = field(default_factory=dict)
@@ -53,6 +54,8 @@ class ServiceConfig:
             raise ValueError("readout must be v5_81 or v5_73")
         if type(self.max_output_tokens) is not int or self.max_output_tokens < 1:
             raise ValueError("max_output_tokens must be positive")
+        if not 0.0 <= self.answer_frequency_penalty <= 2.0:
+            raise ValueError("answer_frequency_penalty must be between 0 and 2")
         if not 0 < self.model_timeout_seconds <= 600:
             raise ValueError("model_timeout_seconds must be in (0, 600]")
         for name in ("llm_model", "embedding_model", "llm_base_url", "embedding_base_url"):
