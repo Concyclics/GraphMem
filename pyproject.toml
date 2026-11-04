@@ -27,9 +27,12 @@ dependencies = [
 dev = ["pytest>=8", "hypothesis>=6", "pytest-asyncio>=0.24"]
 service = ["tokenizers>=0.20", "faiss-cpu>=1.8", "hnswlib>=0.8"]
 dense = ["faiss-cpu>=1.8"]
+research = ["tokenizers==0.22.2", "xgboost==3.4.1", "scikit-learn==1.9.1"]
+research-encoder = ["torch>=2.5", "transformers==5.6.2"]
 
 [project.scripts]
 graphmem = "graphmem.service.cli:main"
+graphmem-research = "graphmem.research.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -40,6 +43,7 @@ include = ["graphmem*"]
 
 [tool.setuptools.package-data]
 "graphmem.service" = ["profiles/*.json"]
+"graphmem.research" = ["assets/*.json", "rubrics/*LICENSE", "rubrics/NOTICE"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]

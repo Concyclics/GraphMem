@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 from graphmem.eval import calibration40, conversation_holdout_split, load_dev_questions, load_gold_turns
 from graphmem.eval.devset import parse_locomo_evidence
 
 
-ROOT = Path("/ssd3/chenhan/Spark_MemGraph_Dev")
-DEV = ROOT / "artifacts/development_sets/hard_lme_multisession_temporal_locomo_cat1_cat2_200_20260804"
+DEV = Path(os.environ.get(
+    "GRAPHMEM_DEVSET_DIR",
+    "eval_annotations/hard_lme_multisession_temporal_locomo_cat1_cat2_200_20260804",
+))
 
 
 def test_locomo_evidence_parser_is_exact_and_deduplicated() -> None:
@@ -18,6 +23,8 @@ def test_locomo_evidence_parser_is_exact_and_deduplicated() -> None:
 
 
 def test_real_devset_has_four_equal_strata_and_stable_calibration() -> None:
+    if not DEV.is_dir() and "GRAPHMEM_DEVSET_DIR" not in os.environ:
+        pytest.skip("Optional development data: set GRAPHMEM_DEVSET_DIR to run this check")
     questions = load_dev_questions(
         DEV / "longmemeval_hard_multisession50_temporal50.json",
         DEV / "locomo_hard_cat1_multihop50_cat2_temporal50.json",

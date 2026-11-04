@@ -1,0 +1,12 @@
+locomo.py is unmodified benchmarks/locomo/prompts.py from
+mem0ai/memory-benchmarks commit 4b61c5d31b9c668a12b4f5e78064248a02c82d2b.
+Copyright 2025 Mem0.ai. Apache-2.0; see MEMORY_BENCHMARKS_LICENSE.
+https://github.com/mem0ai/memory-benchmarks
+
+longmemeval.py is the exact archived material rubric used by this study,
+adapted from LongMemEval's evaluation/generation prompts. It is not a claim
+that every grading detail equals the upstream default harness.
+Copyright (c) 2024 Di Wu. MIT; see LONGMEMEVAL_LICENSE.
+https://github.com/xiaowu0162/LongMemEval
+
+Both files are kept byte-for-byte to preserve recorded rubric SHA256 values.
