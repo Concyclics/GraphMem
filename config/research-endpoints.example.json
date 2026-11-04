@@ -1,0 +1,7 @@
+{
+  "qwen": {"base_url": "http://127.0.0.1:8002/v1", "model": "graphmem-eval-qwen30b", "key_env": "GRAPHMEM_QWEN_API_KEY"},
+  "judge": {"base_url": "http://127.0.0.1:8002/v1", "model": "graphmem-eval-qwen30b", "key_env": "GRAPHMEM_QWEN_API_KEY"},
+  "astra": {"base_url": "https://your-responses-provider.example/v1", "model": "gpt-6-astra", "key_env": "GRAPHMEM_ASTRA_API_KEY", "require_key": true},
+  "base_embedding_locomo": {"base_url": "http://127.0.0.1:8003/v1", "model": "BAAI/bge-m3", "key_env": "GRAPHMEM_EMBED_API_KEY"},
+  "base_embedding_longmemeval": {"base_url": "http://127.0.0.1:8001/v1", "model": "Qwen/Qwen3-Embedding-0.6B", "key_env": "GRAPHMEM_EMBED_API_KEY"}
+}

@@ -1,0 +1,136 @@
+{
+  "protocol": "graphmem-research-20261104",
+  "validated_on": "2026-11-04",
+  "environment": {
+    "python": "3.13.5",
+    "dependencies": "config/research-constraints.txt",
+    "gpu_used_for_migration_checks": false
+  },
+  "automated_tests": {
+    "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4 pytest -q",
+    "passed": 594,
+    "skipped": 1,
+    "failed": 0,
+    "research_tests": 9,
+    "skip_reason": "Optional historical 200-question development data not supplied; configure GRAPHMEM_DEVSET_DIR to run its calibration test."
+  },
+  "release_manifest_sha256": "29d8c3205853ccc6509e0c3d19ec936b2d7b5b9fbf8fd2f9d5918df9f526d63d",
+  "wheel": {
+    "wheel": "graphmem-5.81.1-py3-none-any.whl",
+    "sha256": "35639b4c21e71e1a1c73a4256c8abed95a28c67b493febc34d8f4790a7a39a93",
+    "verified_research_files": 77,
+    "entry_point_present": true,
+    "cli_verify_assets_outside_checkout": true
+  },
+  "saved_request_response_replay": {
+    "description": "Offline replay of the accepted saved responses. No new generation or grading was performed. Request/message hashes were checked when present in the archived ledger; final answers, all executed LLM token totals and call counts were compared for every question.",
+    "qwen": {
+      "locomo": {
+        "n": 1540,
+        "matched": 1540,
+        "mismatches": [],
+        "calls": 1609,
+        "stages": {
+          "quote": 1540,
+          "legacy_evidence": 25,
+          "date_check": 25,
+          "legacy_focus": 7,
+          "quote_repair": 11,
+          "legacy_evidence_repair": 1
+        }
+      },
+      "longmemeval": {
+        "n": 500,
+        "matched": 500,
+        "mismatches": [],
+        "calls": 509,
+        "stages": {
+          "legacy_chronological": 263,
+          "override_0_state_attribute": 17,
+          "legacy_role": 114,
+          "override_0_typed_user_quantities": 23,
+          "override_0_component_evidence": 24,
+          "override_0_activity_count": 20,
+          "zero_guard": 4,
+          "override_0_event_anchored_duration": 14,
+          "calendar": 17,
+          "legacy_source_reread": 3,
+          "override_0_latest_event": 5,
+          "override_0_missing_named_operand": 3,
+          "override_0_latest_event_repair": 1,
+          "zero_guard_repair": 1
+        }
+      }
+    },
+    "astra": {
+      "description": "Exact assembled request and source-ID comparisons against accepted artifacts.",
+      "locomo": {
+        "questions": 1540,
+        "matched": 1540,
+        "branches": {
+          "base": 1257,
+          "grounded_inference": 29,
+          "matching_episodes": 215,
+          "explicit_date_closure": 39
+        },
+        "mismatches": []
+      },
+      "longmemeval": {
+        "questions": 500,
+        "matched": 500,
+        "branches": {
+          "base": 285,
+          "numeric_answer": 158,
+          "topic_count_sources": 9,
+          "ranked_spending": 1,
+          "named_episode": 3,
+          "elapsed_time_anchors": 44
+        },
+        "mismatches": []
+      }
+    },
+    "retrieval": {
+      "description": "Frozen feature caches and shipped models reproduce every ordered selected-source list.",
+      "locomo": {
+        "questions": 1540,
+        "matched": 1540
+      },
+      "longmemeval": {
+        "questions": 500,
+        "matched": 500
+      }
+    }
+  },
+  "partial_feature_regeneration": {
+    "locomo": {
+      "memories": 3,
+      "questions": 433,
+      "bit_identical_matrices": 432,
+      "base_and_enhanced_checked": true,
+      "embedding_job_texts_identical": true,
+      "tie_case": {
+        "qid": "locomo09_0106",
+        "different_feature_cells": 1,
+        "different_features": [
+          "canonical_fact_attr_rank"
+        ],
+        "max_feature_absolute_difference": 0.043290019035339355,
+        "model_prediction_differences": 0,
+        "model_max_absolute_difference": 0.0
+      },
+      "interpretation": "One lexical rank cell differs in a tie-sensitive floating-point computation; the applicable frozen model produces exactly the same scores for all turns of that question. No feature-equivalence claim is made beyond the checked subset."
+    },
+    "longmemeval": {
+      "memories": 3,
+      "questions": 3,
+      "base_matrices_bit_identical": 3,
+      "enhanced_regeneration_checked": false
+    }
+  },
+  "limits": [
+    "No new paid full-benchmark answer or judge run.",
+    "No full GPU embedding or historical graph rebuild was performed in this migration.",
+    "The historical data, graphs and private response caches are not shipped; use the documented inputs or fresh-build path.",
+    "This is reproduction of development-selected operating points, not an independent test set."
+  ]
+}

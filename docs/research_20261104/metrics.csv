@@ -1,0 +1,7 @@
+benchmark,method,n,correct,accuracy,gain_pp_over_archive,mean_query_tokens,query_saving_percent,query_scope,build_llm_tokens_per_history,build_saving_percent,annotated_source_recall,recall_questions,complete_source_questions
+locomo,archived_mem0_qwen,1540,1115,0.724025974025974,0.0,13515.101948051948,0.0,archived_answer_LLM_only,5318817.9,0.0,,,
+locomo,graphmem_qwen,1540,1455,0.9448051948051948,22.07792207792208,9680.881818181819,28.369894245768446,all_query_models_including_embeddings,86660.5,98.37068119967033,0.9919148964342024,1533,1498
+locomo,graphmem_astra,1540,1511,0.9811688311688311,25.714285714285715,8440.464935064934,37.547900359852385,all_query_models_including_embeddings,86660.5,98.37068119967033,0.9925672121550112,1533,1499
+longmemeval,archived_mem0_qwen,500,363,0.726,0.0,11761.066,0.0,archived_answer_LLM_only,2461196.546,0.0,,,
+longmemeval,graphmem_qwen,500,464,0.928,20.2,9877.318,16.016813441910806,all_query_models_including_embeddings,206763.714,91.59905720101722,0.9968085106382979,470,467
+longmemeval,graphmem_astra,500,491,0.982,25.6,8958.582,23.82848629537493,all_query_models_including_embeddings,206763.714,91.59905720101722,0.999468085106383,470,469

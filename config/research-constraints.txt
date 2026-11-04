@@ -1,0 +1,9 @@
+# Recorded CPU ranking / client versions. Python 3.13.5 used for port validation.
+numpy==2.4.3
+xgboost==3.4.1
+scikit-learn==1.9.1
+tokenizers==0.22.2
+openai==2.26.0
+PyYAML==6.0.3
+# Local view encoder is optional and installed in a separate GPU environment.
+transformers==5.6.2

@@ -1,5 +1,7 @@
 # GraphMem
 
+**November research snapshot:** [dual-benchmark Qwen/Astra reproduction](docs/research_20261104/README.md) · [frozen results](docs/research_20261104/RESULTS.md). Includes frozen rankers, query-only source completion, all-query token accounting, and both reader stages.
+
 GraphMem 是一种 **token-efficient memory 算法**，通过图结构组织长期记忆，根据查询自适应选择召回范围和上下文预算，为 LLM 提供精简、可追溯的记忆上下文。
 
 GraphMem 提供 **Python SDK、HTTP API 和持久化 Memory 服务**，支持记忆写入、检索、Prompt 构建与回答生成。可以嵌入 Python 应用，也可以作为独立服务接入；生成的 `messages` 可直接交给产品现有的 LLM。

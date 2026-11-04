@@ -30,3 +30,7 @@ artifacts/
 *.sqlite-shm
 /build/
 /dist/
+
+# Local research endpoint configuration
+/runs-endpoints.json
+.ruff_cache/

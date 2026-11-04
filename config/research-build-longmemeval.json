@@ -1,0 +1,11 @@
+{
+  "data_dir": "../runs/research-build/longmemeval",
+  "llm_model": "graphmem-eval-qwen30b",
+  "llm_base_url": "http://127.0.0.1:8002/v1",
+  "llm_api_key_env": "GRAPHMEM_QWEN_API_KEY",
+  "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+  "embedding_base_url": "http://127.0.0.1:8001/v1",
+  "embedding_api_key_env": "GRAPHMEM_EMBED_API_KEY",
+  "request_profile": "qwen",
+  "generate_answers": false
+}

@@ -1,0 +1,61 @@
+{
+  "protocol": "graphmem-research-20261104",
+  "index_base_commit": "bdc55f8b7fe756de6ee3562948a6a43c77a0dfdb",
+  "data_sha256": {
+    "locomo10.json": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
+    "longmemeval_s_cleaned.json": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442"
+  },
+  "graph_snapshot_sha256": {
+    "locomo": "7b95ab8dd49b4d719c9514b871a4c7f19629bef8a1532f7ea08fe7a37c4cd343",
+    "longmemeval": "b5284e20426747c2457d4e9e6615e912bd3b9686f762659ab16a3043b4ee87de"
+  },
+  "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+  "artifact_sha256": {
+    "phase1_frozen_manifest.json": "0266677c7eac65f841dbf6e8a8547dc5e0cff46b3fd78c0d1a9be8f35569b29e",
+    "phase1_frozen_operating_point.json": "e1a2fe19ec5c97e6f279f1a22653b3ed4c89d79ebe755b138b934ededf0fd704",
+    "phase2_astra_query_sources_98_operating_point.json": "dda057b8c9a6f7dab36a31fe6633e4562f7d9a6ed147dd7f688c65ba90223616",
+    "locomo_date_conclusive_policy.jsonl": "bfc7eb921bdac2691dee63bc7ff1efe878bf83d465fcc8a76abe4658c8452199",
+    "latest_event_reproduced_selected_branches_policy.jsonl": "24a391691e4c3a3d26af9a8e675b7dbaa615c382a41a702be4e2fbcb1b00d692",
+    "astra_context_branches_v1_best_development_policy.jsonl": "9d0464d86599ef2107c1888795afccd4d7b997ba47e3dfd46c4f61be896e16a9",
+    "astra_lme_query_sources_v3_best_development_policy.jsonl": "f29fe981b8803de219e7cceea85f6a01603ac273e64bde0dbf1e08796e06235a"
+  },
+  "inference_uses_reference_answers_or_judge_labels": false,
+  "lme_training": false,
+  "locomo_ranking": "10 frozen conversation-held-out rankers; earlier development-selected hyperparameters",
+  "lme_ranking": "Frozen ranker fitted on LoCoMo only",
+  "phase1": {
+    "reader": "Qwen3-30B-A3B-Instruct-2507-FP8",
+    "locomo_correct": 1455,
+    "longmemeval_correct": 464,
+    "calendar_answer": "Model answer; no deterministic answer rewriting",
+    "sample_count": {
+      "locomo": 1540,
+      "longmemeval": 500
+    }
+  },
+  "phase2": {
+    "reader": "gpt-6-astra",
+    "locomo_correct": 1511,
+    "longmemeval_correct": 491,
+    "source_prelude": "Question-only source completion v3",
+    "reasoning_effort": "high",
+    "max_output_tokens": 4096,
+    "answer_calls_per_question": 1
+  },
+  "judging": {
+    "reader": "Qwen3-30B-A3B-Instruct-2507-FP8",
+    "temperature": 0,
+    "seed": 0,
+    "locomo_max_tokens": 256,
+    "longmemeval_max_tokens": 2048,
+    "lme_format": "material_qwen30b_compact_reason_v2",
+    "format_attempts_max": 3
+  },
+  "limitations": [
+    "Development-selected result, not independent held-out generalization",
+    "Historical Mem0 baseline mode/precision provenance retained in RESULTS.md",
+    "Fresh index build is available but is not the historical frozen graph",
+    "Source-ID recall is distinct from semantic information coverage",
+    "Unknown transport usage is never zero"
+  ]
+}
